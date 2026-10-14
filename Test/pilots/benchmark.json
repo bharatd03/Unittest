@@ -1,0 +1,13 @@
+{
+  "description": "Seeded-defect benchmark [ORC-16]: one known defect per case, each contradicting documented behaviour (E1/E2); controls have no defect and must not receive a fix.",
+  "cases": [
+    {"id": "B1", "pilot": "c_pilot", "sut": "src/thermostat.c", "description": "heating command 2 instead of 1 (E2: @return 1 to heat)", "find": "        return 1;\n", "replace": "        return 2;\n"},
+    {"id": "B2", "pilot": "c_pilot", "sut": "src/thermostat.c", "description": "sensor error not reported (E2: -1 on sensor error)", "find": "return -1;", "replace": "return -2;"},
+    {"id": "B3", "pilot": "c_pilot", "sut": "src/thermostat.c", "description": "upper limit 99 instead of 100 (E2: range 0..100)", "find": "return 100;", "replace": "return 99;"},
+    {"id": "B4", "pilot": "c_pilot", "sut": "src/thermostat.c", "description": "frost protection inverted (E1: REQ-TH-7)", "find": "&& !frost", "replace": "&& frost"},
+    {"id": "B5", "pilot": "cpp_pilot", "sut": "src/rate_limiter.cpp", "description": "remaining tokens off by one (E2: tokens left)", "find": "return capacity_ - used_;", "replace": "return capacity_ - used_ - 1;"},
+    {"id": "B6", "pilot": "cpp_pilot", "sut": "src/rate_limiter.cpp", "description": "burst equal to capacity rejected (E2: 1..capacity)", "find": "burst <= capacity", "replace": "burst < capacity"},
+    {"id": "C1", "pilot": "c_pilot", "sut": "src/thermostat.c", "description": "control: no defect"},
+    {"id": "C2", "pilot": "cpp_pilot", "sut": "src/rate_limiter.cpp", "description": "control: no defect"}
+  ]
+}

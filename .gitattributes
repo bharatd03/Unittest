@@ -1,0 +1,5 @@
+# Line endings (TP-18): every file is stored and checked out byte for byte, as committed,
+# except the entry files, which need the line endings of their operating system.
+* -text
+*.bat text eol=crlf
+*.sh text eol=lf

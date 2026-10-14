@@ -1,0 +1,32 @@
+# Files the setup or a run creates are never committed (TP-18).
+
+# Tools installed by ut_setup.py (TP-2) and the Python environment (TP-13)
+Source/UnitTestGenerator/tools/
+.venv/
+venv/
+
+# Run results, working copies and the knowledge base
+ut_output/
+ut_work/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+test_results.txt
+
+# BaseAgent's local service state: data, principals and client.token (a credential).
+# baseagent.bat creates it again (init-demo, renew-token).
+Source/BaseAgent/demo/
+
+# Python caches and editor files
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Patent material stays on the developer's computer until it is filed (TP-17)
+Patents/*
+!Patents/README.md

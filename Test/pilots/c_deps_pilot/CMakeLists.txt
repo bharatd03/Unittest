@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(mini C)
+add_library(mini src/ctrl.c src/brake_ctrl.c src/steer_assist.c lib/util.c lib/hw.c)
+target_include_directories(mini PUBLIC include)
+target_compile_definitions(mini PRIVATE MINI_LIMIT=40 BOARD_REV=2)

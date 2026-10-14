@@ -1,0 +1,2367 @@
+Unit-Test Generator — Requirements
+Version: 2026-10-09 (agreed review: stable IDs, BaseAgent-derived agents, MCP-only orchestration, fully automatic operation; 2026-10-09: ORC-13 to ORC-15, ORC-13a, ORC-14a, A1-16a, A2-21h, A2-21i, A3-OBS5, A4-23e from the implementation; 2026-10-09 afternoon: build capture A3-BD1 to A3-BD10 and dependency analysis A1-DA1 to A1-DA14 replace Parasoft's build data file and dependency analysis; ORC-3, ORC-7, A1-16a, A1-31a, A2-21g, A3-18a, A3-177 amended; A3-25a, A3-38a, A3-PR4 added; A2-21j from the build-capture prototype; 2026-10-10: tool provisioning TP-1 to TP-16 replaces every tool fallback; phase 1 (build adapters, client compilation databases, flagged estimates), phase 2 (coverage-guided search A3-FZ1 to A3-FZ7, rich test inputs A2-21h, static functions A2-21k, infeasibility proofs A1-37), phase 3 (requirement documents A1-25x, behaviour checks A1-25y, stricter source-fix acceptance A4-23f and A4-32a, seeded-defect benchmark ORC-16); ORC-5a, A1-18c, A2-21l added; ORC-7, ORC-12, ARCH-10, A3-18a, A3-33a, A3-58a, A3-BD2, A3-BD3, A3-BD5, A3-121a amended; 2026-10-11: repository link as input, repository cache, one build capture per commit, several SUT files per run (ORC-17 to ORC-23); delivery by commit: tests directly to the tested branch, production-source changes only after review through a pull request (ORC-24 to ORC-31); ORC-9, ORC-12, ORC-13, ORC-13a, ORC-14, A4-23a, A4-23c amended; 2026-10-11 afternoon: the coverage plan per function is suggested by the brain from deterministic facts and checked by Agent1 before Agent2 receives it (A1-PL1 to A1-PL11, A2-21m); ORC-5, ORC-7, A1-27, A2-21h and the flow summary amended; 2026-10-11 evening: more LLM use where it raises quality, always checked: requirement-based tests and rewrites of failing tests (A2-21n to A2-21q), hard gaps, requirement links from prose and missing declarations (A1-PL12 to A1-PL14), build flags when the build description is estimated (A3-BD11 to A3-BD13), several fix candidates and a second opinion (A4-23g to A4-23i), brain-linked evidence (A3-CL11); build tools of a repository link (TP-12a); ORC-3, ORC-7, ORC-24, ORC-30, A1-31a, A1-PL1, A2-21g, A2-21m and A3-BD10 amended; 2026-10-12: the project's own requirement documents as an optional input, with the requirement status per function in the result (A1-RQ1 to A1-RQ6); Input line, ORC-12, ORC-17 and the flow summary amended; 2026-10-12: knowledge packs for the brains (KP-1 to KP-9); 2026-10-12: adaptive token budget per LLM call in BaseAgent (ARCH-11 to ARCH-17); knowledge packs are loaded and are budget parts (KP-3, KP-4, KP-7 amended); ORC-7 and ORC-12 amended; 2026-10-12: brain selection by access, the same for every installation (ARCH-1a, ARCH-1b); ARCH-1, ARCH-7 to ARCH-9, ARCH-12, ARCH-14, TP-13, ORC-7 and the KP introduction amended; 2026-10-13: coverage targets by ASIL level, ASIL D by default, only measured coverage counts, no exclusions and no way out for the brains (COV-1 to COV-8); verified_effective removed; ORC-7, ORC-12, ORC-24, A1-36, A3-58, A3-65, A3-67, A3-68, A3-95, A3-113, A3-116, A3-119 to A3-122, A3-132, A4-17 and the flow summary amended; 2026-10-13: when and how a run stops below its targets: iteration limit per ASIL level, evidence per item, hand-over to the developer without waiting, checked source-change suggestions from requirements (COV-9 to COV-13); ORC-7, KP-2, ARCH-17, A3-114, A4-54 and the flow summary amended; 2026-10-13: live viewer for every run with UT- agent labels (VIEW-1 to VIEW-7); agent names list amended; 2026-10-13 evening: a source-change suggestion must not weaken the fault detection of the existing tests, checked on mutants of the lines it leaves unchanged (COV-14 to COV-18); infeasibility proofs per build variant of the SUT file, by analysis only (A1-37a to A1-37e, A3-BD14); COV-4, COV-10, COV-12, COV-13, A1-37 and A3-BD8 amended; a blank line now separates every requirement from the next; 2026-10-14: the git repository layout and a working fresh clone (TP-17 to TP-19); TP-2, TP-13 and TP-16 amended)
+
+Agent names used in this document:
+- Agent1 = agent_unittest_analyzer, shown as UT-Analyzer (analyze and plan)
+- Agent2 = agent_unittest_generator, shown as UT-Generator (generate tests, stubs and test-side fixes)
+- Agent3 = agent_unittest_compilation, shown as UT-Compilation (harness, build, execute, measure, classify, route)
+- Agent4 = agent_sourcecode_corrector, shown as UT-Source Code Corrector (production-source correction)
+- KB = ut_fix_knowledgebase, shown as UT-KB (advisory learning store)
+- Orchestrator = ut_pipeline
+- Setup = ut_setup (tool provisioning, called by unittest_generator.bat and unittest_generator.sh)
+Requirement IDs are stable: GEN, ORC, TP, ARCH, COV, VIEW, A1, A1-DA, A1-PL, A1-RQ, A2, KB, KP, SC, A3, A3-BD, A3-PR, A3-OBS, A3-CL, A3-FZ, A4. Gaps in numbering are intentional.
+
+Overall Goal in one sentence: The overall goal is to build an autonomous, evidence-grounded C/C++ unit-test engineering system that continuously analyzes, generates, verifies, diagnoses and improves tests and production code until the required measured verification objectives are satisfied—without weakening tests or hiding real software defects.
+
+Detailed Overall goal:
+The overall goal is to build an evidence-driven, safety-oriented automated unit-test engineering system for C/C++ software that can analyze source code, generate missing unit tests, compile and execute them, measure structural coverage, diagnose failures, and iteratively improve both tests and source code without masking real defects.
+The system must distinguish between what the software is expected to do and what the current implementation actually does. A failing generated test must therefore not automatically be treated as a bad test. The system must determine whether the root cause lies in the generated test, a stub, the test framework/build configuration, the production implementation, or insufficient/conflicting evidence.
+
+The target workflow is:
+Analyze SUT and evidence → identify coverage gaps → generate tests → compile and execute → measure LC/SC/BC/DC/MC/DC → classify failures → repair the correct artifact → reverify → generate only incremental tests for remaining coverage gaps.
+A key goal is that the workflow must preserve test quality and fault-detection capability, rather than simply modifying failing tests until they pass. The patent material specifically frames this as evidence-gated arbitration between test repair and source correction, with an oracle-strength gate and independent reverification of source fixes.
+
+The final objective is therefore:
+Generate a trustworthy, traceable and measured unit-test solution in which valid tests are preserved, actual production defects can be identified and corrected, stale coverage results are invalidated after source changes, and the final verification result is bound to the exact source and test versions that were executed.
+
+Input: the link of a git repository (GitHub or any git server) containing the target C or C++ component and its engineering context, the SUT file or files in it, and optionally a branch - by default the repository's default branch (master or main) (ORC-17 to ORC-19), and optionally the project's own requirement documents (A1-RQ1) - the client's requirements for the code under test, not this document, which specifies the unit-test generator itself. C and C++ repositories shall both be supported.
+
+Central Architecture Rules:
+
+GEN-01. The architecture shall distinguish between current implementation evidence and correctness authority.
+
+GEN-02. The current source code and headers are the primary implementation evidence, but they shall not automatically be assumed to be defect-free.
+
+GEN-03. Agent1 is the analysis and coverage-planning authority.
+
+GEN-04. Agent2 is the unit-test generation authority.
+
+GEN-05. Agent3 is the compilation, execution and measured-coverage verification authority.
+
+GEN-06. The UT Fix Knowledge Base is advisory historical knowledge only.
+
+GEN-07. When a generated unit test fails, the system shall not automatically assume that the generated unit test is incorrect.
+
+GEN-08. Agent3 shall classify every failure into one of the nine categories of A3-158 (test_generation_defect, stub_defect, test_framework_defect, build_configuration_defect, source_compilation_defect, source_behavior_defect, requirement_mismatch, environment_defect, undetermined).
+
+GEN-09. A production-source modification shall never be performed merely to make a failing unit test pass.
+
+GEN-10. Before recommending a source-code change, the system shall establish that:
+the unit test represents a valid requirement or expected behaviour;
+the test uses the correct public/API contract;
+the test inputs and assertions are valid;
+required stubs and dependencies behave correctly;
+the test framework and compiler configuration are valid;
+the observed failure originates from the production implementation rather than the generated test.
+
+GEN-11. If these conditions are satisfied, the failure shall be classified as a potential SUT defect rather than a unit-test generation defect.
+
+GEN-12. The system shall then create a separate source-correction feedback path instead of repeatedly asking Agent2 to modify a correct test.
+
+GEN-13. The feedback shall identify:
+affected production file,
+affected function,
+source location,
+failing test case,
+expected behaviour,
+actual behaviour,
+compiler/runtime/coverage evidence,
+suspected source defect,
+confidence/evidence supporting the classification.
+
+GEN-14. Production source changes shall be handled separately from unit-test changes and shall remain traceable to the failure that triggered them.
+
+GEN-15. After a production-source correction is applied, the complete verification cycle shall be executed again:
+Compile → Execute Tests → Measure Coverage → Compare Results
+
+GEN-16. The source correction shall be accepted only when:
+the previously valid test now passes,
+existing previously passing tests continue to pass,
+no compilation regression is introduced,
+no coverage regression is introduced,
+and the measured behaviour supports the intended correction.
+
+GEN-17. Therefore, the final authority chain shall be:
+Requirements / expected behaviour define what the software should do.
+Source code and headers define what the current implementation actually does.
+Agent1 determines what behaviour and coverage still require verification.
+Agent2 generates tests for that behaviour.
+Agent3 determines what actually compiles, executes and is covered.
+The UT Fix Knowledge Base provides historical guidance but does not override current evidence.
+
+GEN-18. No agent shall claim successful unit-test completion until Agent3 has measured and verified the result.
+
+GEN-19. A failing unit test shall never automatically imply that the test is wrong, and a source-code change shall never automatically be made simply to satisfy a test.
+
+GEN-20. Expected behaviour shall be established from ranked expected-behaviour evidence collected by Agent1 (A1-25a to A1-25j). The observed output of the current implementation alone shall never be treated as evidence of correct behaviour.
+
+GEN-21. A change to an existing test expectation shall be accepted only when Agent3 has measured that the change does not weaken the test's fault-detection ability (A3-85a to A3-85j).
+
+Explicit workflow branches (routing is decided by Agent3, A3-177, and executed by the orchestrator, ORC-6):
+UT failure → Agent3 classifies root cause → test/stub defect → Agent1 re-plans → Agent2 repairs
+UT failure → Agent3 classifies root cause → SUT defect → Agent4 (source correction)
+UT failure → Agent3 classifies root cause → undetermined → Agent1 collects additional expected-behaviour evidence → reclassify → if still undetermined: reported in the final result, no automatic test or source change for that item
+Agent2 test repair changes an expectation → Agent3 oracle-strength check → weakening → change rejected, original test kept → failure reclassified
+
+
+Requirements — Pipeline and Orchestration (ut_pipeline)
+
+ORC-1. The pipeline shall be run by a deterministic orchestrator (ut_pipeline). The orchestrator shall be the only MCP client of the agents.
+
+ORC-2. Agents shall never call each other directly. Every handoff passes through the orchestrator.
+
+ORC-3. Every run shall start with these four steps, in this order, before any test is generated:
+1. Agent1 discovery (A1-31a): the SUT, the repository layout, existing tests and stubs, and the build system. No LLM.
+2. Agent3 build capture (A3-BD1 to A3-BD10): the project's own build runs on the working copy and every compiler call is recorded as the build description. No LLM; only when the description is estimated may Agent3 then ask the brain for missing defines and include paths (A3-BD11 to A3-BD13).
+3. Agent1 dependency analysis (A1-DA1 to A1-DA14): the SUT is parsed with its recorded flags, and every external dependency is decided as stub, real or system. Only the stub-or-real decision (A1-DA8) and the links of requirements written in prose (A1-PL13) may use the LLM.
+4. Agent3 probe (A3-PR1 to A3-PR4). No LLM.
+Agent3 never searches the repository for source files or headers; it builds exactly what Agent1's layout profile and dependency plan name (A3-38a).
+
+ORC-4. Stage A (make it build): while the probe or a later build check reports setup or build issues, the orchestrator shall run Agent1's setup-repair plan (A1-22), Agent2's test-side fixes, Agent4's production-source fixes and an Agent3 build check, until the SUT builds, links and runs or a budget is exhausted.
+
+ORC-5. Stage B (coverage): Agent1 coverage plan (suggested by the brain, checked by Agent1, A1-PL1 to A1-PL11) → Agent2 generation → Agent3 verification → routing (A3-177), repeated until a final state of A3-132 is reached.
+
+ORC-5a. When a verification without failures leaves coverage gaps, the orchestrator shall have Agent3 run the coverage-guided search (A3-FZ1) once for that set of gaps and hand the inputs it finds to Agent1's next plan (A1-18c). Inputs found count as progress for the stagnation limit.
+
+ORC-5b. The pipeline shall end verified only after Agent1 reports the plan done: full coverage is not enough while a function with stated expected behaviour has not yet been checked against it (A1-25y).
+
+ORC-6. Routing decisions shall be made by Agent3 (A3-177) and executed by the orchestrator.
+
+ORC-7. Budgets shall be configurable in one configuration file, with these defaults:
+- coverage targets (COV-1): ASIL D and C: LC, SC, BC, DC and MC/DC 100 %; QM, ASIL A and B: LC, SC, BC and DC 100 %, MC/DC above 95 %; level of a SUT file without a configured level: ASIL D (COV-2)
+- feedback-loop iterations per SUT, per ASIL level (COV-9): 5 for every level
+- consecutive iterations without newly covered items before a stagnation stop: 2
+- attempts per gap or repair item before changing strategy: 2
+- Stage A repair rounds: 3
+- build capture time limit: 30 min
+- depth of real dependencies linked transitively (A1-DA10): 2
+- evidence look-ups (ReAct) per function: 6
+- brain planning calls per function and iteration, re-ask included (A1-PL9): 2
+- candidate source fixes per failure (A4-23g): 3
+- source-change suggestions per SUT file after a stop below target (COV-12): 3; brain calls for them per file, re-ask included: 2
+- flag-suggestion rounds for an estimated build description (A3-BD12): 2
+- SUT files processed in parallel (ORC-23): 1
+- brain order (ARCH-1a): Claude Opus 5.5, Claude Fable 5.1, Claude Sonnet 5.5, Claude Haiku 5.5, Qwen3 8B
+- context windows of Qwen3 8B (ARCH-14): 4,096, 8,192, 12,288 and 16,384 tokens, the largest limited by the memory of the computer running Ollama
+- largest answer of Qwen3 8B (ARCH-14): 8,192 tokens; answer limit of the Claude models: 16,000 tokens, of which a thinking reserve of 8,000
+- mutants per function: 50
+- time limit per LLM call: 300 s
+- coverage-guided search per function and round (A3-FZ3): 60 s
+- translation units parsed to find one definition (A1-DA5): 40
+- independent evidence items for a behaviour fix (A4-23f): 2
+
+ORC-8. Every accepted handoff shall be appended to a hash-chained, append-only ledger: agent, contract name and version, input hash, output hash, decision and time.
+
+ORC-9. The pipeline shall run fully automatically. There is no human approval step, with one exception: changes to production source reach the tested branch only after a person has reviewed them (ORC-26). Items that cannot be decided automatically shall be reported in the final result while the run continues with the remaining items.
+
+ORC-10. Every message shall carry the SUT signature and the test-suite signature. A message with a stale signature shall be refused.
+
+ORC-11. The orchestrator shall expose run_pipeline as an MCP tool, so the pipeline can be started from Copilot, Claude or another MCP client.
+
+ORC-12. The orchestrator shall write a final result in machine-readable form (JSON) and in human-readable form, containing the fields of A3-131 and the final state of A3-132, and also: the source, command and outcome of the build description, marked ESTIMATED when its flags were guessed (A3-BD5); the coverage of every function (A3-63); every dependency with its decision, who decided and why (A1-DA11); the ASIL level of every SUT file and where it came from, the target and the measured value of every metric, and every item not reached with the strategies tried and any proof (COV-8); and what the coverage-guided search did (A3-FZ7); the repository link, the tested branch and commit, and how the result was delivered (direct commit with its commit ID, or pull request with its link and the reason); the project requirement documents used, with their SHA-256 (A1-RQ3), and the requirement status of every function (A1-RQ5); the token use of every brain step: calls, context windows, tokens estimated and reported, parts shortened or left out (ARCH-15); and the knowledge packs used with name, version and SHA-256 (KP-7).
+
+ORC-13. The pipeline shall work in its own working tree of the tested commit, taken from the repository cache (ORC-20). The repository receives only what ORC-24 to ORC-31 allow: the generated test-suite, test and stub files, the test harness and the reports, and production-source changes only through the reviewed pull request of ORC-25.
+
+ORC-13a. When a verified source fix exists, the generated tests expect the corrected behaviour. They shall then be delivered together with the fix in the review pull request (ORC-25), never committed to the tested branch on their own.
+
+ORC-14. A file in the repository that the pipeline did not generate shall never be overwritten by a commit of the pipeline; the generated version then stays only in the run's output folder and the final result names the file. The only exception is a production source file changed by a verified source fix, which is delivered only through ORC-25.
+
+ORC-14a. Every delivered file shall start with a comment carrying the SHA-256 of the rest of the file. A later run may replace a delivered file only while that hash still matches, so a file the user has edited is never overwritten.
+
+ORC-15. Every run shall have its own output folder containing the final result (JSON and human-readable), the ledger, the generated files, the patch files of verified source fixes and the log of every agent.
+
+ORC-16. A seeded-defect benchmark shall be part of the delivery: cases that each seed one known defect contradicting documented behaviour (E1/E2) into a pilot, plus controls without a defect. One command runs the whole pipeline per case and reports, per case and in total, whether the defect was detected and fixed (and whether the original was restored exactly) and whether a control received a fix it should not have (false fix). A false fix is a failed benchmark.
+
+Repository Input and Cache
+
+ORC-17. The pipeline shall take as input the link of a git repository (HTTPS or SSH; GitHub, GitHub Enterprise, GitLab, Bitbucket or any other git server), one or more SUT files given relative to the repository, and optionally a branch and the project's requirement documents (A1-RQ1). A local folder remains accepted for the pilots and for development.
+
+ORC-18. Without a branch, the pipeline shall use the repository's default branch as reported by the server (normally master or main), where the committed files are. With a branch, for example the branch a developer created for a change, it shall use that branch.
+
+ORC-19. A run shall test exactly one commit: the head of the chosen branch when the run starts. Uncommitted changes on any PC are never part of a run. The commit ID shall be recorded in the ledger, bound to every verification result (together with the SUT signature, ORC-10), and named in the report and in every commit and pull request the pipeline makes.
+
+ORC-20. Repository cache: each repository shall be cloned once per PC into a cache folder of the application; later runs only fetch new commits. Every run works in its own working tree of the tested commit, created from the cache (git worktree), so a large repository is neither downloaded nor copied again, and no developer's own clone is touched. The size limit for a copied folder (max_workspace_mb) does not apply to the cache.
+
+ORC-21. Access to private repositories shall use the credentials already configured on the PC: Git Credential Manager, an SSH key, or a token in an environment variable whose name is configured. The pipeline shall never write credentials into a file, the ledger, a report, a commit or a log. Missing read access is an environment_defect, and the final result states which access is missing.
+
+ORC-22. The build capture (A3-BD1) shall be done once per tested commit and build configuration, kept in the cache, and reused for every SUT file of that commit and by later runs on the same commit; its build folder is kept so that later builds are incremental (A3-BD9).
+
+ORC-23. One run may name several SUT files of the same commit. They share the cache and the build description; each is processed by the whole pipeline and gets its own final result, report and ledger section. Files are processed one after another, or in parallel up to a configured number. The run's summary lists the final state of every file.
+
+Delivery into the Repository
+
+ORC-24. Tests only - direct commit: for every SUT file of a run whose processing changed no production source file and reached the verified final state (verified_measured, A3-132), the pipeline shall commit the generated test-suite, test and stub files, the test harness and the reports (ORC-27) directly to the tested branch; all such SUT files of one run go into one commit. SUT files that do not qualify are delivered by ORC-25 or ORC-28. The commit message names the tested commit, the SUT files and, per file, the final state and the measured coverage. No review is needed for this commit.
+
+ORC-25. Production-source changes - review first: when the run changed production source - a source fix after build errors or test-setup issues (A4-23d), or a fix of a source defect found by a test (A4-23c) - nothing shall be committed to the tested branch automatically. The pipeline shall push a review branch (ut-review/<SUT file>-<short tested commit>) based on the tested commit, containing the changed source files, the generated test-suite, test and stub files, the test harness and the reports, and shall open a pull request from it into the tested branch, marked as needing review of production-source changes. The pull request description shall list every source change with its location, the failure that caused it, the expected-behaviour evidence, the result before and after the change, and the unit-test results and coverage.
+
+ORC-26. A person shall review the production-source changes and the unit-test results of the pull request. Merging the pull request is the approval: the source files, the unit-test files and the reports reach the tested branch together. Closing it without merging leaves the tested branch unchanged; the pull request's state is recorded in the next run's report for that SUT. This is the only human approval step of the pipeline (ORC-9).
+
+ORC-27. Reports are committed in both cases, into a fixed folder per SUT file: ut_reports/<path of the SUT file>/, containing the human-readable report, the machine-readable result (ORC-12), the coverage report and the ledger of the run. The folder is replaced by the next delivery for the same SUT file.
+
+ORC-28. A result that is not verified (incomplete, A3-132) shall not be committed to the tested branch: it is delivered as in ORC-25, as a pull request marked incomplete, with the reason, so that the tests already reached are not lost.
+
+ORC-29. A direct commit (ORC-24) shall be made only while the tested branch still points to the tested commit. If the branch has moved during the run, the pipeline shall verify the generated tests again on the new head (Agent3 verify, ORC-19) and commit them only if they still build, pass and reach the same final state; otherwise it opens a pull request as in ORC-25 that states why.
+
+ORC-30. When the server refuses a direct commit to the tested branch (for example branch protection), the pipeline shall open a pull request with the same content instead (branch ut-review/tests-<short tested commit>), marked as tests only, so that no review of production source is needed. Without any write access, the result stays as a branch in the cache, and the run's output folder receives a patch file and a git bundle of it (local delivery); the final result says so.
+
+ORC-31. The pipeline shall never force-push, rewrite history, delete or rename branches, or change any branch other than its own review branches and - only as ORC-24 allows - the tested branch by one new commit.
+
+Requirements — Tool Provisioning (ut_setup, unittest_generator.bat, unittest_generator.sh)
+
+The application itself never installs, searches for or substitutes tools. One setup step guarantees them; with that guarantee the application has no tool fallbacks.
+
+TP-1. A setup step shall check that every tool the pipeline needs is present and working, and install what is missing: unittest_generator.bat on Windows and unittest_generator.sh on Linux, both calling ut_setup.py (Python standard library only).
+
+TP-2. Tools installed by the setup shall go into the folder tools next to the application (Source\UnitTestGenerator\tools in the repository, TP-17), one subfolder per tool. Nothing outside that folder shall be changed, except Linux system headers (TP-7). Removing the tools folder removes everything the setup installed.
+
+TP-3. Before installing a tool, the setup shall check whether a usable version is already installed - in the tools folder or on the system - and use it instead of installing a second, overlapping copy. Usable means: at least the minimum version and passing the functional check of TP-8.
+
+TP-4. Downloads shall come only from the official release pages of each project (llvm/llvm-project, mstorsjo/llvm-mingw, Kitware/CMake, ninja-build/ninja, git-for-windows/git, bazelbuild/bazelisk, mesonbuild/meson on GitHub; PyPI for Python packages), over HTTPS. Every download shall have a pinned version and SHA-256 in ut_config.json (setup.downloads). A download whose SHA-256 differs shall be deleted and the setup shall stop; nothing is installed from it. Every archive member path is checked to stay inside its target folder.
+
+TP-5. Tool sets:
+- always: a Clang/LLVM toolchain (18 or newer) with C and C++, source-based coverage with MC/DC, llvm-profdata, llvm-cov, the libFuzzer runtime and the static analyzer; CMake; Ninja; Git;
+- per repository, determined from its build files when a pipeline run starts: Make (Makefile), Meson (meson.build), Bazel through Bazelisk (WORKSPACE, MODULE.bazel, BUILD.bazel), MSBuild (.sln, .vcxproj; detected only, TP-6).
+
+TP-6. Windows: the toolchain is llvm-mingw (Clang/LLVM with the MinGW-w64 UCRT runtime and headers, GNU make included): free, self-contained, no administrator rights. An installed Visual Studio Build Tools with Clang, or an LLVM installation, that passes TP-8 is used instead (TP-3), with Visual Studio's environment recorded in the manifest. The setup shall never install Visual Studio itself (administrator rights and licence acceptance are the user's decisions); without it, Visual Studio projects are read from their project files (A3-BD5).
+
+TP-7. Linux: an installed Clang 18 or newer that passes TP-8 is used; otherwise the official LLVM release archive is installed (only the parts needed). C and C++ library headers come from the distribution's package manager; the setup installs them only when that needs no password prompt (root or sudo -n), otherwise it stops and shows the exact command.
+
+TP-8. Functional check of a toolchain: compile, link and run a C and a C++ program with -fcoverage-mcdc; merge the profile with llvm-profdata; export it with llvm-cov and confirm that MC/DC records exist; build and run a libFuzzer target; run the static analyzer on a file with a known finding. A toolchain that fails the C, C++, coverage or MC/DC part is not used; a missing fuzzer or analyzer is recorded in the manifest.
+
+TP-9. When the operating system refuses to run a downloaded tool (for example Windows Smart App Control or an application-control policy), the setup shall stop, name the blocked file and the options, and not work around the block.
+
+TP-10. The setup shall write the tool manifest tools/toolchain.json: per tool its path, version and origin (installed or existing), the toolchain's target, features and environment, and the date of the check. The application shall take tool locations only from this manifest (its path may be configured). A missing or invalid manifest is an environment_defect: the run stops with the instruction to run the setup. The application shall not search the system for tools and shall have no fallback compiler (A3-33a).
+
+TP-11. The setup shall be idempotent: when the manifest and the files it names are unchanged, a check takes about a second and changes nothing. "setup" re-checks every tool.
+
+TP-12. Every command of unittest_generator.bat and unittest_generator.sh shall run the setup check first and start the pipeline only when it succeeded; a run for a repository also ensures that repository's build tools (TP-5).
+
+TP-12a. For a repository link (ORC-17) the setup finds the build systems from the file list of the branch to be tested: a clone of only that one commit's file tree (no history, no file contents), made with the credentials of ORC-21 in a temporary folder and deleted afterwards.
+
+TP-13. Python 3.12 is a prerequisite. The brains are not installed by the setup: it checks and reports which are available (ARCH-1a), that is which Claude models the API key in ANTHROPIC_API_KEY can access, and whether Ollama with Qwen3 8B, the fallback brain, is running. No brain is required for the setup to succeed. Missing Python packages of the BaseAgent environment (pydantic, langgraph, fastmcp, uvicorn, and anthropic for the Claude models) are installed from PyPI into that environment.
+
+TP-14. The setup shall store no credentials. Proxies come from the system settings or the environment; ANTHROPIC_API_KEY stays an environment variable.
+
+TP-15. The setup's exit code shall tell the result: 0 ready, 1 a tool is missing or failed its check, 2 blocked by the operating system (TP-9), 3 an action by the user is needed (TP-7).
+
+TP-16. Release validation on each operating system (Windows and Linux): the setup, the complete test suite, the three pilots and the seeded-defect benchmark (ORC-16) shall pass with the tools of that system's manifest before a version is delivered; the results are kept with the version. The validation starts from a fresh clone of the repository (TP-19).
+
+TP-17. Repository layout: the application is kept in one git repository with this layout, and every file finds the others through it, relative to its own location - never through an absolute path or a folder name of one computer:
+- Source/BaseAgent: baseagent.py and baseagent.bat;
+- Source/UnitTestGenerator: the agents, ut_contracts.py, ut_pipeline.py, ut_fix_knowledgebase.py, ut_setup.py, ut_config.json, the knowledge packs (knowledge) and the entry files unittest_generator.bat and unittest_generator.sh;
+- Test: test_unittest_generator.py, test_baseagent.py and the pilots (Test/pilots);
+- Docs: this requirements file, ORCHESTRATION.md and BaseAgent_CHANGES.md;
+- .github: the skills (.github/skills) and the Copilot instructions, where the development tools look for them;
+- Patents: kept on the developer's computer only and never committed (TP-18).
+
+TP-18. Only source belongs in the repository. Files that the setup or a run creates are never committed and are listed in .gitignore: the tools folder (TP-2), the Python environment (.venv), ut_output, ut_work, the knowledge-base database, test_results.txt, Python caches, and BaseAgent's local service state in Source/BaseAgent/demo, which holds the client token and is created again by baseagent.bat. The Patents folder is ignored as well, except a short README.md that explains why. .gitattributes fixes the line endings: .bat files CRLF, .sh files LF, every other file byte for byte as committed, so that a checkout on Windows or Linux gives the same files.
+
+TP-19. A fresh clone shall work on Windows and on Linux with Python 3.12 as the only prerequisite (TP-13): the first command of Source\UnitTestGenerator\unittest_generator.bat (or unittest_generator.sh) creates the Python environment in Source/BaseAgent/.venv, installs the Python packages and the tools (TP-1 to TP-12), and the commands check, test, the pilots and the benchmark then work without any further step. README.md at the root of the repository describes these steps.
+
+Requirements — Agent Architecture
+
+ARCH-1. Every agent (Agent1 to Agent4 and the KB) shall be derived from BaseAgent: a LangGraph graph (retrieve evidence → ask the brain → check the contract → act) with its own knowledge store (agentic RAG), BaseAgent's brain router (ARCH-1a), identities, ledger and deadlines.
+
+ARCH-1a. Brain selection by access: the brains shall be tried in a configured order, by default Claude Opus 5.5, Claude Fable 5.1, Claude Sonnet 5.5, Claude Haiku 5.5, then Qwen3 8B through Ollama. When the agents start, BaseAgent checks for every Claude model whether the configured API key can access it, without spending tokens. A model without access is skipped for the whole run; a model that is only unreachable at the moment is skipped for the cooldown and tried again later. Every brain call goes to the first available brain in the order; Qwen3 8B answers only when no Claude model is available. Which brains an installation uses is configuration only (order, model ids, enabled); no code, requirement or default depends on where the application runs. The brain and model that answered are recorded with every result (ORC-8, ARCH-15).
+
+ARCH-1b. The application shall not be built for one brain: tasks, contracts, checks and token budgets are the same for every brain. What differs between brains (context window, answer limit, characters per token, effort) is set only in BaseAgent's engine settings (ARCH-11 to ARCH-14).
+
+ARCH-2. Each agent shall expose its tools through its own FastMCP server, created with BaseAgent's server factory.
+
+ARCH-3. Agents shall communicate only through BaseAgent's request and response envelopes carrying a typed, versioned contract payload, validated by sender and receiver, in the same way BaseAgent validates the answers of an LLM.
+
+ARCH-4. A smart contract consists of: a versioned schema; preconditions checked by the receiving agent; postconditions checked by the orchestrator; the SUT and test-suite signatures it is bound to (ORC-10); and a ledger entry (ORC-8).
+
+ARCH-5. LLM output is untrusted. Every LLM result shall be validated against its schema; invalid output shall be re-asked once and otherwise rejected.
+
+ARCH-6. Deterministic extraction shall be preferred over LLM inference whenever the same fact can be obtained reliably (A1-25u).
+
+ARCH-7. Agents as subprocesses: the orchestrator shall be able to start the agents as subprocesses and communicate with them over MCP stdio.
+
+ARCH-8. Agents as servers: the same agent files shall also run as FastMCP HTTP servers with BaseAgent's bearer-token identities, behind TLS termination. Only the orchestrator's configuration shall change (an address and a token per agent instead of a start command).
+
+ARCH-9. Agents that need the source tree or the compiler (Agent1, Agent3, Agent4) shall run where the code is. Source code is sent only to the brains enabled in the configuration (ARCH-1a); a brain that is not enabled is never called.
+
+ARCH-10. Each agent shall be implemented in one Python file; the contracts in ut_contracts.py; the orchestrator in ut_pipeline.py; the tool provisioning in ut_setup.py with one entry file per operating system (unittest_generator.bat, unittest_generator.sh).
+
+Requirements — Adaptive Token Budget (ARCH)
+Source files, their dependencies and the work per file differ in size: one function has many gaps and a large dependency header, another has none. A fixed token allocation per LLM call is too small for the first and wasteful for the second. The budget is therefore planned for every call from what that call carries. The budget and the knowledge-pack loader (KP) are part of BaseAgent, so every application derived from it gets them; nothing in them is specific to unit tests.
+
+ARCH-11. Every LLM call shall be planned from its own content: the agent passes its context as named parts, each with a priority (0 = required, higher numbers are given up first) and an optional minimum length, and states the expected answer as a number of items, tokens per item and a fixed overhead. BaseAgent computes the input tokens, the answer tokens and the context window for that call. There is no fixed token size per call or per step.
+
+ARCH-12. Token estimates shall be calibrated per brain: BaseAgent estimates tokens from characters with a ratio per brain and learns the ratio from the token counts the brain reports for real calls (Qwen: prompt tokens evaluated; Claude models: input tokens). It uses a cautious value (the 20th percentile of the observed characters per token, so tokens are rather overestimated) and starts at 3.0 characters per token until calls have been observed.
+
+ARCH-13. When the parts and the answer do not fit the brain's largest window, parts shall be shortened in order of priority, the highest number first: a part is first shortened to its minimum length and only then left out. Every shortened part ends with the marker "[... shortened to fit the context window]". Parts of priority 0 are never shortened. When they do not fit with the answer, the call is not made with that brain (CONTEXT_BUDGET_EXCEEDED) and the next brain of the fallback chain or the agent's rules take over (ARCH-5).
+
+ARCH-14. Qwen3 8B shall use the smallest configured window that holds the input and the answer (ORC-7); a re-ask after an invalid or cut answer uses the next larger window when one exists. The answer limit is the expected answer plus 30 %, at least 256 tokens and at most the configured largest answer; a call with thinking gets at least 4,096 tokens for its answer. The Claude models shall use their context window (1,000,000 tokens for Opus 5.5, Fable 5.1, Sonnet 5.5 and Haiku 5.5, configurable) and an answer limit of the expected answer plus 30 % plus the thinking reserve, never more than the configured maximum. The setting adaptive = false keeps the earlier fixed sizes.
+
+ARCH-15. Every plan shall be recorded with the contract's result (meta.token_plans): step, brain, window, estimated input and answer tokens, characters per token used, parts kept, shortened and left out, and the tokens the brain reported. The orchestrator writes the plans into the ledger and summarises them per step in the final result (ORC-12).
+
+ARCH-16. An agent shall not call a brain for a step without work: no gap to plan, no failing test, no unresolved symbol, no failure to explain. Such a step is decided by the agent's rules and costs no tokens.
+
+ARCH-17. In this application the parts have these priorities: 0 = the facts the answer is built from (function source and signature, the gaps or the failure, parameters, scenarios, stub header, the problems of a re-ask); 1 = expected-behaviour evidence, and the headers of the SUT with at least their beginning kept; 2 = knowledge packs (KP-4); 3 = what was tried before, existing test names, build files, related source and logs; 4 = examples from the KB (KB-1) and the existing test style. Each step states its expected answer: scenarios for the open gaps (A1.plan), tests for the scenarios and rewrites (A2.tests), requirements to link (A1.links), one declaration (A1.declaration), flags for the compiler errors (A3.flags), candidates per failure (A4.candidates), suggestions for the items not reached (A4.suggest), one decision (A1.dependency, A3.root_cause, A4.review). The tokens per item are configurable per agent (tokens_per_scenario, tokens_per_test, tokens_per_candidate).
+
+Requirements — Knowledge Packs for the Brains (KP)
+A knowledge pack is curated guidance for the LLM: short rules and worked examples that make the brains' suggestions consistent across runs, across brains (the Claude models, Qwen) and across projects. It is not the KB (KB-1 to KB-19), which learns examples from verified results, and not a skill for coding assistants (.github/skills), which guides people and assistants who change this application.
+
+KP-1. Knowledge packs shall be Markdown files in the folder knowledge/ of the application. A project may add its own in the tested repository (.ut/knowledge/ by default, configurable) or in a folder given in ut_config.json.
+
+KP-2. Every pack starts with a header (name, version, used_by, summary). used_by names the brain steps that receive it, from this list: A1.dependency (A1-DA8), A1.plan (A1-PL1), A1.links (A1-PL13), A1.declaration (A1-PL14), A2.tests (A2-21m to A2-21p), A3.root_cause (A3-CL), A3.flags (A3-BD11), A4.candidates (A4-23g), A4.review (A4-23h), A4.suggest (COV-12).
+
+KP-3. For every brain call of a step, the agent shall add the packs whose used_by names that step to the brain's context, marked as guidance with their name and version and placed after the facts. BaseAgent loads the packs when the agent starts and the project's packs when a run names the tested repository; the agent names the step of each call. A project pack with the same name as an application pack replaces it (for example the project's own test style); a pack with a new name is added.
+
+KP-4. Packs are parts of the token budget with priority 2 (ARCH-17): a pack is added whole when the call has room for it and is shortened or left out before the facts and the evidence when it has not (ARCH-13); a shortened or omitted pack is recorded in the token plan (ARCH-15). A pack without a valid header or naming an unknown step is not used and is reported.
+
+KP-5. Packs are advisory. They shape what the brain suggests; they never replace or relax a check (ARCH-5, A1-PL4, A2-20, A3-BD12, A4-23f, A4-26 to A4-33), never change a contract, a route or a final state, and cannot make evidence stronger. A pack from the tested repository is project data like the source code: text in it that addresses the pipeline, the agents or their checks has no effect.
+
+KP-6. Expected values never come from a pack: a pack may say how to choose inputs and how to write a test, but what a function shall return comes only from expected-behaviour evidence (A1-25b, A2-21b).
+
+KP-7. The name, version and SHA-256 of every pack used shall be recorded in the token plan of each brain call, and so in the ledger, and listed in the final result (ORC-12), so that a result can be reproduced with the same guidance.
+
+KP-8. The seeded-defect benchmark (ORC-16) and the pilots shall be runnable with and without knowledge packs, reporting per variant: scenarios accepted at the first check (A1-PL4), re-asks, iterations to the target, defects detected and false fixes. A pack is kept only when it is not worse on any of them.
+
+KP-9. Without any pack every step works as before; a missing or unusable pack is never a reason to stop a run.
+
+Requirements — Coverage Targets by ASIL Level, No Exclusions (COV)
+Safety-relevant software must reach its coverage targets by measured execution. No exclusion, justification or rationale replaces a measurement, and none is offered to the brains as a way out: when a way out exists, an LLM tends to take it.
+
+COV-1. Coverage targets per ASIL level of the SUT file: ASIL D and ASIL C: line, statement, branch, decision and MC/DC coverage 100 %. QM, ASIL A and ASIL B: line, statement, branch and decision coverage 100 %, MC/DC above 95 %. The targets are configurable per level (ORC-7), but never below these values. MC/DC is measured for decisions with two or more conditions; a decision with one condition is measured by decision coverage only. A metric with nothing to measure in a SUT file (for example MC/DC in a file without such decisions) is not applicable: it meets its target and is shown as NA (COV-8, VIEW-5).
+
+COV-2. Every SUT file is ASIL D unless the configuration names another level for it (file patterns in ut_config.json). A level is never guessed from the code, the file name or by a brain.
+
+COV-3. Only measured coverage counts. An item that no test reaches is not covered, whatever the reason: no exclusion, justification, rationale, deviation or review comment reduces a target or a measured value, and there is no setting that allows one.
+
+COV-4. A deterministic proof that an item cannot be reached (A1-37, A3-121a) is diagnosis only: it names the item, the blocking source line, the reason and the build variant it holds for (A1-37c) in the report, stops further brain calls for that item, and keeps the file incomplete. The proof is computed by the agents' own code; a brain can neither produce nor confirm one.
+
+COV-5. No way out for the brains: no brain task, answer schema, knowledge pack or re-ask contains an option to declare an item unreachable, infeasible, untestable, excluded, justified or not worth testing. Such text in an answer has no effect and is recorded as a rejected suggestion. A brain is never told that a run may end without reaching the target.
+
+COV-6. The pipeline keeps iterating while items are open (A3-95). An open item counts toward the stagnation limit (ORC-7) only after these strategies have been tried for it, in this order: new scenarios from the brain (A1-PL1); other values and stub return sequences (A2-21g); coverage-guided search (A3-FZ1); the item asked again of the next available brain in the brain order (ARCH-1a); deterministic infeasibility analysis (A1-37). A target below 100 % (COV-1) that is met does not stop work on the remaining items while they make progress within the budget.
+
+COV-7. Production source is never changed to raise coverage (A4-17, A4-55). Code that no test can reach is reported to the developer as a finding with its proof, for example a contradiction such as x > 5 && x < 3, and the file stays incomplete until the developer has changed the source and the pipeline has measured the target on the new commit.
+
+COV-8. The result and the report shall show for every SUT file: its ASIL level and where it came from (default or configuration), the target and the measured value of every metric with met or not met, and for every item not reached the strategies tried (COV-6) and, if one exists, the proof (COV-4).
+
+COV-9. A run stops below its targets in only two cases, both decided by the orchestrator's own counting and never by a brain: the iteration limit of the SUT file's ASIL level is reached (ORC-7, default 5 for every level), or every open item has gone through the strategies of COV-6 without progress for the stagnation limit (ORC-7). Such a stop always ends incomplete and is followed by the hand-over of COV-11. A brain is never told that a stop is near.
+
+COV-10. At the stop the pipeline collects the evidence of every item not reached, from measured data and the agents' own analysis only: the metric and the item (for MC/DC the condition and the missing condition vector), the source location, the path conditions, every strategy tried with its iterations, what it did and its outcome (for example: the values the rule-based tests used and why no brain scenario was given, or the number of inputs the coverage-guided search ran), the brain suggestions rejected and why, and the proof of A1-37 when one exists, with the build variants it holds in and the variants for which no proof exists (A1-37c).
+
+COV-11. Hand-over to the developer without waiting: the result, the report, the review pull request description (ORC-25) and the viewer shall contain an "action needed" section per SUT file. It names every target not met with its measured value, the reason for every item not reached (COV-10), and what the developer can provide: the requirement documents for the functions concerned when none were given (A1-RQ1), or a source change (COV-12). The run does not wait for an answer (ORC-9). A later run with requirement documents or on a new commit continues from the stored state: the build capture (ORC-22), the tests already verified and the evidence are reused.
+
+COV-12. Source-change suggestions (hybrid reasoning): after a stop, Agent4 shall suggest source changes that would let tests reach the open items. The facts come first and are gathered deterministically: the function source, the items with their missing vectors and path conditions (COV-10), the proofs with their build variants (A1-37c) and the text of the requirements that apply (A1-RQ, A1-25x). The brain then reasons step by step over these facts and returns for every item: the cause (a defect in the condition, dead code, defensive code a requirement demands, or code that cannot be controlled from a test), the change, the requirement IDs and the exact words it relies on, and the expected effect on each item. Quotes are checked word for word (A1-PL4); a suggestion without requirement documents is marked "without requirements". The brain is asked only after the stop and has no part in deciding it (COV-9).
+
+COV-13. Every suggestion is checked on a trial copy of the working tree before anyone sees it: the changed source compiles, every existing and generated test still passes, the measured coverage of the targeted items rises without any other metric falling, and the existing tests still detect every fault they detected before on the lines the suggestion leaves unchanged (COV-14 to COV-18). Only suggestions that pass are shown, each as a patch file with its measured effect (for example "MC/DC 83 % to 100 % on a trial copy; fault detection: 14 of 14 compared mutants still detected"). Suggestions are never committed to any branch and never count as coverage: the SUT file stays incomplete until the developer has changed the source and the pipeline has measured the target on the new commit (COV-3, COV-7).
+
+COV-14. Fault-detection check of a suggestion: a suggestion that passes the checks of COV-13 is shown only after Agent3 has checked that it does not weaken the ability of the existing tests to detect faults. The check runs after the other checks of COV-13 have passed, so that a suggestion that already failed costs no mutant builds. It uses no brain.
+
+COV-15. Mutants for the check: in every function the suggestion changes, Agent3 generates mutants with the configured, deterministic operators of A3-85b, once on the original source and once on the suggested source. Mutants exist only in the isolated staging workspace (A3-85i). Every mutant is built and run with every test that passes on the trial copy (COV-13); a mutant is detected when a test fails with it or the test build does not link (A3-85b).
+
+COV-16. Only unchanged lines are compared: a line of the original source and a line of the suggested source are paired when a line-by-line diff of the two sources maps one to the other and their text is identical. A mutant on a paired line of the original is compared with the mutant of the suggested source that has the same operator and the same occurrence on the paired line. Mutants on lines the suggestion adds, removes or changes are not compared; their numbers are reported.
+
+COV-17. Decision: the suggestion passes the check when every compared mutant that the tests detect on the original source is also detected on the suggested source. Compared mutants detected on neither source do not count (possible equivalent mutants, A3-85e). When a suggestion leaves no paired line that has a mutant, there is nothing to compare: the suggestion may be shown, and the check is reported as NA ("fault detection: nothing to compare"). When the limits of A3-85h (maximum mutants per function, time budget) are reached before every compared mutant has been run, the suggestion is not shown, and the result names the suggestion and the reason ("fault detection could not be checked within the limits").
+
+COV-18. Record and report: the operators, the mutant identifiers (line, operator and occurrence), the pairs, the mutants detected before and after, the limits and the compiler configuration are recorded so that the check can be repeated (A3-85c). The patch header, the report and the viewer show the result of every suggestion, for example "fault detection: 14 of 14 compared mutants still detected; 3 mutants on changed lines not compared". A suggestion rejected by the check is listed with the mutants it no longer detects, as a rejected suggestion (COV-13).
+
+Requirements — Live Viewer (VIEW)
+Every run can be watched while it works and replayed afterwards. The viewer is part of BaseAgent, so every application built on it gets the same one; this section states what it shows for unit-test generation.
+
+VIEW-1. Every run shall have a live viewer: a page in the browser that shows the brain in the centre with the model that answered last (ARCH-1a), the agents around it with their tools, every handoff and brain call as it happens, the metrics of VIEW-5, a feed of the latest events and, at the end, the final state, the time taken, the delivery and the action needed (COV-11). The orchestrator is shown as a node of its own (UT-Orchestrator), with the input of the run (repository, SUT file, branch, ASIL level and targets) and its output (final state, delivery, action needed).
+
+VIEW-2. Agent labels carry the application prefix UT: UT-Analyzer (Agent1), UT-Generator (Agent2), UT-Compilation (Agent3), UT-Source Code Corrector (Agent4) and UT-KB (KB). File names, MCP tool names and the technical names in the ledger are unchanged.
+
+VIEW-3. The viewer is configured in the viewer section of ut_config.json: enabled, open_browser, host (default 127.0.0.1), port (0 = any free port), replay, metrics and token_env. On a computer with a desktop the browser opens by itself; otherwise the address is printed. It listens on another address than 127.0.0.1 only when configured, and then only with a bearer token from the environment variable named in token_env (ORC-21). The command line can switch it on or off (--view, --no-view).
+
+VIEW-4. After every run a self-contained viewer.html replays the run offline, without any network access. It is written into the run folder and delivered with the reports (ORC-27); ut_pipeline.py view <run folder> opens it again.
+
+VIEW-5. The viewer shall show these metrics: line, statement, branch, decision and MC/DC coverage of the SUT file, each in percent with the target of the file's ASIL level (COV-1) and a table per function; tests passed as x of y; and the brain calls and tokens of the run. Only measured values are shown (COV-3). A metric with nothing to measure, in the file or in one function, is shown as NA, never as 0 % or 100 %; the same holds for the report, the summary and the pull request (COV-8).
+
+VIEW-6. Events never contain credentials, tokens, API keys, source code or generated code (ORC-21). Summaries are plain language of at most 120 characters; full contents stay in the run folder.
+
+VIEW-7. The viewer only shows; it never changes a run. A run behaves the same with the viewer on or off, and a viewer that cannot start is reported and never stops a run.
+
+VIEW-8. Input and output of every agent, at all times: every agent box shows the input of its latest call (what it received, from whom) and the output it returned, in plain words, while the run works and in the replay. Clicking an agent shows every call of the run in order: the tool, the input, the output and the outcome (success, refused, error). Every contract of ut_contracts.py has such a summary; none is shown only by its type name.
+
+VIEW-9. An agent that was not called in a run is still shown, marked "not called in this run" with the reason, for example UT-Source Code Corrector: "no failing test was classified as a source defect and every target was reached, so no source fix or suggestion was needed (A3-177, COV-12)".
+
+Requirements — agent_unittest_analyzer (Agent1)
+
+SUT Analysis:
+
+A1-1. Agent1 shall accept the selected C/C++ source file as the System Under Test (SUT).
+
+A1-2. Agent1 shall identify the language, source path and functions present in the SUT.
+
+A1-3. Each identified function shall have a stable identity, name, signature and source location.
+
+Component and Repository Discovery:
+
+A1-4. Agent1 shall determine the component/application root containing the SUT.
+
+A1-5. Discovery shall be based on repository evidence rather than a fixed directory structure.
+
+A1-6. Agent1 shall support different repository layouts without coupling repository type to C/C++ language.
+
+Existing Unit-Test Discovery:
+
+A1-7. Agent1 shall discover existing unit-test directories and test-suite files belonging to the SUT/component.
+
+A1-8. Agent1 shall detect the existing unit-test framework and harness structure.
+
+A1-9. Existing tests shall be treated as authoritative examples of project test style.
+
+Stub Discovery:
+
+A1-10. Agent1 shall discover existing stub files and stub directories.
+
+A1-11. Agent1 shall distinguish writable UT stub locations from generated/read-only/component stub locations.
+
+A1-12. Agent1 shall never instruct Agent2 to modify a read-only or generated stub directory.
+
+Existing Test Mapping:
+
+A1-13. Agent1 shall identify existing test cases and map them to SUT functions where possible.
+
+A1-14. Agent1 shall distinguish enabled and disabled test cases.
+
+A1-15. Existing coverage/tests shall be considered before recommending additional tests.
+
+Repository Layout Profile:
+
+A1-16. Agent1 shall produce a layout profile containing the resolved component root, test directories, primary test suite, stub locations, test framework, harness language and build-system information.
+
+A1-16a. Agent1 shall take the SUT's own defines, include paths, forced includes and language standard from Agent3's build description (A3-BD1, A3-BD5), map its paths onto the pipeline's working copy, and record the source of these flags in the layout profile. Optimisation, warning and output flags shall not be taken (A3-126). When the build description is only estimated (last fallback of A3-BD5), a compile error in the SUT shall be classified as a build-configuration issue, never as a production-source defect (A3-CL1).
+
+A1-17. If the repository layout cannot be resolved safely, Agent1 shall mark generation as blocked rather than guess a target path.
+
+Coverage Analysis:
+
+A1-18. Agent1 shall identify coverage gaps for applicable:
+- Line Coverage (LC)
+- Statement Coverage (SC)
+- Branch Coverage (BC)
+- Decision Coverage (DC)
+- MC/DC Coverage
+(Metric definitions: A3-58a.)
+
+A1-19. Coverage gaps shall be associated with real SUT functions and, where evidence permits, specific lines, branches, decisions or conditions.
+
+A1-18a. When no measured coverage result exists yet, Agent1 shall derive the coverage obligations itself from the SUT source (every executable line, branch, decision and condition), mark them as estimated, and replace them with Agent3's measured result as soon as it exists (A3-143).
+
+A1-18b. For every decision with two or more conditions, Agent1 shall compute deterministically the condition vectors required for MC/DC and, from Agent3's measured feedback, the vectors that are still missing.
+
+A1-18c. Inputs found by Agent3's coverage-guided search (A3-FZ4) shall become scenarios of the next plan, one per input, naming the gaps it reaches; they are characterization scenarios (E8).
+
+Setup-Issue Detection and Repair Planning:
+
+A1-20. Agent1 shall use Agent3's probe result (A3-PR1 to A3-PR3) as the authoritative evidence of build and test-setup issues.
+
+A1-21. Agent1 may detect likely setup issues statically (for example unresolved includes) but shall mark them as estimated until Agent3 confirms them.
+
+A1-22. When setup or build issues exist, Agent1 shall produce a setup-repair plan before any coverage plan. Each repair item shall state the issue, its compiler/linker evidence, the target file and its owner: test-side items (test files, includes in test files, stubs, test build flags) are assigned to Agent2; items in production source are assigned to Agent4.
+
+A1-22a. Coverage planning shall start only after Agent3 has confirmed that the SUT builds, links and runs with the existing tests or an empty runner (Stage A complete, ORC-4).
+
+A1-22b. Undefined references reported by the linker for symbols outside the SUT shall be added to the dependency plan and decided there (A1-DA6 to A1-DA9, A3-PR4), not treated as setup defects.
+
+No Existing Test Cases:
+
+A1-23a. If Agent1 does not detect any existing test suite, test cases or stub files, it shall plan the creation of a new test suite, all test cases needed to reach the coverage target, and all required stubs. Agent2 writes them; Agent3 supplies the harness and build files (A3-22).
+
+Gap Recommendations
+
+A1-23. Agent1 shall recommend new or additional tests only for identified gaps.
+
+A1-24. Recommendations shall reference real SUT functions.
+
+A1-25. Agent1 shall identify required stub behaviour only when needed to exercise the identified path.
+
+Expected-Behaviour Evidence (Test Oracle Sources)
+
+A1-25a. For every function targeted by a recommendation, Agent1 shall collect the evidence that defines the function's expected behaviour, kept separate from the evidence of what the current implementation actually does.
+
+A1-25b. Agent1 shall search the following evidence sources, where available, and record every item found with its source file and location:
+E1 – requirements, specifications or design documents linked to the component or function (for example requirement IDs or traceability tags in comments, test names or documentation);
+E2 – interface contracts in headers: documented parameters, return values, error codes, units, value ranges, pre- and postconditions (for example Doxygen @param, @return, @pre, @post);
+E3 – executable contracts in the source: assert statements, static assertions, precondition/postcondition checks and documented invariants;
+E4 – type and declaration constraints: enum ranges, const qualifiers, bit-field widths, array bounds and macro-defined limits;
+E5 – existing developer-written tests and their assertions that currently pass;
+E6 – usage evidence from callers in the repository: how return values, error codes and output parameters are checked and used;
+E7 – documented standard semantics where the function implements a referenced standard algorithm, protocol or formula;
+E8 – observed behaviour of the current implementation (characterization evidence).
+
+A1-25c. Evidence classes shall be ranked from strongest to weakest in the order E1, E2, E3, E4, E5, E6, E7, E8. The ranking shall be configurable per project.
+
+A1-25d. E8 evidence shall never on its own establish expected behaviour for defect classification, because it describes what the code does, not what it should do.
+
+A1-25e. When evidence sources conflict (for example a header comment contradicts an existing test), Agent1 shall record the conflict, the sources involved and their ranks, and shall not silently select one of them.
+
+A1-25f. For each recommended test scenario, Agent1 shall state the expected outcome together with the supporting evidence references and the strongest evidence class supporting it.
+
+A1-25g. When only E8 evidence exists for a scenario, Agent1 shall mark the scenario as characterization-only. Characterization-only tests may be generated to close coverage gaps, but a failure of such a test shall not be classified as source_behavior_defect.
+
+A1-25h. Evidence collection shall be deterministic wherever possible (parsing headers, comments, assert statements, callers and existing tests). Where an LLM interprets natural-language evidence, it shall cite the exact text and location it relied on.
+
+A1-25i. Agent1 shall refresh the expected-behaviour evidence when the SUT, its headers, linked requirements or existing tests change.
+
+A1-25j. When Agent3 reports an undetermined failure, Agent1 shall search for additional expected-behaviour evidence for the affected function and return the result, including the statement that no further evidence was found where applicable.
+
+A1-25x. Requirement documents are E1 evidence: ReqIF (.reqif, .reqifz) and Markdown or text documents in the repository - configured patterns, otherwise files named like requirements or specifications. A requirement links to a function when its ID is cited at the function (traceability tag) or its text names the function. Each item is recorded with its ID, text, file and line.
+
+A1-25y. Coverage is not enough: for every function with E1, E2 or E3 evidence, Agent1 shall plan a behaviour scenario - tests that assert what the evidence states - until such a test exists in the suite or the attempts (A1-36) are used up, even when characterization tests already reach full coverage. Otherwise a defect against documented behaviour would stay hidden behind characterization tests.
+
+Project Requirements as Input (A1-RQ)
+Two kinds of requirements must not be confused: this document specifies the unit-test generator; the project's requirements state what the client's code shall do. Unit tests need only the code to run and to reach coverage; the project's requirements (and the other expected-behaviour evidence E2 to E7) decide whether a test can expose a defect, because without them a test can only record what the code does today (E8, A1-25d).
+
+A1-RQ1. Besides the requirement documents found in the repository (A1-25x), the user may give the project's requirement documents explicitly for a run: one or more files or folders on the PC, or paths inside the repository - on the command line (--requirements, repeatable), as an optional question in the menu of unittest_generator.bat and unittest_generator.sh (Enter = none), in the request of the MCP tools run_pipeline and run_repository, or as fixed paths per repository in ut_config.json. They are optional: without them the pipeline runs on the code and its other evidence (E2 to E7).
+
+A1-RQ2. Accepted formats: ReqIF (.reqif, .reqifz - for example exports from DOORS, Polarion or Codebeamer), Markdown and plain text with requirement IDs (A1-25x), and CSV with an ID column and a text column (column names configurable). Other formats (Word, PDF, Excel) are not read; the final result names the file and asks for one of the accepted exports.
+
+A1-RQ3. Documents given for a run are copied unchanged into the run's output folder; their SHA-256 is recorded in the ledger and named in the final result, so that every result states which version of the requirements its tests rest on. They are never committed to the client's repository.
+
+A1-RQ4. They are E1 evidence and are linked to functions by the rules of A1-25x (a traceability tag at the function, or the function named in the text), otherwise by the brain under the restrictions of A1-PL13. When a document given for the run and a document in the repository state the same requirement ID differently, the conflict is recorded with both sources (A1-25e) and the document given for the run is used.
+
+A1-RQ5. The final result shall list, per SUT function: the requirements linked to it (by rule or by the brain), whether a test asserts each of them, and whether the function has any stated expected behaviour (E1 to E3). Functions without any are listed separately: their tests are characterization only and cannot expose a defect, which the reviewer needs to know.
+
+A1-RQ6. A document that cannot be read or parsed, or that contains no requirement ID, is reported as an open item with the reason; the run continues without it. Requirement IDs are never invented.
+
+Evidence-Grounded Reasoning Requirements
+
+A1-25k. Agent1 shall use a structured evidence-grounded analysis process rather than relying solely on free-form LLM reasoning.
+
+A1-25l. For each SUT function, Agent1 shall separately identify:
+- executable behaviour,
+- expected-behaviour evidence,
+- existing test evidence,
+- measured coverage evidence,
+- remaining candidate gaps.
+
+A1-25m. Every candidate test recommendation shall be supported by:
+- a real SUT function,
+- a real executable path/condition, and
+- expected-behaviour evidence or an explicit characterization-only classification.
+
+A1-25n. Agent1 shall distinguish:
+- confirmed_gap,
+- characterization_gap,
+- conflicting_evidence,
+- insufficient_evidence.
+
+A1-25o. Agent1 shall not convert conflicting_evidence or insufficient_evidence directly into a normative test expectation.
+
+A1-25p. When required evidence is missing, Agent1 may use a ReAct-style retrieval loop to inspect additional repository evidence.
+
+A1-25q. ReAct tool calls shall be bounded and restricted to approved evidence sources.
+(A1-25r is not used.)
+
+A1-25s. Each ReAct iteration shall record:
+- information sought,
+- source inspected,
+- evidence obtained,
+- resulting classification.
+
+A1-25t. Alternative hypotheses may be evaluated when evidence supports multiple explanations, but Agent1 shall not perform unrestricted branching for routine analysis.
+
+A1-25u. Agent1 shall prefer deterministic extraction over LLM inference whenever the same fact can be obtained reliably from source parsing, coverage data, repository metadata or existing tests.
+
+A1-25v. Agent1's final handoff shall contain decisions and supporting evidence, not unrestricted free-form reasoning traces.
+
+A1-25w. Agent1 shall stop evidence retrieval when:
+   - sufficient evidence supports the decision,
+   - available sources are exhausted,
+   - evidence remains conflicting,
+   - or the configured reasoning/tool-call budget is reached.
+
+Coverage Planning by the Brain (A1-PL)
+
+A1-PL1. In Stage B, for every function with open coverage gaps or a pending behaviour scenario (A1-25y), Agent1 shall ask the brain to suggest the function's test scenarios. The brain suggests; Agent1 checks and decides (ARCH-1, ARCH-5). Rules alone cannot plan across repositories and projects; what is project-specific shall reach the brain as facts (A1-PL2), not be built into fixed rules. The brain is asked once a verification of Agent2's first coverage bundle has been measured, so it plans only what the deterministic characterization tests (A2-21h) and the coverage-guided search (A1-18c) left open; the first coverage plan is made by the rules. The setup-repair plan of Stage A stays deterministic (A1-22, A1-34), except the proposal of missing declarations (A1-PL14).
+
+A1-PL2. Facts first (ARCH-6, A1-25u): before asking, Agent1 shall determine deterministically and give the brain:
+- the function's source with line numbers, its signature and the kinds of its parameters (A1-DA2);
+- the open gaps with ID, metric and line, and the MC/DC condition vectors still missing (A1-18b);
+- the conditions on the path to each gap;
+- the stubs with their controls (A2-21g), and the dependencies decided real or system;
+- the expected-behaviour evidence with ID, class, source and line (A1-25b, A1-25x);
+- the style of the existing tests: framework, naming, fixtures and helpers (A1-9);
+- from the previous iteration: which planned scenarios reached which items (per-test coverage, A3-OBS5, where available), the gaps still open and the classified failures.
+Gaps proven infeasible (A1-37) are not given as targets; they stay open and keep the file incomplete (COV-4).
+
+A1-PL3. The brain shall return, through a typed contract, per scenario:
+- the gap IDs it targets;
+- the inputs: parameter values and the contents of structures and buffers;
+- the set-up before the call: earlier calls, global or member state;
+- the stub behaviour: return values or a sequence of return values per call, variables to set, captured arguments to check;
+- the expected outcome with the evidence IDs it rests on; for evidence interpreted from natural-language text, the exact quoted text (A1-25h);
+- its classification: confirmed_gap, characterization_gap, conflicting_evidence or insufficient_evidence (A1-25n).
+Free-form reasoning is not part of the answer (A1-25v).
+
+A1-PL4. Agent1 shall check every suggested scenario deterministically before Agent2 receives it:
+a) the function exists in the function inventory, and every gap ID exists and is still open;
+b) every evidence ID exists, and every quoted text occurs word for word at the cited source and line;
+c) an expected value is normative only when it rests on evidence of class E1 to E7 and the classification is confirmed_gap. A scenario resting only on E8 is characterization-only (A1-25g) and its result is observed (A2-21f). conflicting_evidence and insufficient_evidence never yield a normative expectation (A1-25o);
+d) every stub, stub control and variable it names exists in the dependency plan as stub, and only their controls are set;
+e) every value fits its parameter type: value range, enumerators, NULL only where the function permits it;
+f) no gap proven infeasible (A1-37) is targeted.
+A scenario that fails a check is removed. The brain is asked once more with the reasons (ARCH-5); what still fails is dropped and recorded with the reason.
+
+A1-PL5. When the brain or the check finds evidence items that contradict each other, Agent1 shall record the conflict with the sources involved and their ranks (A1-25e) in the plan and in the final result, and the scenario becomes conflicting_evidence.
+
+A1-PL6. When the brain classifies a scenario insufficient_evidence, Agent1 may run the bounded retrieval loop (A1-25p to A1-25w): the brain names the information sought; Agent1 looks it up only in approved sources (the SUT, its headers, requirement documents, callers in the repository, existing tests) and records every step (A1-25s). The budget is the number of evidence look-ups per function (ORC-7).
+
+A1-PL7. The brain learns from the measurement: in the next iteration it receives what each of its scenarios actually reached (A1-PL2) and revises the inputs, set-up or stub behaviour of the scenarios that missed. A gap still not reached after the attempts of A1-36 is reported as an open item.
+
+A1-PL8. Without an available brain, after a timeout, or when no scenario of a function passes the check, Agent1 shall plan that function deterministically: gap description, path conditions and stub hints, with Agent2's deterministic characterization tests (A2-21h) and the coverage-guided search (A3-FZ1). The plan records for every scenario who made it: the brain (name and model) or the rule fallback, and the final result states how many scenarios came from each.
+
+A1-PL9. Brain calls for planning are bounded: a configured number per function and iteration, re-ask included, and the time limit per LLM call (ORC-7). A timeout counts as no answer (A1-PL8).
+
+A1-PL10. The plan handed to Agent2 shall contain, per scenario, who made it, the classification, the evidence IDs, the result of the check and, for a characterization-only scenario, that marking (A1-26). Agent1 shall not hand over a scenario that did not pass the check.
+
+A1-PL11. The plan stays bound to the SUT signature and the evidence it was made from (ORC-10). After a verified source fix (A4-40), after changed evidence (A1-25i) or after a revised dependency decision (A1-DA12), the affected functions are planned again.
+
+A1-PL12. Hard gaps: for a gap that earlier scenarios - deterministic, from the coverage-guided search or from the brain - did not reach, the brain shall receive, besides the facts of A1-PL2, the path conditions of that gap, the inputs and stub values already tried and what each of them reached, and shall suggest different inputs, set-up or stub behaviour (for example a sequence of return values per call, A2-21g). Agent3's measurement decides whether the gap is reached; the attempts count as in A1-36.
+
+A1-PL13. Requirements written in prose: when a requirement document (A1-25x) states behaviour without citing a traceability tag or naming a function, Agent1 may ask the brain which functions the requirement describes. The brain shall cite the requirement ID and the exact sentence it relies on, with a probability. Agent1 shall check that the ID exists, that the sentence occurs word for word in that requirement and that every function exists, and keep links with a probability of at least 0.6. A link made this way is recorded in the layout profile and the final result as linked by the brain. Its evidence (class E1, marked linked) may be used to plan behaviour scenarios (A1-25y) and test expectations, but:
+- it never counts as evidence for a source fix (A4-23b, A4-23f, A4-23i);
+- a test resting on it that fails is classified requirement_mismatch (A3-CL11), never source_behavior_defect;
+- Agent1 then reports the disagreement between the requirement and the implementation as an open item for review and does not plan that evidence again for the function in this run.
+The same rules apply to evidence found by the retrieval loop of A1-PL6.
+
+A1-PL14. Missing declarations: when the linker reports a symbol that the dependency plan does not stub (A1-22b), Agent1 shall stub it from the declaration the dependency plan or the repository's headers contain. Only when no declaration exists anywhere may Agent1 ask the brain for one, giving it every use of the symbol in the SUT. Agent1 checks that the answer parses as a declaration of exactly that symbol; the stub is then generated from it (A2-21g) and Agent3's build confirms it. The dependency plan and the final result mark such a declaration as proposed by the brain.
+
+Agent2 Handoff:
+
+A1-26. Agent1 shall produce a structured plan for Agent2 containing:
+- SUT information
+- function inventory
+- layout profile
+- existing tests/stubs
+- coverage gaps
+- test recommendations
+- expected-behaviour evidence, evidence class and characterization-only marking per recommended scenario
+- prioritized steps
+- files that may be edited
+- files that may be created
+
+A1-27. Agent1 shall not directly generate or write final unit-test files. It shall generate only the plan to improve for the each coverage that hasnt reached 100%. The coverage plan is made as A1-PL1 to A1-PL11 describe: the brain suggests the scenarios, Agent1 checks and decides.
+
+Deterministic Behaviour and Caching
+
+A1-28. Agent1 shall use deterministic repository/source discovery wherever possible.
+
+A1-29. Cached analysis shall only be reused when the relevant SUT/repository inputs are unchanged.
+
+A1-30. Force-refresh shall bypass the applicable analysis cache.
+
+A1-31. Agent1's state model shall separate SUT information, discovered test/stub assets, layout information, measured coverage, setup issues and deficient metrics.
+
+Discovery First:
+
+A1-31a. Discovery (A1-1 to A1-17) shall run without an LLM and shall be the first step of every pipeline run (ORC-3). The dependency analysis (A1-DA1 to A1-DA14) follows Agent3's build capture; within it, only the stub-or-real decision (A1-DA8) and the requirement links of A1-PL13 may use the LLM.
+
+Dependency Analysis (replaces the dependency analysis of a commercial unit-test tool):
+
+A1-DA1. After Agent3's build capture, Agent1 shall analyze the SUT with the configured compiler's front end, using the SUT's flags from the build description. This is parsing only (syntax tree, header list): Agent1 shall not produce object files, link or run code. Agent3 remains the only agent that builds and executes (GEN-05).
+
+A1-DA2. From the syntax tree Agent1 shall determine deterministically every function defined in the SUT: exact signature, linkage (static or external), C++ qualified name, overloads and source range. This is the function inventory of A1-2 and A1-3.
+
+A1-DA3. Agent1 shall determine every header the SUT includes, directly and indirectly, with its resolved path in the working copy.
+
+A1-DA4. Agent1 shall determine every external dependency of the SUT: functions, C++ methods and constructors of other classes, and global variables that the SUT uses but does not define. Each shall be recorded with its exact declaration and the header and location that declare it.
+
+A1-DA5. For each external dependency Agent1 shall establish these facts deterministically:
+- whether a definition exists in the repository, and in which translation unit of the build description;
+- whether an existing stub already defines it (A1-10), and whether that stub is writable or read-only (A1-11);
+- whether it belongs to the standard library, the compiler runtime or an SDK outside the repository;
+- for a definition in the repository: the further external dependencies that linking the real code would bring in.
+
+A1-DA6. Each external dependency shall be decided as one of:
+- stub: Agent2 generates a stub or reuses an existing one;
+- real: the real definition is compiled and linked into the test program with its own flags from the build description;
+- system: linked from the standard library, compiler runtime or SDK.
+
+A1-DA7. These cases shall be decided deterministically, without the LLM:
+- no definition available and not a system dependency: stub;
+- an existing stub defines the dependency: that stub is reused (stub);
+- a system dependency: system, unless A1-DA8 decides stub for a non-deterministic system service.
+
+A1-DA8. Every other dependency (a definition exists in the repository) shall be decided stub or real by the LLM, through BaseAgent's typed decision (a choice with probabilities and a stated reason). The LLM shall receive as evidence: the dependency's declaration and definition, its own further dependencies, and how the SUT uses it, including which SUT decisions depend on its result. The decision shall weigh these criteria:
+- stub when the dependency accesses hardware or registers, files, time, random numbers, communication or operating-system services; keeps state a test cannot reset; brings in many further dependencies; or when SUT decisions depend on its result and controlling that result is needed for coverage;
+- real when it is a small, deterministic computation without side effects (for example a conversion, calculation or utility function), so the real behaviour makes the test more meaningful and needs no further stubs.
+The same decision may choose stub for a non-deterministic system service (time, random numbers, file or device access) whose result controls SUT decisions.
+
+A1-DA9. The LLM's decision is untrusted (ARCH-5) and shall be checked deterministically. Real shall be refused when no definition exists, when the definition is in the SUT itself, or when its further dependencies cannot all be decided. An invalid answer is asked again once; otherwise the dependency is stubbed. Without an available LLM every repository dependency is stubbed. The reason is recorded in every case.
+
+A1-DA10. A real decision applies transitively: the further dependencies of a real dependency are analyzed and decided in the same way, up to the configured depth (ORC-7). Beyond that depth they are stubbed.
+
+A1-DA11. The dependency plan shall be part of the layout profile handed to Agent2 and Agent3, and of the final result. Per dependency it records: the decision, the reason, who decided (rule, LLM with its probability, or fallback) and the evidence.
+
+A1-DA12. Agent1 shall revise a decision when Agent3's results show it was wrong, and count the attempt (A1-36):
+- a real dependency causes link errors, crashes, timeouts or results that differ between runs → stub;
+- a coverage gap needs control of a real dependency's result → stub;
+- a stub's results cannot represent behaviour the SUT needs (for example a callback or a data structure the SUT walks through), and a definition exists → real.
+
+A1-DA13. Agent1 shall resolve every header the SUT and the test files need, from the front end's header list and the build description's include paths. A header that cannot be found in the working copy or on those paths shall be reported as a setup issue, naming the header and the places searched. Missing headers are resolved only by Agent1 (A3-38a).
+
+A1-DA14. Text pattern matching may be used only when the front end cannot parse the SUT. Its results shall be marked estimated, and the final result shall say so. The dependency analysis is bound to the SUT signature and repeated when the SUT or its flags change, including after a verified source fix (A4-40).
+
+A1-DA15. Variables defined at file or namespace scope in the SUT file itself (with or without static) are part of the SUT, never dependencies: they are neither stubbed nor searched for elsewhere. The variables among them that the SUT can change (not const) are listed in the layout profile as the SUT state (name and type), for A2-21s.
+
+Failure Feedback and Re-Planning:
+
+A1-32. Agent1 shall receive every classified failure from Agent3 except source_compilation_defect and source_behavior_defect (routed to Agent4) and environment_defect (run stops), A3-177.
+
+A1-33. Agent1 shall treat a failure of a generated or an existing test as a failed plan item and shall produce a revised plan: repair items for the affected tests and stubs, plus any remaining gap items.
+
+A1-34. For a compilation error in generated test code whose fix target is unambiguous (file, line, symbol), Agent1 shall forward the diagnostic as a repair item without an LLM call.
+
+A1-35. Agent1 shall be the only agent that sends work to Agent2.
+
+A1-36. Agent1 shall count attempts per gap and per repair item. After the configured number of failed attempts (ORC-7) it shall change strategy in the order of COV-6 (other values and stub behaviour, coverage-guided search, the next brain, then infeasibility analysis, A3-121a) and finally report the item as open; an open item never counts as covered (COV-3).
+
+A1-37. Infeasibility proofs: for every measured gap of a decision Agent1 shall try to prove deterministically that it cannot be covered. The proof handles conditions that compare a variable or member with constants of the program (literals, integer macros with the value the preprocessor gives them in a build variant (A1-37a), enumerators), uses the parameter types' value ranges (unsigned, bool, bit widths), and also uses the conditions on the path to the gap (the enclosing if and while conditions, true or false as the branch requires) on a variable the function does not change before the gap, and checks every combination of condition values under short-circuit evaluation: a decision outcome (DC), a condition value (BC) or an MC/DC independence pair that no satisfiable combination produces is infeasible, and the code of a branch that can never be taken is unreachable (LC/SC). Conditions with calls, assignments or other side effects are never proven. The proof text is attached to the gap and listed in the final result (A3-121); unproven gaps stay open. A proof holds only for the build variant it was computed for (A1-37b, A1-37c).
+
+A1-37a. Macro values per build variant: for every build variant of the SUT file (A3-BD14), Agent1 shall obtain the macro values by running the compiler's preprocessor with that variant's flags (for example clang -dM -E), so that a macro set by a -D or -U flag, by a forced include or inside an #if branch has the value that the variant compiles with. A macro without an integer value in a variant is not a constant for that variant. No brain is asked.
+
+A1-37b. Proof per build variant: when the conditions of a gap or the conditions on its path (A1-37) use a macro whose value differs between build variants, Agent1 shall compute the proof of A1-37 separately for every variant. The result for each variant is either "cannot be reached", with its proof, or "no proof" (a combination that satisfies the conditions exists, or the conditions are outside what A1-37 handles). A gap whose conditions use no macro that differs between variants is proven once, and the proof holds for every variant.
+
+A1-37c. Only the tested variant decides: the tested variant is the one the unit tests are built and measured with (A3-BD14). A proof for the tested variant is diagnosis only (COV-4). A proof for another variant changes nothing in the run. When a gap cannot be reached in the tested variant while another variant has no proof, the gap stays not covered (COV-3) and the result says so, for example "cannot be reached in the tested variant brake_ecu (BRAKE_CHANNELS = 2); no proof in variant brake_ecu_4ch (BRAKE_CHANNELS = 4): the code may be reachable there, which this run neither built nor measured". The hand-over (COV-11) names the variant the developer can test.
+
+A1-37d. This is analysis only: no extra build, no test run and no coverage measurement is made for a variant other than the tested one, and a variant result never counts as coverage or as a reason to stop (COV-3, COV-9).
+
+A1-37e. The variant results are part of the build-bound state: they are computed again whenever the build description is captured again (A3-BD9). When the build description is estimated (A3-BD5), there is a single variant, and the proof is reported as applying to the estimated configuration only.
+
+Requirements — agent_unittest_generator (Agent2)
+
+Agent1 Plan as Input
+
+A2-1. Agent2 shall use the Agent1 plan as the primary generation contract.
+
+A2-2. Agent2 shall not independently reinterpret the repository into a different test layout.
+
+Generation Eligibility
+
+A2-3. Agent2 shall implement the setup-repair items that Agent1 assigns to it (test-side fixes, A1-22). Agent2 shall not generate coverage tests while Agent1 reports an open setup issue.
+
+A2-4. Agent2 shall not generate files when the layout is marked ambiguous or generation-blocked.
+
+A2-5. If all applicable measured coverage metrics are already 100%, Agent2 shall return a completed/no-generation result.
+
+Framework Preservation
+
+A2-6. Agent2 shall write tests for the project's existing test framework when Agent3 reports that framework as executable from the repository (A3-20), otherwise for the harness supplied by Agent3 (A3-18).
+
+A2-7. Agent2 shall preserve the existing test-suite conventions, includes, fixture structure and registration mechanism.
+
+A2-8. Agent2 shall not convert the project to another testing framework.
+
+Existing File Preference
+
+A2-9. Agent2 shall follow the target-file strategy supplied by the resolved layout/Agent1 handoff.
+
+A2-10. Existing primary test suites shall be used as the authoritative structural reference.
+
+A2-11. New files shall only be created in valid discovered/approved test locations.
+
+Coverage-Driven Generation
+
+A2-12. Generated tests shall address the specific gaps supplied by Agent1.
+
+A2-13. Tests shall call real SUT functions using actual names/signatures.
+
+A2-14. BC/DC/MC/DC tests shall use inputs and stub behaviour intended to exercise the missing outcomes or condition combinations.
+
+A2-15. Agent2 shall not claim that generated tests achieved coverage until measured verification exists.
+
+Stub Generation/Modification
+
+A2-16. Agent2 shall reuse existing stubs where possible.
+
+A2-17. Agent2 shall create or modify stubs only in locations explicitly marked writable.
+
+A2-18. Agent2 shall not modify automatic, generated or component-level read-only stubs.
+
+A2-19. Stub APIs shall be based on real signatures available from the project context.
+
+No Invented APIs
+
+A2-20. Agent2 shall not invent production classes, methods, constructors, helper APIs, stub APIs or framework APIs.
+
+A2-21. Generated code shall use symbols that can be grounded in the SUT, existing tests, headers, stubs or discovered framework APIs.
+
+Assertion Grounding
+
+A2-21a. Every assertion and expected value in a generated test shall reference the expected-behaviour evidence supplied by Agent1 (evidence ID and evidence class).
+
+A2-21b. Agent2 shall not invent expected values that are not supported by Agent1's evidence or derivable deterministically from that evidence.
+
+A2-21c. When an expected value is taken from observed execution of the current implementation, the assertion shall be marked as characterization (E8).
+
+A2-21d. Agent2 shall record, per generated test case, the strongest evidence class behind its assertions, and this record shall accompany the corresponding file action.
+
+A2-21e. When Agent2 changes an existing assertion, expected value or tolerance, or removes or disables an assertion or test case during a repair, it shall declare the change explicitly as an expectation change (old expectation, new expectation, reason, supporting evidence). Agent2 shall not mark an expectation change as accepted; acceptance is decided by Agent3's oracle-strength verification.
+
+A2-21f. When an expected value can only come from the current implementation (E8), Agent2 shall first generate a probe that records the value instead of asserting it. Agent3 runs the probe (A3-OBS1) and returns the observed value, which Agent2 then uses in a characterization assertion.
+
+Deterministic Stubs
+
+A2-21g. Stubs for the dependencies decided stub (A1-DA6) shall be generated deterministically from their exact declarations (A1-DA4): functions, C++ methods and constructors, and definitions of global variables. Each stub has a controllable return value or value, captured arguments and a call counter; a stub with a scalar, enumeration or pointer return type can also return a sequence of values, one per call, before it falls back to its single return value. The LLM shall only choose the values a test sets. Agent2 shall not stub a dependency decided real or system.
+
+A2-21j. A stub for a global variable decided stub (A1-DA6) shall define the variable itself, under its own name and with exactly its declared type, qualifiers included (const, volatile, array bounds, struct type). It shall not be renamed or wrapped, so the SUT links against it unchanged.
+- A non-const variable shall be settable by each test before it calls the SUT, like a stub's return value.
+- A const variable cannot be changed by a test. Its value is fixed by the stub's initializer for the whole test program; Agent2 shall choose that initializer from the evidence and record it in the file action. Tests that need different values of the same const variable shall be reported to Agent1, which decides between separate test programs and using the real definition (A1-DA12).
+- Agent3's link check (A3-PR4) confirms that the stub defines exactly the declared symbol: an undefined or duplicate symbol is reported as a stub_defect.
+
+Deterministic Characterization Tests
+
+A2-21h. Before the LLM is asked, Agent2 shall generate characterization tests without an LLM, using the parameter types from the front end (A1-DA2): integers, booleans, enumerations (their enumerators), floating point, pointers to scalars (a local variable, its value observed after the call; NULL when the function checks for it), C strings, output buffers, plain structs by value or pointer (aggregate initializers), and function pointers (generated callbacks with a controllable result); in C++ also classes constructed from scalars. Input values come from the function's own literals and macros and are combined pairwise - every value at least once - together with the return values of the controlled stubs. Their expected values are observed (A2-21f) and marked E8. They add to the tests for Agent1's scenarios (A2-21m); they do not replace them.
+
+A2-21i. New characterization tests that add no covered item and no MC/DC condition vector beyond the other tests (per-test coverage from the observation run, A3-OBS5) shall be removed before verification. Tests with expected-behaviour evidence E1 to E7 shall never be removed this way.
+
+A2-21k. Static functions (internal linkage, anonymous namespaces) shall be tested directly: Agent2 writes a file in the test directory (role sut_access) that includes the SUT and defines a wrapper ut_static_<name> per static function; tests call the wrappers. Agent3 then compiles and instruments that file instead of the SUT, never both; coverage is still measured on the SUT's own lines. The SUT itself is not changed.
+
+A2-21l. For every input of coverage-guided search planned by Agent1 (A1-18c), Agent2 shall generate one test that sets the recorded stub values and variables and calls the function with the recorded arguments, written as readable C/C++ values; its result is observed (E8).
+
+A2-21m. For every scenario of Agent1's plan that passed Agent1's check (A1-PL4), Agent2 shall generate at least one test that applies its inputs, set-up and stub behaviour. Agent2 assembles the test directly from the scenario when every argument, stub value and expected value is given and the function can be called without an object; otherwise the LLM writes the test code from the scenario. A2-20, A2-21 and A2-21a to A2-21c apply in both cases. The expected value is asserted only for a normative scenario; otherwise it is observed (A2-21f). Agent2 shall not change a scenario's targets, evidence or expected outcome; a scenario it cannot implement is reported back to Agent1 with the reason.
+
+A2-21n. Requirement-based tests: for every scenario that asserts stated behaviour - the behaviour scenarios of A1-25y and the normative scenarios of A1-PL4 c) - Agent2 shall write tests that assert what the evidence states, in every iteration in which such a scenario is planned, not only when the deterministic generator produced nothing. Each assertion names its evidence ID in a comment (A2-21a). A test resting on evidence linked by the brain (A1-PL13) is marked linked.
+
+A2-21o. Values the deterministic generator cannot build: for functions or parameters that the deterministic tests (A2-21h) skip - for example C++ member functions, nested structures, pointers to pointers, unions, arrays of structures and objects whose constructors take non-scalar values - the LLM shall write the tests of Agent1's scenarios, including the set-up of such values, in the same iteration in which the deterministic tests are generated for the other functions. Agent3's build and run check them.
+
+A2-21p. Rewriting failing tests: a failing generated test with evidence of class E1 to E7 that Agent1 routes back for repair (A1-33) shall be rewritten by the LLM from Agent3's diagnostic (compiler message, or assertion with expected and actual value) and the test's scenario, not only dropped. The rewrite keeps the test's name, targets and evidence; a changed expected value is an expectation change (A2-21e) and goes through the oracle-strength check (A3-85a). A test still failing after the attempts of A1-36 is dropped and reported. Failing characterization tests (E8) are dropped and observed again (A2-21f).
+
+A2-21q. Readable tests: every test written by the LLM or assembled from a brain scenario shall have a name of the form test_<what>_<behaviour> (at least three words) and, as the first line of its body, a comment with the scenario ID and a one-line purpose. Agent2 checks the name and adds the comment from the scenario when the LLM did not write one.
+
+A2-21r. Values for the rule-based tests of A2-21h shall also come from the decisions on the fields of struct parameters (the compared value and its neighbours, the bit masks tested with &), from the literals and macros of the SUT's static functions the function calls, and from hexadecimal and suffixed literals. A controlled stub that the function calls more than once also gets return sequences in which the calls return different values (A2-21g), so that decisions comparing two results can take both outcomes.
+
+A2-21s. Every test starts from the SUT's initial state: when the SUT has state (A1-DA15), the sut_access file of A2-21k defines ut_sut_reset, which records the state before the first test and restores it before every further test; the stub file's per-test reset calls it. A test's result therefore never depends on the tests before it or on their order. In C++ only state of scalar, enumeration and pointer types (and arrays of them) is restored this way; other state is listed as a note.
+
+Single-Writer File Ownership
+
+A2-22. Each normalized output path shall have one final writer.
+
+A2-23. Agent2 shall prevent multiple parallel generation results from independently producing conflicting complete versions of the same file.
+
+A2-24. Duplicate test definitions, duplicate suite definitions and conflicting actions shall be rejected.
+
+Canonical File Actions
+
+A2-25. Every generated change shall be represented as a structured file action.
+
+A2-26. A file action shall identify:
+- target path
+- create/modify action
+- file role such as testsuite/stub/helper
+- patch mode
+- generated content/additions
+
+A2-27. Paths shall remain inside the resolved repository/component layout.
+
+Structural Validation
+
+A2-28. Agent2 shall validate generated actions before publishing them.
+
+A2-29. Validation shall include, at minimum:
+- valid target paths
+- supported action types
+- supported file roles
+- non-empty generated content
+- duplicate/conflicting actions
+- test-suite structural integrity
+- resulting complete-file integrity
+
+Staged Validation
+
+A2-30. Generated actions shall be applied to an isolated staged copy before they are handed to Agent3.
+
+A2-31. Validation shall operate on the resulting complete files, not only on isolated snippets.
+
+Verification Boundary
+
+A2-32. Agent2 shall not build, execute or measure tests. Compilation, execution and coverage results come only from Agent3 (A3-3, A3-133 to A3-138).
+
+A2-33. Agent2 shall never report compilation, execution or coverage as successful.
+
+Hand-off Gate
+
+A2-38. Invalid or structurally inconsistent bundles shall not be handed to Agent3.
+
+A2-40. Internal structural validation shall not be represented as compile, test or coverage verification.
+
+Generation Cache
+
+A2-41. Agent2 may reuse an unchanged previously validated bundle.
+
+A2-42. Force-regeneration shall bypass only the Agent2 generated-bundle cache and shall not implicitly rerun Agent1.
+
+Progress and Failure Handling
+
+A2-43. Agent2 shall report meaningful generation/validation progress.
+
+A2-44. A failed or timed-out LLM/gateway operation shall terminate with a clear failure state rather than leave generation indefinitely running.
+
+A2-45. Agent2's configuration shall cover single-writer generation, validation modes, repair limits and bounded LLM calls.
+
+Requirements — ut_fix_knowledgebase (KB)
+
+UT-Specific Knowledge Base
+
+KB-1. The knowledge base shall be isolated to the Unit Testing agents.
+
+KB-2. UT learning data shall not be mixed with unrelated agent knowledge bases.
+
+Positive and Negative Learning
+
+KB-3. The KB shall maintain both:
+
+KB-3a. positive examples of successful fixes/patterns
+
+KB-3b. negative examples of rejected or failed patterns.
+
+Positive Sample Qualification
+
+KB-4. A generated solution shall qualify as a verified positive example only when:
+compilation passed,
+generated tests executed successfully,
+fresh coverage is complete,
+verification status is verified.
+
+KB-5. Unverified generated code shall not be learned as a confirmed positive pattern.
+
+KB-5a. A generated test may also be stored as a verified gap-closure example when Agent3 has measured that its target gap is covered, all tests pass and no regression exists, even when the whole SUT has not yet reached 100%. Gap-closure examples shall be marked as such and ranked below complete verified examples.
+
+Negative Sample Qualification
+
+KB-6. Failed or rejected generation patterns may be stored as negative examples.
+
+KB-7. The failure/rejection reason shall be retained so that the same error pattern can be avoided later.
+
+Context Preservation
+
+KB-8. Stored examples should retain relevant context including, where available:
+- language
+- repository family/layout
+- test framework
+- diagnostic category
+- compiler/build profile
+- file role
+- compile result
+- test result
+- coverage result
+- coverage delta.
+
+Deduplication
+
+KB-9. Equivalent samples shall not be stored repeatedly as independent records.
+
+KB-10. Repeated observations may increase pattern usage/count information.
+
+Bounded Storage
+
+KB-11. The KB shall maintain bounded positive and negative working sets.
+
+KB-12. Higher-value verified/relevant patterns shall be preferred when storage limits are reached.
+
+Example Ranking
+
+KB-13. Retrieved examples shall be ranked using relevance and historical quality.
+
+KB-14. Contextually matching framework/language/layout examples shall be preferred.
+
+Contrastive Prompting
+
+KB-15. Agent2 may receive both successful and unsuccessful examples.
+
+KB-16. Positive examples shall demonstrate patterns worth reproducing.
+
+KB-17. Negative examples shall demonstrate patterns that should not be reproduced.
+
+Learning Must Not Block Generation
+
+KB-18. KB persistence or learning failure shall not invalidate an otherwise valid generated bundle.
+
+KB-19. The generation/download result shall not depend on successful KB persistence.
+
+Storage Fallback
+
+KB-20. The implementation shall support persistent/table-backed storage when available.
+
+KB-21. A local fallback may be used when the persistent backend is unavailable.
+
+Note: the KB is an isolated UT store with verification, compile, test and coverage metadata. Positive learning requires compilation passed, tests passed, coverage complete (or a verified gap closure, KB-5a) and verified status.
+
+Smart Contracts — Agent1 ↔ Agent2 ↔ UT Fix Knowledge Base (contract structure: ARCH-4)
+Contract A
+
+SC-1. Agent1 shall provide analysis and intent; Agent2 shall provide code generation.
+
+SC-2. Agent2 shall treat Agent1's SUT identity and resolved layout as authoritative.
+
+SC-3. Agent2 shall generate only against functions that exist in Agent1's SUT inventory.
+
+SC-4. Agent2 shall use Agent1's identified gaps/recommendations as generation targets.
+
+SC-5. Agent2 shall respect Agent1's files_to_edit / files_to_create and writable/read-only directory decisions.
+
+SC-6. If Agent1 reports setup_blocked or generation_blocked, Agent2 shall not generate coverage changes.
+
+SC-7. Agent2 shall not silently change the test framework, harness language or repository layout selected by Agent1.
+
+SC-8. Agent1 recommendations describe what needs coverage; Agent2 decides how to implement the test within the approved project structure.
+
+SC-8a. Agent2 shall derive expected values only from the expected-behaviour evidence supplied by Agent1 and shall carry the evidence reference into each generated assertion.
+
+Contract B
+
+SC-9. Every Agent2 result shall be represented as deterministic file actions.
+
+SC-10. Every action shall remain inside the approved repository/component boundaries.
+
+SC-11. Agent2 output shall pass structural validation before publication.
+
+SC-12. Generated modifications shall be applied to a staged copy before Agent3 executes anything.
+
+SC-13. Compilation status shall come only from Agent3.
+
+SC-14. Test status shall come only from Agent3.
+
+SC-15. Fresh coverage status shall come only from Agent3's measured coverage evidence.
+
+SC-16. A generated result shall clearly distinguish:
+- internally validated
+- compile verified
+- test verified
+- coverage verified.
+
+SC-16a. Every modification of an existing test expectation shall be declared as an expectation change and shall become acceptable only after Agent3's oracle-strength verification has passed.
+
+Contract C
+
+SC-17. Successful patterns shall reach the KB only after Agent3 has verified them; the orchestrator forwards them.
+
+SC-18. A positive learned pattern requires:
+- compile = passed
+- tests = passed
+- coverage = complete
+- verification = verified.
+
+SC-19. Failed compilation/test/coverage or rejected logic may be supplied as negative learning examples.
+
+SC-20. Diagnostic/failure context shall accompany negative examples.
+
+SC-21. KB learning shall occur only after the generation result is known and shall not control the publication result.
+
+Contract D
+
+SC-22. The KB shall provide advisory few-shot knowledge, not repository truth.
+
+SC-23. KB examples shall never override:
+- current SUT source
+- current headers/APIs
+- current primary test suite
+- current stub implementations
+- current Agent1 layout
+- current measured coverage.
+
+SC-24. Agent2 may reuse a KB pattern only when it is compatible with the current language/framework/layout/context.
+
+SC-25. A historic KB example shall never justify inventing an API that is absent from the current repository.
+
+SC-26. Negative KB examples shall be used to avoid previously observed generation failures.
+
+SC-26a. A KB example shall never be used as evidence of the expected behaviour of the current SUT.
+
+Additional information 2: 
+Agent1 = Understand and Plan
+Source + Repository + Existing Tests + Coverage → Trusted UT Plan
+Agent2 = Generate
+Trusted UT Plan + Current Repository Evidence + KB Guidance → Structurally Validated Test/Stub Changes
+UT Fix Knowledge Base = Learn
+Verified Successes + Diagnosed Failures → Reusable Positive/Negative Guidance
+The central rule should therefore be:
+Current repository evidence and measured coverage are authoritative; Agent1 converts that evidence into a generation plan, Agent2 converts the plan into validated file changes, and the Knowledge Base only provides supporting historical guidance.
+
+Requirements — agent_unittest_compilation (Agent3)
+
+A3-1. Agent3 shall be responsible for creating and managing the complete unit-test execution framework required to compile, execute and measure coverage for generated C/C++ unit tests.
+
+A3-2. Agent3 shall not depend on Parasoft, GoogleTest or any other external unit-test tool. It shall itself provide:
+- unit-test framework (harness) creation,
+- test compilation,
+- test execution,
+- coverage measurement,
+- coverage completeness evaluation.
+
+A3-3. Agent3 shall act as the final verification authority for generated unit tests.
+
+A3-4. Agent1 shall remain responsible for analysis and gap planning.
+
+A3-5. Agent2 shall remain responsible for generating unit-test code.
+
+A3-6. The UT Fix Knowledge Base shall remain responsible for reusable verified learning and failure knowledge.
+
+A3-7. Agent3 shall be responsible for determining whether the complete generated unit-test solution actually:
+- compiles,
+- executes,
+- passes,
+- and reaches the required coverage.
+
+Input Source Language Detection
+
+A3-8. Agent3 shall determine whether the selected SUT is written in:
+C, or C++.
+
+A3-9. Language determination shall use the SUT file extension and/or Agent1 language information.
+
+A3-10. Agent3 shall not generate a C++ test harness for a C source unless explicitly required by the repository/build environment.
+
+A3-11. Agent3 shall not generate a C harness for a C++ source when C++ language features are required.
+
+A3-12. The selected compiler, framework, build configuration and instrumentation shall be compatible with the identified SUT language.
+
+Unit-Test Framework Generation
+
+A3-13. Agent3 shall generate or configure the unit-test execution framework required for the current SUT.
+
+A3-14. The generated framework shall support compilation and execution of the unit tests produced by Agent2.
+
+A3-15. The framework shall be generated according to the SUT language.
+
+A3-16. For C projects, the framework shall support C-compatible unit-test execution.
+
+A3-17. For C++ projects, the framework shall support C++-compatible unit-test execution.
+
+A3-18. The harness shall be generated by Agent3 itself (assertion macros, test registration, test runner, result output). It shall not require any external unit-test framework.
+
+A3-18a. The only external tools Agent3 shall use are those of the tool manifest (TP-10): the Clang/LLVM compiler and linker, its coverage tools (A3-50 to A3-54), libFuzzer (A3-FZ1) and the static analyzer (A4-32a), and, for build capture only, the project's build tools (A3-BD2). No external unit-test tool shall be used.
+
+A3-19. The harness shall be deterministic and versioned; its version shall be recorded in every verification result.
+
+A3-20. Existing test suites shall be executed when everything they need is present in the repository. Suites that need an external tool that is not present shall be used only as expected-behaviour evidence (E5).
+
+A3-21. Agent3 shall not rewrite existing test suites into its own harness.
+
+A3-22. Where no usable test suite exists, Agent3 shall supply the harness and the build files; the test suite, test cases and stubs are planned by Agent1 and written by Agent2 (A1-23a).
+
+Build Environment Discovery
+
+A3-23. Agent3 shall inspect the repository for existing build configuration.
+
+A3-24. It shall identify, where available:
+CMake,
+Make,
+Ninja,
+Meson,
+compiler command configuration,
+custom build scripts,
+include directories,
+library dependencies,
+compiler definitions,
+linker options.
+
+A3-25. The existing repository build configuration shall be preferred over generating an independent build environment.
+
+A3-25a. The build environment discovery of A3-23 to A3-25 shall be performed by running the project's own build (build capture, A3-BD1 to A3-BD10).
+
+A3-26. If no suitable build configuration exists for unit tests, Agent3 shall generate an isolated unit-test build configuration.
+
+A3-27. Generated build configuration shall not modify the production build unless explicitly allowed.
+
+A3-28. The unit-test build environment shall be isolated from production artifacts.
+
+A3-29. Temporary build files shall be generated in a dedicated working/staging location.
+
+Build Capture (replaces the build data file of a commercial unit-test tool)
+
+A3-BD1. After Agent1's discovery, Agent3 shall run the project's own build on the pipeline's working copy and record every compiler invocation: source file, compiler, defines, include paths, forced includes, language standard, target flags and working directory. This record is the build description.
+
+A3-BD2. The build description shall come, in this order, from: a compilation database supplied by the client for the run (compile_commands.json from another checkout; its paths are mapped onto the working copy by the SUT's own entry); the build command configured for the repository in ut_config.json; otherwise the build system found in the component or the repository root, through its adapter: CMake (configure with Ninja in a separate build folder, compilation database, then build only the SUT's object so generated headers exist), Meson (setup in a separate build folder, compilation database, SUT object), Bazel (bazel aquery of the CppCompile actions; nothing is built), Ninja (ninja -t compdb), Make (dry run), MSBuild (the project files, A3-BD5). New build systems are added as further adapters producing the same build description.
+
+A3-BD3. Recording shall not change what the build does. The compiler calls are taken from the build system's own record of what it runs - its compilation database (CMake, Meson, Ninja), its action graph (Bazel) or its dry run (Make) - or, for a configured build command, through recording compiler wrappers set as CC and CXX that call the real compiler with unchanged arguments.
+
+A3-BD4. The build shall run only in the working copy (ORC-13), within the configured time limit (ORC-7). Its output shall go to the run folder's log. The user's repository and its build folders shall never be used.
+
+A3-BD5. When the build cannot be run, or fails before the SUT is compiled, Agent3 shall fall back, in this order, to:
+- a compilation database in the repository (compile_commands.json);
+- a compilation database generated by the build system without building (for example CMake's export of compile commands, or Meson's);
+- the compile settings of Visual Studio project files;
+- flags estimated by Agent1 (A1-16).
+The build description shall record which source was used and, on a fallback, why the build was not usable. Because the tools are guaranteed (TP-1), these fallbacks are needed only when the project's own build cannot run (for example a licensed cross-compiler or SDK that is not on the machine). Estimated flags shall be flagged: the build description and the final result say ESTIMATED, the coverage applies only to the configuration listed in the manifest, and a SUT compile error is a build-configuration issue (A1-16a).
+
+A3-BD6. A build that has compiled the SUT is usable even when later steps (other targets, linking, packaging) fail. Those failures shall be recorded as notes, not as setup issues of the unit-test build.
+
+A3-BD7. When the project builds with a cross-compiler (for example for an embedded target), the recorded flags shall be translated for the host compiler that runs the unit tests: defines, include paths and the language standard are kept; target-specific options (CPU, ABI, compiler-specific switches) are dropped and listed in the build description.
+
+A3-BD8. The build description shall list every recorded translation unit with its file and flags, so Agent1 can find where external symbols are defined (A1-DA5) and Agent3 can compile real dependencies with their own flags (A3-38a). When the SUT file itself was compiled more than once with different flags, every distinct invocation is kept as a build variant (A3-BD14).
+
+A3-BD9. The build description is bound to the SUT signature. It shall be captured again only when the build configuration may have changed, not after a change to tests or stubs.
+
+A3-BD10. Build capture shall not call the LLM; only the flag suggestion of A3-BD11 may, after a capture that ended estimated. The final result shall state the build command, its duration and outcome, and the source of the build description.
+
+A3-BD11. When the build description is estimated (A3-BD5) and the SUT does not compile with it, Agent3 shall ask the brain for the missing defines, undefines, include paths, forced includes and language standard. The brain receives the SUT's compiler errors, the repository's build files (CMake, Make, Meson, Bazel, Visual Studio projects, CI configurations, README; bounded in size, nearest to the SUT first) and the folders that contain headers. For every flag it returns the file and the exact text it relies on.
+
+A3-BD12. Agent3 shall check every suggested flag deterministically: only -D, -U, -I, -include and -std are accepted; an include path or forced include must exist inside the working copy; the cited file must exist and contain the cited text. It then compiles the SUT with the accepted flags and keeps them only when they reduce the SUT's compile errors. With errors remaining it asks again with them, up to the configured number of rounds (ORC-7).
+
+A3-BD13. Flags kept this way are recorded in the build description with the file they came from, and the description stays estimated: A1-16a still applies, so a SUT compile error that remains is never classified as a source defect. The final result lists the suggested flags.
+
+A3-BD14. Build variants of the SUT file: when the build description holds more than one compiler invocation for the SUT file, the invocations that differ in defines, undefines, forced includes, include paths or language standard are listed as build variants. Each variant has a name - the target or output file when the build records one, otherwise "variant 1", "variant 2" and so on in the order of the build description - and its flags. The variant whose flags the SUT is compiled with for the unit tests (A1-16a) is marked as the tested variant; the others are used only for the analysis of A1-37a to A1-37e and are never built, run or measured. The final result lists the variants and marks the tested one.
+
+Build Manifest and Re-Creation
+
+A3-29a. Every run shall write a build manifest: compiler and version, every flag, harness version, and the SHA-256 of every SUT, header, test and stub file.
+
+A3-29b. Any recorded run shall be reproducible from its manifest with one command. Different results from the same manifest shall be reported as measurement_failed.
+
+A3-29c. Each run shall produce machine-readable coverage data, a human-readable coverage report and test results (JUnit XML) in a run folder named by the run ID.
+
+Probe (first measurement of every pipeline run)
+
+A3-PR1. After Agent1's dependency analysis (ORC-3), Agent3 shall compile, link and run the SUT with the existing tests, or with an empty runner when none exist, and measure coverage.
+
+A3-PR2. The probe shall report build and setup errors, undefined references (stub candidates for A1-22b), failing existing tests, and the baseline coverage items (0% when no tests exist).
+
+A3-PR3. The probe shall not call the LLM.
+
+A3-PR4. The probe's undefined references shall be compared with Agent1's dependency plan (A1-DA11). A symbol that is missing from the plan shall be reported as an analysis gap and routed to Agent1, which adds it to the plan.
+
+Compiler Selection
+
+A3-30. Agent3 shall select a compiler compatible with the target language and environment.
+
+A3-31. Supported C compilers may include approved versions of:
+GCC,
+Clang,
+or another configured compiler.
+
+A3-32. Supported C++ compilers may include approved versions of:
+G++,
+Clang++,
+or another configured compiler.
+
+A3-33. Compiler selection shall be configurable.
+
+A3-33a. Toolchain: Clang/LLVM 18 or newer with source-based coverage (-fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc, llvm-profdata, llvm-cov), taken only from the tool manifest (TP-10). There is no fallback toolchain: without a valid manifest the result is environment_defect with the instruction to run the setup. When a decision is not instrumented for MC/DC (for example over the condition limit), DC and MC/DC are reported as not_measured, never as complete.
+
+A3-34. The compiler version shall be recorded in the verification result.
+
+A3-35. The same compiler configuration shall be reused within one coverage feedback cycle unless a configuration change is explicitly required.
+
+Compilation of Agent2 Output
+
+A3-36. Every unit-test file generated by Agent2 shall be compiled by Agent3.
+
+A3-37. Generated tests shall not be considered valid merely because Agent2 generated structurally correct code.
+
+A3-38. Compilation shall be performed against:
+the real SUT,
+required headers,
+real project interfaces,
+approved/generated stubs,
+required libraries,
+the generated unit-test framework.
+
+A3-38a. Agent3 shall compile and link exactly: the SUT (the only file instrumented for coverage); the definitions of the dependencies decided real (A1-DA6), each with its own flags from the build description; the existing executable tests; the stubs; Agent2's bundle; and its harness. Agent3 shall not search the repository for source files or headers. A missing file or header shall be reported as a build_configuration_defect and routed to Agent1 (A1-DA13).
+
+A3-39. Agent3 shall detect and report compilation errors such as:
+missing headers,
+undeclared symbols,
+undefined references,
+incorrect signatures,
+incorrect constructors,
+incorrect function arguments,
+duplicate definitions,
+linkage mismatches,
+invalid stub APIs,
+framework misuse,
+language incompatibilities.
+
+A3-40. Compilation diagnostics shall include sufficient information for Agent1, Agent2 and the UT Fix Knowledge Base to identify the root cause.
+
+Compilation Result Contract
+
+A3-41. The compilation result shall include, at minimum:
+compilation status,
+compiler name,
+compiler version,
+language,
+build command,
+failed file,
+source line where available,
+diagnostic category,
+diagnostic code where available,
+compiler message,
+affected symbol,
+generated file role,
+affected test case where identifiable.
+
+A3-42. Compilation status shall be one of:
+passed
+failed
+configuration_error
+environment_error
+
+Test Execution
+
+A3-43. Compilation success shall be followed by unit-test execution.
+
+A3-44. All generated tests shall be executed using the generated/configured unit-test framework.
+
+A3-45. Agent3 shall capture:
+total test count,
+passed tests,
+failed tests,
+skipped/disabled tests,
+execution crashes,
+abnormal termination.
+
+A3-46. A compilation-successful but execution-failing test suite shall not be treated as verified.
+
+A3-47. Coverage results from tests that do not execute successfully shall not be treated as valid completion evidence.
+
+A3-48. The execution result shall include:
+execution status,
+total tests,
+passed tests,
+failed tests,
+skipped tests,
+failed test names,
+assertion failures,
+runtime failures,
+crash information where available.
+
+A3-49. Execution status shall be one of:
+passed
+failed
+partial
+not_executed
+
+Coverage Instrumentation:
+
+A3-50. Agent3 shall instrument the SUT and test build for measurable code coverage.
+
+A3-51. Coverage instrumentation shall be compatible with the configured compiler/toolchain.
+
+A3-52. Coverage measurement shall be based on actual executed tests.
+
+A3-53. Coverage shall never be estimated from generated source code alone.
+
+A3-54. Agent3 shall produce machine-readable coverage data for downstream processing
+
+Required Coverage Metrics
+
+A3-55. Agent3 shall calculate or derive, where applicable:
+Line Coverage — LC
+Statement Coverage — SC
+Branch Coverage — BC
+Decision Coverage — DC
+Modified Condition/Decision Coverage — MC/DC
+
+A3-56. Coverage values shall be derived from measured execution results.
+
+A3-57. Each metric shall contain:
+covered count,
+total count,
+percentage,
+completion status.
+
+A3-58. A metric shall be considered complete only when its measured value reaches the target of the SUT file's ASIL level (COV-1).
+
+A3-58a. Metric definitions (Clang/LLVM): LC = executable lines with a count above 0; SC = code regions with a count above 0; BC = every condition evaluated both true and false; DC = every decision evaluated to both outcomes; MC/DC = every condition shown to independently affect its decision (masking MC/DC).
+
+A3-58b. The toolchain and the metric definitions used shall be recorded in every coverage report.
+
+A3-59. A metric may be marked not_applicable only when the analysis can deterministically demonstrate that the metric does not apply.
+
+A3-60. Missing measurement data shall not be interpreted as 100% coverage.
+
+Coverage Report Generation
+
+A3-61. Agent3 shall generate a coverage report containing, at minimum:
+
+A3-62. File-Level Coverage
+LC percentage
+SC percentage
+BC percentage
+DC percentage
+MC/DC percentage
+
+A3-63. Function-Level Coverage
+For each function:
+function name,
+LC,
+SC,
+BC,
+DC,
+MC/DC,
+uncovered items.
+
+Gap-Level Details
+
+A3-64. Where supported:
+uncovered source lines,
+uncovered statements,
+untaken branches,
+decisions not evaluated both ways,
+MC/DC conditions not independently demonstrated.
+
+Coverage Completeness Evaluation
+
+A3-65. Agent3 shall determine whether all applicable metrics have reached their targets (COV-1).
+
+A3-66. The overall coverage state shall be:
+complete
+incomplete
+measurement_failed
+not_applicable
+
+A3-67. complete shall only be returned when every applicable required metric has reached its target by measurement (COV-1, COV-3).
+
+A3-68. The agent shall not terminate the overall UT workflow as successful when one or more required applicable metrics remain below their targets.
+
+Coverage Gap Feedback Generation
+
+A3-69. When coverage is below 100%, Agent3 shall generate structured feedback.
+
+A3-70. The feedback shall identify:
+affected function,
+deficient coverage metric,
+current coverage,
+uncovered line/statement/branch/decision/condition,
+source location where available,
+missing outcome,
+missing test scenario where deterministically identifiable,
+related generated test cases,
+related stubs where applicable.
+
+A3-71. The feedback shall be consumable directly by Agent1 and Agent2.
+
+A3-71a. For an uncovered decision or MC/DC condition, the feedback shall also contain, where the toolchain provides them: the condition values actually observed at that decision, the values still required, the nearest test that reached the enclosing decision, and the stub calls observed with their return values.
+
+A3-71b. Each gap shall carry the number of attempts already made on it (A1-36).
+
+Feedback Loop — Compilation Failure
+When generated tests fail to compile:
+
+A3-73. Agent3 shall not continue to coverage evaluation.
+
+A3-74. It shall generate structured compiler feedback.
+
+A3-75. The feedback shall be classified (A3-158) and routed by A3-177. It shall not be sent directly to Agent2.
+
+A3-76. Agent1 shall turn the classified diagnostics into repair items for Agent2 (A1-32 to A1-35).
+
+A3-77. The UT Fix Knowledge Base may provide:
+relevant positive fixes,
+relevant known negative patterns.
+
+A3-78. The corrected output shall be returned to Agent3.
+
+A3-79. The compilation cycle shall repeat until:
+compilation succeeds,
+or a configured maximum repair limit is reached.
+
+Feedback Loop — Test Execution Failure
+When tests compile but do not pass:
+
+A3-80. Agent3 shall generate structured test-failure feedback.
+
+A3-81. Feedback shall identify:
+failing test,
+assertion,
+expected value,
+actual value,
+crash/runtime error,
+affected SUT function where identifiable.
+
+A3-82. The classified feedback shall be routed by A3-177: Agent1 for test and stub defects, Agent4 for source defects.
+
+A3-83. Agent1 shall re-plan; Agent2 shall correct the test logic or stub behaviour according to that plan.
+
+A3-84. The UT Fix Knowledge Base may provide relevant verified or rejected historical patterns.
+
+A3-85. Updated tests shall be recompiled and re-executed.
+
+Oracle-Strength Verification (Anti-Weakening Guard)
+
+A3-85a. Whenever a test repair changes an assertion, expected value or tolerance, or removes or disables an assertion or test case, Agent3 shall verify, before accepting the change, that it does not weaken the test's ability to detect faults.
+
+A3-85b. The verification shall use mutation analysis on the SUT function or functions exercised by the affected test. It measures whether the checks themselves have become weaker (which outputs are asserted, comparison operators, tolerances); replacing an evidence-backed expected value is handled by the evidence rule in 85d:
+- mutants of the affected function shall be generated in the isolated staging workspace using a configured, deterministic set of mutation operators (for example relational operator replacement, arithmetic operator replacement, logical connector replacement, condition negation, constant and boundary changes, return-value replacement and statement deletion);
+- mutants shall be limited to the source lines executed by the affected test;
+- because the original test fails on the unmodified SUT, it cannot be compared with mutants directly. A reference form of the original test shall therefore be built by keeping its assertions and replacing each expected value with the value observed when the test runs on the unmodified SUT, so that the reference form passes on the unmodified SUT;
+- the reference form and the changed test shall each be compiled and executed against every mutant. A mutant is detected by a test when the test fails on that mutant.
+
+A3-85c. The mutation operators, mutant list, random seed (if any), limits and compiler configuration shall be recorded so that the result is reproducible.
+
+A3-85d. A test change shall be classified as oracle-weakening when any of the following is true:
+- the changed test detects (kills) fewer mutants than the reference form;
+- the changed test does not detect a mutant that the reference form detected;
+- an assertion has been removed, disabled or replaced by an assertion that cannot fail;
+- a tolerance has been widened beyond the tolerance documented in the expected-behaviour evidence;
+- an expected value has been replaced by the value observed from the current implementation while the original expected value is supported by evidence of class E1 to E7.
+
+A3-85e. Mutants that neither the reference form nor the changed test detects shall not count against the changed test (possible equivalent mutants).
+
+A3-85f. An oracle-weakening change shall be rejected. The original test shall be kept, and the failure shall be reclassified (for example as source_behavior_defect or undetermined) instead of being returned to Agent1 again as a test defect.
+
+A3-85g. A test change that detects at least every mutant the reference form detected, and that is not oracle-weakening under any other condition of 85d, may be accepted, subject to the normal compilation, execution, coverage and regression verification.
+
+A3-85h. Mutation analysis shall run within configured limits (maximum mutants per function, time budget). If a limit is reached before a decision is possible, the change shall not be accepted automatically and shall be reported as oracle_strength_undetermined.
+
+A3-85i. Mutants shall exist only in the isolated staging workspace and shall never be written to the production source tree, published or stored as test files.
+
+A3-85j. The oracle-strength result shall be included in the feedback and in the final verification output: affected test, change declared by Agent2, mutants generated, mutants detected by the reference form, mutants detected by the changed test, decision and reason.
+
+Observation Run (values from the current implementation)
+
+A3-OBS1. Agent3 shall provide an observation run: it compiles and runs probe tests supplied by Agent2 and returns, per probe point, the value observed from the current implementation.
+
+A3-OBS2. Observed values are E8 evidence and shall be marked as characterization.
+
+A3-OBS3. The reference form of the oracle-strength verification (A3-85b) shall be built with the same mechanism.
+
+A3-OBS4. Observation runs are not verification and shall not be used as coverage-completion evidence.
+
+A3-OBS5. Where the toolchain provides it, the observation run shall report per test the covered items and the executed MC/DC condition vectors (input for A2-21i).
+
+Coverage-Guided Search (inputs for remaining gaps)
+
+A3-FZ1. When gaps remain that generated tests did not reach, Agent3 shall search for inputs with libFuzzer (from the tool manifest), per function with gaps. It is an execution step: Agent3 finds inputs, it writes no tests.
+
+A3-FZ2. For each function Agent3 shall generate a fuzz target that decodes the input bytes deterministically into the function's parameters (the kinds of A2-21h, with NULL only where the function checks for it), the return values of the controlled stubs and the variables decided stub, and calls the function in a translation unit that includes the SUT (so static functions are reachable). It is compiled without optimization, so the branches of every decision stay visible. Class methods and parameters that cannot be generated are listed as unsupported.
+
+A3-FZ3. The search shall run within the configured time per function (ORC-7), starting from full-length seed inputs, in the run folder only.
+
+A3-FZ4. Every corpus input shall be replayed one by one in a build instrumented for source-based coverage, printing its decoded values. Inputs that cover an uncovered item, or that add an MC/DC condition vector completing an independence pair together with the vectors already observed, are selected greedily and returned as concrete C/C++ values with the gaps they reach.
+
+A3-FZ5. Inputs that crash or hang the SUT shall be reported in the final result as characterization findings; they are never asserted and are not proof of a defect.
+
+A3-FZ6. Fuzzing results are not verification: only Agent3's verify stage of the generated tests counts (A3-OBS4).
+
+A3-FZ7. The final result shall state, per round, the functions fuzzed, the executions, the inputs found and the functions that could not be fuzzed with the reason.
+
+A3-FZ8. The fuzz target restores the SUT state (A2-21s) before every input, so that an input found by the search reaches the same items when Agent2's test replays it alone.
+
+Feedback Loop — Coverage Below 100%
+When compilation and execution succeed but one or more coverage metrics remain below 100%:
+
+A3-86. Agent3 shall generate a coverage-gap feedback object.
+
+A3-87. The feedback shall be returned to Agent1 (through the orchestrator, ORC-6).
+
+A3-88. Agent1 shall update its coverage-gap plan using the measured results.
+
+A3-89. Agent1 shall identify the remaining:
+uncovered functions,
+lines,
+statements,
+branches,
+decisions,
+MC/DC conditions.
+
+A3-90. Agent1 shall produce an updated handoff to Agent2.
+
+A3-91. Agent2 shall generate only the additional tests/stub changes required for the remaining gaps.
+
+A3-92. Agent2 may use the UT Fix Knowledge Base for relevant historical guidance.
+
+A3-93. The updated generated files shall be passed back to Agent3.
+
+A3-94. Agent3 shall:
+compile,
+execute,
+measure coverage again.
+
+A3-95. This loop shall continue until all applicable required coverage metrics reach their targets (COV-1), and for targets below 100 % as long as the remaining items make progress (COV-6).
+
+Incremental Generation Requirement
+
+A3-96. After the first generation cycle, subsequent Agent2 iterations shall be incremental.
+
+A3-97. Existing verified tests shall be preserved.
+
+A3-98. Agent2 shall not regenerate the entire test suite unless necessary.
+
+A3-99. New iterations shall target only remaining measured gaps.
+
+A3-100. Agent3 shall preserve previously successful tests unless a later change invalidates them.
+
+UT Fix Knowledge Base Integration
+
+A3-101. Agent3 shall provide verification evidence to the UT Fix Knowledge Base.
+
+Positive Learning
+
+A3-102. A generated test/fix may be stored as a verified positive example only when:
+compilation = passed,
+test execution = passed,
+required coverage = complete,
+verification = verified.
+
+Negative Learning
+
+A3-103. The KB may store negative patterns when:
+compilation fails,
+test execution fails,
+a generation pattern causes a regression,
+a generated stub/API is invalid,
+a fix repeatedly fails to close the intended gap,
+a proposed test change was rejected as oracle-weakening.
+
+A3-104. Agent3 shall provide diagnostic evidence with the learning event.
+
+Regression Protection
+
+A3-105. Every feedback-loop iteration shall ensure that newly generated tests do not break previously passing tests.
+
+A3-106. Coverage improvement in one function shall not justify regression in another.
+
+A3-107. Agent3 shall compare the current iteration with the previous successful iteration.
+
+A3-108. The workflow shall reject iterations that:
+reduce previously achieved coverage,
+break previously passing tests,
+introduce compilation failures into previously valid files.
+
+A3-108a. Regression comparisons shall be made between iterations with the same source signature. After a production-source change (A4-40), the comparison shall use covered items and previously passing tests, not coverage percentages.
+
+Coverage Progress Tracking
+
+A3-109. Agent3 shall track coverage across iterations.
+
+A3-110. For every iteration it shall record:
+iteration number,
+LC,
+SC,
+BC,
+DC,
+MC/DC,
+tests added,
+compilation status,
+test status,
+newly covered items,
+remaining gaps.
+
+A3-111. This shall allow the system to determine whether the feedback loop is making progress.
+
+Loop Termination and Stagnation Protection
+
+A3-112. Although the target is 100% coverage, the system shall protect against infinite loops.
+The loop shall terminate when:
+Successful termination
+
+A3-113. All applicable required coverage metrics reach their targets by measurement (COV-1).
+Failure termination
+
+A3-114. The iteration limit of the SUT file's ASIL level is reached (COV-9).
+Stagnation termination
+
+A3-115. No measurable coverage improvement occurs for a configured number of consecutive iterations.
+Unreachable-code termination
+
+A3-116. Every open item has gone through the strategies of COV-6 and is either still not reached or deterministically proven unreachable; the run ends incomplete (COV-4, COV-7).
+Environment termination
+
+A3-117. Compilation/coverage tooling cannot execute because of an external environment failure.
+
+A3-118. The reason for termination shall always be reported.
+
+Coverage Exceptions
+
+A3-119. An item proven unreachable is not treated as a generation defect, but it is not covered either: it keeps the file incomplete (COV-3, COV-4).
+
+A3-120. An item may be reported as unreachable only with deterministic evidence (COV-4).
+
+A3-121. Agent1/Agent3 shall record:
+reason,
+source location,
+evidence,
+affected metric.
+
+A3-121a. A MC/DC condition pair may be reported as infeasible_condition_combination, a decision outcome or condition value as infeasible_outcome, and the code of a branch that can never be taken as unreachable_code, when deterministic analysis shows that it cannot occur (for example coupled conditions on the same variable, a contradiction such as x > 5 && x < 3, a comparison that the variable's type range decides, or a condition on program constants); the analysis is A1-37.
+
+A3-121b. Exclusions are never accepted: a reported item stays an open gap and counts as not covered (COV-3). The report is a finding for the developer (COV-7).
+
+A3-122. The system shall report only measured coverage; there is no effective coverage after exclusions (COV-3).
+
+Framework Isolation
+
+A3-123. The generated unit-test framework shall not modify production source files unless explicitly permitted.
+
+A3-124. Coverage instrumentation shall not permanently modify the production SUT.
+
+A3-125. Generated build artifacts shall remain in an isolated workspace.
+
+A3-126. Test-specific compiler flags shall not alter production build settings.
+
+Security and Execution Safety
+
+A3-127. Build and test commands shall execute only within approved repository/staging boundaries.
+
+A3-128. Arbitrary model-generated shell commands shall not be executed without validation.
+
+A3-129. Build commands shall be constructed from approved configuration and discovered build information.
+
+A3-130. File writes shall remain inside approved unit-test/build directories.
+
+Final Verification Output
+
+A3-131. When the process completes successfully, Agent3 shall produce a final verification result containing:
+SUT file,
+language,
+compiler/toolchain,
+unit-test framework,
+build configuration,
+compilation status,
+execution status,
+total tests,
+passed tests,
+failed tests,
+LC,
+SC,
+BC,
+DC,
+MC/DC,
+iteration count,
+files generated,
+files modified,
+verified coverage status,
+number of characterization-only tests,
+oracle-strength checks performed and their decisions,
+open undetermined failures (if any),
+final completion state.
+
+Final Success Contract
+
+A3-132. The workflow shall end in exactly one final state:
+verified_measured — every applicable required metric has reached its target by measurement (COV-1);
+incomplete — stopped by budget, stagnation, unreachable code or environment, with the reason (A3-118) and every item not reached (COV-8).
+
+A3-132a. A verified state additionally requires that all source files compile, all required tests execute and pass, no coverage or test regression exists, the results come from measured execution, and Agent3 marks the result as verified.
+
+Additional Information-3
+
+Agent Responsibility After Introducing unittest_compilation
+Agent1 — Analyze and Plan
+SUT + Existing Tests + Previous Measured Coverage → Coverage Gap Plan
+Agent1 determines what still needs to be tested.
+Agent2 — Generate
+Agent1 Plan + Repository Evidence + KB Guidance → Unit-Test Code
+Agent2 determines how the required tests should be implemented.
+UT Fix Knowledge Base — Learn
+Verified Success + Diagnosed Failure → Reusable Guidance
+The Knowledge Base determines what previous generation patterns should be reused or avoided.
+Agent3 — Execute and Verify
+Generated Tests + SUT + Build Environment → Compilation + Execution + Measured Coverage
+Agent3 determines whether the generated solution actually works and whether coverage is complete.
+
+Smart Contract — Agent2 → Agent3
+
+A3-133. Agent2 shall provide generated unit-test and stub changes only through validated file actions.
+
+A3-134. Agent3 shall treat Agent2 output as candidate code, not verified code.
+
+A3-135. Agent2 shall provide:
+target SUT,
+generated files,
+modified files,
+framework assumptions,
+required stubs,
+target coverage gaps.
+
+A3-136. Agent3 shall independently compile and execute this output.
+
+A3-137. Agent2 shall not mark compilation, test execution or coverage as successful.
+
+A3-138. Only Agent3 shall provide verified build/test/coverage status.
+
+Smart Contract — Agent3 → Agent1 (failure feedback)
+
+A3-139. When compilation or execution fails, the classified feedback to Agent1 shall include enough information for deterministic correction.
+Minimum contract:
+failure_type + classification + file + line + symbol + diagnostic + affected_test + affected_function
+
+A3-140. Agent1 shall turn it into repair items for Agent2 (A1-33, A1-34).
+
+A3-141. Agent2 shall not regenerate unrelated successful tests.
+
+Smart Contract — Agent3 → Agent1
+Coverage feedback shall include:
+function + metric + covered + total + percentage + uncovered_items + source_locations
+
+A3-142. Agent1 shall treat these measured results as authoritative.
+
+A3-143. Agent1 shall replace any previous estimated gap state with the latest measured gap state.
+
+A3-144. Agent1 shall generate a revised plan only for remaining gaps.
+
+Smart Contract — UT Fix KB → Agent2
+
+A3-145. KB information shall remain advisory.
+
+A3-145a. KB guidance shall be delivered to Agent2 by the orchestrator together with Agent1's plan; agents do not call each other (ORC-2).
+
+A3-146. Historical examples shall never override current compiler diagnostics.
+
+A3-147. Historical examples shall never override current SUT signatures or repository APIs.
+
+A3-148. Positive examples shall be used only when compatible with the current:
+language,
+framework,
+layout,
+diagnostic context.
+
+A3-149. Negative patterns shall be used to prevent repetition of previously failed generation approaches.
+
+
+Smart Contract — Agent3 → UT Fix KB
+
+A3-150. Agent3 shall act as the verification source for learning.
+Positive learning event:
+compile_passed + tests_passed + coverage_complete + verified
+Negative learning event:
+compile_failure | test_failure | coverage_regression | invalid_stub | invalid_framework_usage | oracle_weakening
+
+A3-151. The KB shall not classify Agent2 output as a verified positive sample without verification evidence from Agent3.
+
+Hybrid Reasoning / Chain-of-Thought Requirements:
+
+A3-152. Agent3 shall use a structured hybrid reasoning approach for compilation failure analysis, test failure analysis, root-cause classification and coverage feedback.
+
+A3-153. The reasoning approach shall combine:
+deterministic reasoning,
+ReAct-based evidence retrieval,
+bounded Tree-of-Thought reasoning,
+dependency/graph-based reasoning,
+constraint-based verification,
+iterative reflection and feedback.
+
+A3-154. Deterministic evidence such as compiler results, test execution results and measured coverage results shall always take priority over LLM-generated reasoning.
+
+A3-155. Agent3 shall not use free-form Chain of Thought as the authoritative basis for compilation, execution or coverage decisions.
+
+A3-156. For every compilation or test failure, the agent shall first collect the available deterministic evidence before performing LLM-based root-cause analysis.
+
+A3-157. The agent shall identify the affected:
+test case,
+SUT function,
+source/header,
+stub,
+build target,
+framework component,
+where applicable.
+
+A3-158. When multiple possible root causes exist, the agent shall evaluate only the defined failure categories:
+test_generation_defect
+stub_defect
+test_framework_defect
+build_configuration_defect
+source_compilation_defect
+source_behavior_defect
+requirement_mismatch
+environment_defect
+undetermined.
+
+A3-159. Each possible root cause shall be evaluated using supporting evidence, contradicting evidence and missing evidence.
+
+A3-160. The agent shall use ReAct-style reasoning only when additional evidence is required to determine the root cause.
+
+A3-161. ReAct evidence retrieval may inspect:
+Agent1 expected-behaviour evidence,
+SUT source/header information,
+compiler diagnostics,
+test execution output,
+stub configuration,
+existing tests,
+build configuration,
+previous verification results.
+
+A3-162. ReAct reasoning shall be bounded and shall terminate when sufficient evidence is available, no additional evidence can be found, or the configured evidence-retrieval limit is reached.
+
+A3-163. If sufficient evidence cannot be obtained, the failure shall be classified as undetermined rather than guessed.
+
+A3-164. The agent shall use bounded Tree-of-Thought reasoning when two or more root-cause explanations remain possible after the initial evidence collection.
+
+A3-165. The agent shall reject a root-cause hypothesis when deterministic or stronger evidence contradicts it.
+
+A3-166. The agent shall use dependency/graph reasoning to identify relationships between:
+generated test cases,
+SUT functions,
+headers,
+stubs,
+external dependencies,
+build targets,
+coverage gaps.
+
+A3-167. Dependency analysis shall be used to avoid incorrectly assigning a failure to the SUT when the actual failure originates from a stub, framework or build configuration.
+
+A3-168. The agent shall apply hard verification constraints before declaring a result successful.
+
+A3-169. Verification shall require:
+compilation passed,
+required tests passed,
+required coverage conditions satisfied,
+no unresolved regression,
+no unresolved critical failure.
+
+A3-170. Agent3 shall not classify a failure as source_behavior_defect unless:
+the test uses a valid SUT interface,
+the test input is valid,
+expected behaviour is supported by Agent1 evidence,
+required stubs are valid,
+the test framework is valid,
+the observed failure originates from the SUT implementation.
+
+A3-171. When Agent2 changes an assertion, expected value, tolerance or test behaviour during repair, Agent3 shall apply the existing oracle-strength verification before accepting the change.
+
+A3-172. For coverage below 100%, the agent shall determine whether the remaining gap is caused by:
+missing test scenario,
+missing input combination,
+missing stub behaviour,
+uncovered branch,
+uncovered decision,
+missing MC/DC condition combination,
+unreachable code,
+coverage instrumentation problem,
+measurement problem.
+
+A3-173. Coverage-gap reasoning shall use measured coverage evidence and shall not estimate coverage from the generated source code.
+
+A3-174. The agent shall compare the current verification iteration with the previous iteration to determine:
+coverage improvement,
+new failures,
+removed failures,
+regression,
+stagnation.
+
+A3-175. If repeated iterations do not improve compilation, test execution or coverage, the agent shall detect stagnation and shall not continue the same repair strategy indefinitely.
+
+A3-176. Before issuing a final root-cause classification, the agent shall perform a structured reflection check to verify that:
+the classification agrees with deterministic evidence,
+stronger evidence has not been ignored,
+contradictory evidence has been considered,
+the correct downstream agent is selected.
+
+A3-177. Based on the final classification, Agent3 shall decide the routing, and the orchestrator shall execute it:
+test_generation_defect → Agent1 (re-plan) → Agent2
+stub_defect → Agent1 (re-plan) → Agent2; the KB records a negative example
+test_framework_defect → Agent3 repairs its own harness (bounded); if the cause lies in test code → Agent1
+build_configuration_defect → Agent3 repairs its own harness and test-build flags (bounded); missing headers, include paths, defines, source files and wrong dependency decisions → Agent1 (A1-DA12, A1-DA13); if the cause lies in test code → Agent1
+source_compilation_defect → Agent4
+source_behavior_defect → Agent4
+requirement_mismatch → Agent1
+environment_defect → report and stop
+undetermined → Agent1 additional evidence collection
+coverage_gap (an outcome, not a failure category) → Agent1 → Agent2
+
+A3-178. The reasoning output shall contain structured evidence, classification, confidence and routing decision rather than unrestricted free-form reasoning text.
+
+A3-179. Agent3 shall maintain the reasoning result with the corresponding SUT version, test-suite version and verification iteration.
+
+A3-180. The hybrid reasoning process shall follow the sequence:
+Deterministic Evidence
+→ Dependency Analysis
+→ Initial Classification
+→ Bounded Hypothesis Evaluation
+→ ReAct Evidence Retrieval if Required
+→ Constraint Verification
+→ Regression/Coverage Comparison
+→ Structured Reflection
+→ Final Classification and Routing.
+
+A3-181. The main objective of the hybrid reasoning process shall be to determine the correct root cause and next responsible agent, and not merely to modify tests until they pass.
+
+
+Failure Root-Cause Classification (Agent3; these requirements were previously listed under the source-correction agent)
+
+A3-CL1. Whenever compilation or test execution fails, Agent3 shall classify the failure before requesting any code modification.
+
+A3-CL2. A failing test shall not automatically be classified as an invalid generated test.
+
+A3-CL3. The failure shall be classified into one of the following categories:
+test_generation_defect
+stub_defect
+test_framework_defect
+build_configuration_defect
+source_compilation_defect
+source_behavior_defect
+requirement_mismatch
+environment_defect
+undetermined
+
+A3-CL4. The classification shall use evidence from:
+compiler diagnostics,
+test execution results,
+SUT source,
+SUT headers/interfaces,
+test expectations,
+existing tests,
+stub behaviour,
+build configuration,
+measured coverage,
+available requirement/expected-behaviour information.
+
+A3-CL5. Agent3 shall not request a test modification (through Agent1 and Agent2) when the available evidence indicates that the test is valid and the production implementation is responsible for the failure.
+
+A3-CL6. If the root cause cannot be established with sufficient evidence, the failure shall be reported as undetermined rather than automatically modifying either the test or production source.
+
+A3-CL7. When a failure is undetermined because expected-behaviour evidence is missing or conflicting, Agent3 shall request Agent1 to collect additional evidence for the affected function and shall reclassify the failure with that evidence.
+
+A3-CL8. If the failure remains undetermined after the additional evidence search, it shall be reported with the collected evidence, the conflicting sources and the decision that is needed. The UT workflow shall not be marked verified complete while an undetermined failure remains open.
+
+Valid-Test / Defective-SUT Detection
+
+A3-CL9. Agent3 shall identify a potential SUT defect when:
+the generated test compiles correctly;
+the test invokes a valid SUT interface;
+the test inputs are valid for the intended scenario;
+the expected result is supported by available requirements, interface contracts, existing behaviour specifications or other approved evidence, of evidence class E1 to E7 as collected by Agent1 (E8 characterization evidence alone is not sufficient);
+required stubs/dependencies are configured correctly;
+the test framework is operating correctly;
+the observed failure originates from production implementation behaviour;
+changing the test expectation merely to match the current production behaviour would weaken or invalidate the intended verification, as measured by the oracle-strength verification (A3-85a to A3-85j).
+
+A3-CL10. When these conditions are satisfied, the result shall be classified as:
+source_behavior_defect
+and shall be routed to Agent4.
+
+A3-CL11. A failing test whose expected values rest on evidence linked by the brain (A1-PL13, A1-PL6) shall be classified requirement_mismatch and routed to Agent1, deterministically and without asking the brain: a link made by an LLM is not enough to blame the production source.
+
+New Agent — agent_sourcecode_corrector (Agent4)
+
+A4-11. A dedicated source-correction agent (Agent4) shall be introduced for production-code modifications discovered through unit-test verification.
+
+A4-12. Agent4 shall be separate from Agent2.
+
+A4-13. Agent2 shall remain responsible only for unit-test/stub generation.
+
+A4-14. Agent4 shall be responsible for modifying production source when verified test evidence identifies a production implementation defect.
+
+Requirements — agent_sourcecode_corrector (Agent4)
+Input
+
+A4-15. Agent4 shall receive:
+SUT file,
+affected function,
+failing unit test,
+expected behaviour,
+actual behaviour,
+failure classification,
+compiler/runtime diagnostics,
+relevant source lines,
+relevant headers/interfaces,
+requirement evidence where available,
+previous successful test results,
+previous coverage result.
+
+Source Modification Rules:
+
+A4-16. Agent4 shall modify production code only when the failure has been classified as a source defect.
+
+A4-17. It shall not modify production source to obtain coverage; unreachable code is reported to the developer (COV-7).
+
+A4-18. It shall not modify production behaviour merely so that an incorrectly generated test passes.
+
+A4-19. Source modifications shall be minimal and localized to the identified defect.
+
+A4-20. Existing public interfaces shall be preserved unless the evidence specifically demonstrates that the interface itself is incorrect.
+
+A4-21. Unrelated production code shall not be modified.
+
+A4-22. The correction shall preserve existing successfully verified behaviour.
+
+A4-23. The correction shall be traceable to the failure evidence that caused it.
+
+A4-23a. Agent4 shall run automatically, without a human approval step. Its verified corrections reach the tested branch only after review (ORC-25, ORC-26).
+
+A4-23b. Because an LLM classification alone is not sufficient evidence, a correction shall be attempted only when A3-CL9 is satisfied with expected-behaviour evidence of class E1 to E7 and the oracle-strength verification has passed.
+
+A4-23c. Agent4 shall apply its patch only in the staging copy. A verified_source_fix shall be delivered only through the review branch and pull request of ORC-25, never committed to the tested branch directly, and shall also be delivered as a patch file in the run's output folder.
+
+A4-23d. Production-source repair items from Stage A (A1-22, source_compilation_defect) shall follow the same rules.
+
+A4-23e. Characterization (E8) tests record the behaviour before a fix. After a fix they may fail; such failures shall not block publication of the fix and are re-planned by Agent1 (A1-33). Every other previously passing test shall still pass (A4-32).
+
+A4-23f. A behaviour fix shall rest on at least two independent expected-behaviour evidence items of class E1 to E7 - from different places - at least one of them a stated requirement or contract (E1, E2 or E3). One comment alone does not justify changing production code. Agent4 refuses the correction otherwise, and publication checks it again.
+
+A4-23g. Several candidates: Agent4 shall ask the brain for up to the configured number of different candidate fixes (ORC-7). Each candidate is checked as a single one is (A4-19 to A4-21). The orchestrator has Agent3 reverify every candidate that passes (A4-26 to A4-33); among the candidates that pass every publication check, the smallest change - fewest changed lines, then fewest changed characters - is published. The other candidates are listed in the final result with the reason they were not chosen.
+
+A4-23h. Second opinion: before a candidate is published, a second brain - another one than the brain that wrote it, when one is available - shall review it, given the failure, the evidence, the change and Agent3's results. The review can only block: when it finds the change not supported by the evidence, or changing behaviour beyond the failure, the candidate is not published and the next passing candidate is reviewed. An agreeing review replaces none of the checks (A4-23f, A4-26 to A4-33, A4-32a). Without a second brain the same brain reviews in a separate request that does not contain its own proposal, and the final result says so.
+
+A4-23i. Evidence linked to a function by the brain (A1-PL13, A1-PL6) shall not count for A4-23b and A4-23f.
+
+Source Correction Result Contract
+
+A4-24. Agent4 shall return:
+affected production file,
+affected function,
+source lines modified,
+defect classification,
+root-cause description,
+original source fragment,
+corrected source fragment,
+rationale,
+associated failing test,
+expected behaviour,
+verification status.
+
+A4-25. The source correction shall initially have status:
+candidate_source_fix
+
+A4-26. It shall not become verified_source_fix until Agent3 recompiles and re-executes the complete test set.
+
+Source Change Reverification
+After a production-source modification:
+
+A4-27. The complete affected SUT shall be recompiled.
+
+A4-28. All existing unit tests shall be recompiled.
+
+A4-29. All previously passing unit tests shall be executed again.
+
+A4-30. The test that identified the defect shall be executed again.
+
+A4-31. Coverage shall be measured again.
+
+A4-32. The system shall confirm that:
+the original defect is resolved,
+the identifying test passes,
+previously passing tests remain passing,
+no new compilation failure exists,
+no coverage regression has occurred.
+
+A4-32a. Agent3 shall run the static analyzer (clang --analyze, from the tool manifest) on the SUT at the probe and on every patched source. A fix shall be published only when the patched source was analyzed and has no finding that the source before the fix did not have (compared by checker, function and message). Findings already present are not attributed to the fix.
+
+A4-33. Only after these checks pass shall the source modification be marked:
+verified_source_fix
+
+
+Mandatory Coverage Re-Baselining After Source Change
+
+A4-40. A production-source modification shall invalidate the previous coverage baseline for the modified SUT.
+
+A4-41. This is necessary because modifying production code may introduce:
+new executable lines,
+new statements,
+new branches,
+new decisions,
+new MC/DC conditions,
+modified control-flow paths.
+Therefore:
+- Agent3 shall discard the previous coverage-complete decision for the modified source.
+- Coverage shall be measured again against the new source version.
+- Agent1 shall receive the new measured coverage result.
+- Agent1 shall analyze the updated source and updated coverage gaps.
+- The previous function inventory shall be refreshed when the source structure has changed.
+- Newly introduced executable logic shall become eligible for additional test generation.
+
+Incremental Test Generation After Source Modification
+If the corrected source introduces new uncovered behaviour, the system shall generate additional tests incrementally.
+
+A4-42. Existing verified tests shall be preserved.
+
+A4-43. Agent1 shall identify only coverage gaps present in the corrected source version.
+
+A4-44. Agent1 shall produce a delta coverage plan.
+
+A4-45. Agent2 shall generate only the test cases required to address the newly identified gaps.
+
+A4-46. Agent2 shall not regenerate the complete test suite unless structural changes make existing tests invalid.
+
+A4-47. Newly generated tests shall be added to the previously verified test set.
+
+A4-48. The complete combined test set shall then be passed to Agent3.
+
+A4-49. The cycle shall therefore be:
+Source Fix
+→ Recompile
+→ Run Existing Tests
+→ Measure New Coverage
+→ Agent1 identifies new gaps
+→ Agent2 adds incremental tests
+→ Compile + Execute
+→ Measure Coverage
+→ repeat until completion.
+
+Source-Version Contract:
+
+A4-50. Every UT verification cycle shall be associated with a specific SUT version/signature.
+
+A4-51. The system shall maintain:
+source signature before correction,
+source signature after correction,
+test-suite signature,
+coverage baseline associated with the source signature.
+Coverage results produced for one source version shall not automatically be reused after production source modification.
+
+A4-52. A source-code change shall therefore invalidate:
+stale Agent1 coverage plans,
+stale Agent2 generation assumptions where affected,
+stale coverage results,
+stale 100% coverage status.
+Previously generated tests themselves may be retained when they remain valid.
+
+Smart Contract — Agent3 → Agent4
+
+A4-53. Agent3 shall invoke Agent4 only when a source defect is supported by evidence.
+Minimum contract:
+classification + source_file + function + source_location + failing_test + expected_behavior + actual_behavior + diagnostic_evidence
+
+A4-54. Agent4 shall not receive generic coverage gaps as source defects. After a stop below target it receives the items not reached only to suggest source changes (COV-12); such a suggestion is never a source fix, never published and never committed (COV-13).
+
+A4-55. Coverage below 100% alone is not justification for modifying production code.
+
+Smart Contract — Agent4 → Agent3
+
+A4-56. Agent4 shall return a candidate production patch.
+
+A4-57. Agent3 shall be responsible for verifying the patch.
+
+A4-58. Agent4 shall never independently declare its own correction successful.
+
+A4-59. Agent3 shall determine:
+compilation success,
+test success,
+regression status,
+measured coverage.
+
+Smart Contract — Agent4 → Agent1
+
+A4-60. After a verified production source modification, Agent1 shall receive:
+updated SUT,
+updated source signature,
+modified functions,
+updated measured coverage,
+previous coverage result.
+
+A4-61. Agent1 shall rerun analysis for affected code and determine whether new test gaps exist.
+
+Smart Contract — Agent1 → Agent2 After Source Correction
+
+A4-62. Agent1 shall provide Agent2 only the delta required after the source change.
+
+A4-63. The handoff shall identify:
+newly introduced functions where applicable,
+new executable lines,
+new branches,
+new decisions,
+new MC/DC conditions,
+existing tests that remain valid,
+additional tests required.
+
+A4-64. Agent2 shall generate incremental tests for this delta.
+
+
+Smart Contract — Source Correction → UT Fix Knowledge Base
+
+A4-65. A candidate source fix shall not immediately become a positive KB example.
+
+A4-66. A production-source correction may be stored as a verified positive pattern only after:
+source_fix_applied
+compile_passed
+all_tests_passed
+no_regression
+coverage_complete
+verification_status=verified
+
+A4-67. Failed source corrections may be captured as negative patterns with their diagnostic evidence.
+
+A4-68. Source-correction patterns shall be distinguishable from test-generation patterns in the KB.
+
+Revised Feedback Routing:
+Agent3 decides the routing; the orchestrator executes it (ORC-6).
+
+Case 1 — Generated test is incorrect
+Compilation/Test Failure
+→ test_generation_defect
+→ Agent1 (revised plan)
+→ Agent2 (corrected test)
+→ Agent3
+
+Case 2 — Stub is incorrect
+Compilation/Test Failure
+→ stub_defect
+→ Agent1 (revised plan) + KB negative example
+→ Agent2 (corrected stub)
+→ Agent3
+
+Case 3 — Production source is incorrect
+Test Failure
+→ source_behavior_defect
+→ Agent4
+→ production source corrected in the staging copy
+→ Agent3
+→ recompile + regression tests
+→ measure new coverage
+→ Agent1
+→ Agent2 incremental tests if required
+→ Agent3
+
+Case 4 — Coverage is simply incomplete
+Tests Pass + Coverage < 100%
+→ Agent1
+→ remaining coverage plan
+→ Agent2
+→ incremental tests
+→ Agent3
+
+This case shall not trigger production source modification merely to increase coverage.
+
+
+Overall outcome:
+It is a closed-loop automated verification system that determines what should be tested, generates tests, measures them, distinguishes test defects from source defects, protects test strength, and keeps coverage synchronized with the exact production-source version.
+
+Setup (unittest_generator.bat / .sh → ut_setup.py): tools present and checked, else installed into tools\ (TP)
+        ↓
+Repository + selected SUT (+ optional project requirement documents, A1-RQ1)
+        ↓
+Agent1 — discovery (no LLM)
+        ↓
+Agent3 — build capture: the project's own build recorded (no LLM; when only estimated, the brain suggests missing flags, checked by compiling, A3-BD11)
+        ↓
+Agent1 — dependency analysis with the recorded flags: stub / real / system (LLM only for stub-or-real and for requirements written in prose, A1-PL13)
+        ↓
+Agent3 — probe: build, link, run, baseline coverage, static-analyzer baseline (no LLM)
+        ↓
+Stage A: setup or build issues?
+   yes → Agent1 setup-repair plan → Agent2 (test side) / Agent4 (production source) → Agent3 build check → repeat
+   no  ↓
+Stage B: Agent1 coverage plan - facts determined by Agent1 → scenarios suggested by the brain → checked by Agent1 (A1-PL)
+         (first plan by the rules; the brain from the second plan on, for what is left open; hard gaps with what was tried, A1-PL12)
+        ↓
+Agent2 — generate test suites, test cases, stubs
+        ↓
+Agent3 — compile + execute all tests + measure coverage
+        ↓
+Root-cause decision and routing (A3-177)
+   test/stub defect → Agent1 → Agent2
+   source defect    → Agent4 (up to 3 candidates) → Agent3 reverifies each → smallest passing one, reviewed by a second brain → publish
+   requirement linked by the brain disagrees with the code → open item for review (A3-CL11)
+   gaps remain      → Agent1 → Agent2   (no progress → Agent3 coverage-guided search → inputs → Agent1)
+   coverage 100% but documented behaviour not yet checked → Agent1 behaviour scenarios (A1-25y)
+   target reached   → VERIFIED (verified_measured: every metric at its ASIL target by measurement, COV-1)
+   items no test can reach → reported with proof; INCOMPLETE until the developer changes the source (COV-7)
+   iteration limit of the ASIL level, or no progress after every strategy → stop: INCOMPLETE (COV-9)
+        → evidence per item not reached (COV-10)
+        → Agent4 suggests source changes from the requirements, each checked on a trial copy (COV-12, COV-13)
+        → "action needed" for the developer: provide requirements or change the source; the next run continues (COV-11)
+Delivery (ORC-24 to ORC-31):
+   no production-source change and verified → one commit to the tested branch (tests, stubs, harness, reports)
+   production source changed, or incomplete → review branch + pull request; merging it is the approval
+   budget/stagnation/environment stop → incomplete, with reason
+
+The Mermaid diagrams in ORCHESTRATION.md show the same flow in detail.
+
+The Patent Family C document describes essentially this architecture as four major functional components: planning, test generation, independent verification and source correction. It further requires evidence-based failure classification, routing, oracle-strength protection, source-fix reverification and coverage re-baselining after source changes.
+
+The final system should therefore achieve the following outcomes:
+- generated tests are linked to expected-behaviour evidence;
+- failing tests are not automatically rewritten;
+- valid tests can expose real production defects;
+- source changes occur only when evidence supports them;
+- test repairs cannot silently weaken fault detection;
+- source corrections are independently reverified;
+- stale coverage is invalidated after source changes;
+- only the coverage delta of modified source needs new incremental tests;
+- previously verified tests are preserved where still valid;
+- only measured coverage counts, against the target of the file's ASIL level; there are no exclusions or justifications;
+- every success/failure decision is traceable to evidence.
+
+Final output: a verified modified unit-test suite with the necessary incremental tests/stubs and measured evidence that all applicable coverage objectives have been satisfied (Updated Unit-Test Suite+ Required Stubs+ Verified Compile/Test Result+ Measured Coverage Report+ 100% Applicable Coverage).

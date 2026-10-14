@@ -1,0 +1,88 @@
+# UnitTest – evidence-gated unit-test generator for C and C++
+
+A multi-agent application built on **BaseAgent** that analyses C/C++ source, generates unit tests,
+builds and runs them, measures line, statement, branch, decision and MC/DC coverage, classifies
+every failure and repairs the right artifact – without weakening a test or hiding a real defect.
+
+## Repository layout
+
+```
+UnitTest/
+├── Source/
+│   ├── BaseAgent/              baseagent.py, baseagent.bat – the base framework
+│   └── UnitTestGenerator/      the derived agents, orchestrator, setup, ut_config.json,
+│                               knowledge packs, unittest_generator.bat / .sh
+├── Test/                       test_unittest_generator.py, test_baseagent.py, pilots/
+├── Docs/                       requirements, ORCHESTRATION.md, BaseAgent_CHANGES.md
+├── .github/                    skills (ut-agent-builder, agent-live-viewer), Copilot instructions
+└── Patents/                    kept on your computer only – not in Git
+```
+
+## Prerequisites
+
+* **Python 3.12** – on Windows from python.org with the `py` launcher; on Linux `python3.12`.
+* **Git.**
+* **A brain** (optional for the tests):
+  * `ANTHROPIC_API_KEY` as an environment variable – the Claude models the key can access are
+    used in the order of `ut_config.json`. The key is never written to a file.
+  * otherwise Qwen3 8B through [Ollama](https://ollama.com) (`ollama pull qwen3:8b`).
+
+Nothing else needs to be installed by hand.
+
+## First run
+
+Windows:
+
+```bat
+git clone https://github.com/novaqtek-art/UnitTest.git
+cd UnitTest
+Source\UnitTestGenerator\unittest_generator.bat check
+Source\UnitTestGenerator\unittest_generator.bat test
+Source\UnitTestGenerator\unittest_generator.bat pilot-c
+```
+
+Linux:
+
+```sh
+git clone https://github.com/novaqtek-art/UnitTest.git
+cd UnitTest
+Source/UnitTestGenerator/unittest_generator.sh check
+Source/UnitTestGenerator/unittest_generator.sh test
+Source/UnitTestGenerator/unittest_generator.sh pilot-c
+```
+
+The first command:
+
+1. creates the Python environment in `Source/BaseAgent/.venv` and installs pydantic, langgraph,
+   fastmcp, uvicorn and anthropic;
+2. installs the tools – Clang/LLVM with MC/DC coverage, libFuzzer and the static analyzer, CMake,
+   Ninja, Git – into `Source/UnitTestGenerator/tools`, from the official release pages with
+   SHA-256 checks. This takes a few minutes once; later runs only check them (about a second).
+
+Run without a command, the `.bat` shows a menu.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `check` | tools, Python packages and available brains |
+| `test` | all tests of the generator; results in `test_results.txt` |
+| `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
+| `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
+| `run REPO SUT [--branch NAME]` | a git repository link or a folder, and the source file to test |
+| `view RUN_FOLDER` | replay an earlier run in the viewer |
+
+BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`.
+
+Results of a run go to `Source/UnitTestGenerator/ut_output/`.
+
+## Working on the code
+
+The requirements in [`Docs/unittest_generator_requirments.txt`](Docs/unittest_generator_requirments.txt)
+are the contract: change them first, then the code, then run the tests. The rules are in
+[`.github/skills/ut-agent-builder/SKILL.md`](.github/skills/ut-agent-builder/SKILL.md); the agent
+flow is drawn in [`Docs/ORCHESTRATION.md`](Docs/ORCHESTRATION.md).
+
+Not in the repository (see `.gitignore`): the installed tools, `.venv`, run results, the
+knowledge-base database, test results, BaseAgent's local `demo` state with its client token, and
+the patent material.
