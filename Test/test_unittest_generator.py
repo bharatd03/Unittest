@@ -592,6 +592,35 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertIn("test_shared_name_case_2", names)
 
+    def test_expected_values_must_be_stated_by_the_cited_evidence(self):
+        """A2-21u: an expected value the LLM invented is observed instead of asserted; a stated one stays."""
+        tqm2 = "TQM-2: the maximum torque for an engine speed, interpolated linearly; 0 below 0 rpm and above 6000 rpm."
+        tqm4 = "TQM-4: a request is valid when the speed lies in 500..6000 rpm and the request in 0..400 Nm"
+        ground = a2.ground_expectations
+        body, n = ground("UT_EXPECT_EQ_DBL(TorqueMap().max_torque(4000), 300.0, 1e-6); /* EV-max_torque-1 */",
+                         "t", [tqm2], False)
+        self.assertEqual((body, n), ('UT_OBSERVE_DBL("t_g1", TorqueMap().max_torque(4000));', 1))   # 300 is invented
+        self.assertEqual(ground("UT_EXPECT_EQ_INT(TorqueMap().max_torque(-1), 0);", "t", [tqm2], False)[1], 0)
+        self.assertEqual(ground("UT_EXPECT_EQ_INT(valid_request(500, 200, true, false), true);", "t", [tqm4],
+                                True)[1], 0)                                     # bool function, E1-E3 evidence
+        body, n = ground("UT_EXPECT_EQ_INT(valid_request(500, 200, true, false), true);", "t", [], False)
+        self.assertEqual(body, 'UT_OBSERVE_INT("t_g1", valid_request(500, 200, true, false));')    # E8: never asserted
+        body, n = ground("UT_EXPECT_TRUE(map.limit(1000, 50, false) == 77);", "t", [tqm2], False)
+        self.assertEqual(body, 'UT_OBSERVE_INT("t_g1", map.limit(1000, 50, false));')
+        body, n = ground('UT_EXPECT_EQ_STR(name(), "abc");', "t", ["xyz"], False)
+        self.assertIn("not asserted [A2-21u]", body)
+        b = UTBrain(tests={"clamp_percent": [{"name": "test_clamp_percent_invented_limit", "scenario_ids": [],
+                                              "body": "UT_EXPECT_EQ_INT(clamp_percent(150), 77);",
+                                              "evidence_class": "E2"}]})
+        with brain(b):
+            bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm")).generate_bundle(
+                uc.GenerationRequest(plan=self.plan)))
+        suite = uc.suite_of(bundle)
+        self.assertNotIn("clamp_percent(150), 77", suite)
+        self.assertIn("test_clamp_percent_invented_limit_g1", bundle.observations)        # observed (A2-21f)
+        self.assertIn("test_clamp_percent_invented_limit", bundle.characterization_tests)   # E8, not E2
+        self.assertTrue(any("A2-21u" in n for n in bundle.notes), bundle.notes)
+
     def test_readable_test_name_repairs_instead_of_rejecting(self):
         """[A2-21q] deterministic repair; the result is a valid C identifier within 63 characters."""
         self.assertEqual(a2.readable_test_name("test_clamp_percent_upper_limit", "clamp_percent", set()),
@@ -753,6 +782,19 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual(res.decision, "weakened", res.summary())
         self.assertTrue(any("return->0" in m for m in res.missed), res.missed)
         self.assertIn("no longer detected", res.summary())
+
+    def test_a_failing_test_is_mapped_to_the_method_it_calls(self):
+        """A failing C++ assertion on TorqueMap().max_torque(...) belongs to max_torque, not to the
+        constructor and not to nobody (the corrector refused an empty function name)."""
+        repo = copy_pilot("cpp_pilot", Path(self.tmp.name) / "cpp")
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/torque_map.cpp"))
+        names = {f.name for f in layout.functions}
+        test = uc.TestResult(name="test_TorqueMap_max_torque_returns_interpolated_value_for_rpm_2", status="failed",
+                             message="UT_EXPECT_EQ_DBL(TorqueMap().max_torque(4000), 300.0)")
+        found = self.agent._function_of_test(layout, test, repo)
+        self.assertEqual(found, next(n for n in names if n.endswith("max_torque")))
+        free = uc.TestResult(name="test_x", status="failed", message="UT_EXPECT_EQ_INT(valid_request(1, 2, true, false), 1)")
+        self.assertEqual(self.agent._function_of_test(layout, free, repo), "valid_request")
 
     def test_fault_check_is_na_when_every_line_with_a_mutant_changes(self):        # COV-17
         def rewrite(s):

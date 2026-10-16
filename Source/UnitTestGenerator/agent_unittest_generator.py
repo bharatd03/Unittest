@@ -753,6 +753,117 @@ def readable_test_name(raw: str, function: str, taken: set[str]) -> str:
     return name
 
 
+# ---------------------------------------------------------------- expected values of LLM tests [A2-21u]
+EXPECT_CALL = re.compile(r"\b(UT_EXPECT_(?:EQ_INT|NE_INT|EQ_DBL|EQ_STR|TRUE|FALSE))\s*\(")
+NUMBER = re.compile(r"^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[uUlLfF]*$")
+COMPARE = re.compile(r"(==|!=|<=|>=|(?<![-<>])<(?![<=])|(?<![-<>])>(?![>=]))")
+
+
+def _call_args(text: str, open_at: int) -> tuple[list[str], int]:
+    """The top-level arguments of the call whose '(' is at ``open_at``, and the index after its ')'."""
+    depth, args, start, i, quote = 0, [], open_at + 1, open_at, ""
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "\"'":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(text[start:i].strip())
+                return args, i + 1
+        elif c == "," and depth == 1:
+            args.append(text[start:i].strip())
+            start = i + 1
+        i += 1
+    return [], len(text)
+
+
+def _value(expr: str) -> float | None:
+    expr = expr.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        expr = expr[1:-1].strip()
+    if not NUMBER.match(expr):
+        return None
+    try:
+        return float(expr.rstrip("uUlLfF") if not re.search(r"[eE]", expr) else expr.rstrip("uUlLfF"))
+    except ValueError:
+        return None
+
+
+def _stated(expected: str, texts: list[str], bool_ok: bool) -> bool:
+    """A2-21u: a number occurs in a cited evidence text; a name occurs there as a word; true/false also
+    for a bool function citing E1-E3 evidence of its own."""
+    expected = expected.strip()
+    while expected.startswith("(") and expected.endswith(")"):
+        expected = expected[1:-1].strip()
+    number = _value(expected)
+    if number is not None:
+        found = {float(m) for t in texts for m in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", t)}
+        return number in found
+    if expected in ("true", "false", "1", "0") and bool_ok:
+        return True
+    if re.fullmatch(r"[A-Za-z_][\w:]*", expected):
+        word = expected.split("::")[-1]
+        return any(re.search(r"(?<![\w])" + re.escape(word) + r"(?![\w])", t) for t in texts)
+    if expected.startswith('"') and expected.endswith('"'):
+        return any(expected[1:-1] in t for t in texts)
+    return False
+
+
+def ground_expectations(body: str, test: str, texts: list[str], bool_ok: bool) -> tuple[str, int]:
+    """A2-21u: every expected value the LLM wrote must be stated by the evidence the test cites; one
+    that is not is observed instead of asserted (A2-21f), a string is left out. Returns the body and
+    the number of assertions changed."""
+    calls = []
+    for m in EXPECT_CALL.finditer(body):
+        args, end = _call_args(body, m.end() - 1)
+        if args:
+            calls.append((m.start(), end, m.group(1), args))
+    used = len(re.findall(r"UT_OBSERVE_\w+\(", body))
+    changed = 0
+    for start, end, macro, args in reversed(calls):
+        observed = ""
+        if macro in ("UT_EXPECT_EQ_INT", "UT_EXPECT_NE_INT", "UT_EXPECT_EQ_DBL") and len(args) >= 2:
+            if _stated(args[1], texts, bool_ok):
+                continue
+            observed = f"{'UT_OBSERVE_DBL' if macro == 'UT_EXPECT_EQ_DBL' else 'UT_OBSERVE_INT'}(\"{{id}}\", {args[0]})"
+        elif macro in ("UT_EXPECT_TRUE", "UT_EXPECT_FALSE") and args:
+            cond = args[0]
+            parts = COMPARE.split(cond, maxsplit=1)
+            if len(parts) == 3:
+                left, right = parts[0].strip(), parts[2].strip()
+                literal, other = (right, left) if _value(right) is not None or not _value(left) else (left, right)
+                if _stated(literal, texts, bool_ok):
+                    continue
+                kind = "UT_OBSERVE_DBL" if (_value(literal) or 0) % 1 else "UT_OBSERVE_INT"
+                observed = f"{kind}(\"{{id}}\", {other})"
+            else:
+                if _stated("true" if macro == "UT_EXPECT_TRUE" else "false", texts, bool_ok):
+                    continue
+                observed = f"UT_OBSERVE_INT(\"{{id}}\", ({cond}) ? 1 : 0)"
+        elif macro == "UT_EXPECT_EQ_STR" and len(args) >= 2:
+            if _stated(args[1], texts, bool_ok):
+                continue
+        else:
+            continue
+        used += 1
+        changed += 1
+        tail = body[end:]
+        tail = re.sub(r"^\s*;[ \t]*(/\*\s*EV-[^*]*\*/)?", ";", tail, count=1)
+        replacement = observed.replace("{id}", f"{test}_g{used}") if observed else \
+            "/* expected string not stated by the evidence: not asserted [A2-21u] */ (void)0"
+        body = body[:start] + replacement + tail
+    return body, changed
+
+
 def return_of(fn: uc.FunctionInfo) -> str:
     """The return type: from the front end, else from the signature text [A1-DA14]."""
     if fn.return_type:
@@ -1225,8 +1336,13 @@ class GeneratorAgent(ba.AgentCore):
                         f"LANGUAGE: {'C++' if layout.language == 'cpp' else 'C'}",
                         f"FUNCTION UNDER TEST ({layout.sut_file}):\n{source}",
                         f"PARAMETERS: {params or 'none'}. {call_as}{member}"])),
-                    uc.part("stubs", f"STUB CONTROL (set before calling; reset before every test; ut_stub_<name>_returns[i] "
-                                     f"with ut_stub_<name>_returns_len give one return value per call):\n{stub_header}"),
+                    # A2-21v: only the controls that exist; without stubs no ut_stub_ pattern at all
+                    uc.part("stubs", ("STUB CONTROL (only the names declared below exist; set them before calling; "
+                                      "they are reset before every test; an array ..._returns[i] with ..._returns_len "
+                                      f"gives one return value per call):\n{stub_header}")
+                            if "ut_stub_" in stub_header else
+                            "STUB CONTROL: none. No function this code calls is replaced by a stub, so no ut_stub_ "
+                            "name exists: do not use one. Call the function under test directly."),
                     uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
                     uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
                                        "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),
@@ -1252,7 +1368,7 @@ class GeneratorAgent(ba.AgentCore):
                     "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
                     "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
                     "UT_OBSERVE_DBL(\"id\", expr). When the EVIDENCE states the expected result, assert it, put the "
-                    "EVIDENCE ids into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
+                    "EVIDENCE ids (as written there, for example EV-clamp_percent-1; never the classes E1-E8) into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
                     "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
                     "and set evidence_class to E8. Never guess an expected value.")
                 dropped: list[str] = []
@@ -1278,10 +1394,16 @@ class GeneratorAgent(ba.AgentCore):
                     else:
                         cls, is_linked = "E8", False
                     cited = [i + (f" @{uc.evidence_key(evidence[i])}" if evidence[i].linked_by else "") for i in ids]
+                    # what the expected values may come from [A2-21u]
+                    stated = [evidence[i] for i in ids] if ids else \
+                        [e for e in evidence.values() if e.evidence_class == cls] if cls != "E8" else []
+                    texts = [e.text for e in stated]
+                    bool_ok = re.sub(r"\s+", "", fn.return_type or "") in ("bool", "_Bool") and \
+                        any(e.evidence_class in ("E1", "E2", "E3") for e in stated)
                     purpose = f"{', '.join(t.scenario_ids) or (fn_scenarios[0].scenario_id if fn_scenarios else 'rewrite')}: " \
                               f"{t.purpose or (fn_scenarios[0].purpose or fn_scenarios[0].description[:100] if fn_scenarios else '')}" \
                               + (f" [{', '.join(cited)}]" if cited else "")
-                    produced.append((t, cls, is_linked, purpose))
+                    produced.append((t, cls, is_linked, purpose, texts, bool_ok))
                 return produced, own_notes, fn, to_rewrite
             return run
         work = list(by_function.items())
@@ -1291,10 +1413,18 @@ class GeneratorAgent(ba.AgentCore):
                 raise result
             produced, own_notes, fn, to_rewrite = result
             notes.extend(own_notes)
-            for t, cls, is_linked, purpose in produced:
+            for t, cls, is_linked, purpose, texts, bool_ok in produced:
                 name = t.name if t.name in to_rewrite else \
                     readable_test_name(t.name, fn.name, names) if t.name in names else t.name
-                out.append((name, render_test(name, t.body, cls, is_linked, purpose), cls))
+                # A2-21u; a rewritten test keeps its evidence and goes through the oracle-strength check (A2-21p)
+                body, unstated = (t.body, 0) if t.name in to_rewrite else \
+                    ground_expectations(t.body, name, texts, bool_ok)
+                if unstated:
+                    notes.append(f"{fn.qualified_name}: {name}: {unstated} expected value(s) not stated by the cited "
+                                 "evidence; observed instead of asserted [A2-21u]")
+                    if "UT_OBSERVE" in body:
+                        cls, is_linked = "E8", False
+                out.append((name, render_test(name, body, cls, is_linked, purpose), cls))
                 names.add(name)
                 if is_linked:
                     linked.add(name)

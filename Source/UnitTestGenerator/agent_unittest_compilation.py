@@ -2504,9 +2504,19 @@ class CompilationAgent(ba.AgentCore):
         return out
 
     def _function_of_test(self, layout: uc.LayoutProfile, t: uc.TestResult, repo: Path) -> str:
-        names = [f.name for f in layout.functions]
-        match = [n for n in names if n in t.name or n in t.message]
-        return match[0] if match else ""
+        """The SUT function a failing test checks: a method called in the failing assertion first
+        (``TorqueMap().max_torque(4000)`` is max_torque, not the constructor), then a free function
+        called there, then a function named in the test's name (qualified names as Class_method)."""
+        names = sorted({f.name for f in layout.functions}, key=len, reverse=True)
+        message = t.message or ""
+        for pattern in (r"(?:\.|->)\s*{}\s*\(", r"(?<![\w.>:]){}\s*\("):
+            for name in names:
+                if re.search(pattern.format(re.escape(name.split("::")[-1])), message):
+                    return name
+        for name in names:
+            if name in t.name or name.replace("::", "_") in t.name or name in message:
+                return name
+        return ""
 
     async def _refine(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> uc.VerificationResult:
         """Hybrid step [A3-152..176]: deterministic facts first (execute), then one typed decision
