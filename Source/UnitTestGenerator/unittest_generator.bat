@@ -97,8 +97,11 @@ if /i "%ACTION%"=="benchmark" if not "%~2"=="" set "KNOWLEDGE=%~2"
 if /i "%ACTION%"=="view" set "VIEWDIR=%~2"
 if /i "%ACTION:~0,6%"=="pilot-" if not "%~2"=="" set EXTRA=%2 %3
 rem  Without quotes and without a trailing backslash: "C:\repo\" would escape the closing quote.
-if defined REPO set "REPO=%REPO:"=%"
-if defined REPO if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
+rem  Only when REPO is set: cmd turns a substitution on an unset variable into broken text.
+if not defined REPO goto repo_clean
+set "REPO=%REPO:"=%"
+if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
+:repo_clean
 set "PY="
 if defined BASEAGENT_PYTHON set "PY=%BASEAGENT_PYTHON%"
 if defined PY goto have_python
