@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import contextlib
 import hashlib
 import inspect
@@ -37,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, TypedDict
+from typing import Any, Awaitable, Callable, Literal, Protocol, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -919,6 +920,10 @@ class AnthropicSettings(StrictModel):
     adaptive: bool = True
     context_window: int = Field(default=1_000_000, ge=8192, le=2_000_000)
     thinking_reserve: int = Field(default=8000, ge=0, le=64_000)
+    # ARCH-18: calls of one agent at the same time (match the API quota of the key), and the total
+    # wait for a rate-limited or overloaded model before that call fails (never another brain).
+    parallel_calls: int = Field(default=4, ge=1, le=32)
+    rate_limit_wait: float = Field(default=300.0, ge=0.0, le=3600.0)
 
     @model_validator(mode="before")
     @classmethod
@@ -1187,6 +1192,11 @@ AVAILABILITY_FAULTS = {"BRAIN_UNAVAILABLE", "MODEL_UNAVAILABLE", "MODEL_TIMEOUT"
                        "DEPENDENCY_MISSING", "BRAIN_NO_ACCESS"}
 # The API key cannot use this model (or there is no key): skipped for the rest of the run.
 NO_ACCESS_ERRORS = {"AuthenticationError", "PermissionDeniedError", "NotFoundError"}
+# The brain of the latest call in the current task (ARCH-18: calls of one agent at the same time).
+_CALL_BRAIN: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("baseagent_call_brain",
+                                                                                    default=None)
+# Rate limited (429) or overloaded (529): asked again after a wait, never another brain (ARCH-18).
+RATE_LIMIT_ERRORS = {"RateLimitError", "OverloadedError"}
 
 
 def _labels(definition: dict[str, Any]) -> list[str]:
@@ -1564,6 +1574,22 @@ class ClaudeEngine:
         self.client = client
         self.usage: dict[str, int] = {}
 
+    @property
+    def parallel_calls(self) -> int:
+        """Calls this brain takes at once (ARCH-18)."""
+        return self.settings.parallel_calls
+
+    @staticmethod
+    def _rate_limited(exc: BaseException) -> float | None:
+        """Seconds the server asks to wait when ``exc`` is a rate limit or overload, else None."""
+        if type(exc).__name__ not in RATE_LIMIT_ERRORS and getattr(exc, "status_code", None) not in (429, 529):
+            return None
+        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+        try:
+            return max(0.0, float(headers.get("retry-after", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _unavailable(self, exc: BaseException) -> AgentFault:
         # Class name only: SDK messages can echo request content.
         name = type(exc).__name__
@@ -1620,6 +1646,11 @@ class ClaudeEngine:
             raise AgentFault("MODEL_TIMEOUT", f"{self.model_id} exceeded its deadline.", True) from exc
         except Exception as exc:
             name = type(exc).__name__
+            after = self._rate_limited(exc)
+            if after is not None:
+                fault = AgentFault("BRAIN_RATE_LIMITED", f"{self.model_id} is rate limited or overloaded.", True)
+                fault.retry_after = after
+                raise fault from exc
             if name in {"BadRequestError", "UnprocessableEntityError", "RequestTooLargeError"}:
                 LOG.warning("%s rejected the request: %s", self.model_id, name)
                 raise AgentFault("BRAIN_REQUEST_REJECTED", f"{self.model_id} rejected the request.") from exc
@@ -1638,12 +1669,21 @@ class ClaudeEngine:
         """One request with the plan's answer limit; an answer cut at an ESTIMATED limit is asked
         again once with the configured maximum (ARCH-14)."""
         max_tokens = plan.output_tokens if plan is not None and plan.output_tokens else self.settings.max_tokens
+        waited, attempt = 0.0, 0
         while True:
             if plan is not None:
                 plan.input_chars += len(system) + sum(len(m["content"]) for m in messages)
             try:
                 message = await self._message(system, messages, schema, max_tokens)
             except AgentFault as exc:
+                if exc.code == "BRAIN_RATE_LIMITED":               # wait and ask the same model again [ARCH-18]
+                    pause = max(getattr(exc, "retry_after", 0.0), min(60.0, 5.0 * 2 ** attempt))
+                    if waited + pause > self.settings.rate_limit_wait:
+                        raise
+                    LOG.warning("%s is rate limited or overloaded; asking again in %.0f s.", self.model_id, pause)
+                    await asyncio.sleep(pause)
+                    waited, attempt = waited + pause, attempt + 1
+                    continue
                 if (getattr(exc, "truncated", False) and plan is not None and plan.adaptive
                         and max_tokens < self.settings.max_tokens):
                     LOG.warning("%s's answer was cut at %d tokens; asking again with %d.",
@@ -1819,6 +1859,7 @@ class QwenEngine:
         self.model_id = "ollama:" + settings.model
         self.http = OllamaHTTP(settings.base_url, opener)
         self.gate = asyncio.Semaphore(settings.max_concurrency)
+        self.parallel_calls = settings.max_concurrency        # what Ollama serves at once (ARCH-18)
         self.started = False
         self.details: dict[str, str] = {}
         self.usage: dict[str, int] = {}
@@ -3323,6 +3364,41 @@ class AgentCore:
         self.llm_calls += 1
         self.last_brain = {"brain": router.name_of(brain), "model_id": getattr(brain, "model_id", ""),
                            "fallbacks": skipped}
+        _CALL_BRAIN.set(self.last_brain)
+
+    def brain_of_call(self) -> dict[str, Any]:
+        """The brain that answered the latest call of THIS task: with calls at the same time,
+        ``last_brain`` may already belong to another call (ARCH-18)."""
+        own = _CALL_BRAIN.get()
+        return own if own is not None else self.last_brain
+
+    async def parallel_slots(self) -> int:
+        """How many independent brain calls of this agent may run at once: the limit of the first
+        brain that would answer (ARCH-18); 1 without a brain."""
+        try:
+            router = await self._brains()
+        except AgentFault:
+            return 1
+        for brain in router.brains:
+            name = router.name_of(brain)
+            if name not in self.allowed_brains or router.retry_after.get(name, 0.0) == math.inf:
+                continue
+            return max(1, int(getattr(brain, "parallel_calls", 1) or 1))
+        return 1
+
+    async def in_parallel(self, jobs: list[Callable[[], Awaitable[Any]]]) -> list[Any]:
+        """Runs independent jobs (each makes brain calls) at most ``parallel_slots()`` at a time and
+        returns their results IN THE ORDER OF ``jobs``, whatever order they finish in; a job's
+        exception is returned in its place (ARCH-18)."""
+        if not jobs:
+            return []
+        slots = await self.parallel_slots()
+        gate = asyncio.Semaphore(slots)
+
+        async def one(job: Callable[[], Awaitable[Any]]) -> Any:
+            async with gate:
+                return await job()
+        return list(await asyncio.gather(*(one(job) for job in jobs), return_exceptions=True))
 
     async def decide(self, state: str | list[ContextPart], questions: dict[str, Question], *, step: str = "",
                      project: str | Path | None = None, need: OutputNeed | None = None) -> dict[str, Any]:
@@ -4144,7 +4220,9 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
   document.getElementById("subtitle").textContent=d.subtitle||"";(d.agents||[]).forEach(addAgent);
   Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];ag.runCalls=0;ag.idle=""});
   S.orch=d.orchestrator?{label:d.orchestrator.label,description:d.orchestrator.description,input:d.orchestrator.input,details:d.orchestrator.details||[]}:null;
-  layout();metricsInit(d.metrics);feed(ev,ev.summary||"Run started","gray");return}
+  layout();metricsInit(d.metrics);feed(ev,ev.summary||"Run started","gray");
+  if(S.live){var sr=document.getElementById("status");sr.textContent="live";sr.className="pill live";
+   document.getElementById("final").classList.remove("show")}return}
  if(ev.agent&&ev.agent!=="orchestrator"&&!S.agents[ev.agent]){addAgent({agent:ev.agent,label:ev.label,app:ev.app});layout()}
  if(k==="tool_start"){var a=S.agents[ev.agent];if(a){a.lastIn=ev.summary||ev.contract||"";a.counts[ev.tool]=(a.counts[ev.tool]||0)+1;a.runCalls+=1;a.lastOut="";a.lastFrom=a.from;
   a.history.push({time:ev.time||0,tool:ev.tool,input:a.lastIn,from:a.from,output:"",status:"running"});if(a.history.length>300)a.history.shift();
@@ -4166,7 +4244,7 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="run_end"){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
    if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)});
   if(S.orch){S.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"");paintOrch()}
-  finalPanel(d);feed(ev,ev.summary||"Run finished","gray");var st=document.getElementById("status");st.textContent="finished";st.className="pill";if(S.es)S.es.close();return}}
+  finalPanel(d);feed(ev,ev.summary||"Run finished","gray");var st=document.getElementById("status");st.textContent="finished";st.className="pill";return}}
 document.getElementById("present").addEventListener("click",function(){document.body.classList.toggle("present");this.classList.toggle("on")});
 var embedded=JSON.parse(document.getElementById("embedded").textContent||"null");
 S.animate=!matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -4180,6 +4258,7 @@ if(embedded&&embedded.length){var st=document.getElementById("status");st.textCo
  next()}
 else{S.live=true;var st2=document.getElementById("status");st2.textContent="live";st2.className="pill live";
  var q=location.search||"";var es=new EventSource("events"+q);S.es=es;
+ // a run of several SUT files has one page: after one file's end the stream stays open for the next [VIEW-10]
  es.onopen=function(){if(st2.textContent!=="finished"){st2.textContent="live";st2.className="pill live"}};
  es.onmessage=function(m){try{apply(JSON.parse(m.data))}catch(e){}};
  es.onerror=function(){if(st2.textContent==="finished")return;

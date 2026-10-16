@@ -1,13 +1,24 @@
 # BaseAgent changes
 
+## 2026-10-16: brain calls at the same time
+
+**Why.** A production file has 100 or more functions; asking the brain about one function at a time makes a run take hours with a Claude model, although the calls for different functions do not depend on each other.
+
+* **`AgentCore.in_parallel(jobs)`** runs independent jobs, each of which may call the brain, at most `parallel_slots()` at a time, and returns the results **in the order of the jobs**, whatever order they finish in. A job's exception is returned in its place.
+* **`AgentCore.parallel_slots()`** is the limit of the first brain that would answer: `anthropic.parallel_calls` (default 4) for the Claude models, `qwen.max_concurrency` (default 1) for Qwen through Ollama, 1 without a brain. With Qwen nothing changes: the calls wait for each other as before.
+* **`AgentCore.brain_of_call()`** is the brain of the latest call of the current task; with calls at the same time `last_brain` may belong to another call.
+* **Rate limits.** A Claude model that answers 429 (rate limited) or 529 (overloaded) is asked again after a wait (at least the server's retry-after; 5, 10, 20 ... s) up to `anthropic.rate_limit_wait` (default 300 s), then the call fails as `BRAIN_RATE_LIMITED`. It is never replaced by the next brain for that reason, so one file does not get tests of uneven quality.
+* **Tests.** `ParallelCallTests`: results in the order of the jobs and at most the brain's limit at once; Qwen one call at a time; a rate-limited model asked again and never replaced.
+
+
 ## 2026-10-16: live viewer on Windows
 
 **Why.** On the first Windows run the live page showed "connection closed" while the run went on. The page never returned to "live" after the browser lost its event stream, a reconnect would have started the stream from the first event again, and the stream counted its position in characters of a file that Windows had written with CRLF line ends.
 
 * **`emit_event`** writes LF line ends on every operating system.
 * **`/events`** reads the events file by bytes and sends each event with an `id` (its byte position). A reconnecting browser sends `Last-Event-ID`, and the stream continues after that event: nothing is shown twice or lost.
-* **The page** shows "live", "reconnecting" or "finished", and "connection closed" only when the browser has given up. It closes the stream after the run's last event.
-* **Tests.** `ViewerTests.test_live_server` covers the event ids and a reconnect over a CRLF file.
+* **The page** shows "live", "reconnecting" or "finished", and "connection closed" only when the browser has given up. A run of several SUT files has one page: after one file's end it shows "finished" and keeps listening; the next file's start shows "live" again. (A first version closed the stream at the first file's end, so the page stopped after the first of several files.)
+* **Tests.** `ViewerTests.test_live_server` covers the event ids and a reconnect over a CRLF file; `test_live_page_stays_live_across_several_files` a second file after the first one's end.
 
 ## 2026-10-14: repository layout
 

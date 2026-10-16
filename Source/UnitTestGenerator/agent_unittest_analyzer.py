@@ -2445,7 +2445,8 @@ class AnalyzerAgent(ba.AgentCore):
                 plan_notes["planning"].append(f"{fn.name}: rules - brain not available ({exc.code}) [A1-PL8]"
                                               if not accepted else f"{fn.name}: re-ask failed ({exc.code})")
                 break
-            brain = f"brain:{self.last_brain.get('brain', '')}/{self.last_brain.get('model_id', '')}"
+            used = self.brain_of_call()                             # this call's brain, not another's [ARCH-18]
+            brain = f"brain:{used.get('brain', '')}/{used.get('model_id', '')}"
             ev_map = {e.evidence_id: e for e in evidence}
             problems, sought = [], []
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
@@ -2780,6 +2781,7 @@ class AnalyzerAgent(ba.AgentCore):
         coverage-guided search inputs stay; without a usable answer the rules stay [A1-PL1, A1-PL8]."""
         sut_text = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         out = list(scenarios)
+        work = []
         for name in list(dict.fromkeys(s.function for s in scenarios if not s.inputs)):
             fn = next((f for f in layout.functions if f.name == name), None)
             if fn is None:
@@ -2791,8 +2793,26 @@ class AnalyzerAgent(ba.AgentCore):
             if not open_ids:
                 continue
             evidence = [e for e in self.collect_evidence(layout, name).evidence if uc.evidence_key(e) not in disputed]
-            brain = await self._brain_scenarios(fn, gaps, open_ids, infeasible, layout, req, sut_text, stubs,
-                                                evidence, notes)
+            work.append((name, fn, gaps, open_ids, evidence))
+
+        # ARCH-18: the functions are planned at the same time, each with notes of its own; the
+        # results are combined below in the order of the functions, never in the order they arrive.
+        def job(fn: uc.FunctionInfo, gaps: list[uc.GapItem], open_ids: set[str], evidence: list[uc.EvidenceRef]):
+            async def run() -> tuple[list[uc.Scenario], dict[str, list[str]], dict[str, int]]:
+                own = {key: [line for line in lines if key == "lookups" and line.startswith(fn.name + ":")]
+                       for key, lines in notes.items()}
+                before = {key: len(lines) for key, lines in own.items()}
+                found = await self._brain_scenarios(fn, gaps, open_ids, infeasible, layout, req, sut_text, stubs,
+                                                    evidence, own)
+                return found, own, before
+            return run
+        results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
+        for (name, *_), result in zip(work, results):
+            if isinstance(result, BaseException):
+                raise result
+            brain, own, before = result
+            for key, lines in own.items():
+                notes.setdefault(key, []).extend(lines[before[key]:])
             if brain:
                 out = [s for s in out if s.function != name or s.inputs] + brain
             elif not any(line.startswith(f"{name}:") for line in notes["planning"]):

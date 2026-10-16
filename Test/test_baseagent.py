@@ -1832,6 +1832,88 @@ class EchoIn(_PydanticBase):
     text: str = ""
 
 
+class SlowGenBrain(GenBrain):
+    """Answers after a delay chosen per task, so calls finish out of order; counts calls at once."""
+    def __init__(self, name="sonnet", parallel=3, delays=None):
+        super().__init__(name)
+        self.parallel_calls, self.delays, self.running, self.peak = parallel, delays or {}, 0, 0
+
+    async def generate(self, task, context, schema, validate):
+        import asyncio
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        try:
+            await asyncio.sleep(self.delays.get(task, 0.01))
+            return {"model": f"{self.model_id}-{task}", "output": validate({**PLAN_REPLY, "name": task}),
+                    "usage": {}}
+        finally:
+            self.running -= 1
+
+
+class RateLimitError(Exception):
+    """Same class name as the Anthropic SDK's 429 error."""
+    def __init__(self, retry_after="0"):
+        super().__init__("rate limited")
+        self.response = types.SimpleNamespace(headers={"retry-after": retry_after})
+
+
+class ParallelCallTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-18: independent brain calls at the same time, results in a fixed order, no brain switch."""
+    async def test_results_keep_the_order_of_the_jobs(self):
+        brain = SlowGenBrain(parallel=3, delays={"t0": 0.2, "t1": 0.01, "t2": 0.1, "t3": 0.05, "t4": 0.01})
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        agent.allowed_brains = ["sonnet"]
+
+        def job(task):
+            async def run():
+                plan = await agent.generate(task, "c", GenPlan)
+                return plan.name, agent.brain_of_call()["model_id"]
+            return run
+        results = await agent.in_parallel([job(f"t{i}") for i in range(5)])
+        self.assertEqual([r[0] for r in results], ["t0", "t1", "t2", "t3", "t4"])      # job order, not finish order
+        self.assertEqual(brain.peak, 3)                                                   # at most the brain's limit
+        self.assertEqual(await agent.parallel_slots(), 3)
+
+    async def test_qwen_takes_one_call_at_a_time(self):
+        brain = SlowGenBrain("qwen", parallel=1)
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        await agent.in_parallel([lambda t=t: agent.generate(t, "c", GenPlan) for t in ("a", "b", "c")])
+        self.assertEqual(brain.peak, 1)
+        settings = ba.QwenSettings()
+        self.assertEqual(ba.QwenEngine(settings).parallel_calls, settings.max_concurrency)
+        self.assertEqual(ba.ClaudeEngine(ba.AnthropicSettings(), "sonnet", client=FakeAnthropic()).parallel_calls, 4)
+
+    async def test_a_rate_limited_model_is_asked_again_never_replaced(self):
+        fake = FakeAnthropic(reply=PLAN_REPLY)
+        failures = [RateLimitError("2"), RateLimitError()]
+        stream = fake.messages.stream
+
+        class _Limited:
+            async def __aenter__(self):
+                raise failures.pop(0)
+
+            async def __aexit__(self, *exc):
+                return False
+        fake.messages.stream = lambda **kw: _Limited() if failures else stream(**kw)
+        engine = ba.ClaudeEngine(ba.AnthropicSettings(), "sonnet", client=fake)
+        router = ba.BrainRouter([engine, GenBrain("qwen")], 0.0)
+        await router.start()
+        sleeps = []
+
+        async def no_wait(seconds):
+            sleeps.append(seconds)
+        with mock.patch.object(ba.asyncio, "sleep", no_wait):
+            result, brain, skipped = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan),
+                                                           ["sonnet", "qwen"])
+        self.assertEqual((brain.brain_name, skipped), ("sonnet", []))                   # not Qwen
+        self.assertEqual(sleeps, [5.0, 10.0])                                          # at least the server's 2 s
+        failures[:] = [RateLimitError()] * 20
+        engine.settings = ba.AnthropicSettings(rate_limit_wait=20)
+        with mock.patch.object(ba.asyncio, "sleep", no_wait), self.assertRaises(ba.AgentFault) as ctx:
+            await router.generate("t", "c", {}, ba.model_validator_for(GenPlan), ["sonnet", "qwen"])
+        self.assertEqual(ctx.exception.code, "BRAIN_RATE_LIMITED")                      # fails, no other brain
+
+
 class EchoOut(_PydanticBase):
     doubled: int
     found: list[str] = []
@@ -2352,6 +2434,36 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nothing to measure", metrics)
         card = [x for x in metrics.split("MC/DC", 1)[1].splitlines() if x.strip()]
         self.assertEqual(card[0].strip(), "NA")                               # the value, not 100 % or 0 %
+
+    @unittest.skipUnless(importlib.util.find_spec("uvicorn") and importlib.util.find_spec("starlette")
+                         and importlib.util.find_spec("playwright"), "uvicorn, starlette and playwright are required")
+    def test_live_page_stays_live_across_several_files(self):
+        """VIEW-10: a run of several SUT files has one page; the end of the first file must not end the page."""
+        hub = ba.ViewHub(self.dir, app="UT")
+        agents = [{"agent": "a", "label": "UT-Analyzer", "description": "plans the tests", "tools": ["plan"]}]
+        hub.emit("run_start", summary="Run started: src/a.cpp", data={"title": "UT", "subtitle": "pilot - src/a.cpp",
+                                                                       "agents": agents})
+        hub.emit("run_end", summary="src/a.cpp: verified_measured", data={"state": "verified_measured"})
+        server = ba.serve_viewer(hub, open_browser=False, title="UT live")
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto(server.url)
+                page.wait_for_function("document.getElementById('status').textContent === 'finished'", timeout=10000)
+                hub.emit("run_start", summary="Run started: src/b.cpp", data={"title": "UT",
+                                                                               "subtitle": "pilot - src/b.cpp",
+                                                                               "agents": agents})
+                page.wait_for_function("document.getElementById('subtitle').textContent.includes('src/b.cpp')",
+                                       timeout=10000)
+                status = page.locator("#status").inner_text()
+                hub.emit("stage", summary="Stage B: iteration 1 of 5")
+                page.wait_for_function("document.body.innerText.includes('Stage B: iteration 1 of 5')", timeout=10000)
+                browser.close()
+        finally:
+            server.stop()
+        self.assertEqual(status, "live")
 
     @unittest.skipUnless(importlib.util.find_spec("uvicorn") and importlib.util.find_spec("starlette"),
                          "uvicorn and starlette are required")

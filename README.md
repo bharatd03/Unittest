@@ -78,6 +78,8 @@ BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`.
 
 Results of a run go to `Source/UnitTestGenerator/ut_output/`.
 
+With a Claude model, the brain is asked about several functions at the same time (`brain.anthropic.parallel_calls` in `ut_config.json`, default 4; match it to your API quota); with Qwen one at a time. The results are combined in a fixed order, so the same input gives the same tests.
+
 Stopping a run: press Ctrl+C once. The run stops and still delivers the tests Agent3 has verified so far, with the report and the ledger (answer `N` if Windows asks "Terminate batch job" before the report is printed). A second Ctrl+C ends at once. Once every coverage target is met, the run spends at most 10 minutes checking the documented behaviour (`pipeline.after_target_seconds` in `ut_config.json`, 0 = no limit).
 
 ## Working on the code

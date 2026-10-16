@@ -2,10 +2,11 @@
   "brain": {
     "engine": {"mode": "auto", "brain_order": ["opus", "fable", "sonnet", "haiku", "qwen"]},
     "qwen": {"model": "qwen3:8b", "adaptive": true, "windows": [4096, 8192, 12288, 16384], "max_num_predict": 8192,
-             "generate_num_ctx": 16384, "generate_num_predict": 4096, "generate_timeout": 900},
+             "generate_num_ctx": 16384, "generate_num_predict": 4096, "generate_timeout": 900, "max_concurrency": 1},
     "anthropic": {"models": {"opus": "claude-opus-5-5", "fable": "claude-fable-5-1", "sonnet": "claude-sonnet-5-5",
                              "haiku": "claude-haiku-5-5"},
-                  "effort": "high", "max_tokens": 16000, "adaptive": true, "thinking_reserve": 8000}
+                  "effort": "high", "max_tokens": 16000, "adaptive": true, "thinking_reserve": 8000,
+                  "parallel_calls": 4, "rate_limit_wait": 300}
   },
   "coverage": {
     "default_level": "D",

@@ -1183,105 +1183,121 @@ class GeneratorAgent(ba.AgentCore):
             if fn is not None:
                 rewrites_of.setdefault(fn.name, []).append(name)
                 by_function.setdefault(fn.name, [])
-        for fn_name, fn_scenarios in by_function.items():
-            fn = next((f for f in layout.functions if fn_name in (f.name, f.qualified_name)), None)
-            if fn is None or (fn.is_static and not fn.from_frontend):
-                notes.append(f"{fn_name}: static or unknown, covered only through its callers")
-                continue
-            to_rewrite = rewrites_of.get(fn.name, [])
-            call_as = f"Call it as {wrapper_name(fn)}(...): it is static [A2-21k]. " if fn.is_static else ""
-            member = "It is a class member: construct an object in the test (see HEADERS) and call it on the " \
-                "object. " if fn.member else ""
-            params = "; ".join(f"{p.name}: {p.type} ({p.kind}{', may be NULL' if p.nullable else ''})" for p in fn.params)
-            source = "\n".join(f"{n:4d}| {sut_lines[n - 1]}" for n in range(fn.line_start, fn.line_end + 1))
-            evidence: dict[str, uc.EvidenceRef] = {}
-            for s in fn_scenarios:
-                for e in s.evidence:
-                    evidence.setdefault(e.evidence_id, e)
-            scenario_rows = []
-            for s in fn_scenarios:
-                row = f"- {s.scenario_id} ({'asserts stated behaviour' if not s.characterization else 'characterization'}"\
-                      f"): {s.purpose or s.description}"
-                if s.checked:
-                    row += "".join([
-                        f" | args: {', '.join(f'{a.name}={a.value}' for a in s.args)}" if s.args else "",
-                        f" | setup: {' '.join(s.setup)}" if s.setup else "",
-                        "".join(f" | stub {v.stub} returns {', '.join(v.returns)} per call" for v in s.stub_values),
-                        "".join(f" | set {v.name} = {v.value}" for v in s.variables),
-                        f" | expected return: {s.expected_return}" if s.expected_return else "",
-                        "".join(f" | expect {c.expr} == {c.value}" for c in s.expected_after)])
-                else:
-                    row += f" | conditions: {'; '.join(s.required_conditions) or '-'} | stubs: {'; '.join(s.stub_hints) or '-'}"
-                scenario_rows.append(row)
-            fixes = [f"- {name}: {rewrite[name].issue}: {rewrite[name].diagnostic[:300]}\n{existing[name]['source']}"
-                     for name in to_rewrite]
-            # ARCH-17: what the tests are built from stays whole; the headers keep at least their
-            # beginning; KB examples and the list of names give way first.
-            context = [
-                uc.part("facts", "\n".join([
-                    f"LANGUAGE: {'C++' if layout.language == 'cpp' else 'C'}",
-                    f"FUNCTION UNDER TEST ({layout.sut_file}):\n{source}",
-                    f"PARAMETERS: {params or 'none'}. {call_as}{member}"])),
-                uc.part("stubs", f"STUB CONTROL (set before calling; reset before every test; ut_stub_<name>_returns[i] "
-                                 f"with ut_stub_<name>_returns_len give one return value per call):\n{stub_header}"),
-                uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
-                uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
-                                   "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),
-                uc.part("evidence", "EVIDENCE (expected behaviour):\n" + ("\n".join(
-                    f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
-                    f"{e.source}:{e.line}: {e.text}" for e in evidence.values()) or
-                    "- none (all expected values must be observed)"), uc.P_EVIDENCE),
-                uc.part("headers", f"HEADERS:\n{headers}", uc.P_EVIDENCE, min_chars=2000),
-                uc.part("names", "EXISTING TEST NAMES (do not reuse): " + ", ".join(sorted(names)), uc.P_TRIED),
-                uc.part("kb", "KB GUIDANCE:\n" + "\n".join(
-                    [f"+ {k.snippet[:300]}" for k in req.guidance.positive[:3]] +
-                    [f"- avoid: {k.snippet[:200]} ({k.reason})" for k in req.guidance.negative[:3]]), uc.P_EXAMPLES),
-            ]
-            need = ba.OutputNeed(items=min(self.cfg.max_llm_tests_per_function,
-                                           max(len(fn_scenarios) + len(to_rewrite), 1)),
-                                 tokens_per_item=self.cfg.tokens_per_test, overhead=100)
-            task = (
-                f"Write at most {need.items} unit tests for {fn.qualified_name} that cover "              # ARCH-11a
-                "the SCENARIOS and rewrite the TESTS TO REWRITE. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
-                "\"purpose\", \"evidence_ids\", \"body\", \"evidence_class\"}]}. name: test_<what>_<behaviour> (at least "
-                f"three words, at most {NAME_LIMIT} characters; a rewritten test keeps its name). purpose: one line. body: statements only, no function "
-                "header, no #include. Use only: the function under test and other functions declared in HEADERS, the "
-                "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
-                "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
-                "UT_OBSERVE_DBL(\"id\", expr). When the EVIDENCE states the expected result, assert it, put the "
-                "EVIDENCE ids into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
-                "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
-                "and set evidence_class to E8. Never guess an expected value.")
-            dropped: list[str] = []
-            check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite), fn.name, dropped)
-            try:
-                result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
-                                             project=layout.repo_root, check=check)
-            except ba.AgentFault as exc:
-                notes.append(f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})")
-                continue
-            notes.extend(f"{fn.qualified_name}: {d}" for d in dropped)
-            for t in result.tests[: self.cfg.max_llm_tests_per_function]:
-                ids = [i for i in t.evidence_ids if i in evidence and evidence[i].evidence_class != "E8"]
-                if "UT_OBSERVE" in t.body:
-                    cls, is_linked = "E8", False
-                elif ids:
-                    cls = min(evidence[i].evidence_class for i in ids)
-                    is_linked = all(evidence[i].linked_by for i in ids)
-                elif re.fullmatch(r"E[1-7]", t.evidence_class) and any(
-                        e.evidence_class == t.evidence_class for e in evidence.values()):
-                    cls = t.evidence_class
-                    is_linked = all(e.linked_by for e in evidence.values() if e.evidence_class == cls)
-                else:
-                    cls, is_linked = "E8", False
-                cited = [i + (f" @{uc.evidence_key(evidence[i])}" if evidence[i].linked_by else "") for i in ids]
-                purpose = f"{', '.join(t.scenario_ids) or (fn_scenarios[0].scenario_id if fn_scenarios else 'rewrite')}: " \
-                          f"{t.purpose or (fn_scenarios[0].purpose or fn_scenarios[0].description[:100] if fn_scenarios else '')}" \
-                          + (f" [{', '.join(cited)}]" if cited else "")
-                out.append((t.name, render_test(t.name, t.body, cls, is_linked, purpose), cls))
-                names.add(t.name)
+        # ARCH-18: the functions' tests are asked for at the same time; every call sees the same names
+        # and evidence it would see alone, and the answers are combined below in the order of the
+        # functions, with names made unique there (A2-21q).
+        def job(fn_name: str, fn_scenarios: list[uc.Scenario]):
+            async def run():
+                fn = next((f for f in layout.functions if fn_name in (f.name, f.qualified_name)), None)
+                if fn is None or (fn.is_static and not fn.from_frontend):
+                    return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, []
+                to_rewrite = rewrites_of.get(fn.name, [])
+                call_as = f"Call it as {wrapper_name(fn)}(...): it is static [A2-21k]. " if fn.is_static else ""
+                member = "It is a class member: construct an object in the test (see HEADERS) and call it on the " \
+                    "object. " if fn.member else ""
+                params = "; ".join(f"{p.name}: {p.type} ({p.kind}{', may be NULL' if p.nullable else ''})" for p in fn.params)
+                source = "\n".join(f"{n:4d}| {sut_lines[n - 1]}" for n in range(fn.line_start, fn.line_end + 1))
+                evidence: dict[str, uc.EvidenceRef] = {}
+                for s in fn_scenarios:
+                    for e in s.evidence:
+                        evidence.setdefault(e.evidence_id, e)
+                scenario_rows = []
+                for s in fn_scenarios:
+                    row = f"- {s.scenario_id} ({'asserts stated behaviour' if not s.characterization else 'characterization'}"\
+                          f"): {s.purpose or s.description}"
+                    if s.checked:
+                        row += "".join([
+                            f" | args: {', '.join(f'{a.name}={a.value}' for a in s.args)}" if s.args else "",
+                            f" | setup: {' '.join(s.setup)}" if s.setup else "",
+                            "".join(f" | stub {v.stub} returns {', '.join(v.returns)} per call" for v in s.stub_values),
+                            "".join(f" | set {v.name} = {v.value}" for v in s.variables),
+                            f" | expected return: {s.expected_return}" if s.expected_return else "",
+                            "".join(f" | expect {c.expr} == {c.value}" for c in s.expected_after)])
+                    else:
+                        row += f" | conditions: {'; '.join(s.required_conditions) or '-'} | stubs: {'; '.join(s.stub_hints) or '-'}"
+                    scenario_rows.append(row)
+                fixes = [f"- {name}: {rewrite[name].issue}: {rewrite[name].diagnostic[:300]}\n{existing[name]['source']}"
+                         for name in to_rewrite]
+                # ARCH-17: what the tests are built from stays whole; the headers keep at least their
+                # beginning; KB examples and the list of names give way first.
+                context = [
+                    uc.part("facts", "\n".join([
+                        f"LANGUAGE: {'C++' if layout.language == 'cpp' else 'C'}",
+                        f"FUNCTION UNDER TEST ({layout.sut_file}):\n{source}",
+                        f"PARAMETERS: {params or 'none'}. {call_as}{member}"])),
+                    uc.part("stubs", f"STUB CONTROL (set before calling; reset before every test; ut_stub_<name>_returns[i] "
+                                     f"with ut_stub_<name>_returns_len give one return value per call):\n{stub_header}"),
+                    uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
+                    uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
+                                       "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),
+                    uc.part("evidence", "EVIDENCE (expected behaviour):\n" + ("\n".join(
+                        f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
+                        f"{e.source}:{e.line}: {e.text}" for e in evidence.values()) or
+                        "- none (all expected values must be observed)"), uc.P_EVIDENCE),
+                    uc.part("headers", f"HEADERS:\n{headers}", uc.P_EVIDENCE, min_chars=2000),
+                    uc.part("names", "EXISTING TEST NAMES (do not reuse): " + ", ".join(sorted(names)), uc.P_TRIED),
+                    uc.part("kb", "KB GUIDANCE:\n" + "\n".join(
+                        [f"+ {k.snippet[:300]}" for k in req.guidance.positive[:3]] +
+                        [f"- avoid: {k.snippet[:200]} ({k.reason})" for k in req.guidance.negative[:3]]), uc.P_EXAMPLES),
+                ]
+                need = ba.OutputNeed(items=min(self.cfg.max_llm_tests_per_function,
+                                               max(len(fn_scenarios) + len(to_rewrite), 1)),
+                                     tokens_per_item=self.cfg.tokens_per_test, overhead=100)
+                task = (
+                    f"Write at most {need.items} unit tests for {fn.qualified_name} that cover "              # ARCH-11a
+                    "the SCENARIOS and rewrite the TESTS TO REWRITE. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
+                    "\"purpose\", \"evidence_ids\", \"body\", \"evidence_class\"}]}. name: test_<what>_<behaviour> (at least "
+                    f"three words, at most {NAME_LIMIT} characters; a rewritten test keeps its name). purpose: one line. body: statements only, no function "
+                    "header, no #include. Use only: the function under test and other functions declared in HEADERS, the "
+                    "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
+                    "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
+                    "UT_OBSERVE_DBL(\"id\", expr). When the EVIDENCE states the expected result, assert it, put the "
+                    "EVIDENCE ids into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
+                    "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
+                    "and set evidence_class to E8. Never guess an expected value.")
+                dropped: list[str] = []
+                check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite), fn.name, dropped)
+                try:
+                    result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
+                                                 project=layout.repo_root, check=check)
+                except ba.AgentFault as exc:
+                    return [], [f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})"], fn, to_rewrite
+                own_notes = [f"{fn.qualified_name}: {d}" for d in dropped]
+                produced = []
+                for t in result.tests[: self.cfg.max_llm_tests_per_function]:
+                    ids = [i for i in t.evidence_ids if i in evidence and evidence[i].evidence_class != "E8"]
+                    if "UT_OBSERVE" in t.body:
+                        cls, is_linked = "E8", False
+                    elif ids:
+                        cls = min(evidence[i].evidence_class for i in ids)
+                        is_linked = all(evidence[i].linked_by for i in ids)
+                    elif re.fullmatch(r"E[1-7]", t.evidence_class) and any(
+                            e.evidence_class == t.evidence_class for e in evidence.values()):
+                        cls = t.evidence_class
+                        is_linked = all(e.linked_by for e in evidence.values() if e.evidence_class == cls)
+                    else:
+                        cls, is_linked = "E8", False
+                    cited = [i + (f" @{uc.evidence_key(evidence[i])}" if evidence[i].linked_by else "") for i in ids]
+                    purpose = f"{', '.join(t.scenario_ids) or (fn_scenarios[0].scenario_id if fn_scenarios else 'rewrite')}: " \
+                              f"{t.purpose or (fn_scenarios[0].purpose or fn_scenarios[0].description[:100] if fn_scenarios else '')}" \
+                              + (f" [{', '.join(cited)}]" if cited else "")
+                    produced.append((t, cls, is_linked, purpose))
+                return produced, own_notes, fn, to_rewrite
+            return run
+        work = list(by_function.items())
+        results = await self.in_parallel([job(fn_name, fn_scenarios) for fn_name, fn_scenarios in work])
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            produced, own_notes, fn, to_rewrite = result
+            notes.extend(own_notes)
+            for t, cls, is_linked, purpose in produced:
+                name = t.name if t.name in to_rewrite else \
+                    readable_test_name(t.name, fn.name, names) if t.name in names else t.name
+                out.append((name, render_test(name, t.body, cls, is_linked, purpose), cls))
+                names.add(name)
                 if is_linked:
-                    linked.add(t.name)
+                    linked.add(name)
         return out, notes, linked
 
     @staticmethod

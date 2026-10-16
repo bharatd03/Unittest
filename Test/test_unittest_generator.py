@@ -556,6 +556,42 @@ class GeneratorTests(unittest.TestCase):
                         bundle.notes)
         self.assertEqual(sum("select_mode" in t for t in b.generate_calls), 1)      # no second ask
 
+    def test_tests_asked_at_the_same_time_give_the_same_suite(self):
+        """ARCH-18: several functions' tests are asked for at once; the answers arrive in another order,
+        yet the suite is the same as with one call at a time, and the names stay unique."""
+        class ParallelBrain(UTBrain):
+            def __init__(self, parallel, delays, **kw):
+                super().__init__(**kw)
+                self.parallel_calls, self.delays, self.running, self.peak = parallel, delays, 0, 0
+
+            async def generate(self, task, context, schema, validate):
+                fn = next((name for name in self.delays if f"tests for {name} " in task), "")
+                self.running += 1
+                self.peak = max(self.peak, self.running)
+                try:
+                    await asyncio.sleep(self.delays.get(fn, 0))
+                    return await super().generate(task, context, schema, validate)
+                finally:
+                    self.running -= 1
+
+        same_name = {fn: [{"name": "test_shared_name_case", "scenario_ids": [], "body": body, "evidence_class": "E8"}]
+                     for fn, body in (("select_mode", "UT_OBSERVE_INT(\"o1\", select_mode(0, 0, 0));"),
+                                      ("clamp_percent", "UT_OBSERVE_INT(\"o2\", clamp_percent(150));"),
+                                      ("thermostat_command", "UT_OBSERVE_INT(\"o3\", thermostat_command(20, 2));"))}
+        suites = []
+        for parallel, delays in ((1, {}), (3, {"thermostat_command": 0.3, "select_mode": 0.1, "clamp_percent": 0.0})):
+            b = ParallelBrain(parallel, delays, tests=same_name)
+            agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
+            with brain(b):
+                bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
+            suites.append(uc.suite_of(bundle))
+            if parallel > 1:
+                self.assertGreater(b.peak, 1)                                   # really at the same time
+        self.assertEqual(suites[0], suites[1])
+        names = re.findall(r"UT_TEST\((\w+)\)", suites[1])
+        self.assertEqual(len(names), len(set(names)))
+        self.assertIn("test_shared_name_case_2", names)
+
     def test_readable_test_name_repairs_instead_of_rejecting(self):
         """[A2-21q] deterministic repair; the result is a valid C identifier within 63 characters."""
         self.assertEqual(a2.readable_test_name("test_clamp_percent_upper_limit", "clamp_percent", set()),
@@ -1579,6 +1615,40 @@ class BrainPlanningTests(unittest.TestCase):
                     classification="confirmed_gap")
         base.update(kw)
         return planned(**base)
+
+    def test_functions_planned_at_the_same_time_give_the_same_plan(self):
+        """ARCH-18: two functions are planned at once and the slower one answers last; the plan, the brain
+        recorded per scenario and the planning notes are the same as with one call at a time."""
+        class ParallelBrain(UTBrain):
+            def __init__(self, parallel, delays, **kw):
+                super().__init__(**kw)
+                self.parallel_calls, self.delays, self.running, self.peak = parallel, delays, 0, 0
+
+            async def generate(self, task, context, schema, validate):
+                fn = next((name for name in self.delays if f"function {name} " in task), "")
+                self.running += 1
+                self.peak = max(self.peak, self.running)
+                try:
+                    await asyncio.sleep(self.delays.get(fn, 0))
+                    return await super().generate(task, context, schema, validate)
+                finally:
+                    self.running -= 1
+
+        clamp = planned(gap_ids=["LC:clamp_percent:19"], name="test_clamp_percent_negative", purpose="below 0",
+                        args=[{"name": "value", "value": "-5"}])
+        gaps = self.gaps + [uc.GapItem(gap_id="LC:clamp_percent:19", function="clamp_percent", metric="LC", line=19)]
+        plans = {"thermostat_command": [self.good()], "clamp_percent": [clamp]}
+        seen = []
+        for parallel, delays in ((1, {}), (2, {"thermostat_command": 0.3, "clamp_percent": 0.0})):
+            b = ParallelBrain(parallel, delays, plans=plans)
+            with brain(b):
+                plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                                  iteration=2)))
+            seen.append(([(s.scenario_id, s.function, s.made_by, s.gap_ids) for s in plan.scenarios], plan.planning))
+            if parallel > 1:
+                self.assertEqual(b.peak, 2)                                          # really at the same time
+        self.assertEqual(seen[0], seen[1])
+        self.assertTrue(any(s[2].startswith("brain:qwen") for s in seen[1][0]), seen[1])
 
     def test_brain_scenarios_are_checked_before_agent2(self):
         bad_range = self.good(name="test_thermostat_command_huge", args=[
