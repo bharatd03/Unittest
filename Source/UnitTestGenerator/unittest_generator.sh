@@ -4,7 +4,8 @@
 #
 #    ./unittest_generator.sh setup             check every tool again and install what is missing
 #    ./unittest_generator.sh check             show the tools, Python packages and brains in use
-#    ./unittest_generator.sh test              all tests, results in test_results.txt
+#    ./unittest_generator.sh test              the component tests (a few minutes), results in test_results.txt
+#    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
 #    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps
 #                                              every SUT file of a pilot, one live viewer page for all
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
@@ -38,7 +39,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|pilot-c|pilot-cpp|pilot-deps|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|pilot-c|pilot-cpp|pilot-deps|benchmark|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -107,12 +108,19 @@ pilot() {                     # pilot NAME SUT [SUT ...] [--no-view]: every SUT 
 
 case "$ACTION" in
   check) "$PY" ut_pipeline.py check --config ut_config.json ;;
-  test)
+  test|test-full)
+    # TP-20: "test" the component tests, "test-full" every test in parallel; TP-21: never a real brain
     RESULTS="$HERE/test_results.txt"
-    { echo "==== Unit-test generator tests $(date) ===="; "$PY" ut_pipeline.py check --config ut_config.json; echo; } > "$RESULTS" 2>&1
-    (cd "$TESTS" && "$PY" -u -m unittest -v test_unittest_generator) >> "$RESULTS" 2>&1
-    RC=$?
-    grep -E "^(FAIL|ERROR):|^Ran [0-9]+ test|^OK|^FAILED" "$RESULTS"
+    { echo "==== Unit-test generator tests ($ACTION) $(date) ===="; "$PY" ut_pipeline.py check --config ut_config.json; echo; } > "$RESULTS" 2>&1
+    if [ "$ACTION" = test-full ]; then
+      (cd "$TESTS" && UT_TESTS=full "$PY" -u test_unittest_generator.py --parallel) >> "$RESULTS" 2>&1
+      RC=$?
+      grep -E "^(FAIL|ERROR):|^Summary:" "$RESULTS"
+    else
+      (cd "$TESTS" && UT_TESTS=quick "$PY" -u -m unittest -v test_unittest_generator) >> "$RESULTS" 2>&1
+      RC=$?
+      grep -E "^(FAIL|ERROR):|^Ran [0-9]+ test|^OK|^FAILED" "$RESULTS"
+    fi
     echo "Full results: $RESULTS"
     exit $RC ;;
   pilot-c) pilot c_pilot src/thermostat.c "$@" ;;

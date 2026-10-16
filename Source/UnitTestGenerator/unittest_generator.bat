@@ -5,7 +5,8 @@ rem
 rem    unittest_generator.bat                   menu
 rem    unittest_generator.bat setup             check every tool again and install what is missing
 rem    unittest_generator.bat check             show the tools, Python packages and brains in use
-rem    unittest_generator.bat test              all tests, results in test_results.txt
+rem    unittest_generator.bat test              the component tests (a few minutes), results in test_results.txt
+rem    unittest_generator.bat test-full         every test incl. whole pipeline runs, in parallel (release validation)
 rem    unittest_generator.bat pilot-c           full pipeline on the C pilot
 rem    unittest_generator.bat pilot-cpp         full pipeline on the C++ pilot (three SUT files)
 rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot with dependencies (three SUT files)
@@ -60,16 +61,18 @@ echo  Unit-test generator
 echo.
 echo    0  Setup - check every tool again and install what is missing
 echo    1  Check - show the tools, Python packages and brains in use
-echo    2  Run all tests - results go to test_results.txt
+echo    2  Run the component tests - a few minutes, results go to test_results.txt
 echo    3  Run the pipeline on the C pilot
 echo    4  Run the pipeline on the C++ pilot
 echo    5  Run the pipeline on the CMake pilot with dependencies
 echo    6  Run the seeded-defect benchmark
 echo    7  Run the pipeline on your own repository (link or folder)
+echo    8  Run every test, with the whole pipeline runs (test-full, slower)
 echo    Q  Quit
 echo.
-choice /c 01234567Q /n /m "Choose 0-7 or Q: "
-if errorlevel 9 goto end
+choice /c 012345678Q /n /m "Choose 0-8 or Q: "
+if errorlevel 10 goto end
+if errorlevel 9 (set "ACTION=test-full" & goto prepare)
 if errorlevel 8 goto pick_run
 if errorlevel 7 (set "ACTION=benchmark" & goto prepare)
 if errorlevel 6 (set "ACTION=pilot-deps" & goto prepare)
@@ -144,6 +147,7 @@ if /i "%ACTION%"=="setup" goto end
 
 rem ---------------------------------------------------------------- Ollama (Qwen3 8B, the fallback brain)
 if /i "%ACTION%"=="test" goto dispatch
+if /i "%ACTION%"=="test-full" goto dispatch
 if /i "%ACTION%"=="check" goto dispatch
 where ollama >nul 2>&1
 if errorlevel 1 goto dispatch
@@ -164,12 +168,13 @@ rem ---------------------------------------------------------------- actions
 :dispatch
 if /i "%ACTION%"=="check" goto check
 if /i "%ACTION%"=="test" goto run_tests
+if /i "%ACTION%"=="test-full" goto run_tests
 if /i "%ACTION%"=="pilot-c" goto pilot_c
 if /i "%ACTION%"=="pilot-cpp" goto pilot_cpp
 if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
 set "RC=2"
 goto end
 
@@ -180,19 +185,31 @@ set "RC=%errorlevel%"
 goto end
 
 :run_tests
+rem  TP-20: "test" runs the component tests; "test-full" every test, spread over parallel processes.
+rem  TP-21: no test reaches a real brain (API key, Ollama), whatever this PC has.
+set "UT_TESTS=quick"
+if /i "%ACTION%"=="test-full" set "UT_TESTS=full"
 echo.
-echo Running the tests ...
-> "%RESULTS%" echo ==== Unit-test generator tests %date% %time% ====
+if /i "%ACTION%"=="test-full" echo Running every test in parallel, including whole pipeline runs ...
+if /i not "%ACTION%"=="test-full" echo Running the component tests ...
+> "%RESULTS%" echo ==== Unit-test generator tests (%ACTION%) %date% %time% ====
 "%PY%" ut_pipeline.py check --config ut_config.json >> "%RESULTS%" 2>&1
 >> "%RESULTS%" echo.
 pushd "%TESTS%"
+if /i "%ACTION%"=="test-full" goto tests_full
 "%PY%" -u -m unittest -v test_unittest_generator >> "%RESULTS%" 2>&1
 set "RC=%errorlevel%"
+goto tests_done
+:tests_full
+"%PY%" -u test_unittest_generator.py --parallel >> "%RESULTS%" 2>&1
+set "RC=%errorlevel%"
+:tests_done
 popd
 echo.
 echo ---- summary ----
 findstr /b /c:"FAIL:" /c:"ERROR:" "%RESULTS%"
-findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
+if /i "%ACTION%"=="test-full" findstr /b /c:"Summary:" "%RESULTS%"
+if /i not "%ACTION%"=="test-full" findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
 echo Full results: %RESULTS%
 if not "%RC%"=="0" echo Some tests failed. Send test_results.txt to Claude.
 goto end

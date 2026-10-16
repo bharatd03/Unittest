@@ -277,6 +277,14 @@ def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None =
         return -126, f"{cmd[0]}: {exc}"
 
 
+# A program the pipeline just built that the operating system refuses to start (Smart App Control, App
+# Control for Business, AppLocker, a group policy) [TP-9, TP-9a]
+BLOCKED_RUN = re.compile(r"WinError (4551|4556|1260|225)\b|Application Control|blocked by (your )?(group )?policy", re.I)
+BLOCKED_HINT = ("Windows refused to run {name}, a program the pipeline has just built (an application-control "
+                "policy such as Smart App Control). Allow programs built in the tool's work folder, or have the "
+                "policy changed; nothing was worked around [TP-9, TP-9a].")
+
+
 # ============================================================================ build variants [A3-BD14]
 VARIANT_FLAGS = ("-D", "-U", "-include", "-I", "-isystem", "-iquote", "-std=")
 
@@ -1675,7 +1683,14 @@ class CompilationAgent(ba.AgentCore):
             result.reason = "the build did not link" if not env else "build tools failed"
             return result
         # Execute [A3-43..49]
-        tests, observed, crashed = self._execute(build["binary"], run_dir, chain)
+        try:
+            tests, observed, crashed = self._execute(build["binary"], run_dir, chain)
+        except ba.AgentFault as exc:                                       # TP-9a
+            result.decision, result.reason = "environment_error", exc.message
+            result.failures.append(uc.Failure(failure_id="env-blocked", kind="environment",
+                                              classification="environment_defect", route="stop",
+                                              diagnostic=exc.message))
+            return result
         result.tests, result.observed, result.run_ok = tests, observed, not crashed
         result.total = len(tests)
         result.passed = sum(t.status == "passed" for t in tests)
@@ -1944,6 +1959,8 @@ class CompilationAgent(ba.AgentCore):
         prof.mkdir(exist_ok=True)
         env = chain.env(LLVM_PROFILE_FILE=str(prof / "run-%p.profraw"))
         code, text = _run([str(binary)], run_dir, self.cfg.run_timeout, env)
+        if code == -126 and BLOCKED_RUN.search(text):                     # TP-9a: once, no retries
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", BLOCKED_HINT.format(name=binary.name))
         (run_dir / "run_output.txt").write_text(text, encoding="utf-8")
         tests, observed, summary = parse_run_output(text)
         crashed = summary is None
@@ -2531,7 +2548,8 @@ class CompilationAgent(ba.AgentCore):
         except ba.AgentFault as exc:
             return uc.FaultCheckResult(**base, decision="not_checked", changed_line_mutants=changed_count,
                                        compared=len(compared), elapsed_s=round(time.monotonic() - started, 2),
-                                       reason=f"the test program could not be built for the check: {exc.message}")
+                                       reason=exc.message if exc.code == "ENVIRONMENT_BLOCKED" else
+                                       f"the test program could not be built for the check: {exc.message}")
         chain = self.toolchain()
         base["compiler"] = f"{chain.cc if req.layout.language == 'c' else chain.cxx} {chain.version}"
         if ran is None or after is None:
@@ -2605,6 +2623,8 @@ class CompilationAgent(ba.AgentCore):
                     detected = True                                  # does not build: detected [A3-85b]
                 else:
                     code, text = _run([str(binary)], repo, self.cfg.mutant_run_timeout, env, quiet=True)
+                    if code == -126 and BLOCKED_RUN.search(text):             # TP-9a: not a detection
+                        raise ba.AgentFault("ENVIRONMENT_BLOCKED", BLOCKED_HINT.format(name=binary.name))
                     tests, _, summary = parse_run_output(text)
                     status = {t.name: t.status for t in tests}
                     detected = summary is None or any(status.get(name) != "passed" for name in wanted)

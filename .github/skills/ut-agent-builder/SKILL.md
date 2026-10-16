@@ -44,6 +44,8 @@ The agent flow is drawn in [ORCHESTRATION.md](../../../Docs/ORCHESTRATION.md).
 ## Before you finish
 
 - `Source\UnitTestGenerator\unittest_generator.bat test` (Windows) or
-  `Source/UnitTestGenerator/unittest_generator.sh test` (Linux): all tests pass.
+  `Source/UnitTestGenerator/unittest_generator.sh test` (Linux): the component tests pass; before a
+  release `test-full` (every test, in parallel; TP-16, TP-20). Mark a test that runs a whole pipeline
+  with `@full_run`, and never let a test reach a real brain (TP-21).
 - Pilots: `pilot-c`, `pilot-cpp`, `pilot-deps`; benchmark: `benchmark` (no false fix, ORC-16).
 - For delivery changes: a run with a repository link (the RepositoryTests use a local bare repository).

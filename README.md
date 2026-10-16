@@ -66,7 +66,8 @@ Run without a command, the `.bat` shows a menu.
 | Command | What it does |
 | --- | --- |
 | `check` | tools, Python packages and available brains |
-| `test` | all tests of the generator; results in `test_results.txt` |
+| `test` | the component tests, a few minutes; results in `test_results.txt` |
+| `test-full` | every test, including whole pipeline runs, in parallel processes (release validation) |
 | `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
 | `run REPO SUT [--branch NAME]` | a git repository link or a folder, and the source file to test |
@@ -82,6 +83,10 @@ The requirements in [`Docs/unittest_generator_requirments.txt`](Docs/unittest_ge
 are the contract: change them first, then the code, then run the tests. The rules are in
 [`.github/skills/ut-agent-builder/SKILL.md`](.github/skills/ut-agent-builder/SKILL.md); the agent
 flow is drawn in [`Docs/ORCHESTRATION.md`](Docs/ORCHESTRATION.md).
+
+The tests never use a real brain, even when an API key is set or Ollama is running, so they cost no tokens and give the same result on every computer.
+
+Windows: the pipeline compiles and runs test programs. Smart App Control, or a company's application-control policy, must allow programs built in the tool's work folder; otherwise the run stops with a message that names the blocked program.
 
 Not in the repository (see `.gitignore`): the installed tools, `.venv`, run results, the
 knowledge-base database, test results, BaseAgent's local `demo` state with its client token, and

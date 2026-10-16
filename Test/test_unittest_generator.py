@@ -59,6 +59,32 @@ import ut_pipeline as up  # noqa: E402
 import ut_setup as us  # noqa: E402
 
 PILOTS = HERE / "pilots"
+
+# TP-21: no test reaches a real brain, whatever this computer offers (an API key, Ollama with Qwen). The key
+# is removed from this process and the agents it starts; Qwen is pointed at an address where nothing listens.
+# A test that needs a brain patches in the scripted stand-in (brain(...)).
+NO_BRAIN_URL = "http://127.0.0.1:9"
+os.environ.pop("ANTHROPIC_API_KEY", None)
+_REAL_BUILD_ROUTER = ba.build_router
+
+
+def _hermetic_router(settings, *, injected=None):
+    qwen = settings.qwen.model_copy(update={"base_url": NO_BRAIN_URL})
+    return _REAL_BUILD_ROUTER(settings.model_copy(update={"qwen": qwen}), injected=injected)
+
+
+ba.build_router = _hermetic_router
+
+# TP-20: "test" (UT_TESTS=quick) skips the tests that run a whole pipeline; "test-full" runs every test.
+QUICK = os.environ.get("UT_TESTS", "full") == "quick"
+
+
+def full_run(item):
+    """A whole pipeline run (minutes on Windows): only in test-full [TP-20]."""
+    item.ut_full_run = True
+    return unittest.skipIf(QUICK, "a whole pipeline run - included in test-full [TP-20]")(item)
+
+
 try:
     import fastmcp  # noqa: F401
     HAVE_FASTMCP = True
@@ -668,6 +694,22 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual(res.decision, "not_checked")
         self.assertIn("limit", res.reason)
 
+    def test_a_blocked_test_program_is_reported_once(self):                         # TP-9a
+        real, runs = a3._run, []
+
+        def blocked(cmd, cwd, timeout, env=None, quiet=False):
+            if Path(str(cmd[0])).stem == "ut_runner":
+                runs.append(cmd)
+                return -126, f"{cmd[0]}: [WinError 4551] An Application Control policy has blocked this file"
+            return real(cmd, cwd, timeout, env, quiet)
+        with mock.patch.object(a3, "_run", blocked):
+            r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(
+                self.CLAMP_TESTS)))
+        self.assertEqual(r.decision, "environment_error")
+        self.assertIn("refused to run", r.reason)
+        self.assertEqual([f.classification for f in r.failures], ["environment_defect"])
+        self.assertEqual(len(runs), 1)                                   # no test-by-test reruns
+
     def test_mutant_sites_are_the_mutants_of_the_oracle_check(self):                # COV-15: same operators
         source = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
         for fn in self.layout.functions:
@@ -1060,6 +1102,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertEqual(scale.metrics.LC.percent, 100.0)
 
     @unittest.skipUnless(_tools().fuzzer if not TOOLCHAIN_SKIP else False, "libFuzzer not available")
+    @full_run
     def test_fuzzer_finds_inputs_for_gaps(self):
         """[A3-FZ1..A3-FZ4] coverage-guided search returns readable inputs that reach a gap."""
         repo = copy_pilot("c_deps_pilot", self.d)
@@ -1170,7 +1213,8 @@ def pipeline_config(d: Path, transport="inprocess", viewer: dict | None = None, 
     config["compilation"]["work_dir"] = str(d / "ut_work")
     config["compilation"]["tools_manifest"] = str(uc.DEFAULT_MANIFEST)
     config["kb"]["db_path"] = str(d / "kb.sqlite3")
-    config["brain"] = {"engine": {"mode": "qwen"}, "qwen": {"startup_timeout": 2}}
+    config["brain"] = {"engine": {"mode": "qwen"}, "qwen": {"startup_timeout": 2, "base_url": NO_BRAIN_URL},
+                       "anthropic": {"enabled": False}}                                     # TP-21
     path = d / "ut_config.json"
     path.write_text(json.dumps(config, indent=1))
     return path
@@ -1178,6 +1222,7 @@ def pipeline_config(d: Path, transport="inprocess", viewer: dict | None = None, 
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 @unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH, "fastmcp and langgraph are required")
+@full_run
 class PipelineTests(unittest.TestCase):
     """The whole pipeline over MCP (in-process FastMCP transport), scripted brain."""
     def setUp(self):
@@ -1305,24 +1350,33 @@ class PipelineTests(unittest.TestCase):
         delivered = repo / "tests" / "ut_sut_access.c"
         self.assertTrue(delivered.is_file())                                                # A2-21k
 
-    def test_new_pilots_reach_every_target_without_a_brain(self):
+    def new_pilot_reaches_every_target_without_a_brain(self, pilot: str, sut: str):
         """The ASIL D pilots: stub sequences, struct fields, SUT state, classes with a clock, std::array - every
-        metric at 100 % by measurement, with rules and coverage-guided search only (COV-1, COV-6)."""
-        cases = [("c_deps_pilot", "src/brake_ctrl.c"), ("c_deps_pilot", "src/steer_assist.c"),
-                 ("cpp_pilot", "src/steering_monitor.cpp"), ("cpp_pilot", "src/torque_map.cpp")]
-        if not (have_tool("cmake") and have_tool("ninja")):
-            cases = cases[2:]
-        for pilot, sut in cases:
-            with self.subTest(sut=sut):
-                d = self.d / Path(sut).stem
-                d.mkdir()
-                repo = copy_pilot(pilot, d)
-                with brain(DownBrain()):
-                    result = run(up.Orchestrator(pipeline_config(d, fuzz_seconds=10)).run(
-                        uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
-                self.assertEqual(result.final_state, "verified_measured", up.report(result))
-                self.assertTrue(all(getattr(result.metrics, m).percent == 100.0 for m in uc.METRICS))
-                self.assertEqual(result.failed, 0)
+        metric at 100 % by measurement, with rules and coverage-guided search only (COV-1, COV-6). One test per
+        file, so test-full runs them in parallel (TP-20)."""
+        if pilot == "c_deps_pilot" and not (have_tool("cmake") and have_tool("ninja")):
+            self.skipTest("cmake and ninja are not in the tool manifest")
+        d = self.d / Path(sut).stem
+        d.mkdir()
+        repo = copy_pilot(pilot, d)
+        with brain(DownBrain()):
+            result = run(up.Orchestrator(pipeline_config(d, fuzz_seconds=10)).run(
+                uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
+        self.assertEqual(result.final_state, "verified_measured", up.report(result))
+        self.assertTrue(all(getattr(result.metrics, m).percent == 100.0 for m in uc.METRICS))
+        self.assertEqual(result.failed, 0)
+
+    def test_new_pilot_brake_ctrl(self):
+        self.new_pilot_reaches_every_target_without_a_brain("c_deps_pilot", "src/brake_ctrl.c")
+
+    def test_new_pilot_steer_assist(self):
+        self.new_pilot_reaches_every_target_without_a_brain("c_deps_pilot", "src/steer_assist.c")
+
+    def test_new_pilot_steering_monitor(self):
+        self.new_pilot_reaches_every_target_without_a_brain("cpp_pilot", "src/steering_monitor.cpp")
+
+    def test_new_pilot_torque_map(self):
+        self.new_pilot_reaches_every_target_without_a_brain("cpp_pilot", "src/torque_map.cpp")
 
     def test_cpp_pilot_runs(self):
         repo = copy_pilot("cpp_pilot", self.d)
@@ -1355,6 +1409,7 @@ class PipelineTests(unittest.TestCase):
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 @unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH, "fastmcp and langgraph are required")
+@full_run
 class StdioPipelineTests(unittest.TestCase):
     """The agents as real subprocesses, MCP over stdio, exactly as on your laptop [ARCH-7].
     No LLM: deterministic generation only."""
@@ -1759,6 +1814,7 @@ def git_cmd(cwd: Path, *args: str) -> str:
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 @unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH and have_tool("git"), "fastmcp, langgraph and git are required")
+@full_run
 class RepositoryTests(unittest.TestCase):
     """ORC-17 .. ORC-31 against a local bare repository standing in for the git server."""
     def setUp(self):
@@ -2144,6 +2200,7 @@ class CoveragePolicyTests(unittest.TestCase):
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 @unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH, "fastmcp and langgraph are required")
+@full_run
 class HandOverTests(unittest.TestCase):
     """COV-9 .. COV-13: a stop below target hands the evidence, checked suggestions and the action needed to the
     developer. The SUT here has code no test can reach; the pilots have none."""
@@ -2225,6 +2282,7 @@ class HandOverTests(unittest.TestCase):
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 @unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH, "fastmcp and langgraph are required")
+@full_run
 class ViewerPipelineTests(unittest.TestCase):
     """VIEW-1 .. VIEW-7: every run writes its events; the live page serves them; the replay works offline."""
     def test_run_writes_events_and_replay(self):
@@ -2344,5 +2402,68 @@ class RequirementsTests(unittest.TestCase):
             self.assertTrue(agent.contract_catalog()["tools"])
 
 
+# ============================================================================ the parallel runner [TP-20]
+def _test_ids(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _test_ids(item)
+        else:
+            yield item
+
+
+def parallel_main(workers: int) -> int:
+    """test-full: every test, spread over parallel processes. A test that runs a whole pipeline gets a process
+    of its own and starts first; the other tests run class by class. Prints one summary at the end, in the
+    words unittest uses, so the entry files can show it."""
+    import concurrent.futures
+    import time as _time
+    module = sys.modules[__name__]
+    tests = list(_test_ids(unittest.defaultTestLoader.loadTestsFromModule(module)))
+    jobs: list[list[str]] = []
+    classes: dict[str, list[str]] = {}
+    for test in tests:
+        cls, method = type(test), getattr(type(test), test._testMethodName, None)
+        name = f"test_unittest_generator.{cls.__name__}.{test._testMethodName}"
+        if getattr(cls, "ut_full_run", False) or getattr(method, "ut_full_run", False):
+            jobs.append([name])
+        else:
+            classes.setdefault(cls.__name__, []).append(name)
+    jobs += list(classes.values())
+    env = {**os.environ, "UT_TESTS": "full", "PYTHONDONTWRITEBYTECODE": "1"}
+    started = _time.time()
+
+    def run_job(names: list[str]) -> tuple[list[str], str, int]:
+        proc = subprocess.run([sys.executable, "-u", "-m", "unittest", "-v", *names], cwd=str(HERE), env=env,
+                              capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL)
+        return names, proc.stdout + proc.stderr, proc.returncode
+
+    totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    failed_jobs = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for names, output, code in pool.map(run_job, jobs):
+            print(output, flush=True)
+            m = re.search(r"^Ran (\d+) tests?", output, re.M)
+            totals["tests"] += int(m.group(1)) if m else 0
+            for key in ("failures", "errors", "skipped"):
+                totals[key] += sum(int(n) for n in re.findall(rf"{key}=(\d+)", output.splitlines()[-1] if output.strip() else ""))
+            if code != 0:
+                failed_jobs += 1
+                if not m:                                   # the process itself failed
+                    totals["errors"] += len(names)
+                    print("ERROR: " + ", ".join(names) + " - the test process ended without a result", flush=True)
+    print("=" * 70)
+    print(f"Summary: Ran {totals['tests']} tests in {_time.time() - started:.1f}s "
+          f"(test-full, {workers} parallel processes)")
+    extra = f"skipped={totals['skipped']}" if totals["skipped"] else ""
+    if failed_jobs or totals["failures"] or totals["errors"]:
+        parts = [f"failures={totals['failures']}", f"errors={totals['errors']}"] + ([extra] if extra else [])
+        print(f"Summary: FAILED ({', '.join(parts)})")
+        return 1
+    print("Summary: OK" + (f" ({extra})" if extra else ""))
+    return 0
+
+
 if __name__ == "__main__":
+    if "--parallel" in sys.argv:
+        sys.exit(parallel_main(int(os.environ.get("UT_TEST_WORKERS") or max(1, (os.cpu_count() or 2) - 1))))
     unittest.main()
