@@ -40,6 +40,8 @@ rem  to a file.
 rem ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
+rem  The exit code is kept in UT_EXIT, never in RC: CMake reads a variable named RC as the Windows
+rem  resource compiler, and every program started from here inherits it [A3-BD15].
 set "PYTHONUTF8=1"
 set "PYTHONDONTWRITEBYTECODE=1"
 if not defined BASEAGENT_HOME set "BASEAGENT_HOME=%~dp0..\BaseAgent"
@@ -117,12 +119,12 @@ py -3.12 -m venv "%BASEAGENT_HOME%\.venv"
 if exist "%PY%" goto have_python
 :no_python
 echo Python 3.12 was not found. Install it from python.org (with the "py" launcher) and run this file again.
-set "RC=1"
+set "UT_EXIT=1"
 goto end
 :have_python
 if exist "%BASEAGENT_HOME%\baseagent.py" goto have_baseagent
 echo baseagent.py was not found in %BASEAGENT_HOME%. Set BASEAGENT_HOME to the BaseAgent folder.
-set "RC=1"
+set "UT_EXIT=1"
 goto end
 :have_baseagent
 
@@ -135,12 +137,12 @@ if /i "%ACTION%"=="run" if defined REPO set "SETUP_ARGS=ensure --repo "%REPO%""
 if /i "%ACTION%"=="run" if defined REPO if defined BRANCH set "SETUP_ARGS=ensure --repo "%REPO%" --branch "%BRANCH%""
 if /i "%ACTION%"=="pilot-deps" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
 "%PY%" ut_setup.py %SETUP_ARGS%
-set "RC=%errorlevel%"
-if "%RC%"=="0" goto tools_ready
+set "UT_EXIT=%errorlevel%"
+if "%UT_EXIT%"=="0" goto tools_ready
 echo.
-if "%RC%"=="2" echo Windows blocked a tool. Nothing was worked around - see the options above.
-if "%RC%"=="3" echo An action by you is needed - see above.
-if not "%RC%"=="2" if not "%RC%"=="3" echo Setup did not complete. The pipeline does not start without its tools.
+if "%UT_EXIT%"=="2" echo Windows blocked a tool. Nothing was worked around - see the options above.
+if "%UT_EXIT%"=="3" echo An action by you is needed - see above.
+if not "%UT_EXIT%"=="2" if not "%UT_EXIT%"=="3" echo Setup did not complete. The pipeline does not start without its tools.
 goto end
 :tools_ready
 if /i "%ACTION%"=="setup" goto end
@@ -175,13 +177,13 @@ if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
 echo Unknown option "%ACTION%". Use: setup, check, test, test-full, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
-set "RC=2"
+set "UT_EXIT=2"
 goto end
 
 :check
 echo.
 "%PY%" ut_pipeline.py check --config ut_config.json
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto end
 
 :run_tests
@@ -198,11 +200,11 @@ if /i not "%ACTION%"=="test-full" echo Running the component tests ...
 pushd "%TESTS%"
 if /i "%ACTION%"=="test-full" goto tests_full
 "%PY%" -u -m unittest -v test_unittest_generator >> "%RESULTS%" 2>&1
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto tests_done
 :tests_full
 "%PY%" -u test_unittest_generator.py --parallel >> "%RESULTS%" 2>&1
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 :tests_done
 popd
 echo.
@@ -211,14 +213,14 @@ findstr /b /c:"FAIL:" /c:"ERROR:" "%RESULTS%"
 if /i "%ACTION%"=="test-full" findstr /b /c:"Summary:" "%RESULTS%"
 if /i not "%ACTION%"=="test-full" findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
 echo Full results: %RESULTS%
-if not "%RC%"=="0" echo Some tests failed. Send test_results.txt to Claude.
+if not "%UT_EXIT%"=="0" echo Some tests failed. Send test_results.txt to Claude.
 goto end
 
 :benchmark
 echo.
 echo Running the seeded-defect benchmark - one full pipeline run per case ...
 "%PY%" ut_pipeline.py benchmark --config ut_config.json --knowledge %KNOWLEDGE%
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto end
 
 :pilot_c
@@ -240,13 +242,13 @@ xcopy "%PILOTS%\%PILOT%" "%REPO%\" /E /I /Q /Y >nul
 echo.
 echo Running the pipeline on %REPO% - this can take several minutes ...
 "%PY%" ut_pipeline.py run --repo "%REPO%" %SUTS% --config ut_config.json %EXTRA%
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto end
 
 :view_run
-if not defined VIEWDIR (echo Usage: unittest_generator.bat view RUN_FOLDER & set "RC=2" & goto end)
+if not defined VIEWDIR (echo Usage: unittest_generator.bat view RUN_FOLDER & set "UT_EXIT=2" & goto end)
 "%PY%" ut_pipeline.py view "%VIEWDIR%"
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto end
 
 :run_repo
@@ -258,15 +260,15 @@ echo Running the pipeline on %REPO% for %SUT% ...
 set "BRANCH_ARG="
 if defined BRANCH set BRANCH_ARG=--branch "%BRANCH%"
 "%PY%" ut_pipeline.py run --repo "%REPO%" --sut "%SUT%" --config ut_config.json %BRANCH_ARG% %EXTRA%
-set "RC=%errorlevel%"
+set "UT_EXIT=%errorlevel%"
 goto end
 :run_usage
 echo Usage: unittest_generator.bat run REPO SUT [--branch NAME] [--sut FILE] [--build-command "..."] [--compile-commands FILE]
 echo        REPO is a git repository link or a folder.
-set "RC=2"
+set "UT_EXIT=2"
 goto end
 
 :end
-if not defined RC set "RC=0"
+if not defined UT_EXIT set "UT_EXIT=0"
 if defined INTERACTIVE pause
-endlocal & exit /b %RC%
+endlocal & exit /b %UT_EXIT%

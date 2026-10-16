@@ -1036,8 +1036,10 @@ class CaptureAndDependencyTests(unittest.TestCase):
     @unittest.skipUnless(have_tool("cmake") and have_tool("ninja"), "cmake and ninja are not in the tool manifest")
     def test_cmake_build_is_captured(self):
         repo = copy_pilot("c_deps_pilot", self.d)
-        build, layout = self.analyze(repo, "src/ctrl.c")
+        with mock.patch.dict(os.environ, {"RC": "0"}):          # what the entry file once left behind [A3-BD15]
+            build, layout = self.analyze(repo, "src/ctrl.c")
         self.assertEqual(build.source, "cmake", build.notes)                      # A3-BD2
+        self.assertIn("SUT object built", build.outcome)                          # the tested variant's [A3-BD15]
         self.assertFalse(build.estimated)
         self.assertEqual(set(build.sut_flags), {"-DBOARD_REV=2", "-DMINI_LIMIT=40", "-I{repo}/include"})
         self.assertEqual({e.file for e in build.entries}, {"src/ctrl.c", "src/brake_ctrl.c", "src/steer_assist.c",
@@ -1401,15 +1403,14 @@ class PipelineTests(unittest.TestCase):
 
         async def slow_after_targets(orch, s, plan, **kw):
             if s.targets_met_at is not None:
-                slowed.append(plan.plan_id)
+                slowed.append(time.monotonic())
                 await asyncio.sleep(30)                       # a CPU brain writing tests
             return await original(orch, s, plan, **kw)
 
-        started = time.monotonic()
         with brain(UTBrain(tests={})), mock.patch.object(up.Orchestrator, "_generate", slow_after_targets):
             result = self.run_pipeline(repo, "src/thermostat.c", after_target_seconds=1)
         self.assertTrue(slowed, "the run never reached the documented-behaviour round")
-        self.assertLess(time.monotonic() - started, 25)
+        self.assertLess(time.monotonic() - slowed[0], 20)              # not the 30 s of the slow brain
         self.assertEqual(result.final_state, "verified_measured", result.reason)
         self.assertIn("ORC-32", result.reason)
         self.assertTrue(any("time limit" in i and "ORC-32" in i for i in result.open_items), result.open_items)

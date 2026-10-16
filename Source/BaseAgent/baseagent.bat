@@ -73,7 +73,7 @@ if /i "%ACTION%"=="start" goto prepare
 if /i "%ACTION%"=="all"   goto prepare
 if /i "%ACTION%"=="check" goto prepare
 echo Unknown option "%ACTION%". Use: test, start, all or check.
-set "RC=2"
+set "BA_EXIT=2"
 goto end
 
 rem ---------------------------------------------------------------- Python
@@ -106,7 +106,7 @@ if exist "%PY%" goto have_python
 :no_python
 echo Python 3.11 or newer was not found. Install it from https://www.python.org/downloads/windows/
 echo and tick "Add python.exe to PATH", then run this file again.
-set "RC=1"
+set "BA_EXIT=1"
 goto end
 
 :have_python
@@ -120,7 +120,7 @@ echo.
 echo A required package cannot be imported - see the message above.
 echo If it says a DLL or file was blocked, Windows App Control stopped that package;
 echo send the message to Claude rather than turning App Control off.
-set "RC=1"
+set "BA_EXIT=1"
 goto end
 :python_ok
 echo Python : %PY%
@@ -176,14 +176,14 @@ ollama --version >> "%RESULTS%" 2>&1
 rem Repository layout: the tests are in the Test folder at the root, two levels up.
 pushd "%~dp0..\..\Test"
 "%PY%" -u -m unittest -v %FILTER% test_baseagent >> "%RESULTS%" 2>&1
-set "RC=%errorlevel%"
+set "BA_EXIT=%errorlevel%"
 popd
 echo.
 echo ---- summary ----
 findstr /b /c:"FAIL:" /c:"ERROR:" "%RESULTS%"
 findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
 echo Full results: %RESULTS%
-if not "%RC%"=="0" echo Some tests failed. Send test_results.txt to Claude.
+if not "%BA_EXIT%"=="0" echo Some tests failed. Send test_results.txt to Claude.
 if /i not "%ACTION%"=="all" goto end
 
 rem ---------------------------------------------------------------- server
@@ -200,11 +200,11 @@ echo BaseAgent: http://127.0.0.1:8765/mcp - token in demo\client.token - brain %
 echo Keep this window open while agents use BaseAgent. Stop with Ctrl+C.
 echo.
 "%PY%" baseagent.py serve --config demo\config.json --brain %BASEAGENT_BRAIN% --qwen-model %MODEL%
-set "RC=%errorlevel%"
+set "BA_EXIT=%errorlevel%"
 echo BaseAgent stopped.
 goto end
 :start_failed
-set "RC=1"
+set "BA_EXIT=1"
 echo BaseAgent could not be prepared - see the message above.
 goto end
 
@@ -216,10 +216,10 @@ if errorlevel 1 goto start_failed
 :check_demo
 echo Checking which brains are available and asking each one question - the first Qwen answer can take a few minutes ...
 "%PY%" baseagent.py probe --config demo\config.json --ask --qwen-model %MODEL%
-set "RC=%errorlevel%"
+set "BA_EXIT=%errorlevel%"
 goto end
 
 :end
-if not defined RC set "RC=0"
+if not defined BA_EXIT set "BA_EXIT=0"
 if defined INTERACTIVE pause
-endlocal & exit /b %RC%
+endlocal & exit /b %BA_EXIT%

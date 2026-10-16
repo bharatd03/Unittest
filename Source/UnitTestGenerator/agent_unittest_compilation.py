@@ -27,6 +27,7 @@ Run as an MCP server:  python agent_unittest_compilation.py serve [--config ut_c
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import itertools
 import json
@@ -896,7 +897,7 @@ class BuildCapture:
             entries.append(uc.CompileEntry(file=rel, flags=flags, dropped=dropped, language=language,
                                            output=output.replace("\\", "/")))
             if item.get("output"):
-                outputs[rel] = str(item["output"])
+                outputs.setdefault(rel, str(item["output"]))      # the first entry: the tested variant [A3-BD15]
         return entries, outputs
 
     @staticmethod
@@ -966,6 +967,9 @@ class BuildCapture:
         target = outputs.get(layout.sut_file)
         if not target:
             return "configured"
+        with contextlib.suppress(ValueError):          # ninja names its targets relative to the build folder [A3-BD15]
+            if Path(target).is_absolute():
+                target = Path(target).resolve().relative_to(build.resolve()).as_posix()
         code, out = self._exec([*ninja, "-C", str(build), "-k", "0", target], build, cap)
         return "configured; SUT object built" if code == 0 else \
             "configured; building the SUT object failed (generated files may be missing): " + out.strip()[-300:]
@@ -977,12 +981,25 @@ class BuildCapture:
         cmd = [*cmake, "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                "-DCMAKE_BUILD_TYPE=Debug", f"-DCMAKE_C_COMPILER={self.chain.cc}",
                f"-DCMAKE_CXX_COMPILER={self.chain.cxx}", f"-DCMAKE_MAKE_PROGRAM={ninja[0]}"]
+        rc = self._resource_compiler()
+        if rc:                                   # not the RC variable of the environment [A3-BD15]
+            cmd.append(f"-DCMAKE_RC_COMPILER={rc}")
         code, out = self._exec(cmd, repo, cap)
         db = build / "compile_commands.json"
         if not db.is_file():
             raise CaptureFailed("CMake configure failed: " + out.strip()[-400:])
         entries, outputs = self._entries(json.loads(db.read_text(encoding="utf-8")), repo, [])
         return entries, " ".join(cmd), self._build_sut_object(ninja, build, outputs, cap, layout)
+
+    def _resource_compiler(self) -> str:
+        """Windows: the toolchain's own resource compiler, next to its C compiler [A3-BD15]."""
+        if os.name != "nt":
+            return ""
+        folder = Path(self.chain.cc).parent
+        for name in ("llvm-rc.exe", "llvm-windres.exe", "windres.exe"):
+            if (folder / name).is_file():
+                return str(folder / name)
+        return ""
 
     def _meson(self, repo: Path, component: Path, cap: Path, layout: uc.LayoutProfile):
         meson, ninja = self._tool("meson"), self._tool("ninja")
