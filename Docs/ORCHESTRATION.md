@@ -27,7 +27,7 @@ deterministically and decide; the tools (compiler, coverage, git) act. Where the
 | Agent3 | missing flags of an estimated build [A3-BD11] | allowed flags, cited text exists, kept only if the SUT's errors drop [A3-BD12] |
 | Agent4 | up to 3 candidate fixes [A4-23g] | fragment checks, Agent3 reverifies each, publication rules; smallest one wins |
 | Agent4 | a second opinion from another brain [A4-23h] | can only block |
-| Agent4 | after a stop below target: source changes that let tests reach the open items, from the requirements [COV-12] | fragment and quotes word for word; Agent3 measures each on a trial copy; shown only when it reaches more and lowers nothing; never applied [COV-13] |
+| Agent4 | after a stop below target: source changes that let tests reach the open items, from the requirements [COV-12] | fragment and quotes word for word; Agent3 measures each on a trial copy; shown only when it reaches more and lowers nothing, and the tests still detect every compared mutant they detected before (Agent3 fault_check, no brain); never applied [COV-13, COV-14 .. COV-19] |
 
 ## 0. Tools first
 
@@ -335,7 +335,7 @@ cannot be lowered and nothing is excluded: only measured coverage counts [COV-1,
 flowchart LR
     item["open item"] --> s1["brain scenarios<br/>(A1-PL1)"] --> s2["other values,<br/>stub return sequences"] --> s3["coverage-guided<br/>search"] --> s4["the next brain<br/>in the brain order"] --> s5["deterministic analysis:<br/>a proof is a diagnosis,<br/>never an exclusion"]
     s5 --> stop{"iteration limit<br/>or stagnation"}
-    stop --> ev["evidence per item<br/>(COV-10)"] --> sug["Agent4 suggestions,<br/>hybrid reasoning over the<br/>facts and requirements"] --> trial["Agent3: trial copy<br/>builds, passes, reaches more"] --> act["action needed<br/>report, PR, viewer (COV-11)"]
+    stop --> ev["evidence per item<br/>(COV-10)"] --> sug["Agent4 suggestions,<br/>hybrid reasoning over the<br/>facts and requirements"] --> trial["Agent3: trial copy<br/>builds, passes, reaches more"] --> faults["Agent3 fault_check:<br/>mutants on unchanged lines<br/>still detected (COV-14 .. COV-19)"] --> act["action needed<br/>report, PR, viewer (COV-11)"]
 ```
 
 The run does not wait: a later run with requirement documents, or on a new commit after the developer changed the
@@ -376,7 +376,7 @@ flowchart LR
     outdir --> r4["source_fixes/<br/>patch files"]
     outdir --> r5["logs/<br/>one per agent"]
     outdir --> r6["events.jsonl and viewer.html<br/>(VIEW-4)"]
-    outdir --> r7["coverage_suggestions/<br/>checked patches, never applied"]
+    outdir --> r7["coverage_suggestions/<br/>checked patches, never applied,<br/>with their fault-check records"]
     run --> repo["your repository"]
     repo --> fix{"verified<br/>source fix?"}
     fix -- no --> t1["tests, stubs and harness<br/>in the test folders"]

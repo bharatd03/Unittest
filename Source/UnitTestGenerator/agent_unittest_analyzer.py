@@ -898,6 +898,38 @@ def _number(text: str, constants: dict[str, int]) -> int | None:
     return None
 
 
+def preprocessor_macros(tools: uc.Tools, repo: Path, rel_file: str, flags: list[str],
+                        language: str) -> dict[str, int] | None:
+    """A1-37a: the integer macros the preprocessor defines for the SUT file with one variant's flags
+    (clang -dM -E). Analysis only: nothing is compiled, linked or run (A1-37d). None: it did not run."""
+    cpp = language == "cpp"
+    cmd = [tools.cxx if cpp else tools.cc, "-dM", "-E", "-w", "-x", "c++" if cpp else "c",
+           *(tools.cxx_flags if cpp else []), *uc.expand_flags(flags, repo), str(repo / rel_file)]
+    try:
+        proc = subprocess.run(cmd, cwd=str(repo), capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
+                              env={**os.environ, **tools.env()})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    values: dict[str, int] = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        m = re.match(r"#define\s+([A-Za-z_]\w*)\s+(.+?)\s*$", line)
+        if m:
+            value = _number(m.group(2), {})
+            if value is not None:
+                values[m.group(1)] = value
+    return values
+
+
+def variant_dependent(variants: list[tuple[uc.BuildVariant, dict[str, int]]]) -> set[str]:
+    """A1-37b: the macros whose value differs between the build variants (or that only some define)."""
+    if len(variants) < 2:
+        return set()
+    names = set().union(*(values for _, values in variants))
+    return {n for n in names if len({values.get(n) for _, values in variants}) > 1}
+
+
 def _ivs(op: str, c: int) -> list[tuple[float, float]]:
     return {"==": [(c, c)], "!=": [(-INF, c - 1), (c + 1, INF)], "<": [(-INF, c - 1)], "<=": [(-INF, c)],
             ">": [(c + 1, INF)], ">=": [(c, INF)]}[op]
@@ -1447,6 +1479,7 @@ class AnalyzerAgent(ba.AgentCore):
                  router: ba.BrainRouter | None = None):
         self.cfg = config or AnalyzerConfig()
         self._link_cache: dict[str, list[uc.RequirementLink]] = {}
+        self._variant_cache: dict[str, list[tuple[uc.BuildVariant, dict[str, int]]]] = {}   # A1-37a, A1-37e
         super().__init__(settings, router=router)
 
     def tools(self) -> list[ba.ContractTool]:
@@ -2868,8 +2901,11 @@ class AnalyzerAgent(ba.AgentCore):
             gaps = self._estimated_gaps(layout, sut_text)
         lines = sut_text.splitlines()
         constants = self._constants(layout) if measured else {}
+        variants = self._variant_macros(layout) if measured else []                  # A1-37a
+        differing = variant_dependent(variants)
         functions = {f.name: f for f in layout.functions}
         unreachable: list[tuple[int, int, str]] = []
+        block_variants: dict[tuple[int, int, int], list[uc.VariantProof]] = {}
         for g in gaps:
             expr = decision_text(lines[g.line - 1], g.column) if 0 < g.line <= len(lines) else ""
             if g.metric in ("MCDC", "DC") and expr:
@@ -2890,9 +2926,14 @@ class AnalyzerAgent(ba.AgentCore):
             # conditions on the path to it [A1-37].
             path = enclosing_conditions(sut_text, fn, g.line)
             before = "\n".join(lines[fn.line_start - 1: g.line - 1])
+            use = constants
+            used = differing & set(re.findall(r"[A-Za-z_]\w*", " ".join([expr, *path])))
+            if used:                    # A1-37b: the item depends on a macro that differs between variants
+                g.variant_proofs, use = self._variant_proofs(g, expr, fn, constants, variants, differing, used,
+                                                             path, before, lines)
             proof = ""
             if g.metric == "MCDC":
-                proof = prove_infeasible(expr, "MCDC", g.condition_index, "", fn, constants, path, before)
+                proof = prove_infeasible(expr, "MCDC", g.condition_index, "", fn, use, path, before)
                 if proof:
                     g.detail += f" | infeasible_condition_combination: {proof} [A3-121a]"
             elif g.metric in ("DC", "BC"):
@@ -2901,7 +2942,7 @@ class AnalyzerAgent(ba.AgentCore):
                 index = self._leaf_at(lines[g.line - 1], expr, g.column) if g.metric == "BC" else None
                 if g.metric == "BC" and index is None:
                     continue
-                proofs = [prove_infeasible(expr, g.metric, index, o, fn, constants, path, before) for o in missing]
+                proofs = [prove_infeasible(expr, g.metric, index, o, fn, use, path, before) for o in missing]
                 if missing and all(proofs):
                     g.detail += f" | infeasible_outcome: {'; '.join(proofs)} [A3-121a]"
                     if g.metric == "DC" or len(split_conditions(expr)) == 1:
@@ -2909,14 +2950,67 @@ class AnalyzerAgent(ba.AgentCore):
                             block = block_lines(lines, g.line, o)
                             if block:
                                 unreachable.append((*block, f"line {g.line}: {proofs[0]}"))
+                                if g.variant_proofs:                          # A1-37c: the lines inherit them
+                                    block_variants[tuple(block)] = g.variant_proofs
         for g in gaps:
             if g.metric in ("LC", "SC") and "unreachable_code" not in g.detail:
-                why = next((w for a, b, col, w in unreachable if a <= g.line <= b and
+                hit = next(((a, b, col, w) for a, b, col, w in unreachable if a <= g.line <= b and
                             (g.line != a or col == 0 or g.column >= col) and
-                            (g.metric == "SC" or a != b or col == 0)), "")
+                            (g.metric == "SC" or a != b or col == 0)), None)
+                why = hit[3] if hit else ""
                 if why:
                     g.detail += f" | unreachable_code: the branch is never taken ({why}) [A3-116, A3-121a]"
+                    g.variant_proofs = list(block_variants.get(hit[:3], g.variant_proofs))
         return gaps
+
+    def _variant_macros(self, layout: uc.LayoutProfile) -> list[tuple[uc.BuildVariant, dict[str, int]]]:
+        """A1-37a, A1-37e: the macro values of every build variant, computed again whenever the build
+        description or the SUT changes. Empty for a build with one variant, so nothing changes there."""
+        build = layout.build
+        if build is None or len(build.variants) < 2:
+            return []
+        key = layout.sut_sha256 + build.model_dump_json(include={"variants"})
+        if key not in self._variant_cache:
+            try:
+                tools = uc.Tools.load(self.cfg.tools_manifest or None)
+            except ba.AgentFault:
+                return []
+            repo = Path(layout.repo_root).resolve()
+            found = [(v, preprocessor_macros(tools, repo, layout.sut_file, v.flags, layout.language))
+                     for v in build.variants]
+            self._variant_cache[key] = [] if any(values is None for _, values in found) else found
+        return self._variant_cache[key]
+
+    def _variant_proofs(self, g: uc.GapItem, expr: str, fn: uc.FunctionInfo, constants: dict[str, int],
+                        variants: list[tuple[uc.BuildVariant, dict[str, int]]], differing: set[str], used: set[str],
+                        path: list[str], before: str, lines: list[str]
+                        ) -> tuple[list[uc.VariantProof], dict[str, int]]:
+        """A1-37b: the proof of A1-37 for every variant, with that variant's macro values. Returns the
+        results and the constants of the tested variant, which alone decides (A1-37c)."""
+        results, tested = [], constants
+        for variant, values in variants:
+            own = {k: v for k, v in constants.items() if k not in differing}
+            own.update({k: values[k] for k in differing if k in values})
+            results.append(uc.VariantProof(variant=variant.name, tested=variant.tested, proof=self._proof_of(
+                g, expr, fn, own, path, before, lines), macros={k: values[k] for k in sorted(used) if k in values}))
+            if variant.tested:
+                tested = own
+        return results, tested
+
+    def _proof_of(self, g: uc.GapItem, expr: str, fn: uc.FunctionInfo, constants: dict[str, int],
+                  path: list[str], before: str, lines: list[str]) -> str:
+        """The proof that _gaps() computes for one gap, with the given constants ("" = no proof)."""
+        if g.metric == "MCDC":
+            return prove_infeasible(expr, "MCDC", g.condition_index, "", fn, constants, path, before)
+        if g.metric not in ("DC", "BC"):
+            return ""
+        seen = {o.rsplit("=", 1)[-1] for o in g.observed}
+        missing = [o for o in ("T", "F") if o not in seen] if g.metric == "DC" else [g.gap_id.rsplit(":", 1)[-1]]
+        index = self._leaf_at(lines[g.line - 1], expr, g.column) if g.metric == "BC" else None
+        if g.metric == "BC" and index is None:
+            return ""
+        proofs = [prove_infeasible(expr, g.metric, index, o, fn, constants, path, before) for o in missing]
+        return "; ".join(proofs) if missing and all(proofs) else ""
 
     @staticmethod
     def _leaf_at(line: str, expr: str, column: int) -> int | None:

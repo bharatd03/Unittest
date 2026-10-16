@@ -622,6 +622,149 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual(same.decision, "accepted")
         self.assertGreater(same.mutants, 0)
 
+    # ---------------------------------------------------------------- fault check of suggestions [COV-14..19]
+    CLAMP_TESTS = ('UT_TEST(test_clamp) { UT_EXPECT_EQ_INT(clamp_percent(150), 100); '
+                   'UT_EXPECT_EQ_INT(clamp_percent(-1), 0); UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                   'UT_SUITE_BEGIN\nUT_CASE(test_clamp)\nUT_SUITE_END\n')
+
+    def fault(self, change, agent=None):
+        original = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
+        return (agent or self.agent).fault_check(uc.FaultCheckRequest(
+            layout=self.layout, bundle=self.bundle(self.CLAMP_TESTS), suggestion_id="cov-test",
+            original_source=original, suggested_source=change(original), tests=["test_clamp"]))
+
+    def test_fault_check_keeps_a_suggestion_that_detects_as_much(self):            # COV-15 .. COV-18
+        res = self.fault(lambda s: s.replace("    return value;\n", "    /* in range */\n    return value;\n"))
+        self.assertEqual(res.decision, "kept", res.reason)
+        self.assertEqual(res.functions, ["clamp_percent"])
+        self.assertGreater(res.detected_before, 0)
+        self.assertEqual(res.still_detected, res.detected_before)
+        self.assertIn(f"{res.still_detected} of {res.detected_before} compared mutants still detected", res.summary())
+        moved = [m for m in res.mutants if m.label.endswith("return->0") and m.suggested_line != m.original_line]
+        self.assertTrue(moved, "the line after the inserted one is still paired [COV-16]")
+        self.assertTrue(res.operators and res.compiler and res.workers >= 1)               # COV-18
+
+    def test_fault_check_rejects_a_suggestion_that_hides_a_check(self):             # COV-17
+        early = "{\n    if (value == 150) {\n        return 100;\n    }\n    if (value < 0) {"
+        res = self.fault(lambda s: s.replace("{\n    if (value < 0) {", early, 1))
+        self.assertEqual(res.decision, "weakened", res.summary())
+        self.assertTrue(any("return->0" in m for m in res.missed), res.missed)
+        self.assertIn("no longer detected", res.summary())
+
+    def test_fault_check_is_na_when_every_line_with_a_mutant_changes(self):        # COV-17
+        def rewrite(s):
+            return (s.replace("if ((window_open || !occupied) && !frost) {",
+                              "if ((window_open != 0 || occupied == 0) && frost == 0) {")
+                    .replace("return MODE_ECO;", "return (MODE_ECO);").replace("return MODE_COMFORT;", "return (MODE_COMFORT);"))
+        res = self.fault(rewrite)
+        self.assertEqual(res.decision, "not_applicable", res.summary())
+        self.assertGreater(res.changed_line_mutants, 0)
+        self.assertIn("NA", res.summary())
+
+    def test_fault_check_over_the_limit_is_not_checked(self):                       # COV-17, A3-85h
+        small = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(self.tmp.name) / "w2"),
+                                                                max_mutants=1))
+        res = self.fault(lambda s: s.replace("    return value;\n", "    /* in range */\n    return value;\n"), small)
+        self.assertEqual(res.decision, "not_checked")
+        self.assertIn("limit", res.reason)
+
+    def test_mutant_sites_are_the_mutants_of_the_oracle_check(self):                # COV-15: same operators
+        source = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
+        for fn in self.layout.functions:
+            sites = self.agent.mutant_sites(source, range(fn.line_start, fn.line_end + 1))
+            self.assertEqual([s[3] for s in sites][: self.agent.cfg.max_mutants],
+                             [label for label, _ in self.agent.mutants(source, fn)])
+            self.assertEqual([s[4] for s in sites][: self.agent.cfg.max_mutants],
+                             [text for _, text in self.agent.mutants(source, fn)])
+
+
+# ============================================================================ build variants [A3-BD14, A1-37a..e]
+CHAN_C = """#include "chan.h"
+
+int channel_gate(int ch)
+{
+    if (ch < 2) {
+        if (ch >= BRAKE_CHANNELS) {
+            return -1;
+        }
+        return ch;
+    }
+    return 0;
+}
+"""
+
+
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+class BuildVariantTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.d = Path(self.tmp.name)
+        self.repo = self.d / "chan"
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "include").mkdir()
+        (self.repo / "src/chan.c").write_text(CHAN_C)
+        (self.repo / "include/chan.h").write_text("#ifndef CHAN_H\n#define CHAN_H\nint channel_gate(int ch);\n#endif\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def database(self, *variants):
+        items = [{"directory": str(self.repo), "file": "src/chan.c", "output": f"CMakeFiles/{name}.dir/src/chan.c.o",
+                  "arguments": ["cc", "-Iinclude", f"-DBRAKE_CHANNELS={n}", "-c", "src/chan.c",
+                                "-o", f"CMakeFiles/{name}.dir/src/chan.c.o"]} for name, n in variants]
+        db = self.d / "compile_commands.json"
+        db.write_text(json.dumps(items))
+        return db
+
+    def capture(self, *variants):
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/chan.c"))
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "work")))
+        build = agent.capture(uc.CaptureRequest(layout=layout, compile_commands=str(self.database(*variants))))
+        layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(layout=layout, build=build)))
+        return layout, agent, build
+
+    def test_variants_are_listed_and_the_tested_one_marked(self):                   # A3-BD14
+        layout, _, build = self.capture(("brake_ecu", 2), ("brake_ecu_1ch", 1))
+        self.assertEqual([(v.name, v.tested) for v in build.variants], [("brake_ecu", True), ("brake_ecu_1ch", False)])
+        self.assertIn("-DBRAKE_CHANNELS=2", " ".join(build.sut_flags))                  # tests use the tested one
+        self.assertEqual(self.capture(("brake_ecu", 2))[2].variants, [])               # one variant: as before
+        self.assertEqual(self.capture(("a", 2), ("b", 2))[2].variants, [])             # same flags: one variant
+        old = uc.BuildDescription.model_validate_json(build.model_dump_json(exclude={"variants"}))
+        self.assertEqual(old.variants, [])                                              # older caches still load
+
+    def measured_gaps(self, layout, agent):
+        suite = ('#include "ut_harness.h"\n#include "chan.h"\nvoid ut_before_each(void) {}\n'
+                 'UT_TEST(test_gate) { UT_EXPECT_EQ_INT(channel_gate(0), 0); UT_EXPECT_EQ_INT(channel_gate(5), 0); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_gate)\nUT_SUITE_END\n')
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+            path=f"{layout.writable_test_dir}/test_chan.c", action="create", role="testsuite", content=suite)])
+        last = agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
+        self.assertTrue(last.coverage and last.coverage.measured, last.reason)
+        return a1.AnalyzerAgent()._gaps(layout, last, CHAN_C)
+
+    def test_proof_per_variant_only_the_tested_one_decides(self):                   # A1-37a .. A1-37d
+        layout, agent, _ = self.capture(("brake_ecu", 2), ("brake_ecu_1ch", 1))
+        gaps = self.measured_gaps(layout, agent)
+        dc = next(g for g in gaps if g.metric == "DC" and g.line == 6)
+        self.assertIn("infeasible_outcome", dc.detail)                     # tested: ch < 2 and ch >= 2 never hold
+        proofs = {v.variant: v for v in dc.variant_proofs}
+        self.assertTrue(proofs["brake_ecu"].proof and proofs["brake_ecu"].tested)
+        self.assertEqual(proofs["brake_ecu_1ch"].proof, "")                # ch == 1 reaches it there
+        self.assertEqual(proofs["brake_ecu_1ch"].macros, {"BRAKE_CHANNELS": 1})
+        text = uc.variant_text(dc.variant_proofs)
+        self.assertTrue(any("brake_ecu_1ch (BRAKE_CHANNELS = 1): no proof - may be reachable there" in t for t in text),
+                        text)
+        line = next(g for g in gaps if g.metric == "LC" and g.line == 7)
+        self.assertIn("unreachable_code", line.detail)
+        self.assertEqual({v.variant for v in line.variant_proofs}, {"brake_ecu", "brake_ecu_1ch"})   # inherited
+
+    def test_one_variant_proves_as_before(self):                                    # nothing changes with one
+        layout, agent, _ = self.capture(("brake_ecu", 2))
+        gaps = self.measured_gaps(layout, agent)
+        dc = next(g for g in gaps if g.metric == "DC" and g.line == 6)
+        self.assertEqual(dc.variant_proofs, [])
+        self.assertNotIn("infeasible_outcome", dc.detail)        # a macro set by -D is no constant (A1-37)
+
 
 # ============================================================================ 6. knowledge base
 class KnowledgeBaseTests(unittest.TestCase):
@@ -815,6 +958,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertEqual(set(build.sut_flags), {"-DBOARD_REV=2", "-DMINI_LIMIT=40", "-I{repo}/include"})
         self.assertEqual({e.file for e in build.entries}, {"src/ctrl.c", "src/brake_ctrl.c", "src/steer_assist.c",
                                                            "lib/util.c", "lib/hw.c"})              # A3-BD8
+        self.assertEqual([(v.name, v.tested) for v in build.variants], [("mini", True), ("mini_4ch", False)])  # A3-BD14
         self.assertEqual(layout.build_flags_source, "cmake")                      # A1-16a
         self.assertIn("include/ctrl.h", layout.headers)                           # not include/brake_ctrl.h
         self.assertNotIn("include/brake_ctrl.h", layout.headers)
@@ -1154,6 +1298,7 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(all(line.endswith("- met") for line in result.target_check), result.target_check)
         self.assertEqual(result.not_reached, [])
         self.assertTrue(result.build.startswith("cmake"))                                   # A3-BD10
+        self.assertIn("mini (tested), mini_4ch (analysed only)", result.build)              # A3-BD14
         self.assertFalse(result.build_estimated)
         self.assertTrue(any(line.startswith("clamp: stub") for line in result.dependencies))   # A1-DA11
         self.assertIn("scale", {f.name for f in result.function_coverage})                  # A3-63
@@ -2046,6 +2191,7 @@ class HandOverTests(unittest.TestCase):
         self.assertTrue(result.action_needed)                                               # COV-11
         self.assertEqual(len(result.suggestions), 1, (result.suggestions, result.open_items))   # COV-13
         self.assertIn("dead code", result.suggestions[0])
+        self.assertIn("compared mutants still detected", result.suggestions[0])            # COV-17, COV-18
         self.assertNotIn("without requirements", result.suggestions[0])                     # cites GRD-1 [COV-12]
         self.assertFalse(any("Provide the requirement documents" in a for a in result.action_needed))
         patches = list((Path(result.output_dir) / "coverage_suggestions").glob("*.patch"))
@@ -2053,6 +2199,10 @@ class HandOverTests(unittest.TestCase):
         patch = patches[0].read_text()
         self.assertIn("-            return -1;", patch)
         self.assertIn("not applied, not committed, not counted as coverage", patch)
+        self.assertIn("Fault detection:", patch)                                            # COV-18
+        record = uc.FaultCheckResult.model_validate_json(patches[0].with_suffix(".faults.json").read_text())
+        self.assertEqual(record.decision, "kept")
+        self.assertTrue(record.mutants and record.operators)
         self.assertTrue(any("cov-" in n and "not shown" in n and "[COV-13]" in n for n in result.open_items),
                         result.open_items)                                                  # the guess is not shown
         self.assertEqual((self.repo / "src/guard.c").read_text(), GUARD_C)                # COV-7: never applied

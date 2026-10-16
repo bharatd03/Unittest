@@ -671,6 +671,11 @@ class Orchestrator:
             if problem:
                 s.notes.append(f"suggestion {sug.suggestion_id} not shown: {problem} on a trial copy [COV-13]")
                 continue
+            # COV-14: only a suggestion that passed the checks above is checked for its fault detection
+            fault = await self._fault_check(s, sug, trial, folder)
+            if fault.decision in ("weakened", "not_checked"):
+                s.notes.append(f"suggestion {sug.suggestion_id} not shown: {fault.summary()} [COV-17]"[:400])
+                continue
             effect = ", ".join(f"{METRIC_NAMES[n]} {getattr(last.coverage.file_metrics, n).percent:g} % to "
                                f"{getattr(trial.coverage.file_metrics, n).percent:g} %" for n in METRIC_IDS
                                if getattr(trial.coverage.file_metrics, n).percent
@@ -682,6 +687,8 @@ class Orchestrator:
                                                 f"a/{sug.file}", f"b/{sug.file}"))
             header = (f"# Suggestion {sug.suggestion_id} for {sug.file}, function {sug.function or '-'}: {sug.cause}\n"
                       f"# Measured on a trial copy: {effect}\n"
+                      f"# {fault.summary()[:1].upper() + fault.summary()[1:]} - record: {sug.suggestion_id}.faults.json "
+                      "[COV-18]\n"
                       f"# Requirements: {', '.join(sug.requirement_ids) or 'none given - without requirements'}\n"
                       f"# Rationale: {' '.join(sug.rationale.split())[:1500]}\n"
                       "# A suggestion for the developer only: not applied, not committed, not counted as coverage "
@@ -689,9 +696,27 @@ class Orchestrator:
             path = folder / f"{sug.suggestion_id}.patch"
             path.write_text(header + diff, encoding="utf-8", newline="")
             s.suggestions.append(f"{sug.suggestion_id} ({sug.cause.replace('_', ' ')}, {sug.function or sug.file}): "
-                                 f"{effect} on a trial copy" + ("" if sug.with_requirements else
-                                                                " - without requirements")
+                                 f"{effect} on a trial copy; {fault.summary()}" + ("" if sug.with_requirements else
+                                                                                   " - without requirements")
                                  + f" - {path.relative_to(s.out).as_posix()}")
+
+    async def _fault_check(self, s: "RunState", sug: uc.CoverageSuggestion, trial: uc.VerificationResult,
+                           folder: Path) -> uc.FaultCheckResult:
+        """COV-14 .. COV-18: does the suggestion weaken what the tests detect? The record is kept for every
+        suggestion checked, shown or not, so the check can be repeated (COV-18)."""
+        original = uc.read_source(s.workspace / self.layout.sut_file)
+        try:
+            fault = await self.call("compilation", "fault_check", uc.FaultCheckRequest(
+                layout=self.layout, bundle=s.best_bundle or s.bundle, suggestion_id=sug.suggestion_id,
+                original_source=original, suggested_source=sug.patched_content,
+                tests=[t.name for t in trial.tests if t.status == "passed"],
+                functions=[sug.function] if sug.function else []), uc.FaultCheckResult)
+        except (Rejected, ba.AgentFault) as exc:
+            fault = uc.FaultCheckResult(suggestion_id=sug.suggestion_id, decision="not_checked",
+                                        reason=f"the check did not run ({exc})"[:300])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{sug.suggestion_id}.faults.json").write_text(fault.model_dump_json(indent=2), encoding="utf-8")
+        return fault
 
     @staticmethod
     def _only_proven(plan: uc.UTPlan, last: uc.VerificationResult) -> bool:
@@ -1152,6 +1177,7 @@ class RunState:
         self.targets: dict[str, str] = dict(uc.MIN_TARGETS["D"])                             # COV-1
         self.strategies: dict[str, list[str]] = {}                # item -> strategies tried [COV-6, COV-10]
         self.proofs: dict[str, str] = {}                          # item -> deterministic proof [COV-4]
+        self.variant_proofs: dict[str, list[uc.VariantProof]] = {}   # item -> proof per build variant [A1-37c]
         self.paths: dict[str, list[str]] = {}
         self.missing: dict[str, list[str]] = {}
         self.rejected: dict[str, list[str]] = {}                  # function -> brain suggestions refused [COV-5]
@@ -1236,6 +1262,8 @@ class RunState:
         for g in plan.gaps:
             if g.required:
                 self.missing[g.gap_id] = g.required[:6]
+            if g.variant_proofs:                                                # A1-37c, A1-37e: latest
+                self.variant_proofs[g.gap_id] = list(g.variant_proofs)
             if ("infeasible_" in g.detail or "unreachable_code" in g.detail) and g.gap_id not in self.proofs:
                 self.proofs[g.gap_id] = g.detail
                 self.note(g.gap_id, f"iteration {iteration}: deterministic analysis: no test can reach it")
@@ -1256,7 +1284,8 @@ class RunState:
                     strategies=merge_strategies(self.strategies.get(g.gap_id, [])) or ["not planned before the stop"],
                     rejected=self.rejected.get(g.function or fc.name, [])[:5],
                     proof=plain_proof(self.proofs.get(g.gap_id, "") or (g.detail if "infeasible_" in g.detail
-                                                                          or "unreachable_code" in g.detail else ""))))
+                                                                          or "unreachable_code" in g.detail else "")),
+                    variants=uc.variant_text(self.variant_proofs.get(g.gap_id, []))))
         return out
 
     def target_check(self, last: uc.VerificationResult | None) -> list[str]:
@@ -1290,6 +1319,8 @@ class RunState:
         for i in self.not_reached[:8]:
             why = (f"no test can reach it: {i.proof[:220]}" if i.proof else
                    f"not reached after: {'; '.join(i.strategies[-3:])[:300]}")
+            if any("may be reachable there" in v for v in i.variants):                   # A1-37c
+                why += "; " + "; ".join(v for v in i.variants if "may be reachable there" in v)[:200]
             rows.append(f"{i.item_id} ({i.function}, line {i.line}): {why}")
         if len(self.not_reached) > 8:
             rows.append(f"... and {len(self.not_reached) - 8} more item(s): see the report")
@@ -1337,6 +1368,9 @@ class RunState:
             suggestions=self.suggestions,
             build=(f"{self.build.source}: {self.build.command or '-'} ({self.build.outcome}, {self.build.duration_s} s)"
                    + (" - reused from the capture of the tested commit [ORC-22]" if self.build.reused else "")
+                   + ("; build variants of the SUT file: " + ", ".join(
+                       v.name + (" (tested)" if v.tested else " (analysed only)") for v in self.build.variants)
+                      + " [A3-BD14]" if self.build.variants else "")
                    if self.build else ""),
             build_estimated=bool(self.build and self.build.estimated),
             dependencies=[f"{d.qualified_name or d.name}: {d.decision} ({d.decided_by}) - {d.reason}"
@@ -1395,6 +1429,8 @@ def report(r: uc.PipelineResult) -> str:
                 rows.append(f"- Brain suggestion refused: {line}")
             if i.proof:
                 rows.append(f"- Why no test can reach it (diagnosis only; still counted as not covered): {i.proof}")
+            if i.variants:
+                rows.append("- Build variants (analysis only, A1-37c): " + "; ".join(i.variants))
             rows.append("")
     if r.build:
         rows += [f"- Build description: {r.build}" + (" - ESTIMATED: the coverage applies only to the include "
@@ -1988,6 +2024,9 @@ class Delivery:
                 break
         for patch in sorted((r.out / "coverage_suggestions").glob("*.patch")):               # COV-13
             files[f"{folder}/coverage_suggestions/{patch.name}"] = patch.read_bytes()
+            record = patch.with_suffix(".faults.json")                                       # COV-18
+            if record.is_file():
+                files[f"{folder}/coverage_suggestions/{record.name}"] = record.read_bytes()
         files[f"{folder}/coverage.json"] = json.dumps(
             {"file": result.metrics.model_dump() if result.metrics else None,
              "functions": [f.model_dump() for f in result.function_coverage]}, indent=1).encode("utf-8")

@@ -133,6 +133,15 @@ class CompileEntry(Contract):
     flags: list[str] = Field(default_factory=list)  # host flags: -D -U -I -isystem -include -std= ...
     dropped: list[str] = Field(default_factory=list)  # target-specific options left out [A3-BD7]
     language: Literal["c", "cpp"] = "c"
+    output: str = ""                                # the object file the build writes; names a variant [A3-BD14]
+
+
+class BuildVariant(Contract):
+    """One way the build compiles the SUT file, when it compiles it more than once with different
+    flags [A3-BD14]. Only the tested variant is built and measured; the others are analysed (A1-37a)."""
+    name: str
+    flags: list[str] = Field(default_factory=list)
+    tested: bool = False
 
 
 class BuildDescription(Contract):
@@ -147,6 +156,7 @@ class BuildDescription(Contract):
     estimated: bool = True               # True: flags were guessed, results are flagged [A3-BD5]
     suggested_flags: list[str] = Field(default_factory=list)   # "flag (file: text)" kept from the brain [A3-BD13]
     reused: bool = False                 # taken from the build-capture cache of this commit [ORC-22]
+    variants: list[BuildVariant] = Field(default_factory=list)  # two or more ways the SUT is compiled [A3-BD14]
 
 
 class Dependency(Contract):
@@ -391,6 +401,15 @@ class GapItem(Contract):
     required: list[str] = Field(default_factory=list)   # vectors still needed (filled by Agent1) [A1-18b]
     attempts: int = 0
     estimated: bool = False
+    variant_proofs: list["VariantProof"] = Field(default_factory=list)   # per build variant [A1-37b, A1-37c]
+
+
+class VariantProof(Contract):
+    """The proof of A1-37 for one build variant of the SUT file [A1-37b]. Analysis only (A1-37d)."""
+    variant: str
+    tested: bool = False
+    macros: dict[str, int] = Field(default_factory=dict)   # the variant-dependent macros the item depends on
+    proof: str = ""                                       # empty: no proof in this variant
 
 
 class FunctionCoverage(Contract):
@@ -761,6 +780,64 @@ class OracleResult(Contract):
     operators: list[str] = Field(default_factory=list)
 
 
+class FaultCheckRequest(Contract):
+    """Does a source-change suggestion weaken the fault detection of the existing tests? [COV-14 .. COV-19]"""
+    layout: LayoutProfile
+    bundle: FileActionBundle | None = None
+    suggestion_id: str
+    original_source: str
+    suggested_source: str
+    tests: list[str] = Field(default_factory=list)       # the tests that pass on the trial copy [COV-15]
+    functions: list[str] = Field(default_factory=list)   # functions the suggestion names, besides the changed ones
+
+
+class FaultMutant(Contract):
+    """One compared mutant [COV-16, COV-18]: the same operator at the same place on an unchanged line."""
+    mutant_id: str                       # L<original line>:<operator>.<occurrence>
+    label: str                           # as A3-85c records it, e.g. "L12:<-><="
+    function: str
+    original_line: int
+    suggested_line: int
+    detected_before: bool
+    detected_after: bool | None = None   # None: not run, because it was not detected before [COV-19]
+
+
+class FaultCheckResult(Contract):
+    suggestion_id: str
+    decision: Literal["kept", "weakened", "not_applicable", "not_checked"]
+    functions: list[str] = Field(default_factory=list)
+    compared: int = 0                    # mutants on unchanged lines [COV-16]
+    detected_before: int = 0
+    still_detected: int = 0
+    changed_line_mutants: int = 0        # on added, removed or changed lines: counted only [COV-16]
+    missed: list[str] = Field(default_factory=list)       # labels of mutants no longer detected
+    mutants: list[FaultMutant] = Field(default_factory=list)
+    operators: list[str] = Field(default_factory=list)
+    max_mutants: int = 0
+    time_limit_s: float = 0.0
+    workers: int = 0
+    elapsed_s: float = 0.0
+    compiler: str = ""
+    reason: str = ""
+
+    def summary(self) -> str:
+        """The line shown with a suggestion [COV-18]."""
+        changed = (f"; {self.changed_line_mutants} mutant(s) on changed lines not compared"
+                   if self.changed_line_mutants else "")
+        if self.decision == "not_applicable":
+            return "fault detection: NA - no unchanged line of the changed function(s) has a mutant" + changed
+        if self.decision == "not_checked":
+            return "fault detection could not be checked: " + self.reason
+        if self.decision == "weakened":
+            return (f"fault detection weakened: {len(self.missed)} of {self.detected_before} compared mutants are no "
+                    f"longer detected ({', '.join(self.missed[:5])})" + changed)
+        if not self.detected_before:
+            return (f"fault detection: none of the {self.compared} compared mutants was detected before, so none "
+                    f"can be lost" + changed)
+        return f"fault detection: {self.still_detected} of {self.detected_before} compared mutants still detected" + \
+            changed
+
+
 # ============================================================================ Agent4
 class CorrectionRequest(Contract):
     layout: LayoutProfile
@@ -919,6 +996,7 @@ class ItemEvidence(Contract):
     strategies: list[str] = Field(default_factory=list)       # COV-6, in the order tried
     rejected: list[str] = Field(default_factory=list)         # brain suggestions refused, with the reason
     proof: str = ""                                           # A1-37, when the item cannot be reached
+    variants: list[str] = Field(default_factory=list)         # the proof per build variant [A1-37c]
 
 
 class SuggestRequest(Contract):
@@ -1227,6 +1305,24 @@ def _n(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
 
+def variant_text(proofs: list["VariantProof"]) -> list[str]:
+    """A1-37c in plain words: the tested variant decides; another variant without a proof may reach the
+    item, which this run neither built nor measured (A1-37d)."""
+    def values(v: "VariantProof") -> str:
+        return f" ({', '.join(f'{k} = {n}' for k, n in v.macros.items())})" if v.macros else ""
+    rows = []
+    for v in sorted(proofs, key=lambda v: not v.tested):
+        if v.tested:
+            rows.append(f"tested variant {v.variant}{values(v)}: " +
+                        ("cannot be reached" if v.proof else "no proof"))
+        elif v.proof:
+            rows.append(f"variant {v.variant}{values(v)}: cannot be reached there either")
+        else:
+            rows.append(f"variant {v.variant}{values(v)}: no proof - may be reachable there; not built or "
+                        "measured by this run")
+    return rows
+
+
 def view_summary(label: str, model: Any) -> str | None:
     """Plain-language summaries of the main contracts (counts and states only, never code) [VIEW-6]."""
     def pct(v: "VerificationResult") -> str:
@@ -1308,6 +1404,10 @@ def view_summary(label: str, model: Any) -> str | None:
         return f"{label}: is the changed test {model.test} as strong as before?"
     if isinstance(model, OracleResult):
         return f"{label}: {model.test}: {model.decision.replace('_', ' ')} ({model.mutants} mutants)"
+    if isinstance(model, FaultCheckRequest):
+        return f"{label}: does suggestion {model.suggestion_id} weaken what the {_n(len(model.tests), 'test')} detect?"
+    if isinstance(model, FaultCheckResult):
+        return f"{label}: {model.suggestion_id}: {model.summary()}"
     if isinstance(model, FinalizeRequest):
         return f"{label}: turn {_n(len(model.observed), 'observed value')} into assertions, drop tests that add nothing"
     if isinstance(model, CorrectionRequest):

@@ -192,6 +192,9 @@ class CompilationConfig(BaseModel):
     required_metrics: list[str] = list(uc.METRICS)
     max_copy_mb: int = 200
     max_mutants: int = 50
+    fault_check_seconds: float = 120.0  # one suggestion's fault-detection check [COV-17, COV-19, ORC-7]
+    fault_check_workers: int = 0        # 0: processor cores minus one [COV-19, ORC-7]
+    mutant_run_timeout: float = 5.0     # one run of the test program with a mutant; a timeout detects it
     minimize_tests: bool = True        # observe stage: per-test coverage so redundant probes can be dropped
     keep_runs: int = 10                # run folders kept in work_dir (older ones are deleted)
     max_minimize_tests: int = 300
@@ -253,14 +256,17 @@ def _program_event(cmd: list[str], code: int, seconds: float) -> None:
                   summary=f"UT-Compilation ran {name}: {outcome}")
 
 
-def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None = None) -> tuple[int, str]:
-    """Runs an approved command (never a model-generated string) [A3-128, A3-129]."""
+def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None = None,
+         quiet: bool = False) -> tuple[int, str]:
+    """Runs an approved command (never a model-generated string) [A3-128, A3-129]. ``quiet``: no viewer
+    event for each run (the many mutant builds of COV-19 are reported once, as one result)."""
     started = time.monotonic()
     try:
         # stdin is never inherited: in an MCP stdio server it is the JSON-RPC channel.
         proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
                               stdin=subprocess.DEVNULL, env={**os.environ, **(env or {})}, errors="replace")
-        _program_event(cmd, proc.returncode, time.monotonic() - started)
+        if not quiet:
+            _program_event(cmd, proc.returncode, time.monotonic() - started)
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
@@ -269,6 +275,94 @@ def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None =
         return -127, f"tool not found: {cmd[0]}"
     except OSError as exc:
         return -126, f"{cmd[0]}: {exc}"
+
+
+# ============================================================================ build variants [A3-BD14]
+VARIANT_FLAGS = ("-D", "-U", "-include", "-I", "-isystem", "-iquote", "-std=")
+
+
+def _output_of(args: list[str]) -> str:
+    """The object file a compiler call writes (-o FILE or -oFILE), or ""."""
+    for i, a in enumerate(args):
+        if a == "-o" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("-o") and len(a) > 2 and not a.startswith("-object"):
+            return a[2:]
+    return ""
+
+
+def _variant_key(flags: list[str]) -> tuple[str, ...]:
+    """What makes two compiler calls of one file different variants: defines (in any order), include
+    paths and forced includes (in order) and the language standard."""
+    kept, defines, skip = [], [], False
+    for i, f in enumerate(flags):
+        if skip:
+            skip = False
+            continue
+        if f in ("-include", "-isystem", "-iquote", "-I", "-D", "-U") and i + 1 < len(flags):
+            (defines if f in ("-D", "-U") else kept).append(f + flags[i + 1])
+            skip = True
+        elif f.startswith(("-D", "-U")):
+            defines.append(f)
+        elif f.startswith(VARIANT_FLAGS):
+            kept.append(f)
+    return tuple(kept) + tuple(sorted(defines))
+
+
+def _variant_name(entry: uc.CompileEntry, index: int, used: set[str]) -> str:
+    """The build's own name for a variant: the CMake target (CMakeFiles/<target>.dir/...), else the
+    object file's folder or name; otherwise "variant N" [A3-BD14]."""
+    out = entry.output.replace("\\", "/")
+    m = re.search(r"CMakeFiles/([^/]+)\.dir/", out)
+    name = m.group(1) if m else (Path(out).parent.name if out and Path(out).parent.name not in ("", ".", "obj", "build")
+                                 else Path(out).name.split(".")[0] if out else "")
+    name = name or f"variant {index}"
+    if name in used:
+        name = f"{name} ({index})"
+    used.add(name)
+    return name
+
+
+def build_variants(entries: list[uc.CompileEntry], sut_file: str,
+                   tested: uc.CompileEntry | None) -> list[uc.BuildVariant]:
+    """A3-BD14: the different ways the build compiles the SUT file. Empty when it compiles it in only one
+    way, so a build with one variant is described exactly as before. The variant of ``tested`` (the entry
+    the unit tests are built with, A1-16a) is marked; the others are never built, run or measured."""
+    own = [e for e in entries if e.file.replace("\\", "/").lower() == sut_file.lower()]
+    groups: dict[tuple[str, ...], list[uc.CompileEntry]] = {}
+    for e in own:
+        groups.setdefault(_variant_key(e.flags), []).append(e)
+    if len(groups) < 2:
+        return []
+    tested_key = _variant_key(tested.flags) if tested is not None else None
+    used: set[str] = set()
+    out = []
+    for index, (key, members) in enumerate(groups.items(), start=1):
+        out.append(uc.BuildVariant(name=_variant_name(members[0], index, used), flags=list(members[0].flags),
+                                   tested=key == tested_key))
+    return out
+
+
+# ============================================================================ fault check [COV-14 .. COV-19]
+def line_pairs(original: list[str], suggested: list[str]) -> dict[int, int]:
+    """COV-16: line numbers (1-based) of the original source mapped to the suggested source, for every
+    line that a line-by-line diff keeps unchanged (identical text)."""
+    import difflib
+    pairs: dict[int, int] = {}
+    matcher = difflib.SequenceMatcher(None, original, suggested, autojunk=False)
+    for tag, i1, i2, j1, _ in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                pairs[i1 + k + 1] = j1 + k + 1
+    return pairs
+
+
+def changed_ranges(original: list[str], suggested: list[str]) -> list[tuple[int, int, int, int]]:
+    """(first, last) original lines and (first, last) suggested lines of every change, 1-based and
+    inclusive; an insertion has last < first on the original side."""
+    import difflib
+    matcher = difflib.SequenceMatcher(None, original, suggested, autojunk=False)
+    return [(i1 + 1, i2, j1 + 1, j2) for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
 
 
 class Toolchain:
@@ -714,7 +808,7 @@ class BuildCapture:
                 fh.write(f"{source}: {cmd}\n{outcome}\n")
             description = uc.BuildDescription(
                 source=source, command=cmd, duration_s=round(time.time() - start, 1), outcome=outcome[:500],
-                entries=entries, sut_flags=sut.flags,
+                entries=entries, sut_flags=sut.flags, variants=build_variants(entries, layout.sut_file, sut),
                 notes=notes + [f"dropped for the host: {' '.join(sut.dropped)}"] * bool(sut.dropped), estimated=False)
             if req.cache_key:
                 (cap / "description.json").write_text(description.model_dump_json(), encoding="utf-8")
@@ -739,6 +833,7 @@ class BuildCapture:
             return None
         return data.model_copy(update={
             "sut_flags": list(sut.flags), "reused": True, "duration_s": 0.0,
+            "variants": build_variants(data.entries, layout.sut_file, sut),            # A3-BD14
             "notes": [n for n in data.notes if not n.startswith("dropped for the host")] +
             [f"dropped for the host: {' '.join(sut.dropped)}"] * bool(sut.dropped) +
             ["reused from the build-capture cache of the tested commit [ORC-22]"]})
@@ -785,7 +880,9 @@ class BuildCapture:
             flags, dropped = uc.translate_flags([str(a) for a in args], directory, map_path)
             language = "cpp" if rel.lower().endswith((".cpp", ".cc", ".cxx", ".c++", ".cp")) or "-x" in args and \
                 "c++" in args else "c"
-            entries.append(uc.CompileEntry(file=rel, flags=flags, dropped=dropped, language=language))
+            output = str(item.get("output") or _output_of([str(a) for a in args]))
+            entries.append(uc.CompileEntry(file=rel, flags=flags, dropped=dropped, language=language,
+                                           output=output.replace("\\", "/")))
             if item.get("output"):
                 outputs[rel] = str(item["output"])
         return entries, outputs
@@ -1271,6 +1368,7 @@ class CompilationAgent(ba.AgentCore):
                  router: ba.BrainRouter | None = None):
         self.cfg = config or CompilationConfig()
         self._toolchain: Toolchain | None = None
+        self._fault_baseline: dict[str, dict[str, bool]] = {}    # original-side mutant results [COV-19]
         super().__init__(settings, router=router)
 
     # ---------------------------------------------------------------- tools
@@ -1287,6 +1385,13 @@ class CompilationAgent(ba.AgentCore):
                         raise ba.ContractRejected("Agent2 must not claim verification [A2-33]")
                     self._check_paths(payload.layout, payload.bundle)
             return check
+
+        def fault_pre(payload: uc.FaultCheckRequest, request):
+            uc.check_signature(payload.layout, request)
+            if payload.layout.blocked:
+                raise ba.ContractRejected("layout is blocked: " + (payload.layout.blocked_reason or ""))
+            if payload.bundle is not None:
+                self._check_paths(payload.layout, payload.bundle)
 
         def oracle_pre(payload: uc.OracleRequest, request):
             uc.check_signature(payload.layout, request)
@@ -1353,6 +1458,10 @@ class CompilationAgent(ba.AgentCore):
                             description="The harness sources, delivered next to the generated tests."),
             ba.ContractTool("oracle_check", uc.OracleRequest, uc.OracleResult, self._oracle_work, oracle_pre,
                             description="Mutation-based anti-weakening check of a changed test [A3-85a]."),
+            ba.ContractTool("fault_check", uc.FaultCheckRequest, uc.FaultCheckResult, self._fault_work, fault_pre,
+                            read_only=True,
+                            description="Does a source-change suggestion weaken what the tests detect? Mutants on "
+                                        "unchanged lines, before and after [COV-14 .. COV-19]."),
             ba.ContractTool("fuzz", uc.FuzzRequest, uc.FuzzResult, fuzz, fuzz_pre,
                             description="Coverage-guided search (libFuzzer) for inputs that reach remaining gaps "
                                         "[A3-FZ1]."),
@@ -2327,6 +2436,190 @@ class CompilationAgent(ba.AgentCore):
         res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle))
         shutil.rmtree(res.run_dir, ignore_errors=True)
         return {t.line: t.actual for t in res.tests if t.name == req.test and t.status == "failed" and t.line}
+
+    # ---------------------------------------------------------------- fault check of a suggestion [COV-14..COV-19]
+    def mutant_sites(self, source: str, lines: Any) -> list[tuple[int, int, int, str, str]]:
+        """The mutants of mutants() on the given lines (1-based), each with its place: (line, operator index,
+        occurrence on the line, label, mutated source). Same operators, same labels, same order as
+        mutants(); no limit here - the caller decides (COV-16, COV-17)."""
+        src_lines = source.splitlines(keepends=True)
+        out = []
+        for number in lines:
+            if not 0 < number <= len(src_lines):
+                continue
+            text = src_lines[number - 1]
+            code = text.split("//")[0]
+            for op, (pattern, replacement) in enumerate(self.MUTATIONS):
+                for occurrence, m in enumerate(re.finditer(pattern, code)):
+                    copy = src_lines[:]
+                    copy[number - 1] = text[:m.start()] + replacement + text[m.end():]
+                    out.append((number, op, occurrence, f"L{number}:{m.group(0)}->{replacement}", "".join(copy)))
+            for occurrence, m in enumerate(re.finditer(r"\breturn\s+([^;]+);", code)):
+                copy = src_lines[:]
+                copy[number - 1] = text[:m.start(1)] + "0" + text[m.end(1):]
+                out.append((number, len(self.MUTATIONS), occurrence, f"L{number}:return->0", "".join(copy)))
+        return out
+
+    async def _fault_work(self, payload: uc.FaultCheckRequest, request, scratch) -> uc.FaultCheckResult:
+        return await asyncio.to_thread(self.fault_check, payload)
+
+    def fault_check(self, req: uc.FaultCheckRequest) -> uc.FaultCheckResult:
+        """COV-14 .. COV-19: the compared mutants (same operator, same place, on a line the suggestion left
+        unchanged) are run against the tests that pass on the trial copy, on the original source and on
+        the suggested one. The suggestion keeps its fault detection when every compared mutant detected
+        before is still detected. No brain is used."""
+        started = time.monotonic()
+        operators = [p for p, _ in self.MUTATIONS] + ["return->0"]
+        workers = self.cfg.fault_check_workers or max(1, (os.cpu_count() or 2) - 1)
+        base = dict(suggestion_id=req.suggestion_id, operators=operators, max_mutants=self.cfg.max_mutants,
+                    time_limit_s=self.cfg.fault_check_seconds, workers=workers)
+        original = req.original_source.splitlines(keepends=True)
+        suggested = req.suggested_source.splitlines(keepends=True)
+        pairs = line_pairs(original, suggested)
+        changes = changed_ranges(original, suggested)
+        # Every function the suggestion changes, and the functions it names [COV-15]
+        functions = [f for f in req.layout.functions
+                     if any(a <= f.line_end and max(a, b) >= f.line_start - (1 if b < a else 0)
+                            for a, b, _, _ in changes) or f.name in req.functions]
+        base["functions"] = [f.name for f in functions]
+        paired_new = set(pairs.values())
+        compared: list[tuple[str, tuple, tuple]] = []
+        changed_count = 0
+        for fn in functions:
+            own = self.mutant_sites(req.original_source, range(fn.line_start, fn.line_end + 1))
+            mapped = [pairs[n] for n in range(fn.line_start, fn.line_end + 1) if n in pairs]
+            new_lines: set[int] = set()
+            for a, b, c, d in changes:                     # changed lines of the suggestion inside the function
+                if a <= fn.line_end and max(a, b) >= fn.line_start - (1 if b < a else 0):
+                    new_lines.update(range(c, d + 1))
+            new_sites = {(s[0], s[1], s[2]): s for s in self.mutant_sites(req.suggested_source,
+                                                                           sorted(set(mapped) | new_lines))}
+            count = 0
+            for site in own:
+                j = pairs.get(site[0])
+                partner = new_sites.get((j, site[1], site[2])) if j else None
+                if partner is None:
+                    changed_count += 1
+                    continue
+                compared.append((fn.name, site, partner))
+                count += 1
+            changed_count += sum(1 for key in new_sites if key[0] not in paired_new)
+            if count > self.cfg.max_mutants:
+                return uc.FaultCheckResult(**base, decision="not_checked", changed_line_mutants=changed_count,
+                                           elapsed_s=round(time.monotonic() - started, 2),
+                                           reason=f"{fn.name} has {count} compared mutants, more than the limit of "
+                                                  f"{self.cfg.max_mutants} per function [A3-85h, COV-17]")
+        if not compared:
+            return uc.FaultCheckResult(**base, decision="not_applicable", changed_line_mutants=changed_count,
+                                       elapsed_s=round(time.monotonic() - started, 2),
+                                       reason="no unchanged line of the changed function(s) has a mutant [COV-17]")
+        deadline = started + self.cfg.fault_check_seconds
+        mid = {id(site): f"L{site[0]}:{site[1]}.{site[2]}" for _, site, _ in compared}
+        # The original side once per source version, test suite and tests [COV-19]
+        key = hashlib.sha256("\0".join([req.original_source, req.bundle.model_dump_json() if req.bundle else "",
+                                         *sorted(req.tests)]).encode("utf-8")).hexdigest()
+        known = self._fault_baseline.setdefault(key, {})
+        todo = [(mid[id(site)], site[4]) for _, site, _ in compared if mid[id(site)] not in known]
+        try:
+            ran = self._mutant_runs(req, todo, deadline, workers)
+            if ran is not None:
+                known.update(ran)
+                need = [(mid[id(site)], partner[4]) for _, site, partner in compared if known[mid[id(site)]]]
+                after = self._mutant_runs(req, need, deadline, workers) if need else {}
+            else:
+                after = None
+        except ba.AgentFault as exc:
+            return uc.FaultCheckResult(**base, decision="not_checked", changed_line_mutants=changed_count,
+                                       compared=len(compared), elapsed_s=round(time.monotonic() - started, 2),
+                                       reason=f"the test program could not be built for the check: {exc.message}")
+        chain = self.toolchain()
+        base["compiler"] = f"{chain.cc if req.layout.language == 'c' else chain.cxx} {chain.version}"
+        if ran is None or after is None:
+            return uc.FaultCheckResult(**base, decision="not_checked", changed_line_mutants=changed_count,
+                                       compared=len(compared), elapsed_s=round(time.monotonic() - started, 2),
+                                       reason=f"the time limit of {self.cfg.fault_check_seconds:g} s was reached "
+                                              "[COV-17, COV-19]")
+        records = [uc.FaultMutant(mutant_id=mid[id(site)], label=site[3], function=name, original_line=site[0],
+                                  suggested_line=partner[0], detected_before=known[mid[id(site)]],
+                                  detected_after=after.get(mid[id(site)])) for name, site, partner in compared]
+        before = [r for r in records if r.detected_before]
+        missed = [r.label + (f" (now line {r.suggested_line})" if r.suggested_line != r.original_line else "")
+                  for r in before if not r.detected_after]
+        return uc.FaultCheckResult(**base, decision="weakened" if missed else "kept", compared=len(records),
+                                   detected_before=len(before), still_detected=len(before) - len(missed),
+                                   changed_line_mutants=changed_count, missed=missed, mutants=records,
+                                   elapsed_s=round(time.monotonic() - started, 2),
+                                   reason=("the tests no longer detect " + ", ".join(missed[:5])) if missed else
+                                   "every compared mutant detected before is still detected")
+
+    def _mutant_runs(self, req: uc.FaultCheckRequest, todo: list[tuple[str, str]], deadline: float,
+                     workers: int) -> dict[str, bool] | None:
+        """COV-19: is each mutant detected? The test program is built once per worker; for each mutant only
+        the SUT translation unit is compiled again (no coverage instrumentation), linked with the objects
+        already built and run. A mutant is detected when a test of ``req.tests`` does not pass, the program
+        crashes or times out, or the mutant does not build. None: the time limit was reached."""
+        if not todo:
+            return {}
+        import concurrent.futures
+        import threading
+        chain = self.toolchain()
+        layout = req.layout
+        root = Path(self.cfg.work_dir) / ("fault-" + time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
+        count = max(1, min(workers, len(todo)))
+        stop = threading.Event()
+        results: dict[str, bool] = {}
+        lock = threading.Lock()
+        queue = list(reversed(todo))
+        wanted = set(req.tests)
+        sut_name = layout.sut_file
+
+        def prepare(index: int) -> tuple[Path, list[str], list[str], Path]:
+            run_dir = root / f"w{index}"
+            vreq = uc.VerifyRequest(layout=layout, stage="observe", bundle=req.bundle)
+            repo = self._stage(layout, vreq, run_dir)
+            build = self._build(layout, vreq, repo, run_dir, chain)
+            if not build["linked"]:
+                raise ba.AgentFault("BUILD_FAILED", "the test program does not build: " +
+                                    "; ".join(d.message for d in build["diagnostics"][:2])[:300])
+            coverage = set(chain.coverage_flags())
+            compile_sut = [c for c in build["commands"][0] if c not in coverage]
+            return repo, compile_sut, build["commands"][-1], build["binary"]
+
+        def work(index: int) -> None:
+            repo, compile_sut, link, binary = prepare(index)
+            env = chain.env(LLVM_PROFILE_FILE=str(root / f"w{index}" / "m-%p.profraw"))
+            target = repo / sut_name
+            while not stop.is_set():
+                with lock:
+                    if not queue:
+                        return
+                    mutant_id, source = queue.pop()
+                if time.monotonic() > deadline:
+                    stop.set()
+                    return
+                self._write_new(target, uc.encode_like(Path(layout.repo_root) / sut_name, source))
+                code, _ = _run(compile_sut, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                if code == 0:
+                    code, _ = _run(link, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                if code != 0:
+                    detected = True                                  # does not build: detected [A3-85b]
+                else:
+                    code, text = _run([str(binary)], repo, self.cfg.mutant_run_timeout, env, quiet=True)
+                    tests, _, summary = parse_run_output(text)
+                    status = {t.name: t.status for t in tests}
+                    detected = summary is None or any(status.get(name) != "passed" for name in wanted)
+                with lock:
+                    results[mutant_id] = detected
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                for future in [pool.submit(work, i) for i in range(count)]:
+                    future.result()
+        finally:
+            shutil.rmtree(root, ignore_errors=True)                  # mutants exist only here [A3-85i]
+        if stop.is_set() or len(results) < len(todo):
+            return None
+        return results
 
 
 def _assertion_count(suite: str, test: str) -> int:
