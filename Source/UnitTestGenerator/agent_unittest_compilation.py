@@ -767,6 +767,14 @@ class CaptureFailed(Exception):
     pass
 
 
+def _first_error(output: str, marker: str, size: int = 700) -> str:
+    """The first error of a build tool's output with what follows it, not only the end of the output,
+    which for CMake is the call stack and hides the reason."""
+    text = output.strip()
+    at = text.find(marker)
+    return " ".join(text[at: at + size].split()) if at >= 0 else text[-size:]
+
+
 class BuildCapture:
     """Runs the project's own build on the working copy and records every compiler call. The
     result is the build description: per translation unit the host flags [A3-BD1, A3-BD7]."""
@@ -978,16 +986,19 @@ class BuildCapture:
         cmake, ninja = self._tool("cmake"), self._tool("ninja")
         source = repo if (repo / "CMakeLists.txt").is_file() else component
         build = cap / "cmake"
+        # Paths given to CMake with forward slashes: CMake writes some of them into its own scripts, where a
+        # backslash is an escape ("Invalid character escape '\U'" for C:\Users\...) [A3-BD15]
+        posix = lambda p: Path(p).as_posix()
         cmd = [*cmake, "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-               "-DCMAKE_BUILD_TYPE=Debug", f"-DCMAKE_C_COMPILER={self.chain.cc}",
-               f"-DCMAKE_CXX_COMPILER={self.chain.cxx}", f"-DCMAKE_MAKE_PROGRAM={ninja[0]}"]
+               "-DCMAKE_BUILD_TYPE=Debug", f"-DCMAKE_C_COMPILER={posix(self.chain.cc)}",
+               f"-DCMAKE_CXX_COMPILER={posix(self.chain.cxx)}", f"-DCMAKE_MAKE_PROGRAM={posix(ninja[0])}"]
         rc = self._resource_compiler()
         if rc:                                   # not the RC variable of the environment [A3-BD15]
-            cmd.append(f"-DCMAKE_RC_COMPILER={rc}")
+            cmd.append(f"-DCMAKE_RC_COMPILER={posix(rc)}")
         code, out = self._exec(cmd, repo, cap)
         db = build / "compile_commands.json"
         if not db.is_file():
-            raise CaptureFailed("CMake configure failed: " + out.strip()[-400:])
+            raise CaptureFailed("CMake configure failed: " + _first_error(out, "CMake Error"))
         entries, outputs = self._entries(json.loads(db.read_text(encoding="utf-8")), repo, [])
         return entries, " ".join(cmd), self._build_sut_object(ninja, build, outputs, cap, layout)
 
@@ -996,7 +1007,7 @@ class BuildCapture:
         if os.name != "nt":
             return ""
         folder = Path(self.chain.cc).parent
-        for name in ("llvm-rc.exe", "llvm-windres.exe", "windres.exe"):
+        for name in ("windres.exe", "llvm-windres.exe", "llvm-rc.exe"):      # Windows-GNU expects windres
             if (folder / name).is_file():
                 return str(folder / name)
         return ""
