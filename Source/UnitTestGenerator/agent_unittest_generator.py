@@ -719,6 +719,40 @@ def _ident(name: str) -> str:
     return re.sub(r"\W", "_", name.replace("(anonymous namespace)::", ""))
 
 
+# A test name has at most 63 characters: the length of an internal identifier that C99 and later
+# guarantee to be significant [A2-21q].
+NAME_LIMIT = 63
+
+
+def readable_test_name(raw: str, function: str, taken: set[str]) -> str:
+    """A2-21q: the name repaired deterministically - never a reason to discard a test. Characters not
+    allowed in an identifier become underscores, test_ and missing words come from the function's name,
+    a long name is cut after its last whole word, a name in use gets _2, _3 ..."""
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", raw or "") if w]
+    if words and words[0].lower() == "test":
+        words = words[1:]
+    fn_words = [w for w in re.split(r"[^A-Za-z0-9]+", _ident(function)) if w] or ["function"]
+    if len(words) < 2:                                  # test_<what>_<behaviour>: at least three words
+        words = fn_words + (words or ["checks", "behaviour"])
+        words = words if len(words) >= 2 else words + ["case"]
+
+    def cut(limit: int) -> str:
+        name = "test"
+        for w in words:
+            if len(name) + 1 + len(w) > limit:
+                break
+            name += "_" + w
+        if name.count("_") < 2:                         # one very long word: cut inside it
+            name = ("test_" + "_".join(words))[:limit].rstrip("_")
+        return name
+
+    name, k = cut(NAME_LIMIT), 2
+    while name in taken:
+        suffix = f"_{k}"
+        name, k = cut(NAME_LIMIT - len(suffix)) + suffix, k + 1
+    return name
+
+
 def return_of(fn: uc.FunctionInfo) -> str:
     """The return type: from the front end, else from the signature text [A1-DA14]."""
     if fn.return_type:
@@ -1127,10 +1161,7 @@ class GeneratorAgent(ba.AgentCore):
     def _test_name(sc: uc.Scenario, names: set[str]) -> str:
         base = sc.test_name if re.fullmatch(r"test_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+", sc.test_name or "") else \
             f"test_{_ident(sc.function)}_{'checks_stated_behaviour' if not sc.characterization else 'scenario'}"
-        name, k = base[:90], 2
-        while name in names:
-            name, k = f"{base[:86]}_{k}", k + 1
-        return name
+        return readable_test_name(base, sc.function, names)                                  # A2-21q
 
     # ---------------------------------------------------------------- LLM tests
     async def _llm_tests(self, plan: uc.UTPlan, req: uc.GenerationRequest, names: set[str],
@@ -1210,10 +1241,10 @@ class GeneratorAgent(ba.AgentCore):
                                            max(len(fn_scenarios) + len(to_rewrite), 1)),
                                  tokens_per_item=self.cfg.tokens_per_test, overhead=100)
             task = (
-                f"Write at most {self.cfg.max_llm_tests_per_function} unit tests for {fn.qualified_name} that cover "
+                f"Write at most {need.items} unit tests for {fn.qualified_name} that cover "              # ARCH-11a
                 "the SCENARIOS and rewrite the TESTS TO REWRITE. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
                 "\"purpose\", \"evidence_ids\", \"body\", \"evidence_class\"}]}. name: test_<what>_<behaviour> (at least "
-                "three words; a rewritten test keeps its name). purpose: one line. body: statements only, no function "
+                f"three words, at most {NAME_LIMIT} characters; a rewritten test keeps its name). purpose: one line. body: statements only, no function "
                 "header, no #include. Use only: the function under test and other functions declared in HEADERS, the "
                 "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
                 "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
@@ -1221,13 +1252,15 @@ class GeneratorAgent(ba.AgentCore):
                 "EVIDENCE ids into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
                 "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
                 "and set evidence_class to E8. Never guess an expected value.")
-            check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite))
+            dropped: list[str] = []
+            check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite), fn.name, dropped)
             try:
                 result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
                                              project=layout.repo_root, check=check)
             except ba.AgentFault as exc:
-                notes.append(f"{fn.qualified_name}: no LLM tests ({exc.code})")
+                notes.append(f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})")
                 continue
+            notes.extend(f"{fn.qualified_name}: {d}" for d in dropped)
             for t in result.tests[: self.cfg.max_llm_tests_per_function]:
                 ids = [i for i in t.evidence_ids if i in evidence and evidence[i].evidence_class != "E8"]
                 if "UT_OBSERVE" in t.body:
@@ -1277,23 +1310,32 @@ class GeneratorAgent(ba.AgentCore):
         return ""
 
     @classmethod
-    def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None):
+    def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None,
+                   function: str = "", dropped: list[str] | None = None):
+        """The check of one LLM answer, test by test [A2-21t]: names are repaired (A2-21q), a test whose body
+        fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left."""
         rewritten = rewritten or set()
 
         def check(parsed: GeneratedTests) -> None:
-            seen = set()
+            seen: set[str] = set()
+            kept: list[GeneratedTest] = []
+            problems: list[str] = []
             for t in parsed.tests:
-                if t.name not in rewritten and not re.fullmatch(r"test_[A-Za-z0-9]+(?:_[A-Za-z0-9]+){1,}", t.name):
-                    raise ba.AgentFault("MODEL_OUTPUT_INVALID", f"test name {t.name!r} must be test_<what>_<behaviour> "
-                                        "(at least three words) [A2-21q]")
-                if len(t.name) > 90 or not re.fullmatch(r"test_\w+", t.name):
-                    raise ba.AgentFault("MODEL_OUTPUT_INVALID", f"test name {t.name!r} is not a C identifier")
-                if t.name in existing_names or t.name in seen:
-                    raise ba.AgentFault("MODEL_OUTPUT_INVALID", f"test name {t.name} is already used")
-                seen.add(t.name)
+                if not (t.name in rewritten and t.name not in seen):
+                    name = readable_test_name(t.name, function, existing_names | seen | rewritten)
+                    if name != t.name:
+                        t = t.model_copy(update={"name": name})
                 problem = cls._body_problem(t.body, allowed | setup_names([t.body]))
                 if problem:
-                    raise ba.AgentFault("MODEL_OUTPUT_INVALID", f"{t.name}: {problem}")
+                    problems.append(f"{t.name}: {problem}")
+                    continue
+                seen.add(t.name)
+                kept.append(t)
+            if not kept:
+                raise ba.AgentFault("MODEL_OUTPUT_INVALID", "no test passes the checks: " + "; ".join(problems[:3]))
+            parsed.tests = kept
+            if dropped is not None:
+                dropped[:] = [f"dropped {p} [A2-21t]" for p in problems]
         return check
 
     # ---------------------------------------------------------------- structural validation [A2-28, A2-29]

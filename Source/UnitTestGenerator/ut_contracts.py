@@ -624,6 +624,7 @@ class FuzzResult(Contract):
     unsupported: list[str] = Field(default_factory=list)    # "fn: reason"
     crashes: list[str] = Field(default_factory=list)        # inputs that crashed the SUT (reported, never asserted)
     reason: str = ""
+    engine: str = ""                                        # "libFuzzer" or "ut_search" [A3-FZ11]
 
 
 class PlanRequest(Contract):

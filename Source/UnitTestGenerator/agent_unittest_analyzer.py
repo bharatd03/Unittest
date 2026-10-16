@@ -2424,7 +2424,6 @@ class AnalyzerAgent(ba.AgentCore):
         accepted: list[uc.Scenario] = []
         extra, calls, brain = "", 0, ""
         dropped: list[str] = []
-        task = PLAN_TASK.format(fn=fn.qualified_name, limit=self.cfg.max_brain_scenarios)
         if not open_ids:
             return []                                                        # nothing to plan [ARCH-16]
         while calls < self.cfg.max_brain_calls_per_function:
@@ -2435,6 +2434,8 @@ class AnalyzerAgent(ba.AgentCore):
             covered = {g for s in accepted for g in s.gap_ids}
             need = ba.OutputNeed(items=min(self.cfg.max_brain_scenarios, max(len(open_ids - covered), 1)),
                                  tokens_per_item=self.cfg.tokens_per_scenario, overhead=100)
+            # as many scenarios as the answer limit was planned for, not the configured maximum [ARCH-11a]
+            task = PLAN_TASK.format(fn=fn.qualified_name, limit=need.items)
             try:
                 avoid = set(req.avoid_brains)                                      # COV-6: the next brain
                 allowed = [b for b in self.allowed_brains if b not in avoid] if avoid else None

@@ -1,5 +1,14 @@
 # BaseAgent changes
 
+## 2026-10-16: live viewer on Windows
+
+**Why.** On the first Windows run the live page showed "connection closed" while the run went on. The page never returned to "live" after the browser lost its event stream, a reconnect would have started the stream from the first event again, and the stream counted its position in characters of a file that Windows had written with CRLF line ends.
+
+* **`emit_event`** writes LF line ends on every operating system.
+* **`/events`** reads the events file by bytes and sends each event with an `id` (its byte position). A reconnecting browser sends `Last-Event-ID`, and the stream continues after that event: nothing is shown twice or lost.
+* **The page** shows "live", "reconnecting" or "finished", and "connection closed" only when the browser has given up. It closes the stream after the run's last event.
+* **Tests.** `ViewerTests.test_live_server` covers the event ids and a reconnect over a CRLF file.
+
 ## 2026-10-14: repository layout
 
 **Why.** BaseAgent now lives in the UnitTest git repository together with the applications built on it, so that a fresh clone works on any computer.

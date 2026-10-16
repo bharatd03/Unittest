@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -528,6 +529,46 @@ class GeneratorTests(unittest.TestCase):
         self.assertNotIn("invented_api", uc.suite_of(bundle))                    # A2-20, A2-21
         self.assertTrue(any("no LLM tests" in n for n in bundle.notes))
 
+    def test_one_faulty_test_does_not_cost_the_others(self):
+        """[A2-21t, A2-21q] the answer is checked test by test: a long or duplicate name is repaired, a test
+        with an invented call is dropped and noted, the others are used - without asking the brain again."""
+        long_name = "test_select_mode_returns_eco_when_nobody_is_home_and_the_window_is_open_and_it_is_night"
+        body = "UT_EXPECT_EQ_INT(select_mode(0, 0, 0), MODE_ECO);"
+        b = UTBrain(tests={"select_mode": [
+            {"name": long_name, "scenario_ids": [], "body": body, "evidence_class": "E1"},
+            {"name": "test_select_mode_invents", "scenario_ids": [], "body": "UT_EXPECT_EQ_INT(invented_api(1), 2);",
+             "evidence_class": "E2"},
+            {"name": "test_select_mode_nobody_home", "scenario_ids": [], "body": body, "evidence_class": "E1"},
+            {"name": "test_select_mode_nobody_home", "scenario_ids": [], "body": body, "evidence_class": "E1"},
+            {"name": "select mode/away", "scenario_ids": [], "body": body, "evidence_class": "E1"}]})
+        agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm", max_llm_tests_per_function=8))
+        with brain(b):
+            bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
+        suite = uc.suite_of(bundle)
+        self.assertNotIn("invented_api", suite)
+        names = re.findall(r"UT_TEST\((\w+)\)", suite)
+        self.assertTrue(all(len(n) <= a2.NAME_LIMIT for n in names), names)
+        self.assertIn("test_select_mode_returns_eco_when_nobody_is_home_and_the_window", names)
+        self.assertIn("test_select_mode_nobody_home", names)
+        self.assertIn("test_select_mode_nobody_home_2", names)
+        self.assertIn("test_select_mode_away", names)
+        self.assertTrue(any("dropped test_select_mode_invents" in n and "A2-21t" in n for n in bundle.notes),
+                        bundle.notes)
+        self.assertEqual(sum("select_mode" in t for t in b.generate_calls), 1)      # no second ask
+
+    def test_readable_test_name_repairs_instead_of_rejecting(self):
+        """[A2-21q] deterministic repair; the result is a valid C identifier within 63 characters."""
+        self.assertEqual(a2.readable_test_name("test_clamp_percent_upper_limit", "clamp_percent", set()),
+                         "test_clamp_percent_upper_limit")
+        self.assertEqual(a2.readable_test_name("limit!", "clamp_percent", set()), "test_clamp_percent_limit")
+        self.assertEqual(a2.readable_test_name("", "ns::clamp", set()), "test_ns_clamp_checks_behaviour")
+        cut = a2.readable_test_name("test_" + "_".join(["word"] * 30), "f", set())
+        self.assertLessEqual(len(cut), 63)
+        self.assertTrue(re.fullmatch(r"test(_word)+", cut))
+        taken = {"test_a_b"}
+        self.assertEqual(a2.readable_test_name("test_a_b", "f", taken), "test_a_b_2")
+        self.assertLessEqual(len(a2.readable_test_name("test_" + "x" * 80, "f", set())), 63)
+
     def test_llm_tests_keep_their_evidence_class(self):
         agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
         with brain(UTBrain()):
@@ -901,7 +942,8 @@ class CorrectorTests(unittest.TestCase):
                                                                  evidence=self.evidence)))
         self.assertEqual(patch.status, "candidate_source_fix")                   # A4-25
         self.assertEqual(patch.function, "clamp_percent")
-        original = (self.repo / "src/thermostat.c").read_text()
+        # As stored on disk: on Windows the seeded copy has CRLF line ends, and the corrector keeps them.
+        original = (self.repo / "src/thermostat.c").read_bytes().decode("utf-8")
         self.assertEqual(patch.patched_content, original.replace("return 99;", "return 100;"))
         self.assertIn("return 99;", original)                                     # source tree untouched [A4-23c]
 
@@ -995,7 +1037,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
     def test_cmake_build_is_captured(self):
         repo = copy_pilot("c_deps_pilot", self.d)
         build, layout = self.analyze(repo, "src/ctrl.c")
-        self.assertEqual(build.source, "cmake")                                   # A3-BD2
+        self.assertEqual(build.source, "cmake", build.notes)                      # A3-BD2
         self.assertFalse(build.estimated)
         self.assertEqual(set(build.sut_flags), {"-DBOARD_REV=2", "-DMINI_LIMIT=40", "-I{repo}/include"})
         self.assertEqual({e.file for e in build.entries}, {"src/ctrl.c", "src/brake_ctrl.c", "src/steer_assist.c",
@@ -1101,10 +1143,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertTrue(scale.executed)                                           # measured in the SUT's lines
         self.assertEqual(scale.metrics.LC.percent, 100.0)
 
-    @unittest.skipUnless(_tools().fuzzer if not TOOLCHAIN_SKIP else False, "libFuzzer not available")
-    @full_run
-    def test_fuzzer_finds_inputs_for_gaps(self):
-        """[A3-FZ1..A3-FZ4] coverage-guided search returns readable inputs that reach a gap."""
+    def fuzz_control(self, seconds=3):
         repo = copy_pilot("c_deps_pilot", self.d)
         with brain(DownBrain()):
             _, layout = self.analyze(repo, "src/ctrl.c")
@@ -1115,11 +1154,37 @@ class CaptureAndDependencyTests(unittest.TestCase):
             uc.FileAction(path=stub_path.replace("ut_stubs.c", "ut_stubs.h"), action="create", role="helper",
                           content=stub_h)])
         gap = uc.GapItem(gap_id="BC:control:13:9:T", function="control", metric="BC", line=13, column=9)
-        result = self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=["control"], gaps=[gap], seconds=3))
+        return self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=["control"], gaps=[gap],
+                                           seconds=seconds))
+
+    def assert_control_input(self, result):
         self.assertIn("control", result.functions, result.unsupported)
         self.assertTrue(result.inputs, result.reason)
         self.assertIn("BC:control:13:9:T", result.inputs[0].covers)
         self.assertTrue(any(line.startswith("STATUS_REG = ") for line in result.inputs[0].setup))
+
+    @full_run
+    def test_fuzzer_finds_inputs_for_gaps(self):
+        """[A3-FZ1..A3-FZ4, A3-FZ11] coverage-guided search returns readable inputs that reach a gap - with
+        libFuzzer where the toolchain has it, otherwise with ut_search."""
+        result = self.fuzz_control()
+        self.assertEqual(result.engine, "libFuzzer" if self.a3.toolchain().tools.fuzzer else "ut_search")
+        self.assert_control_input(result)
+
+    def test_ut_search_without_libfuzzer_is_deterministic(self):
+        """[A3-FZ9, A3-FZ10] without libFuzzer (llvm-mingw on Windows) Agent3's own search finds the input;
+        with the same seed and number of executions it finds the same inputs again."""
+        chain = self.a3.toolchain()
+        self.a3.cfg.search_executions = 20_000
+        with mock.patch.object(chain.tools, "fuzzer", False):
+            first = self.fuzz_control(seconds=60)
+            shutil.rmtree(self.d / "c_deps_pilot")
+            second = self.fuzz_control(seconds=60)
+        self.assertEqual(first.engine, "ut_search")
+        self.assert_control_input(first)
+        self.assertEqual(first.executions, second.executions)
+        self.assertEqual([(i.args, i.setup, i.covers) for i in first.inputs],
+                         [(i.args, i.setup, i.covers) for i in second.inputs])
 
 
 # ============================================================================ tool setup [TP]
@@ -1327,6 +1392,50 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 100);", suite)
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
+
+    def test_behaviour_round_after_the_targets_has_a_time_limit(self):
+        """ORC-32: once every target is met and verified, the documented-behaviour round (A1-25y) runs only within
+        its time; then the run finishes with the verified result instead of waiting for a slow brain."""
+        repo = copy_pilot("c_pilot", self.d)
+        original, slowed = up.Orchestrator._generate, []
+
+        async def slow_after_targets(orch, s, plan, **kw):
+            if s.targets_met_at is not None:
+                slowed.append(plan.plan_id)
+                await asyncio.sleep(30)                       # a CPU brain writing tests
+            return await original(orch, s, plan, **kw)
+
+        started = time.monotonic()
+        with brain(UTBrain(tests={})), mock.patch.object(up.Orchestrator, "_generate", slow_after_targets):
+            result = self.run_pipeline(repo, "src/thermostat.c", after_target_seconds=1)
+        self.assertTrue(slowed, "the run never reached the documented-behaviour round")
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        self.assertIn("ORC-32", result.reason)
+        self.assertTrue(any("time limit" in i and "ORC-32" in i for i in result.open_items), result.open_items)
+        self.assertTrue((repo / "tests/test_thermostat.c").is_file())                  # the verified tests
+
+    def test_a_stopped_run_delivers_what_was_verified(self):
+        """ORC-33: Ctrl+C (the task is cancelled) after a verified result: the verified tests, report and ledger
+        are delivered; the state comes from that verified result and the reason names the stop."""
+        repo = copy_pilot("c_pilot", self.d)
+        original, calls = up.Orchestrator._learn, []
+
+        async def stop_on_second(orch, s, result, bundle):
+            calls.append(1)
+            if len(calls) == 2:
+                raise asyncio.CancelledError()               # what asyncio.run does on Ctrl+C
+            return await original(orch, s, result, bundle)
+
+        with brain(UTBrain(tests={})), mock.patch.object(up.Orchestrator, "_learn", stop_on_second):
+            result = self.run_pipeline(repo, "src/thermostat.c")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("stopped by the user", result.reason)
+        self.assertIn("ORC-33", result.reason)
+        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        self.assertTrue((repo / "tests/test_thermostat.c").is_file())
+        self.assertTrue((Path(result.output_dir) / "report.md").is_file())
+        self.assertTrue(up.Ledger.verify(Path(result.ledger)))
 
     @unittest.skipUnless(have_tool("cmake") and have_tool("ninja"), "cmake and ninja are not in the tool manifest")
     def test_dependency_pilot_reaches_every_target(self):

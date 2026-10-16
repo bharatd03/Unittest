@@ -55,7 +55,8 @@ The first command:
 
 1. creates the Python environment in `Source/BaseAgent/.venv` and installs pydantic, langgraph,
    fastmcp, uvicorn and anthropic;
-2. installs the tools – Clang/LLVM with MC/DC coverage, libFuzzer and the static analyzer, CMake,
+2. installs the tools – Clang/LLVM with MC/DC coverage, libFuzzer (Linux; on Windows the tool's own
+   search ut_search takes its place) and the static analyzer, CMake,
    Ninja, Git – into `Source/UnitTestGenerator/tools`, from the official release pages with
    SHA-256 checks. This takes a few minutes once; later runs only check them (about a second).
 
@@ -76,6 +77,8 @@ Run without a command, the `.bat` shows a menu.
 BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`.
 
 Results of a run go to `Source/UnitTestGenerator/ut_output/`.
+
+Stopping a run: press Ctrl+C once. The run stops and still delivers the tests Agent3 has verified so far, with the report and the ledger (answer `N` if Windows asks "Terminate batch job" before the report is printed). A second Ctrl+C ends at once. Once every coverage target is met, the run spends at most 10 minutes checking the documented behaviour (`pipeline.after_target_seconds` in `ut_config.json`, 0 = no limit).
 
 ## Working on the code
 

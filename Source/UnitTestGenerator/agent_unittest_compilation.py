@@ -6,7 +6,8 @@ ut_setup.py installed or verified and recorded in tools/toolchain.json [A3-18a, 
 
 * Clang/LLVM 18 or newer: -fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc,
   llvm-profdata, llvm-cov. Gives LC, SC (regions), BC, DC and MC/DC [A3-33a, A3-58a].
-* libFuzzer (-fsanitize=fuzzer) for coverage-guided search of inputs for remaining gaps [A3-FZ1].
+* libFuzzer (-fsanitize=fuzzer) for coverage-guided search of inputs for remaining gaps [A3-FZ1]; without it,
+  ut_search, Agent3's own search on the coverage counters [A3-FZ9].
 * The static analyzer (clang --analyze) for source-fix acceptance [A4-32a].
 * The project's own build tools, for build capture only [A3-BD2]. The capture of a tested commit is
   kept and reused for every SUT file of that commit [ORC-22].
@@ -200,6 +201,9 @@ class CompilationConfig(BaseModel):
     max_minimize_tests: int = 300
     fuzz_seconds: int = 60             # per function [A3-FZ3]
     max_fuzz_replays: int = 200        # corpus inputs measured one by one [A3-FZ4]
+    search_executions: int = 200_000   # ut_search without libFuzzer: executions per function [A3-FZ10]
+    search_seed: int = 1               # its fixed pseudo-random seed [A3-FZ10]
+    search_input_timeout: int = 5      # seconds one input may run before it counts as a hang [A3-FZ10]
     flag_rounds: int = 2               # A3-BD12, ORC-7
     flag_context_chars: int = 12_000   # build files given to the brain [A3-BD11]
 
@@ -1165,6 +1169,329 @@ int main(int argc, char **argv) {
     return 0;
 }
 """
+
+# Agent3's own coverage-guided search when the toolchain has no libFuzzer [A3-FZ9, A3-FZ10].
+SEARCH_MAIN = r"""/* ut_search: Agent3's own coverage-guided input search for toolchains without libFuzzer [A3-FZ9].
+   Written by agent_unittest_compilation; linked with the fuzz target (LLVMFuzzerTestOneInput) that is
+   compiled with source-based coverage and -fsanitize-coverage=trace-pc,trace-cmp.
+   Feedback: coverage counters (bucketed hit counts), MC/DC test-vector bitmaps and comparison outcomes.
+   Deterministic: fixed seed, stops after max_execs or the time limit [A3-FZ10].
+   usage: ut_search CORPUS_DIR SECONDS MAX_EXECS SEED TIMEOUT_PER_INPUT SEED_FILE... */
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+char *__llvm_profile_begin_counters(void);
+char *__llvm_profile_end_counters(void);
+char *__llvm_profile_begin_bitmap(void);
+char *__llvm_profile_end_bitmap(void);
+
+#define MAX_LEN 4096
+#define MAX_CORPUS 4096
+#define VP_BITS (1u << 16)
+#define TORC 256
+
+static uint64_t rng_state;
+static uint64_t rnd(void) {                       /* xorshift64*: the same sequence on every computer */
+    rng_state ^= rng_state >> 12;
+    rng_state ^= rng_state << 25;
+    rng_state ^= rng_state >> 27;
+    return rng_state * 2685821657736338717ULL;
+}
+static size_t below(size_t n) { return n ? (size_t)(rnd() % n) : 0; }
+
+static uint8_t *corpus[MAX_CORPUS];
+static size_t corpus_len[MAX_CORPUS];
+static size_t corpus_n;
+static uint8_t *seen_cnt;                         /* per counter: hit-count buckets seen */
+static size_t n_cnt;
+static uint8_t *seen_bm;                          /* MC/DC test-vector bits seen */
+static size_t n_bm;
+static uint8_t vp_seen[VP_BITS / 8];              /* comparison outcomes seen */
+static unsigned new_vp;
+static uint64_t torc[TORC];                       /* recent comparison operands: values to try */
+static unsigned torc_n;
+static const char *out_dir;
+static unsigned saved;
+static unsigned long long execs;
+static const uint8_t *current;
+static size_t current_len;
+static volatile unsigned long long progress;
+static volatile int running;
+static unsigned timeout_s = 5;
+
+static void save(const char *name, const uint8_t *data, size_t len) {
+    char path[4096];
+    FILE *f;
+    snprintf(path, sizeof path, "%s/%s", out_dir, name);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite(data, 1, len, f);
+        fclose(f);
+    }
+}
+
+static void found_problem(const char *kind) {
+    char name[64];
+    snprintf(name, sizeof name, "../%s-%llu", kind, execs);
+    if (current) save(name, current, current_len);
+    printf("stat::number_of_executed_units: %llu\nstat::%s: 1\n", execs, kind);
+    fflush(stdout);
+}
+
+static void on_signal(int sig) {
+    (void)sig;
+    found_problem("crash");
+    _exit(71);
+}
+
+#ifdef _WIN32
+static LONG WINAPI on_exception(EXCEPTION_POINTERS *info) {
+    (void)info;
+    found_problem("crash");
+    TerminateProcess(GetCurrentProcess(), 71);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static DWORD WINAPI watchdog(LPVOID arg) {
+    unsigned long long last = 0;
+    unsigned still = 0;
+    (void)arg;
+    for (;;) {
+        Sleep(1000);
+        if (running && progress == last) {
+            if (++still >= timeout_s) {
+                found_problem("timeout");
+                TerminateProcess(GetCurrentProcess(), 72);
+            }
+        } else {
+            still = 0;
+        }
+        last = progress;
+    }
+    return 0;
+}
+#else
+static void on_alarm(int sig) {
+    (void)sig;
+    found_problem("timeout");
+    _exit(72);
+}
+#endif
+
+/* ---------------------------------------------------------------- comparison feedback (trace-cmp) */
+static void cmp(uintptr_t pc, uint64_t a, uint64_t b) {
+    uint64_t diff = a ^ b;
+    unsigned pop = 0, key, outcome = a == b ? 0u : a < b ? 1u : 2u;
+    while (diff) { pop += (unsigned)(diff & 1u); diff >>= 1; }
+    key = (unsigned)((pc * 2654435761u) ^ (pop << 2) ^ outcome) % VP_BITS;
+    if (!(vp_seen[key >> 3] & (1u << (key & 7)))) {
+        vp_seen[key >> 3] |= (uint8_t)(1u << (key & 7));
+        ++new_vp;
+    }
+    torc[torc_n++ % TORC] = b;
+    torc[torc_n++ % TORC] = a;
+}
+/* relative to the target's entry: the same key in every run, whatever address the program is loaded at */
+#define PC ((uintptr_t)__builtin_return_address(0) - (uintptr_t)&LLVMFuzzerTestOneInput)
+void __sanitizer_cov_trace_pc(void) {}
+void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { cmp(PC, a, b); }
+void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
+    uint64_t i;
+    for (i = 0; i < cases[0]; ++i) cmp(PC + (uintptr_t)i, val, cases[2 + i]);
+}
+void __sanitizer_cov_trace_div4(uint32_t val) { cmp(PC, val, 0); }
+void __sanitizer_cov_trace_div8(uint64_t val) { cmp(PC, val, 0); }
+void __sanitizer_cov_trace_gep(uintptr_t idx) { (void)idx; }
+
+/* ---------------------------------------------------------------- one execution */
+static unsigned bucket(uint64_t c) {
+    return c == 1 ? 1u : c == 2 ? 2u : c == 3 ? 4u : c < 8 ? 8u : c < 16 ? 16u : c < 32 ? 32u : c < 128 ? 64u : 128u;
+}
+
+static unsigned run_one(const uint8_t *data, size_t len) {
+    uint64_t *cnt = (uint64_t *)__llvm_profile_begin_counters();
+    uint8_t *bm = (uint8_t *)__llvm_profile_begin_bitmap();
+    unsigned fresh;
+    size_t i;
+    memset(cnt, 0, n_cnt * sizeof *cnt);
+    if (n_bm) memset(bm, 0, n_bm);
+    new_vp = 0;
+    current = data;
+    current_len = len;
+    running = 1;
+#ifndef _WIN32
+    alarm(timeout_s);
+#endif
+    LLVMFuzzerTestOneInput(data, len);
+#ifndef _WIN32
+    alarm(0);
+#endif
+    running = 0;
+    ++progress;
+    ++execs;
+    fresh = new_vp;
+    for (i = 0; i < n_cnt; ++i) {
+        if (cnt[i]) {
+            unsigned b = bucket(cnt[i]);
+            if (!(seen_cnt[i] & b)) {
+                seen_cnt[i] |= (uint8_t)b;
+                ++fresh;
+            }
+        }
+    }
+    for (i = 0; i < n_bm; ++i) {
+        uint8_t add = (uint8_t)(bm[i] & ~seen_bm[i]);
+        if (add) {
+            seen_bm[i] |= add;
+            ++fresh;
+        }
+    }
+    return fresh;
+}
+
+static void keep(const uint8_t *data, size_t len, int write) {
+    char name[32];
+    if (corpus_n < MAX_CORPUS) {
+        corpus[corpus_n] = (uint8_t *)malloc(len ? len : 1);
+        memcpy(corpus[corpus_n], data, len);
+        corpus_len[corpus_n++] = len;
+    }
+    if (write) {
+        snprintf(name, sizeof name, "s_%06u", saved++);
+        save(name, data, len);
+    }
+}
+
+/* ---------------------------------------------------------------- mutations */
+static void put(uint8_t *d, size_t len, uint64_t v, size_t width) {
+    size_t at;
+    if (len < width) return;
+    at = below(len - width + 1);
+    memcpy(d + at, &v, width);                    /* the host's byte order, as the target decodes it */
+}
+
+static void mutate(uint8_t *d, size_t len) {
+    static const int64_t interesting[] = {0, 1, -1, 2, 7, 8, 10, 16, 32, 64, 100, 127, -128, 128, 255, 256,
+                                          1000, 1024, 4096, 32767, -32768, 65535, 2147483647, -2147483647 - 1};
+    static const size_t widths[] = {1, 2, 4, 8};
+    size_t width = widths[below(4)], at, k;
+    uint64_t v;
+    if (!len) return;
+    switch (below(8)) {
+    case 0: d[below(len)] ^= (uint8_t)(1u << below(8)); break;
+    case 1: d[below(len)] = (uint8_t)rnd(); break;
+    case 2: put(d, len, (uint64_t)interesting[below(sizeof interesting / sizeof *interesting)], width); break;
+    case 3:
+        if (len < width) break;
+        at = below(len - width + 1);
+        v = 0;
+        memcpy(&v, d + at, width);
+        v += below(2) ? (uint64_t)(1 + below(35)) : (uint64_t)0 - (uint64_t)(1 + below(35));
+        memcpy(d + at, &v, width);
+        break;
+    case 4:
+    case 5:                                       /* a comparison operand, or one next to it */
+        if (!torc_n) break;
+        v = torc[below(torc_n < TORC ? torc_n : TORC)] + (uint64_t)((int64_t)below(3) - 1);
+        put(d, len, v, width);
+        break;
+    case 6:                                       /* crossover at the same offset */
+        k = below(corpus_n);
+        if (corpus_len[k] == len) {
+            at = below(len);
+            width = 1 + below(len - at);
+            memcpy(d + at, corpus[k] + at, width);
+        }
+        break;
+    default:
+        d[below(len)] = 0;
+        break;
+    }
+}
+
+static uint8_t *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf;
+    if (!f) return NULL;
+    buf = (uint8_t *)malloc(MAX_LEN);
+    *len = fread(buf, 1, MAX_LEN, f);
+    fclose(f);
+    return buf;
+}
+
+int main(int argc, char **argv) {
+    double seconds;
+    unsigned long long max_execs;
+    clock_t start;
+    uint8_t buf[MAX_LEN];
+    int i;
+    if (argc < 7) {
+        fprintf(stderr, "usage: ut_search CORPUS_DIR SECONDS MAX_EXECS SEED TIMEOUT SEED_FILE...\n");
+        return 2;
+    }
+    out_dir = argv[1];
+    seconds = atof(argv[2]);
+    max_execs = strtoull(argv[3], NULL, 10);
+    rng_state = strtoull(argv[4], NULL, 10) * 0x9E3779B97F4A7C15ULL + 1u;
+    timeout_s = (unsigned)atoi(argv[5]);
+    if (!timeout_s) timeout_s = 5;
+    n_cnt = (size_t)(__llvm_profile_end_counters() - __llvm_profile_begin_counters()) / sizeof(uint64_t);
+    n_bm = (size_t)(__llvm_profile_end_bitmap() - __llvm_profile_begin_bitmap());
+    seen_cnt = (uint8_t *)calloc(n_cnt + 1, 1);
+    seen_bm = (uint8_t *)calloc(n_bm + 1, 1);
+    signal(SIGSEGV, on_signal);
+    signal(SIGFPE, on_signal);
+    signal(SIGILL, on_signal);
+    signal(SIGABRT, on_signal);
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(on_exception);
+    CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+#else
+    signal(SIGALRM, on_alarm);
+#endif
+    for (i = 6; i < argc; ++i) {                  /* the seeds are always kept */
+        size_t len;
+        uint8_t *data = read_file(argv[i], &len);
+        if (!data) continue;
+        run_one(data, len);
+        keep(data, len, 0);
+        free(data);
+    }
+    if (!corpus_n) {
+        memset(buf, 0, 64);
+        run_one(buf, 64);
+        keep(buf, 64, 0);
+    }
+    start = clock();
+    while (execs < max_execs && (double)(clock() - start) / CLOCKS_PER_SEC < seconds) {
+        size_t parent = below(corpus_n), len = corpus_len[parent], n = 1 + below(4), k;
+        memcpy(buf, corpus[parent], len);
+        for (k = 0; k < n; ++k) mutate(buf, len);
+        if (run_one(buf, len)) keep(buf, len, 1);
+    }
+    printf("stat::number_of_executed_units: %llu\nstat::corpus_size: %u\nstat::counters: %u\nstat::mcdc_bitmap_bytes: %u\n",
+           execs, (unsigned)corpus_n, (unsigned)n_cnt, (unsigned)n_bm);
+    return 0;
+}
+"""
+SEARCH_FLAGS = ["-fsanitize-coverage=trace-pc,trace-cmp"]   # comparison operands, no section symbols [A3-FZ9]
 
 
 def _plain(t: str) -> str:
@@ -2212,14 +2539,14 @@ class CompilationAgent(ba.AgentCore):
 
     # ---------------------------------------------------------------- coverage-guided search [A3-FZ1 .. A3-FZ7]
     def fuzz(self, req: uc.FuzzRequest) -> uc.FuzzResult:
-        """libFuzzer on functions with remaining gaps; the inputs that reach uncovered items are
-        returned as concrete values, which Agent1 plans and Agent2 turns into tests [A3-FZ4]."""
+        """Coverage-guided search on functions with remaining gaps - libFuzzer, or ut_search when the
+        toolchain has none [A3-FZ9, A3-FZ11]; the inputs that reach uncovered items are returned as
+        concrete values, which Agent1 plans and Agent2 turns into tests [A3-FZ4]."""
         try:
             chain = self.toolchain()
         except ba.AgentFault as exc:
             return uc.FuzzResult(reason=exc.message)
-        if not chain.tools.fuzzer:
-            return uc.FuzzResult(reason="libFuzzer is not available with this toolchain [TP-8]")
+        engine = "libFuzzer" if chain.tools.fuzzer else "ut_search"
         layout = req.layout
         run_dir = Path(self.cfg.work_dir) / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8] + "-fuzz")
         self._prune_runs()
@@ -2229,7 +2556,7 @@ class CompilationAgent(ba.AgentCore):
         std = [] if any(f.startswith("-std=") for f in sut_flags) else \
             [f"-std={self.cfg.cxx_std}" if cpp else f"-std={self.cfg.c_std}"]
         incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}"]
-        result = uc.FuzzResult()
+        result = uc.FuzzResult(engine=engine)
         # Objects every target links: stubs and real dependencies (not instrumented).
         support = run_dir / "fuzz_support"
         support.mkdir(parents=True, exist_ok=True)
@@ -2274,26 +2601,20 @@ class CompilationAgent(ba.AgentCore):
             harness.write_text(source, encoding="utf-8")
             (d / "replay.c").write_text(REPLAY_MAIN, encoding="utf-8")
             compiler = chain.cxx if cpp else chain.cc
-            fuzzer = d / f"fuzz{EXE}"
-            # -O0: the short-circuit branches of decisions stay visible to the fuzzer's coverage
-            build = [compiler, "-g", "-O0", "-w", "-fsanitize=fuzzer", *chain.compile_flags(cpp), *sut_flags, *std, *incs,
-                     str(harness), *objects, "-o", str(fuzzer), *chain.tools.link_flags,
-                     *(chain.tools.cxx_link_flags if cpp else [])]
-            code, text = _run(build, repo, self.cfg.compile_timeout * 2, chain.env())
-            if code != 0:
-                result.unsupported.append(f"{fn.qualified_name}: fuzz target does not build: {text.strip()[-200:]}")
-                continue
             corpus = d / "corpus"
             corpus.mkdir(exist_ok=True)
             seconds = max(1, req.seconds)
             for byte in (0, 1, 255):                         # full-length seeds: every parameter is decoded
                 (corpus / f"seed_{byte}").write_bytes(bytes([byte]) * (plan.size + 8))
-            # -use_value_profile=1: comparison operands guide the search too; a decision that clang emits as a
-            # select (a ?: with constant arms) has no branch edge of its own [A3-FZ1]
-            code, text = _run([str(fuzzer), str(corpus), f"-max_total_time={seconds}", "-seed=1", "-len_control=0",
-                               "-use_value_profile=1",
-                               f"-max_len={max(64, plan.size + 16)}", "-timeout=5", "-rss_limit_mb=2048",
-                               f"-artifact_prefix={d}{os.sep}", "-print_final_stats=1"], d, seconds + 120, chain.env())
+            if engine == "libFuzzer":
+                problem, text = self._libfuzzer(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
+                                                corpus, seconds, plan, repo)
+            else:
+                problem, text = self._ut_search(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
+                                                corpus, seconds, repo)
+            if problem:
+                result.unsupported.append(f"{fn.qualified_name}: {problem}")
+                continue
             (d / "fuzz.log").write_text(text, encoding="utf-8")
             m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text)
             result.executions += int(m.group(1)) if m else 0
@@ -2320,7 +2641,8 @@ class CompilationAgent(ba.AgentCore):
                     result.crashes.append(f"{fn.qualified_name}({', '.join(args)}) "
                                           f"{'with ' + ' '.join(setup) + ' ' if setup else ''}"
                                           f"{'crashed' if crash.name.startswith('crash') else 'timed out'}")
-            inputs = sorted(corpus.iterdir(), key=lambda f: (not f.name.startswith("seed_"), f.stat().st_mtime))
+            inputs = sorted(corpus.iterdir(), key=lambda f: (not f.name.startswith("seed_"),        # A3-FZ10: in order
+                                                             0 if engine == "ut_search" else f.stat().st_mtime, f.name))
             result.inputs += self._select_inputs(fn, plan, inputs[: self.cfg.max_fuzz_replays],
                                                  replay, d, repo, layout, chain, gaps_by_fn.get(fn.name, []) +
                                                  gaps_by_fn.get(fn.qualified_name, []) if fn.name != fn.qualified_name
@@ -2328,6 +2650,51 @@ class CompilationAgent(ba.AgentCore):
         result.reason = (f"{len(result.inputs)} input(s) reach uncovered items; {result.executions} executions"
                          if result.functions else "no function could be fuzzed")
         return result
+
+    def _libfuzzer(self, chain: "Toolchain", compiler: str, cpp: bool, sut_flags: list[str], std: list[str],
+                   incs: list[str], harness: Path, objects: list[str], d: Path, corpus: Path, seconds: int,
+                   plan: "FuzzPlan", repo: Path) -> tuple[str, str]:
+        """libFuzzer from the toolchain [A3-FZ1, A3-FZ3]: (problem, log)."""
+        fuzzer = d / f"fuzz{EXE}"
+        # -O0: the short-circuit branches of decisions stay visible to the fuzzer's coverage
+        build = [compiler, "-g", "-O0", "-w", "-fsanitize=fuzzer", *chain.compile_flags(cpp), *sut_flags, *std, *incs,
+                 str(harness), *objects, "-o", str(fuzzer), *chain.tools.link_flags,
+                 *(chain.tools.cxx_link_flags if cpp else [])]
+        code, text = _run(build, repo, self.cfg.compile_timeout * 2, chain.env())
+        if code != 0:
+            return f"fuzz target does not build: {text.strip()[-200:]}", ""
+        # -use_value_profile=1: comparison operands guide the search too; a decision that clang emits as a
+        # select (a ?: with constant arms) has no branch edge of its own [A3-FZ1]
+        code, text = _run([str(fuzzer), str(corpus), f"-max_total_time={seconds}", "-seed=1", "-len_control=0",
+                           "-use_value_profile=1",
+                           f"-max_len={max(64, plan.size + 16)}", "-timeout=5", "-rss_limit_mb=2048",
+                           f"-artifact_prefix={d}{os.sep}", "-print_final_stats=1"], d, seconds + 120, chain.env())
+        return "", text
+
+    def _ut_search(self, chain: "Toolchain", compiler: str, cpp: bool, sut_flags: list[str], std: list[str],
+                   incs: list[str], harness: Path, objects: list[str], d: Path, corpus: Path, seconds: int,
+                   repo: Path) -> tuple[str, str]:
+        """Agent3's own search when the toolchain has no libFuzzer [A3-FZ9, A3-FZ10]: the fuzz target with
+        the coverage instrumentation Agent3 measures with, plus comparison tracing; (problem, log)."""
+        (d / "ut_search.c").write_text(SEARCH_MAIN, encoding="utf-8")
+        search = d / f"ut_search{EXE}"
+        steps = [
+            ([compiler, "-g", "-O0", "-w", *chain.compile_flags(cpp), *sut_flags, *std, *incs, *chain.coverage_flags(),
+              *SEARCH_FLAGS, "-c", str(harness), "-o", str(d / "search_target.o")], repo),
+            ([chain.cc, "-g", "-O1", "-w", "-c", str(d / "ut_search.c"), "-o", str(d / "ut_search.o")], d),
+            ([compiler, str(d / "search_target.o"), str(d / "ut_search.o"), *objects, "-o", str(search),
+              *chain.link_flags(cpp)] + (["-lm"] if os.name != "nt" else []), d)]
+        for cmd, cwd in steps:
+            code, text = _run(cmd, cwd, self.cfg.compile_timeout * 2, chain.env())
+            if code != 0:
+                return f"ut_search target does not build: {text.strip()[-200:]}", ""
+        seeds = sorted(str(p) for p in corpus.glob("seed_*"))
+        code, text = _run([str(search), str(corpus), str(seconds), str(self.cfg.search_executions),
+                           str(self.cfg.search_seed), str(self.cfg.search_input_timeout), *seeds], d, seconds + 120,
+                          chain.env(LLVM_PROFILE_FILE=str(d / "search.profraw")))
+        if BLOCKED_RUN.search(text or ""):
+            return BLOCKED_HINT.format(name=search.name), ""
+        return "", text
 
     @staticmethod
     def _controls(layout: uc.LayoutProfile, repo: Path, actions: list[uc.FileAction]) -> list[tuple[str, str]]:

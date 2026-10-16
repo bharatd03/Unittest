@@ -123,6 +123,8 @@ class PipelineConfig(BaseModel):
     max_workspace_mb: int = 200
     fuzz_after_stagnation: bool = True       # ORC-5a
     fuzz_seconds: int = Field(default=60, ge=1, le=3600)
+    # the documented-behaviour round after every target is met; 0 = no limit [ORC-32, ORC-7]
+    after_target_seconds: float = Field(default=600.0, ge=0)
     repo_cache: str = "ut_cache"             # one clone per repository and PC [ORC-20]
     max_parallel_suts: int = Field(default=1, ge=1, le=16)          # ORC-23, ORC-7
     git_token_env: str = ""                  # name of an environment variable holding a token [ORC-21]
@@ -379,9 +381,24 @@ class Orchestrator:
             result = state.finish("incomplete", f"{exc.agent} refused: {exc.reason}")
         except ba.AgentFault as exc:
             result = state.finish("incomplete", f"{exc.code}: {exc.message}")
+        except asyncio.CancelledError:            # Ctrl+C: deliver what was verified, then end [ORC-33]
+            task = asyncio.current_task()
+            if task is not None:
+                task.uncancel()
+            print("\nStopped by the user: delivering what Agent3 verified (Ctrl+C again ends at once).",
+                  file=sys.stderr, flush=True)
+            result = state.stopped("stopped by the user")
         except Exception as exc:                  # an agent that did not start, a broken pipe: still report
-            LOG.exception("pipeline run failed")
-            result = state.finish("incomplete", f"{type(exc).__name__}: {exc}"[:500])
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # Windows sends Ctrl+C to the agent processes too: their broken pipe arrives before the cancel
+                task.uncancel()
+                print("\nStopped by the user: delivering what Agent3 verified (Ctrl+C again ends at once).",
+                      file=sys.stderr, flush=True)
+                result = state.stopped("stopped by the user")
+            else:
+                LOG.exception("pipeline run failed")
+                result = state.stopped(f"ended by an error ({type(exc).__name__}: {exc})"[:400])
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         delivered = self._deliver(state, result)
         if self.hub is not None:
@@ -512,6 +529,7 @@ class Orchestrator:
             if rounds >= self.cfg.stage_a_rounds:
                 return s.finish("incomplete", "setup or build issues remain after the Stage A budget: " + last.reason)
             rounds += 1
+            s.current = f"Stage A round {rounds}"
             before = self._problems(last)
             last = await self._stage_a_round(s, last, rounds)
             if last.decision == "environment_error":
@@ -524,87 +542,106 @@ class Orchestrator:
         stagnant = 0
         fuzz: uc.FuzzResult | None = None
         next_brain_asked = False
-        for iteration in range(1, s.iter_limit + 1):
-            self._stage(f"Stage B: iteration {iteration} of {s.iter_limit}")
-            if self._needs_revision(last, s):                                  # A1-DA12
-                await self._dependencies(s, last)
-            plan = await self.call("analyzer", "plan", uc.PlanRequest(
-                layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
-                fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
-                avoid_brains=sorted(s.avoid_brains)), uc.UTPlan)
-            s.take_plan(plan)
-            s.note_plan(plan, iteration)                                       # COV-6, COV-10
-            fuzz = None
-            s.revise = any("[A1-DA12]" in item for item in plan.open_items)
-            if plan.layout.sut_sha256 != self.layout.sut_sha256:
-                raise ba.AgentFault("CONTRACT_VIOLATION", "Agent1 planned for another SUT version [ORC-10].")
-            s.open_items.update(plan.open_items)
-            if plan.stage == "done":
-                if not last.verified:                 # only Agent3's verify stage can prove it [GEN-05]
-                    last = await self.call("compilation", "verify", uc.VerifyRequest(
-                        layout=self.layout, stage="verify", bundle=s.bundle, previous=last_good), uc.VerificationResult)
-                    self.check_result(last, self.layout.sut_sha256)
-                    s.record(iteration, "verify", last, s.bundle)
-                if last.verified and last.decision == "complete":
-                    return s.finish("verified_measured", VERIFIED_REASON, last)
-                return s.finish("incomplete", "Agent1 reported done, but Agent3 did not verify it: " + last.reason, last)
-            if plan.stage == "blocked":
-                return s.finish("incomplete", "Agent1 blocked: " + plan.reason, last)
-            if self._only_proven(plan, last):                                       # COV-4, COV-7
-                return await self._stop(s, "no test can reach the remaining items: each has a deterministic proof, "
-                                           "so only a change of the source can reach them [COV-4, COV-7]", last)
-            for item in [g for sc in plan.scenarios for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
-                s.attempts[item] = s.attempts.get(item, 0) + 1
-            bundle = await self._generate(s, plan)
-            result = await self.call("compilation", "verify", uc.VerifyRequest(
-                layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
-            self.check_result(result, self.layout.sut_sha256)
-            if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
-                before = set(last.coverage.covered_items) if last.coverage else set()
-                result.newly_covered = len(set(result.coverage.covered_items) - before)
-            self._accept_bundle(s, bundle)
-            s.notes.extend(n for n in bundle.notes if n not in s.notes)
-            s.record(iteration, "verify", result, bundle)
-            await self._learn(s, result, bundle)
-            if result.decision == "environment_error":
-                return s.finish("incomplete", "environment: " + result.reason, result)
-            fixed = False
-            for failure in [f for f in result.failures if f.route == "agent4"][:1]:      # A3-177
-                verified = await self._correct_source(s, failure, result, last_good)
-                if verified is not None:
-                    result, fixed = verified, True
-            for failure in [f for f in result.failures if f.route == "stop"]:
-                return s.finish("incomplete", "environment: " + failure.diagnostic, result)
-            progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures)
-            stagnant = 0 if progress else stagnant + 1
-            if progress:
-                next_brain_asked = False
-            if not result.failures:
-                last_good = result
-            last = result
-            self._metrics(s, result)
-            complete = result.verified and result.decision == "complete"
-            if complete and not self._open(result):
-                if not progress:              # one more round added nothing: the target and the checks are done
-                    return s.finish("verified_measured", VERIFIED_REASON, result)
-                continue                      # Agent1 decides whether the documented behaviour is checked [A1-25y]
-            if not result.failures and result.coverage is not None and self.cfg.fuzz_after_stagnation \
-                    and self._open(result):
-                fuzz = await self._fuzz(s, result, iteration)                  # ORC-5a, A3-FZ1, COV-6
-                if fuzz is not None and fuzz.inputs:
-                    stagnant = 0                                           # new inputs are progress in the making
-            if stagnant >= self.cfg.stagnation_limit:
-                if not next_brain_asked and s.brains_last and self._open(result):      # COV-6: the next brain
-                    next_brain_asked = True
-                    s.avoid_brains |= s.brains_last
-                    s.note_all(result, iteration, "the gaps asked again of the next brain (not "
-                               + ", ".join(sorted(s.brains_last)) + ")")
-                    stagnant = self.cfg.stagnation_limit - 1
-                    continue
-                return await self._stop(s, f"no progress for {stagnant} consecutive iterations after every strategy "
-                                           "[A3-115, COV-6, COV-9]", result)
-        return await self._stop(s, f"iteration limit of ASIL {s.asil} reached: {s.iter_limit} iterations "
-                                   "[A3-114, COV-9]", last)
+        budget = asyncio.timeout(None)          # set when every target is met [ORC-32]
+        try:
+            async with budget:
+                for iteration in range(1, s.iter_limit + 1):
+                    s.current = f"Stage B iteration {iteration}"
+                    self._stage(f"Stage B: iteration {iteration} of {s.iter_limit}" + (
+                        " - targets met: checking the documented behaviour [A1-25y, ORC-32]" if s.targets_met_at else ""))
+                    if self._needs_revision(last, s):                                  # A1-DA12
+                        await self._dependencies(s, last)
+                    plan = await self.call("analyzer", "plan", uc.PlanRequest(
+                        layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
+                        fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
+                        avoid_brains=sorted(s.avoid_brains)), uc.UTPlan)
+                    s.take_plan(plan)
+                    s.note_plan(plan, iteration)                                       # COV-6, COV-10
+                    fuzz = None
+                    s.revise = any("[A1-DA12]" in item for item in plan.open_items)
+                    if plan.layout.sut_sha256 != self.layout.sut_sha256:
+                        raise ba.AgentFault("CONTRACT_VIOLATION", "Agent1 planned for another SUT version [ORC-10].")
+                    s.open_items.update(plan.open_items)
+                    if plan.stage == "done":
+                        if not last.verified:                 # only Agent3's verify stage can prove it [GEN-05]
+                            last = await self.call("compilation", "verify", uc.VerifyRequest(
+                                layout=self.layout, stage="verify", bundle=s.bundle, previous=last_good), uc.VerificationResult)
+                            self.check_result(last, self.layout.sut_sha256)
+                            s.record(iteration, "verify", last, s.bundle)
+                        if last.verified and last.decision == "complete":
+                            return s.finish("verified_measured", VERIFIED_REASON, last)
+                        return s.finish("incomplete", "Agent1 reported done, but Agent3 did not verify it: " + last.reason, last)
+                    if plan.stage == "blocked":
+                        return s.finish("incomplete", "Agent1 blocked: " + plan.reason, last)
+                    if self._only_proven(plan, last):                                       # COV-4, COV-7
+                        return await self._stop(s, "no test can reach the remaining items: each has a deterministic proof, "
+                                                   "so only a change of the source can reach them [COV-4, COV-7]", last)
+                    for item in [g for sc in plan.scenarios for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
+                        s.attempts[item] = s.attempts.get(item, 0) + 1
+                    bundle = await self._generate(s, plan)
+                    result = await self.call("compilation", "verify", uc.VerifyRequest(
+                        layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
+                    self.check_result(result, self.layout.sut_sha256)
+                    if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
+                        before = set(last.coverage.covered_items) if last.coverage else set()
+                        result.newly_covered = len(set(result.coverage.covered_items) - before)
+                    self._accept_bundle(s, bundle)
+                    s.notes.extend(n for n in bundle.notes if n not in s.notes)
+                    s.record(iteration, "verify", result, bundle)
+                    await self._learn(s, result, bundle)
+                    if result.decision == "environment_error":
+                        return s.finish("incomplete", "environment: " + result.reason, result)
+                    fixed = False
+                    for failure in [f for f in result.failures if f.route == "agent4"][:1]:      # A3-177
+                        verified = await self._correct_source(s, failure, result, last_good)
+                        if verified is not None:
+                            result, fixed = verified, True
+                    for failure in [f for f in result.failures if f.route == "stop"]:
+                        return s.finish("incomplete", "environment: " + failure.diagnostic, result)
+                    progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures)
+                    stagnant = 0 if progress else stagnant + 1
+                    if progress:
+                        next_brain_asked = False
+                    if not result.failures:
+                        last_good = result
+                    last = result
+                    self._metrics(s, result)
+                    complete = result.verified and result.decision == "complete"
+                    if complete and not self._open(result):
+                        if not progress:              # one more round added nothing: the target and the checks are done
+                            return s.finish("verified_measured", VERIFIED_REASON, result)
+                        if s.targets_met_at is None and self.cfg.after_target_seconds:          # ORC-32
+                            s.targets_met_at = time.monotonic()
+                            budget.reschedule(asyncio.get_running_loop().time() + self.cfg.after_target_seconds)
+                        continue                      # Agent1 decides whether the documented behaviour is checked [A1-25y]
+                    if not result.failures and result.coverage is not None and self.cfg.fuzz_after_stagnation \
+                            and self._open(result):
+                        fuzz = await self._fuzz(s, result, iteration)                  # ORC-5a, A3-FZ1, COV-6
+                        if fuzz is not None and fuzz.inputs:
+                            stagnant = 0                                           # new inputs are progress in the making
+                    if stagnant >= self.cfg.stagnation_limit:
+                        if not next_brain_asked and s.brains_last and self._open(result):      # COV-6: the next brain
+                            next_brain_asked = True
+                            s.avoid_brains |= s.brains_last
+                            s.note_all(result, iteration, "the gaps asked again of the next brain (not "
+                                       + ", ".join(sorted(s.brains_last)) + ")")
+                            stagnant = self.cfg.stagnation_limit - 1
+                            continue
+                        return await self._stop(s, f"no progress for {stagnant} consecutive iterations after every strategy "
+                                                   "[A3-115, COV-6, COV-9]", result)
+                return await self._stop(s, f"iteration limit of ASIL {s.asil} reached: {s.iter_limit} iterations "
+                                           "[A3-114, COV-9]", last)
+        except TimeoutError:
+            if not budget.expired() or s.best_result is None:
+                raise
+            s.notes.append(f"the documented-behaviour round was cut by its time limit of "
+                           f"{self.cfg.after_target_seconds:.0f} s after every target was met; the tests marked E8 only "
+                           "characterize, the others assert documented behaviour [ORC-32, A1-25y]")
+            best = s.best_result
+            if best.verified and best.decision == "complete":
+                return s.finish("verified_measured", VERIFIED_REASON + "; documented-behaviour round cut by its time "
+                                "limit [ORC-32]", best)
+            return s.stopped("stopped by the time limit after the targets were met [ORC-32]")
 
     @staticmethod
     def _open(result: uc.VerificationResult) -> bool:
@@ -788,9 +825,10 @@ class Orchestrator:
         except (Rejected, ba.AgentFault) as exc:
             s.fuzzing.append(f"not run: {exc}")
             return None
-        s.fuzzing.append(f"{', '.join(fuzz.functions) or '-'}: {fuzz.reason}")
+        engine = fuzz.engine or "libFuzzer"                                                 # A3-FZ11
+        s.fuzzing.append(f"{engine}: {', '.join(fuzz.functions) or '-'}: {fuzz.reason}")
         for g in gaps:                                                                       # COV-6, COV-10
-            s.note(g.gap_id, f"iteration {iteration}: coverage-guided search (libFuzzer, {fuzz.executions:,} inputs run, "
+            s.note(g.gap_id, f"iteration {iteration}: coverage-guided search ({engine}, {fuzz.executions:,} inputs run, "
                              + (f"{len(fuzz.inputs)} reached new items)" if fuzz.inputs else "none reached it)"))
         s.fuzzing += [f"not fuzzed: {u}" for u in fuzz.unsupported]
         s.open_items.update(f"input that crashes the SUT (characterization only, not a proven defect): {c}"
@@ -1190,6 +1228,9 @@ class RunState:
         self.files_modified: set[str] = set()
         self.bundle: uc.FileActionBundle | None = None
         self.best_bundle: uc.FileActionBundle | None = None
+        self.best_result: uc.VerificationResult | None = None     # the verify result of best_bundle [ORC-33]
+        self.targets_met_at: float | None = None                  # ORC-32
+        self.current = ""                                         # the stage in progress, for ORC-33
         self.last: uc.VerificationResult | None = None
         self.learned: set[str] = set()
         self.fix_branch = ""
@@ -1349,7 +1390,18 @@ class RunState:
             decision=f"{result.decision}: {result.reason}"[:300]))
         self.last = result
         if bundle is not None and result.build_ok and result.link_ok and not result.failures and result.total:
-            self.best_bundle = bundle
+            self.best_bundle, self.best_result = bundle, result
+
+    def stopped(self, why: str) -> uc.PipelineResult:
+        """ORC-33: a run stopped by the user or an unexpected error delivers what Agent3 verified."""
+        where = f"during {self.current}" if self.current else "before the first test run"
+        best = self.best_result
+        if best is not None and best.verified and best.decision == "complete":
+            return self.finish("verified_measured", f"{VERIFIED_REASON}; the run was then {why} {where} [ORC-33]", best)
+        if best is not None:
+            return self.finish("incomplete", f"{why} {where}; delivered: the last tests that all passed, with their "
+                               "measured coverage [ORC-33]", best)
+        return self.finish("incomplete", f"{why} {where}; nothing was verified yet [ORC-33]")
 
     def finish(self, state: str, reason: str, last: uc.VerificationResult | None = None) -> uc.PipelineResult:
         last = last or self.last
@@ -2203,7 +2255,8 @@ async def check_setup(config_path: Path) -> int:
         print(f"Manifest    : {tools.path}")
         print(f"Compiler    : {tools.kind} {tools.version} ({tools.target}), {tools.tc.get('origin', '')}")
         print(f"MC/DC       : {'measured' if tools.mcdc else 'NOT measured'}")
-        print(f"libFuzzer   : {'yes' if tools.fuzzer else 'no'}; static analyzer: {'yes' if tools.analyzer else 'no'}")
+        print(f"libFuzzer   : {'yes' if tools.fuzzer else 'no - the built-in search ut_search is used [A3-FZ9]'}; "
+              f"static analyzer: {'yes' if tools.analyzer else 'no'}")
         for name, entry in sorted((tools.data.get("tools") or {}).items()):
             print(f"{name:12}: {entry.get('version', '')} {entry.get('path', '')} ({entry.get('origin', '')})")
         for note in tools.data.get("notes", []):

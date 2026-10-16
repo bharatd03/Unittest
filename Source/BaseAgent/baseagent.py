@@ -3758,7 +3758,8 @@ def emit_event(kind: str, **fields: Any) -> None:
     if not path or kind not in VIEW_KINDS:
         return
     try:
-        with open(path, "a", encoding="utf-8") as handle:
+        # LF on every operating system: the live page reads the file by bytes [VIEW-10]
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(_event_line(kind, fields) + "\n")
     except (OSError, TypeError, ValueError):
         pass
@@ -3907,22 +3908,29 @@ def serve_viewer(hub: ViewHub, *, host: str = "127.0.0.1", port: int = 0, open_b
         if not allowed(request):
             return PlainTextResponse("unauthorized", status_code=401)
 
+        # A reconnecting browser sends the id of the last event it received; the stream continues
+        # after it, so no event is shown twice or lost. Positions are bytes, read in binary mode,
+        # so Windows line ends cannot shift them [VIEW-10].
+        last = request.headers.get("last-event-id", "")
+        start = int(last) if last.isdigit() else 0
+
         async def lines():
-            position, idle = 0, 0.0
+            position, idle = start, 0.0
             while True:
                 if await request.is_disconnected():
                     return
                 try:
-                    with hub.path.open("r", encoding="utf-8", errors="replace") as handle:
+                    with hub.path.open("rb") as handle:
                         handle.seek(position)
                         chunk = handle.read()
                 except OSError:
-                    chunk = ""
-                complete = chunk[:chunk.rfind("\n") + 1] if "\n" in chunk else ""
-                position += len(complete.encode("utf-8"))
-                for line in complete.splitlines():
-                    if line.strip():
-                        yield "data: " + line + "\n\n"
+                    chunk = b""
+                complete = chunk[:chunk.rfind(b"\n") + 1]
+                for raw in complete.splitlines(keepends=True):
+                    position += len(raw)
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        yield f"id: {position}\ndata: {line}\n\n"
                 idle = 0.0 if complete else idle + 0.25
                 if idle >= 10:
                     idle = 0.0
@@ -4158,7 +4166,7 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="run_end"){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
    if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)});
   if(S.orch){S.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"");paintOrch()}
-  finalPanel(d);feed(ev,ev.summary||"Run finished","gray");var st=document.getElementById("status");st.textContent="finished";st.className="pill";return}}
+  finalPanel(d);feed(ev,ev.summary||"Run finished","gray");var st=document.getElementById("status");st.textContent="finished";st.className="pill";if(S.es)S.es.close();return}}
 document.getElementById("present").addEventListener("click",function(){document.body.classList.toggle("present");this.classList.toggle("on")});
 var embedded=JSON.parse(document.getElementById("embedded").textContent||"null");
 S.animate=!matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -4171,9 +4179,11 @@ if(embedded&&embedded.length){var st=document.getElementById("status");st.textCo
  document.getElementById("end").addEventListener("click",function(){clearTimeout(timer);var a=S.animate;S.animate=false;while(i<embedded.length)apply(embedded[i++]);S.animate=a});
  next()}
 else{S.live=true;var st2=document.getElementById("status");st2.textContent="live";st2.className="pill live";
- var q=location.search||"";var es=new EventSource("events"+q);
+ var q=location.search||"";var es=new EventSource("events"+q);S.es=es;
+ es.onopen=function(){if(st2.textContent!=="finished"){st2.textContent="live";st2.className="pill live"}};
  es.onmessage=function(m){try{apply(JSON.parse(m.data))}catch(e){}};
- es.onerror=function(){st2.textContent="connection closed";st2.className="pill";}}
+ es.onerror=function(){if(st2.textContent==="finished")return;
+  st2.textContent=es.readyState===2?"connection closed":"reconnecting";st2.className="pill";}}
 })();
 </script></body></html>
 """

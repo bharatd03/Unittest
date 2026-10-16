@@ -28,6 +28,7 @@
     "output_dir": "ut_output",
     "deliver_tests_to_repo": true,
     "fuzz_after_stagnation": true,
+    "after_target_seconds": 600,
     "repo_cache": "ut_cache",
     "max_parallel_suts": 1,
     "git_token_env": "",

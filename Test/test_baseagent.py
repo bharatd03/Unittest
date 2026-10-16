@@ -2363,8 +2363,26 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(server.url.startswith("http://127.0.0.1:"))
             self.assertIn("EventSource", urllib.request.urlopen(server.url, timeout=5).read().decode())
             self.assertEqual(len(json.loads(urllib.request.urlopen(server.url + "events.json", timeout=5).read())), 1)
-            line = urllib.request.urlopen(server.url + "events", timeout=5).readline().decode()
+            stream = urllib.request.urlopen(server.url + "events", timeout=5)
+            first_id = stream.readline().decode()
+            line = stream.readline().decode()
+            self.assertTrue(first_id.startswith("id: "), first_id)              # resumable [VIEW-10]
             self.assertTrue(line.startswith("data: ") and '"first"' in line)
+            stream.close()
+            # A Windows-written file (CRLF) and a reconnecting browser: the stream continues after the
+            # last event it sent, with no event twice and no broken line [VIEW-10].
+            with hub.path.open("ab") as handle:
+                handle.write(b'{"kind": "stage", "summary": "second", "time": 1}\r\n')
+                handle.write(b'{"kind": "stage", "summary": "third", "time": 2}\r\n')
+            request = urllib.request.Request(server.url + "events", headers={"Last-Event-ID": first_id[4:].strip()})
+            stream = urllib.request.urlopen(request, timeout=5)
+            data = []
+            while len(data) < 2:
+                row = stream.readline().decode()
+                if row.startswith("data: "):
+                    data.append(json.loads(row[6:])["summary"])
+            stream.close()
+            self.assertEqual(data, ["second", "third"])
         finally:
             server.stop()
         with self.assertRaises(ba.AgentFault) as ctx:                          # never on the network without a token

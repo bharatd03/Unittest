@@ -79,7 +79,7 @@ flowchart TD
         verify --> route{"Agent3 routing<br/>A3-177"}
         route -- "test or stub defect" --> covPlan
         route -- "gaps remain" --> covPlan
-        route -- "gaps remain,<br/>no new tests reach them" --> fuzz["Agent3 fuzz<br/>libFuzzer, inputs that<br/>reach the gaps"]
+        route -- "gaps remain,<br/>no new tests reach them" --> fuzz["Agent3 fuzz<br/>libFuzzer or ut_search,<br/>inputs that reach the gaps"]
         fuzz --> covPlan
         covPlan -. "coverage 100%,<br/>stated behaviour unchecked<br/>A1-25y" .-> gen
         route -- "undetermined" --> covPlan
