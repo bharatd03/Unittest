@@ -2443,7 +2443,7 @@ class AnalyzerAgent(ba.AgentCore):
                 answer = await self.generate(task, context, PlannedScenarios, need=need, step="A1.plan",
                                              project=layout.repo_root, allowed=allowed)
             except ba.AgentFault as exc:
-                plan_notes["planning"].append(f"{fn.name}: rules - brain not available ({exc.code}) [A1-PL8]"
+                plan_notes["planning"].append(f"{fn.name}: rules - no usable brain answer ({exc.code}) [A1-PL8]"
                                               if not accepted else f"{fn.name}: re-ask failed ({exc.code})")
                 break
             used = self.brain_of_call()                             # this call's brain, not another's [ARCH-18]

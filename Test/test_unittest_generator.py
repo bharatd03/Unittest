@@ -705,6 +705,54 @@ class CompilationTests(unittest.TestCase):
         run_dir = Path(r.run_dir)
         self.assertTrue((run_dir / "junit.xml").is_file())                       # A3-29c
 
+    def test_tests_that_do_not_compile_are_left_out_and_the_rest_measured(self):
+        tests = ('/* evidence: E8 */\nUT_TEST(test_heat)\n{\n    ut_stub_read_sensor_return = 10;\n'
+                 '    UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);\n}\n\n'
+                 '/* evidence: E8 */\nUT_TEST(test_broken)\n{\n    UT_EXPECT_EQ_INT(no_such_value, 1);\n}\n\n'
+                 'UT_SUITE_BEGIN\n    UT_CASE(test_heat)\n    UT_CASE(test_broken)\nUT_SUITE_END\n')
+        b = self.bundle(tests)
+        with self.assertLogs(level="WARNING") as logs:
+            r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=b))
+        self.assertTrue(any("A3-CL12" in line for line in logs.output))
+        self.assertTrue(r.build_ok and r.link_ok)                                    # A3-CL12
+        self.assertEqual((r.total, r.passed), (1, 1))
+        self.assertEqual([f.affected_test for f in r.quarantined], ["test_broken"])
+        q = r.quarantined[0]
+        self.assertEqual((q.classification, q.kind, q.route), ("test_generation_defect", "compile", "agent1"))
+        self.assertIn("no_such_value", q.diagnostic)
+        self.assertFalse(any(f.affected_test == "test_broken" for f in r.failures))
+        self.assertIsNotNone(r.coverage)
+        # the suite Agent3 measured is exactly the bundle the orchestrator keeps
+        kept = uc.without_tests(b, ["test_broken"])
+        self.assertEqual(r.suite_sha256, uc.files_signature(Path(r.run_dir) / "repo", ["tests/stubs/ut_stubs.c",
+                                                                                    "tests/test_thermostat.c"]))
+        self.assertEqual((Path(r.run_dir) / "repo" / "tests/test_thermostat.c").read_text(encoding="utf-8"),
+                         uc.suite_of(kept))
+        self.assertNotIn("test_broken", uc.suite_of(kept))
+        self.assertIn("UT_CASE(test_heat)", uc.suite_of(kept))
+
+    def test_errors_outside_tests_are_not_quarantined(self):
+        tests = ('UT_TEST(test_heat) { UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1); }\n'
+                 'int broken_helper = no_such_value;\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_heat)\nUT_SUITE_END\n')
+        r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(tests)))
+        self.assertFalse(r.link_ok)
+        self.assertEqual(r.quarantined, [])
+        self.assertEqual(r.reason, "the build did not link")
+        only = ('UT_TEST(test_broken) { UT_EXPECT_EQ_INT(no_such_value, 1); }\n'
+                'UT_SUITE_BEGIN\nUT_CASE(test_broken)\nUT_SUITE_END\n')            # nothing would be left
+        r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(only)))
+        self.assertFalse(r.link_ok)
+        self.assertEqual(r.quarantined, [])
+        two = ('UT_TEST(test_heat) { UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1); }\n'
+               'UT_TEST(test_broken) { UT_EXPECT_EQ_INT(no_such_value, 1); }\n'
+               'UT_SUITE_BEGIN\nUT_CASE(test_heat)\nUT_CASE(test_broken)\nUT_SUITE_END\n')
+        source = (Path(self.layout.repo_root) / "src/thermostat.c").read_text(encoding="utf-8")
+        r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(two),
+                                                source_overrides={"src/thermostat.c": source}))
+        self.assertFalse(r.link_ok)                                     # a source-fix trial is never quarantined
+        self.assertEqual(r.quarantined, [])
+
     def test_e2_failure_is_decided_by_the_brain(self):
         b = self.bundle('UT_TEST(test_clamp) { UT_EXPECT_EQ_INT(clamp_percent(150), 99); }\n'
                         'UT_SUITE_BEGIN\nUT_CASE(test_clamp)\nUT_SUITE_END\n', {"test_clamp": "E2"})
@@ -1473,6 +1521,23 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
 
+    def test_a_brain_test_that_does_not_compile_costs_no_iteration(self):
+        """A3-CL12: one generated test does not compile; the others are still run and measured in the same
+        iteration, the broken test is removed from the bundle and never delivered."""
+        tests = dict(CANNED_TESTS)
+        tests["clamp_percent"] = [*CANNED_TESTS["clamp_percent"],
+                                  {"name": "test_clamp_percent_two_arguments", "scenario_ids": [],
+                                   "body": "UT_EXPECT_EQ_INT(clamp_percent(150, 1), 100);", "evidence_class": "E2"}]
+        repo = copy_pilot("c_pilot", self.d)
+        with brain(UTBrain(tests=tests)):
+            result = self.run_pipeline(repo, "src/thermostat.c")
+        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        suite = (repo / "tests/test_thermostat.c").read_text()
+        self.assertNotIn("test_clamp_percent_two_arguments", suite)
+        self.assertIn("UT_TEST(test_select_mode_nobody_home)", suite)          # the brain's other tests stay
+        self.assertTrue(any("A3-CL12" in n and "clamp_percent" in n for n in result.open_items), result.open_items)
+        self.assertFalse(any("did not link" in i.decision for i in result.iterations if i.stage == "verify"))
+
     def test_behaviour_round_after_the_targets_has_a_time_limit(self):
         """ORC-32: once every target is met and verified, the documented-behaviour round (A1-25y) runs only within
         its time; then the run finishes with the verified result instead of waiting for a slow brain."""
@@ -1733,7 +1798,7 @@ class BrainPlanningTests(unittest.TestCase):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                       iteration=2)))
         self.assertTrue(all(s.made_by == "rule" for s in plan.scenarios))              # A1-PL8
-        self.assertTrue(any("rules - brain not available" in p for p in plan.planning))
+        self.assertTrue(any("rules - no usable brain answer" in p for p in plan.planning))
 
     def test_hard_gap_shows_what_was_tried(self):
         suite = ('/* evidence: E8 */\nUT_TEST(test_thermostat_command_auto_1)\n{\n    ut_stub_read_sensor_return = 5;\n'

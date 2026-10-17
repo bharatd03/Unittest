@@ -489,6 +489,8 @@ class VerificationResult(Contract):
     decision: Literal["complete", "gaps_remain", "failures", "setup_blocked", "environment_error"]
     reason: str = ""
     verified: bool = False
+    # generated tests that did not compile: left out of this run, which measured the others [A3-CL12]
+    quarantined: list[Failure] = Field(default_factory=list)
 
 
 # ============================================================================ planning (Agent1)
@@ -1115,6 +1117,50 @@ def test_sources(suite: str) -> dict[str, str]:
                     break
             i += 1
         out[m.group(1)] = suite[m.start(): i + 1]
+    return out
+
+
+def test_at_line(suite: str, line: int) -> str:
+    """The UT_TEST whose source holds ``line`` (1-based) of the suite, or ""."""
+    if line <= 0:
+        return ""
+    offset = sum(len(row) + 1 for row in suite.split("\n")[: line - 1])
+    for name, source in test_sources(suite).items():
+        start = suite.find(source)
+        if start <= offset <= start + len(source):
+            return name
+    return ""
+
+
+def remove_tests(suite: str, names: list[str] | set[str]) -> str:
+    """The suite without the named UT_TEST blocks and their UT_CASE registrations. Agent3 and the
+    orchestrator use the same function, so the suite Agent3 measured is the suite delivered [A3-CL12]."""
+    sources = test_sources(suite)
+    for name in sorted(set(names)):
+        if name in sources:
+            source = sources[name]
+            suite = suite.replace(source + "\n\n", "", 1) if source + "\n\n" in suite else suite.replace(source, "", 1)
+        suite = re.sub(r"[ \t]*UT_CASE\(\s*" + re.escape(name) + r"\s*\)[ \t]*\r?\n?", "", suite)
+    return suite
+
+
+def without_tests(bundle: "FileActionBundle", names: list[str] | set[str], note: str = "") -> "FileActionBundle":
+    """A copy of the bundle without the named tests [A3-CL12, A2-21i]."""
+    gone = set(names)
+    out = bundle.model_copy(deep=True)
+    if not gone:
+        return out
+    for action in out.actions:
+        if action.role == "testsuite":
+            action.content = remove_tests(action.content, gone)
+            for name in gone:
+                action.evidence_classes.pop(name, None)
+    out.tests = [t for t in out.tests if t not in gone]
+    out.characterization_tests = [t for t in out.characterization_tests if t not in gone]
+    out.new_tests = [t for t in out.new_tests if t not in gone]
+    out.observations = [o for o in out.observations if not any(o == n or o.startswith(n + "_") for n in gone)]
+    if note:
+        out.notes.append(note)
     return out
 
 

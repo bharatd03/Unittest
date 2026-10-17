@@ -139,7 +139,8 @@ class FakeAnthropic:
             async def get_final_message(self):
                 return types.SimpleNamespace(
                     stop_reason=outer.stop, usage=types.SimpleNamespace(input_tokens=10, output_tokens=5),
-                    content=[_Block("thinking"), _Block("text", json.dumps(outer.reply))])
+                    content=[_Block("thinking"), _Block("text", outer.reply if isinstance(outer.reply, str)
+                                                         else json.dumps(outer.reply))])
 
         class _Manager:
             async def __aenter__(self):
@@ -165,7 +166,8 @@ class FakeOllama(http.server.BaseHTTPRequestHandler):
     """
     defaults = dict(version="0.12.3", has_model=True, capabilities=["completion", "tools", "thinking"],
                     chat_status=200, generate_status=200, error="boom", delay=0.0, generate_delay=0.0,
-                    done_reason="stop", prompt_eval_count=120, eval_count=40, replies=None)
+                    done_reason="stop", prompt_eval_count=120, eval_count=40, replies=None,
+                    chat_statuses=None, done_reasons=None)
     calls: list = []
 
     def log_message(self, *_):
@@ -200,16 +202,19 @@ class FakeOllama(http.server.BaseHTTPRequestHandler):
             return self._send(200, {"model": body["model"], "done": True, "done_reason": "load", "response": ""})
         if self.path == "/api/chat":
             time.sleep(cls.delay)                      # Ollama is up but answers slowly
-            if cls.chat_status != 200:
-                return self._send(cls.chat_status, {"error": cls.error})
-            replies = cls.replies or [json.dumps(QWEN_REPLY)]
             chats = sum(1 for path, _ in cls.calls if path == "/api/chat")
+            status = cls.chat_statuses[min(chats, len(cls.chat_statuses)) - 1] if cls.chat_statuses else cls.chat_status
+            if status != 200:
+                return self._send(status, {"error": cls.error})
+            replies = cls.replies or [json.dumps(QWEN_REPLY)]
             content = replies[min(chats, len(replies)) - 1]
             message = {"role": "assistant", "content": content}
             if body.get("think"):
                 message["thinking"] = "Let me look at the state first. " * 50
             return self._send(200, {"model": body["model"], "message": message, "done": True,
-                                    "done_reason": cls.done_reason, "prompt_eval_count": cls.prompt_eval_count,
+                                    "done_reason": (cls.done_reasons[min(chats, len(cls.done_reasons)) - 1]
+                                                    if cls.done_reasons else cls.done_reason),
+                                    "prompt_eval_count": cls.prompt_eval_count,
                                     "eval_count": cls.eval_count})
         self._send(404, {"error": "unknown path"})
 
@@ -1815,8 +1820,14 @@ class GenerateTests(unittest.IsolatedAsyncioTestCase):
         router = ba.BrainRouter([GenBrain("opus", fail="BRAIN_UNAVAILABLE"), GenBrain("qwen")])
         result, brain, skipped = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
         self.assertEqual((brain.brain_name, skipped), ("qwen", ["opus"]))
-        with self.assertRaises(ba.AgentFault) as ctx:      # invalid output is not routed around
-            await ba.BrainRouter([GenBrain("opus", reply={"x": 1}), GenBrain("qwen")]).generate(
+        # Work output that stays unusable goes to the next allowed brain, without a cooldown [ARCH-19]
+        router = ba.BrainRouter([GenBrain("opus", reply={"x": 1}), GenBrain("qwen")])
+        with self.assertLogs("baseagent", "WARNING"):
+            result, brain, skipped = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual((brain.brain_name, skipped, result["output"].name), ("qwen", ["opus"], "p1"))
+        self.assertEqual(router.retry_after.get("opus", 0.0), 0.0)
+        with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault) as ctx:   # none usable
+            await ba.BrainRouter([GenBrain("opus", reply={"x": 1}), GenBrain("qwen", reply={"x": 1})]).generate(
                 "t", "c", {}, ba.model_validator_for(GenPlan))
         self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
 
@@ -1855,6 +1866,104 @@ class RateLimitError(Exception):
     def __init__(self, retry_after="0"):
         super().__init__("rate limited")
         self.response = types.SimpleNamespace(headers={"retry-after": retry_after})
+
+
+class BrainAnswerRobustnessTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-19, ARCH-20: answer failures are handled once, in BaseAgent, for every agent."""
+    CUT = '{"name": "p1", "steps": [{"title": "first", "lines": [1, 2]}, {"title": "sec'
+    REPEAT = "prediction aborted, token repeat limit reached"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server, cls.url = start_fake_ollama()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        FakeOllama.reset()
+
+    def qwen(self, **changes):
+        return ba.QwenEngine(ba.QwenSettings(base_url=self.url, preload=False, **changes))
+
+    def test_salvage_keeps_only_complete_items(self):
+        self.assertEqual(ba.salvage_json(self.CUT), {"name": "p1", "steps": [{"title": "first", "lines": [1, 2]}]})
+        tricky = '```json\n{"tests": [{"name": "a", "body": "s = \\"}]\\"; {"}, {"name": "b", "body": "y'
+        self.assertEqual(ba.salvage_json(tricky), {"tests": [{"name": "a", "body": 's = "}]"; {'}]})
+        for nothing in (None, "", '{"name": "p1", "steps": [{"title": "fir', '[{"a": 1}, {"b', "not json"):
+            self.assertIsNone(ba.salvage_json(nothing))
+
+    async def test_qwen_repetition_is_asked_again_with_other_sampling(self):
+        FakeOllama.chat_statuses, FakeOllama.error = [500, 200], self.REPEAT
+        FakeOllama.replies = ["", json.dumps(PLAN_REPLY)]
+        router = ba.BrainRouter([self.qwen()])
+        with self.assertLogs("baseagent", "WARNING") as logs:
+            result, _, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual(result["output"].name, "p1")
+        first, second = FakeOllama.chat_bodies()
+        self.assertEqual((first["options"]["seed"], first["options"]["temperature"]), (42, 0.0))
+        self.assertEqual((second["options"]["seed"], second["options"]["temperature"],
+                          second["options"]["repeat_penalty"]), (43, 0.4, 1.2))
+        self.assertEqual(router.retry_after.get("qwen", 0.0), 0.0)                # no cooldown
+        self.assertTrue(any("other sampling" in line for line in logs.output))
+
+    async def test_qwen_repeating_twice_is_an_output_failure_not_unavailable(self):
+        FakeOllama.chat_status, FakeOllama.error = 500, self.REPEAT
+        router = ba.BrainRouter([self.qwen()])
+        with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault) as ctx:
+            await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
+        self.assertEqual(len(FakeOllama.chat_bodies()), 2)
+        self.assertEqual(router.retry_after.get("qwen", 0.0), 0.0)
+        FakeOllama.reset()
+        FakeOllama.chat_status, FakeOllama.error = 500, "out of memory"                 # a real outage
+        with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault) as ctx:
+            await self.qwen().generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual(ctx.exception.code, "MODEL_UNAVAILABLE")
+
+    async def test_qwen_cut_answer_uses_its_complete_items(self):
+        FakeOllama.done_reason, FakeOllama.replies = "length", [self.CUT]
+        plans = []
+        router = ba.BrainRouter([self.qwen()])
+        with self.assertLogs("baseagent", "WARNING") as logs:
+            result, _, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan), need=400, plans=plans)
+        self.assertEqual([s.title for s in result["output"].steps], ["first"])
+        self.assertEqual(len(FakeOllama.chat_bodies()), 2)                  # asked once with more room first
+        self.assertTrue(plans[-1].salvaged and plans[-1].record()["salvaged"])
+        self.assertTrue(any("complete items" in line for line in logs.output))
+
+    async def test_cut_answer_that_fails_the_check_keeps_the_cut_fault(self):
+        FakeOllama.done_reason, FakeOllama.replies = "length", [self.CUT]
+
+        def strict(raw):
+            plan = ba.model_validator_for(GenPlan)(raw)
+            if len(plan.steps) < 2:
+                raise ba.AgentFault("MODEL_OUTPUT_INVALID", "two steps needed")
+            return plan
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await self.qwen(output_retries=0).generate("t", "c", {}, strict)
+        self.assertIn("num_predict", ctx.exception.message)
+
+    async def test_claude_cut_answer_uses_its_complete_items(self):
+        fake = FakeAnthropic(reply=self.CUT, stop="max_tokens")
+        engine = ba.OpusEngine(ba.AnthropicSettings(), client=fake)
+        with self.assertLogs("baseagent", "WARNING"):
+            result = await engine.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual([s.title for s in result["output"].steps], ["first"])
+
+    def test_keep_valid_filters_items_and_fails_only_when_none_is_left(self):
+        dropped = []
+        check = ba.keep_valid("steps", lambda s: "" if s.title != "bad" else "bad title", dropped=dropped,
+                              label=lambda s: s.title, limit=1)
+        plan = GenPlan(name="p", steps=[{"title": "bad", "lines": []}, {"title": "ok", "lines": []},
+                                        {"title": "ok2", "lines": []}])
+        check(plan)
+        self.assertEqual(([s.title for s in plan.steps], dropped), (["ok"], ["bad: bad title"]))
+        with self.assertRaises(ba.AgentFault) as ctx:
+            check(GenPlan(name="p", steps=[{"title": "bad", "lines": []}]))
+        self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
+        self.assertIn("bad title", ctx.exception.message)
 
 
 class ParallelCallTests(unittest.IsolatedAsyncioTestCase):
@@ -2173,7 +2282,7 @@ class TokenBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.requests[-1]["max_tokens"], 1300 + 8000)
         await router.generate("t", "c", {}, validate)
         self.assertEqual(fake.requests[-1]["max_tokens"], 16_000)
-        fake.stop = "max_tokens"
+        fake.stop, fake.reply = "max_tokens", '{"name": "p1", "steps": [{"title": "fir'   # no complete item
         with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault):
             await router.generate("t", "c", {}, validate, need=1000)
         self.assertEqual([r["max_tokens"] for r in fake.requests[-2:]], [9300, 16_000])   # once with the maximum

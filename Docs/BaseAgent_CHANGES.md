@@ -1,5 +1,16 @@
 # BaseAgent changes
 
+## 2026-10-16 (night): unusable brain answers, handled once for every agent
+
+**Why.** In the first C++ run with Qwen, one A2.tests call ended with Ollama's HTTP 500 "token repeat limit reached". BaseAgent reported every HTTP 500 as `MODEL_UNAVAILABLE`, so a healthy Qwen was put on a 30 s cooldown and the function got no LLM tests. Each agent also repeated the same item-by-item filtering code.
+
+* **Repetition (ARCH-19).** An answer that repeats itself until Ollama stops it is `MODEL_OUTPUT_INVALID`, not `MODEL_UNAVAILABLE`: no cooldown. It is asked once more with other sampling, still seeded so a run can be repeated: seed + 1, temperature at least 0.4, `repeat_penalty` 1.2. Other HTTP 500s stay `MODEL_UNAVAILABLE`.
+* **Cut answers (ARCH-19).** After the existing retry with twice the room, `salvage_json()` keeps the complete items of the answer's top-level list (`{"tests": [a, b, {"na` gives `{"tests": [a, b]}`) and drops the item cut in the middle. The result goes through the same schema and agent checks; when nothing passes, the original "cut" fault is raised. Qwen and the Claude models both. The token plan and the live page show `salvaged`.
+* **Next brain for unusable work output (ARCH-19).** For `generate` (plans, tests, flags, patches) an answer that stays invalid after the brain's own re-ask is passed to the next allowed brain, without a cooldown. Decisions (`decide`) are never sent to another brain because of an invalid answer.
+* **`keep_valid(field, rule, ...)` (ARCH-20).** A generic `check` for `generate()`: the agent gives the rule for one item; unusable items are dropped with their reasons; the answer is invalid only when none is left. Agent4 uses it for fix candidates and suggestions.
+* **Tests.** `BrainAnswerRobustnessTests` (7): salvage only of complete items, repetition asked again with other sampling and no cooldown, repeating twice is an output failure, a real outage is still `MODEL_UNAVAILABLE`, a cut answer uses its complete items (Qwen and Claude), a cut answer that fails the check keeps the cut fault, `keep_valid`. `test_router_generate_falls_back` now expects the next brain for invalid work output.
+
+
 ## 2026-10-16: brain calls at the same time
 
 **Why.** A production file has 100 or more functions; asking the brain about one function at a time makes a run take hours with a Claude model, although the calls for different functions do not depend on each other.

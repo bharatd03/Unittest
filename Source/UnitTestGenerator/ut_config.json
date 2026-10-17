@@ -62,6 +62,7 @@
     "build_timeout": 1800,
     "fuzz_seconds": 60,
     "flag_rounds": 2,
+    "quarantine_rounds": 2,
     "build_commands": {}
   },
   "corrector": {"max_fragment_lines": 30, "min_independent_evidence": 2, "candidates": 3, "suggestions": 3},

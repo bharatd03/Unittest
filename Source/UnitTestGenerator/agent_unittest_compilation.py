@@ -199,6 +199,7 @@ class CompilationConfig(BaseModel):
     mutant_run_timeout: float = 5.0     # one run of the test program with a mutant; a timeout detects it
     minimize_tests: bool = True        # observe stage: per-test coverage so redundant probes can be dropped
     keep_runs: int = 10                # run folders kept in work_dir (older ones are deleted)
+    quarantine_rounds: int = 2         # rebuilds without generated tests that do not compile [A3-CL12]
     max_minimize_tests: int = 300
     fuzz_seconds: int = 60             # per function [A3-FZ3]
     max_fuzz_replays: int = 200        # corpus inputs measured one by one [A3-FZ4]
@@ -1967,7 +1968,7 @@ class CompilationAgent(ba.AgentCore):
                                              need=ba.OutputNeed(items=min(len(errors), 10), tokens_per_item=90,
                                                                 overhead=80))
             except ba.AgentFault as exc:
-                build.notes.append(f"flag suggestion by the brain not available ({exc.code}) [A3-BD11]")
+                build.notes.append(f"no usable flag suggestion by the brain ({exc.code}) [A3-BD11]")
                 break
             accepted, sources = [], []
             for s in answer.flags[:30]:
@@ -2021,13 +2022,18 @@ class CompilationAgent(ba.AgentCore):
         base.update(sut_sha256=sut_sha, suite_sha256=uc.files_signature(repo, suite_files),
                     compiler=chain.cc if layout.language == "c" else chain.cxx, compiler_version=chain.version)
         build = self._build(layout, req, repo, run_dir, chain)
+        quarantined: list[uc.Failure] = []
+        if not build["linked"] and req.stage in ("verify", "observe") and not req.source_overrides:
+            build, quarantined = self._quarantine(layout, req, repo, run_dir, chain, build)
+            if quarantined:
+                base.update(suite_sha256=uc.files_signature(repo, suite_files))
         manifest = self._write_manifest(run_dir, chain, build, repo, layout, suite_files)
         base.update(manifest=str(manifest))
         result = uc.VerificationResult(**base, build_ok=build["compiled"], link_ok=build["linked"],
                                        diagnostics=build["diagnostics"],
                                        undefined_symbols=sorted({d.symbol for d in build["diagnostics"]
                                                                  if d.category == "undefined_reference" and d.symbol}),
-                                       decision="setup_blocked")
+                                       decision="setup_blocked", quarantined=quarantined)
         if req.static_analysis:
             result.analyzer_findings, result.analyzer_run = self._analyze(layout, repo, run_dir, chain), True
         if not build["linked"]:
@@ -2261,6 +2267,67 @@ class CompilationAgent(ba.AgentCore):
                 "mcdc_notes": mcdc_notes, "objects": objects, "commands": commands, "obj_dir": obj,
                 "sut_object": sut_object}
 
+    def _quarantine(self, layout: uc.LayoutProfile, req: uc.VerifyRequest, repo: Path, run_dir: Path,
+                    chain: Toolchain, build: dict[str, Any]) -> tuple[dict[str, Any], list[uc.Failure]]:
+        """A3-CL12: when every build error lies in generated tests, those tests are left out of the staged
+        suite and the rest is built, run and measured in the same verify. They are reported with the
+        compiler's message, so the orchestrator removes them and Agent1 plans their gaps again. Any other
+        error (SUT, stub, harness, header, dependency) keeps the build failure as it is."""
+        suites = [a.path for a in (req.bundle.actions if req.bundle else []) if a.role == "testsuite"]
+        if not suites or self.cfg.quarantine_rounds <= 0:
+            return build, []
+        current, removed = build, {}
+        for _ in range(self.cfg.quarantine_rounds):
+            failures = self._classify_build(layout, current["diagnostics"], req)
+            texts = {path: (repo / path).read_text(encoding="utf-8", errors="replace") for path in suites}
+            hits: dict[str, dict[str, uc.Failure]] = {}
+            for f in failures:
+                if f.classification != "test_generation_defect":
+                    return build, []
+                where = self._tests_of(f, texts, layout)
+                if not where:
+                    return build, []                         # an error outside every test: not a test's fault
+                for path, name in where:
+                    hits.setdefault(path, {}).setdefault(name, f)
+            if not hits:
+                return build, []
+            for path, names in hits.items():
+                left = uc.remove_tests(texts[path], set(names))
+                if not uc.test_sources(left):
+                    return build, []                         # nothing would be left to run
+                self._write_new(repo / path, left.encode("utf-8"))
+                for name, f in names.items():
+                    removed[name] = f.model_copy(update={
+                        "failure_id": f"quarantine-{len(removed)}", "affected_test": name, "file": path,
+                        "diagnostic": f"{name} does not compile: {f.diagnostic}"[:1000],
+                        "evidence": [*f.evidence, "left out of the run [A3-CL12]"]})
+            current = self._build(layout, req, repo, run_dir, chain)
+            if current["linked"]:
+                LOG.warning("%d generated test(s) did not compile and were left out of the run: %s [A3-CL12]",
+                            len(removed), ", ".join(sorted(removed)))
+                return current, list(removed.values())
+        for path in suites:                              # still broken: the original suite and its errors
+            original = next(a.content for a in req.bundle.actions if a.path == path)
+            self._write_new(repo / path, original.encode("utf-8"))
+        return build, []
+
+    @staticmethod
+    def _tests_of(f: uc.Failure, texts: dict[str, str], layout: uc.LayoutProfile) -> list[tuple[str, str]]:
+        """(suite path, test) a build error belongs to: by the error's line in the suite, or, for a
+        symbol that does not link, every test that names it."""
+        file = f.file.replace("\\", "/")
+        for path, text in texts.items():
+            if f.line and file and (file == path or file.endswith("/" + path) or
+                                    Path(file).name == Path(path).name):
+                name = uc.test_at_line(text, f.line)
+                return [(path, name)] if name else []
+        if f.kind == "link" and f.symbol:
+            word = re.split(r"::", f.symbol.split("(")[0])[-1]
+            found = [(path, name) for path, text in texts.items()
+                     for name, source in uc.test_sources(text).items() if re.search(rf"\b{re.escape(word)}\b", source)]
+            return found
+        return []
+
     @staticmethod
     def _role_of(path: str, unit_role: str, layout: uc.LayoutProfile) -> str:
         path = path.replace("\\", "/")
@@ -2419,6 +2486,8 @@ class CompilationAgent(ba.AgentCore):
         out = []
         for i, d in enumerate(diags):
             path = d.file.replace("\\", "/")
+            # the SUT itself, not a file whose name ends like it (tests/test_x.c is not x.c)
+            in_sut = path == sut_name or path.endswith("/" + sut_name)
             evidence_extra = ""
             if d.category == "tool_missing":
                 category = "environment_defect"
@@ -2446,7 +2515,7 @@ class CompilationAgent(ba.AgentCore):
                 evidence_extra = f"real dependency {d.file} does not compile"
             elif d.category == "missing_header" and d.role in ("sut", "real_dependency"):
                 category = "build_configuration_defect"         # Agent1 resolves headers [A1-DA13, A3-38a]
-            elif d.role == "sut" or path.endswith(sut_name):
+            elif d.role == "sut" or (in_sut and d.role not in ("test", "stub", "helper")):
                 # With estimated flags a SUT error is far more likely a missing define or include than a
                 # production defect: never sent to Agent4 then [A1-16a, A3-CL1].
                 estimated = layout.build is None or layout.build.estimated
@@ -2460,7 +2529,7 @@ class CompilationAgent(ba.AgentCore):
                 route = "agent1"          # Agent3 already tried its own repair; Agent1 plans the rest
             message = d.message
             if category == "build_configuration_defect" and (layout.build is None or layout.build.estimated) and \
-                    (d.role == "sut" or path.endswith(sut_name)):
+                    (d.role == "sut" or (in_sut and d.role not in ("test", "stub", "helper"))):
                 message += " | the build description is estimated: the SUT is built without the project's own " \
                            "defines and include paths [A3-BD5]"
             out.append(uc.Failure(failure_id=f"build-{i}", kind="link" if d.role == "link" else "compile",

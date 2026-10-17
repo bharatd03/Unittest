@@ -1538,22 +1538,8 @@ def redundant_tests(candidates: list[str], test_items: dict[str, list[str]]) -> 
 def drop_tests(bundle: uc.FileActionBundle, names: list[str]) -> uc.FileActionBundle:
     if not names:
         return bundle
-    out = bundle.model_copy(deep=True)
-    for action in out.actions:
-        if action.role != "testsuite":
-            continue
-        sources = uc.test_sources(action.content)
-        for name in names:
-            if name in sources:
-                action.content = action.content.replace(sources[name] + "\n\n", "").replace(sources[name], "")
-            action.content = re.sub(r"[ \t]*UT_CASE\(\s*" + re.escape(name) + r"\s*\)\n?", "", action.content)
-            action.evidence_classes.pop(name, None)
-    gone = set(names)
-    out.tests = [t for t in out.tests if t not in gone]
-    out.characterization_tests = [t for t in out.characterization_tests if t not in gone]
-    out.new_tests = [t for t in out.new_tests if t not in gone]
-    out.notes.append(f"{len(names)} redundant characterization test(s) removed: they added no coverage")
-    return out
+    return uc.without_tests(bundle, names, f"{len(names)} redundant characterization test(s) removed: "
+                                           "they added no coverage")
 
 
 def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],

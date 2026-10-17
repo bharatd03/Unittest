@@ -322,20 +322,11 @@ class CorrectorAgent(ba.AgentCore):
                                    project: str) -> list[PatchProposal]:
         """generate() with the fragment check inside the brain's validate step: candidates that fail it
         are left out; when none passes, the brain is asked once more with the reason [ARCH-5]."""
-        def keep_good(parsed: PatchProposals) -> None:
-            good, reasons = [], []
-            for proposal in parsed.candidates:
-                try:
-                    check(proposal)
-                    good.append(proposal)
-                except ba.AgentFault as exc:
-                    reasons.append(exc.message)
-            if not good:
-                raise ba.AgentFault("MODEL_OUTPUT_INVALID", "no candidate passed the checks: " +
-                                    ("; ".join(reasons[:3]) or "no candidates"))
-            parsed.candidates[:] = good
+        def rule(proposal: PatchProposal) -> str:
+            check(proposal)                                  # raises with the reason [ARCH-20]
+            return ""
         answer = await self.generate(task, context, PatchProposals, need=need, step="A4.candidates", project=project,
-                                     check=keep_good)
+                                     check=ba.keep_valid("candidates", rule))
         return list(answer.candidates)
 
     async def review(self, req: uc.ReviewRequest) -> uc.ReviewResult:
@@ -376,32 +367,24 @@ class CorrectorAgent(ba.AgentCore):
         known = {e.evidence_id: e for e in req.evidence}
         limit = max(1, min(req.max_suggestions, 5))
 
-        def keep_good(parsed: SuggestionProposals) -> None:
-            good, reasons = [], []
-            for s in parsed.suggestions:
-                problem = ""
-                original = s.original_fragment.replace("\r\n", "\n")
-                if not original.strip() or source.count(original) != 1:
-                    problem = "original_fragment must occur exactly once in the SOURCE"
-                elif original == s.corrected_fragment.replace("\r\n", "\n"):
-                    problem = "the change does not change anything"
-                for q in s.quotes:
-                    ev = known.get(q.evidence_id)
-                    if ev is None or not q.text.strip() or " ".join(q.text.split()) not in " ".join(ev.text.split()):
-                        problem = f"the quote of {q.evidence_id} does not occur word for word"
-                if problem:
-                    reasons.append(problem)
-                else:
-                    good.append(s)
-            if not good:
-                raise ba.AgentFault("MODEL_OUTPUT_INVALID", "no suggestion passed the checks: " + "; ".join(reasons[:3]))
-            parsed.suggestions[:] = good[:limit]
+        def rule(s: SuggestionProposal) -> str:
+            original = s.original_fragment.replace("\r\n", "\n")
+            if not original.strip() or source.count(original) != 1:
+                return "original_fragment must occur exactly once in the SOURCE"
+            if original == s.corrected_fragment.replace("\r\n", "\n"):
+                return ("the change does not change anything: corrected_fragment must differ from "
+                        "original_fragment")
+            for q in s.quotes:
+                ev = known.get(q.evidence_id)
+                if ev is None or not q.text.strip() or " ".join(q.text.split()) not in " ".join(ev.text.split()):
+                    return f"the quote of {q.evidence_id} does not occur word for word"
+            return ""
 
         need = ba.OutputNeed(items=limit, tokens_per_item=self.cfg.tokens_per_candidate + 200, overhead=100)
         try:
             answer = await self.generate(SUGGEST_TASK.format(file=layout.sut_file, limit=limit), context,
                                          SuggestionProposals, need=need, step="A4.suggest", project=layout.repo_root,
-                                         check=keep_good)
+                                         check=ba.keep_valid("suggestions", rule, limit=limit))
         except ba.AgentFault as exc:
             return uc.SuggestionSet(notes=[f"no suggestion: brain not available or no usable answer ({exc.code}) [COV-12]"])
         author = self.last_brain.get("brain", "")

@@ -582,6 +582,7 @@ class Orchestrator:
                     result = await self.call("compilation", "verify", uc.VerifyRequest(
                         layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
                     self.check_result(result, self.layout.sut_sha256)
+                    bundle = await self._drop_quarantined(s, bundle, result, iteration)        # A3-CL12
                     if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
                         before = set(last.coverage.covered_items) if last.coverage else set()
                         result.newly_covered = len(set(result.coverage.covered_items) - before)
@@ -885,11 +886,34 @@ class Orchestrator:
             obs = await self.call("compilation", "observe", uc.VerifyRequest(
                 layout=self.layout, stage="observe", bundle=bundle), uc.VerificationResult)
             self.check_result(obs, self.layout.sut_sha256)
+            bundle = await self._drop_quarantined(s, bundle, obs)                       # A3-CL12
             s.test_items.update(obs.test_items)                            # what each test reached [A1-PL7]
             bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
                 bundle=bundle, observed=obs.observed, test_items=obs.test_items), uc.FileActionBundle)
             self.check_bundle(bundle)
         return await self._oracle_checks(s, bundle)
+
+    async def _drop_quarantined(self, s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult,
+                                iteration: int = 0) -> uc.FileActionBundle:
+        """A3-CL12: generated tests that did not compile were left out of Agent3's run; they are removed
+        from the bundle too, so the bundle is the suite Agent3 measured. Their gaps stay open, so Agent1
+        plans them again; the compiler's message goes to the knowledge base as a negative example."""
+        if not result.quarantined:
+            return bundle
+        names = sorted({f.affected_test for f in result.quarantined if f.affected_test})
+        tests = uc.test_sources(uc.suite_of(bundle))
+        for f in result.quarantined[:3]:
+            with contextlib.suppress(Rejected, ba.AgentFault):
+                await self.call("kb", "learn", uc.LearningEvent(
+                    kind="negative", language=self.layout.language, framework=self.layout.framework,
+                    category=f.classification, snippet=tests.get(f.affected_test, f.diagnostic)[:4000] or f.classification,
+                    reason=f.diagnostic or f.classification), uc.LearnAck)
+        note = (f"{len(names)} generated test(s) did not compile and were removed; their gaps are planned again "
+                f"[A3-CL12]: " + "; ".join(f.diagnostic[:160] for f in result.quarantined[:4]))[:1200]
+        s.notes.append(note)
+        s.quarantined += names
+        self._stage(f"{len(names)} generated test(s) did not compile; the others were run and measured [A3-CL12]")
+        return uc.without_tests(bundle, names, note)
 
     async def _oracle_checks(self, s: "RunState", bundle: uc.FileActionBundle) -> uc.FileActionBundle:
         """Declared expectation changes are accepted only when they do not weaken the test
@@ -1097,7 +1121,7 @@ class Orchestrator:
             return False, f"the tests could not be verified again ({exc})"[:300]
         finally:
             await asyncio.to_thread(cache.remove_worktree, workspace)
-        if not (result.build_ok and result.link_ok) or result.failures or result.failed:
+        if not (result.build_ok and result.link_ok) or result.failures or result.failed or result.quarantined:
             return False, "the tests no longer build or pass on the new head"
         if result.verified and result.decision == "complete":                       # COV-1, COV-3: measured again
             return True, ""
@@ -1229,6 +1253,7 @@ class RunState:
         self.bundle: uc.FileActionBundle | None = None
         self.best_bundle: uc.FileActionBundle | None = None
         self.best_result: uc.VerificationResult | None = None     # the verify result of best_bundle [ORC-33]
+        self.quarantined: list[str] = []                           # generated tests that did not compile [A3-CL12]
         self.targets_met_at: float | None = None                  # ORC-32
         self.current = ""                                         # the stage in progress, for ORC-33
         self.last: uc.VerificationResult | None = None

@@ -1334,6 +1334,46 @@ def llm_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return walk({k: v for k, v in schema.items() if k != "$defs"})
 
 
+def salvage_json(text: Any) -> Any:
+    """ARCH-19: the complete part of a JSON answer that was cut at its token limit, or None.
+
+    The answer {"tests": [{...}, {...}, {"na   is closed after its last complete item of a top-level
+    list field, giving {"tests": [{...}, {...}]}. An item cut in the middle is never used; the
+    caller still runs the full schema and agent checks on the result."""
+    if not isinstance(text, str):
+        return None
+    text = re.sub(r"^\s*<think>.*?</think>", "", text, flags=re.S).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    stack, quote, escape, cuts = [], False, False, []
+    for i, c in enumerate(text):
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                quote = False
+            continue
+        if c == '"':
+            quote = True
+        elif c in "{[":
+            stack.append("}" if c == "{" else "]")
+        elif c in "}]":
+            if not stack:
+                return None
+            stack.pop()
+            if len(stack) == 2 and stack == ["}", "]"]:   # a complete item of a top-level list field
+                cuts.append((i + 1, "]}"))
+    for end, closers in reversed(cuts):
+        try:
+            value = json_loads(text[:end] + closers, max_bytes=GENERATE_MAX_BYTES)
+        except AgentFault:
+            continue
+        if isinstance(value, dict) and any(isinstance(v, list) and v for v in value.values()):
+            return value
+    return None
+
+
 def parse_generated(text: Any) -> Any:
     """JSON from a brain's text: tolerates a leading think block or a code fence."""
     if not isinstance(text, str):
@@ -1408,6 +1448,7 @@ class TokenPlan:
     used_input_tokens: int = 0        # reported by the brain
     used_output_tokens: int = 0
     outcome: str = "planned"          # answered, or the fault code
+    salvaged: bool = False            # True: only the complete items of a cut answer were used (ARCH-19)
 
     def record(self) -> dict[str, Any]:
         window = self.window if self.window < UNLIMITED_WINDOW else 0
@@ -1416,7 +1457,8 @@ class TokenPlan:
                 "chars_per_token": round(self.chars_per_token, 3), "kept": list(self.kept),
                 "shortened": list(self.shortened), "dropped": list(self.dropped),
                 "packs": [dict(pack) for pack in self.packs], "used_input_tokens": self.used_input_tokens,
-                "used_output_tokens": self.used_output_tokens, "outcome": self.outcome}
+                "used_output_tokens": self.used_output_tokens, "outcome": self.outcome,
+                "salvaged": self.salvaged}
 
 
 class TokenMeter:
@@ -1661,6 +1703,8 @@ class ClaudeEngine:
         if stop != "end_turn":
             fault = AgentFault("MODEL_OUTPUT_INVALID", f"{self.model_id} stopped before a complete answer.")
             fault.truncated = stop == "max_tokens"
+            fault.partial = "".join(getattr(b, "text", "") for b in getattr(message, "content", [])
+                                    if getattr(b, "type", None) == "text")          # [ARCH-19]
             raise fault
         return message
 
@@ -1720,7 +1764,21 @@ class ClaudeEngine:
         messages = [{"role": "user", "content": generate_prompt(task, context)}]
         usage = {"input_tokens": 0, "output_tokens": 0}
         for attempt in range(2):
-            message = await self._bounded(GENERATE_SYSTEM_PROMPT, messages, schema, plan, usage)
+            try:
+                message = await self._bounded(GENERATE_SYSTEM_PROMPT, messages, schema, plan, usage)
+            except AgentFault as exc:
+                salvaged = salvage_json(getattr(exc, "partial", None)) if getattr(exc, "truncated", False) else None
+                if salvaged is None:
+                    raise
+                try:
+                    result = validate(salvaged)                # the complete items of the cut answer [ARCH-19]
+                except AgentFault:
+                    raise exc from None
+                LOG.warning("%s's answer was cut at its token limit; its complete items are used.", self.model_id)
+                if plan is not None:
+                    plan.salvaged = True
+                self.usage = usage
+                return {"model": self.model_id, "output": result, "usage": dict(usage)}
             texts = [b.text for b in getattr(message, "content", []) if getattr(b, "type", None) == "text"]
             try:
                 if len(texts) != 1:
@@ -1972,12 +2030,14 @@ class QwenEngine:
                                      settings.num_ctx, settings.num_predict, settings.inference_timeout)
 
     async def _post_chat(self, messages: list[dict[str, str]], fmt: dict[str, Any], num_ctx: int,
-                         num_predict: int, timeout: float) -> dict[str, Any]:
+                         num_predict: int, timeout: float, vary: bool = False) -> dict[str, Any]:
         settings = self.settings
+        options = {"temperature": settings.temperature, "seed": settings.seed, "num_ctx": num_ctx,
+                   "num_predict": num_predict}
+        if vary:              # after a repetition loop: other sampling, still a fixed seed [ARCH-19]
+            options.update(temperature=max(settings.temperature, 0.4), seed=settings.seed + 1, repeat_penalty=1.2)
         body = {"model": settings.model, "messages": messages, "stream": False, "think": settings.think,
-                "format": fmt, "keep_alive": settings.keep_alive,
-                "options": {"temperature": settings.temperature, "seed": settings.seed,
-                            "num_ctx": num_ctx, "num_predict": num_predict}}
+                "format": fmt, "keep_alive": settings.keep_alive, "options": options}
         status, reply = await self.http.call("POST", "/api/chat", body, timeout)
         if status == 404:
             self.started = False
@@ -1989,6 +2049,13 @@ class QwenEngine:
             raise AgentFault("BRAIN_REQUEST_REJECTED", "Ollama rejected the request; see the local log.")
         if status != 200:
             self._log_reply(status, reply)
+            detail = str(reply.get("error", "")) if isinstance(reply, dict) else ""
+            if re.search(r"repeat", detail, re.I):
+                # The model repeated itself until Ollama stopped it: a bad answer, not a missing
+                # model; asked again with other sampling, never a reason to skip the brain [ARCH-19].
+                fault = AgentFault("MODEL_OUTPUT_INVALID", "Qwen repeated itself until Ollama stopped the answer.")
+                fault.degenerate = True
+                raise fault
             raise AgentFault("MODEL_UNAVAILABLE" if status >= 500 else "MODEL_EXECUTION_FAILED",
                              "Ollama decision request failed.", status >= 500)
         if not isinstance(reply, dict) or not isinstance(reply.get("message"), dict):
@@ -1997,6 +2064,7 @@ class QwenEngine:
             fault = AgentFault("MODEL_OUTPUT_INVALID",
                                "Qwen hit qwen.num_predict before finishing its answer; raise num_predict.")
             fault.truncated = True
+            fault.partial = reply["message"].get("content")             # its complete items may be used [ARCH-19]
             raise fault
         if _token_count(reply, "prompt_eval_count") + _token_count(reply, "eval_count") >= num_ctx:
             # The context window was full, so Ollama may have dropped part of the evidence.
@@ -2046,13 +2114,28 @@ class QwenEngine:
             raise AgentFault("MODEL_BUSY", "The local model is busy with other requests.", True) from exc
         try:
             usage = {"input_tokens": 0, "output_tokens": 0}
-            attempt = 0
+            attempt, varied = 0, False
             while True:
                 try:
-                    reply = await self._post_chat(messages, fmt, window, out, timeout)
+                    reply = await self._post_chat(messages, fmt, window, out, timeout, varied)
                 except AgentFault as exc:
+                    if getattr(exc, "degenerate", False) and not varied:
+                        varied = True
+                        LOG.warning("Qwen repeated itself; asking again with other sampling.")
+                        continue
                     if not (getattr(exc, "truncated", False) and plan is not None and plan.adaptive
                             and attempt < settings.output_retries and out < settings.max_num_predict):
+                        salvaged = salvage_json(getattr(exc, "partial", None))
+                        if salvaged is not None:          # the complete items of the cut answer [ARCH-19]
+                            try:
+                                result = check({"message": {"content": json.dumps(salvaged)}})
+                            except AgentFault:
+                                raise exc from None
+                            LOG.warning("Qwen's answer was cut at its token limit; its complete items are used.")
+                            if plan is not None:
+                                plan.salvaged = True
+                            self.usage = usage
+                            return result, dict(usage)
                         raise
                     attempt += 1
                     out = min(settings.max_num_predict, out * 2)
@@ -2204,7 +2287,7 @@ class BrainRouter:
     async def _route(self, kind: str, candidates: list[Any], step: str, parts: list[ContextPart],
                      fixed_chars: int, need: int | None, plans: list[TokenPlan] | None,
                      call: Callable[[Any, str, TokenPlan], Any]) -> tuple[Any, Any, list[str]]:
-        skipped, budget_fault = [], None
+        skipped, budget_fault, output_fault = [], None, None
         for brain in candidates:
             name = self.name_of(brain)
             wait = self.retry_after.get(name, 0.0)
@@ -2225,6 +2308,14 @@ class BrainRouter:
                     budget_fault = exc
                     skipped.append(name)
                     continue
+                if exc.code == "MODEL_OUTPUT_INVALID" and kind == "generate" and brain is not candidates[-1]:
+                    # Work output (a plan, tests, a patch) that stayed unusable after the brain's own
+                    # retries: the next allowed brain is asked; the work is still checked and verified
+                    # afterwards. Decisions are never shopped around this way. No cooldown [ARCH-19].
+                    LOG.warning("Brain %s gave no usable answer (%s); asking the next brain.", name, exc.message)
+                    output_fault = exc
+                    skipped.append(name)
+                    continue
                 if exc.code not in AVAILABILITY_FAULTS:
                     raise
                 self._skip(name, exc.code)
@@ -2236,6 +2327,8 @@ class BrainRouter:
             self._observe(plan, result)
             self.retry_after[name], self.status[name] = 0.0, "available"
             return result, brain, skipped
+        if output_fault is not None:
+            raise output_fault
         if budget_fault is not None:
             raise budget_fault
         raise AgentFault("NO_BRAIN_AVAILABLE", "No allowed brain is currently available.", True)
@@ -3058,6 +3151,35 @@ def contract_failure(request_id: str, fault: AgentFault, meta: ContractMeta | No
                             error=ErrorInfo(code=fault.code, message=fault.message, retryable=fault.retryable))
 
 
+def keep_valid(field_name: str, rule: Callable[[Any], str], *, dropped: list[str] | None = None,
+               limit: int | None = None, label: Callable[[Any], str] | None = None) -> Callable[[Any], None]:
+    """ARCH-20: a ``check`` for generate() that judges an answer item by item.
+
+    ``rule(item)`` returns "" for a usable item or the reason it is not. Unusable items are left out
+    (their reasons go to ``dropped``); the answer is kept with the usable ones, at most ``limit``.
+    Only when no item is usable is the answer invalid: the brain is then asked once more with the
+    first reasons. The agent states only its domain rule; BaseAgent does the rest."""
+    def check(parsed: Any) -> None:
+        items = list(getattr(parsed, field_name))
+        good, reasons = [], []
+        for item in items:
+            try:
+                problem = rule(item)
+            except AgentFault as exc:
+                problem = exc.message
+            if problem:
+                reasons.append(f"{label(item)}: {problem}" if label else problem)
+            else:
+                good.append(item)
+        if dropped is not None:
+            dropped[:] = reasons
+        if not good:
+            raise AgentFault("MODEL_OUTPUT_INVALID", f"no item of {field_name} passed the checks: "
+                             + ("; ".join(dict.fromkeys(reasons[:3])) or f"{field_name} is empty"))
+        getattr(parsed, field_name)[:] = good[:limit] if limit else good
+    return check
+
+
 def validation_summary(exc: ValidationError, limit: int = 3) -> str:
     """Short, content-free description of what failed (field paths and error types only)."""
     parts = []
@@ -3431,10 +3553,12 @@ class AgentCore:
             brain = next((b for b in self.router.brains if self.router.name_of(b) == last.brain), None)
             model = getattr(brain, "model_id", "") or last.brain
         self.emit("brain_answer", data={"step": step, "brain": last.brain, "model": model, "outcome": last.outcome,
+                                        "salvaged": last.salvaged,
                                         "window": last.window if last.window < UNLIMITED_WINDOW else 0,
                                         "tokens": last.used_input_tokens + last.used_output_tokens},
-                  summary=(f"{self.view_label}: {model} answered ({step})" if last.outcome == "answered"
-                           else f"{self.view_label}: brain {last.outcome} ({step})"))
+                  summary=(f"{self.view_label}: {model} answered ({step})"
+                           + (" - only the complete items of a cut answer used" if last.salvaged else "")
+                           if last.outcome == "answered" else f"{self.view_label}: brain {last.outcome} ({step})"))
 
     async def generate(self, task: str, context: str | list[ContextPart], output_model: type[BaseModel], *,
                        need: OutputNeed | None = None, step: str = "", project: str | Path | None = None,
