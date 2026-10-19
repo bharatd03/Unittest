@@ -71,8 +71,9 @@ Run without a command, the `.bat` shows a menu.
 | `test-full` | every test, including whole pipeline runs, in parallel processes (release validation) |
 | `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
 | `pilot-embedded`, `pilot-embedded-cpp` | the full pipeline on the embedded pilots: registers, register polling, a superloop, interrupt flags, target keywords and assembly; an injected interface, exceptions, a static object in a function and a header-only template |
+| `pilot-realrepo` | the full pipeline on patterns found in real repositories: a header that needs its configuration header first, `T * const` parameters, a header next to the source only, `_Atomic` and callback fields, a handle whose `Instance` points to registers, C++ namespaces |
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
-| `run REPO SUT [--branch NAME]` | a git repository link or a folder, and the source file to test |
+| `run REPO [SUT\|all] [--branch NAME] [--requirements FILE_OR_FOLDER]` | a git repository link or a folder, and the source file to test; without a file (or `all`) every production file of the commit is selected and tested (ORC-35); `--requirements` adds the project's requirement documents - ReqIF, Markdown, text or CSV - for the run (A1-RQ1) |
 | `view RUN_FOLDER` | replay an earlier run in the viewer |
 | `baseagent-test` | the BaseAgent tests (Windows and Linux); results in `test_results_baseagent.txt` |
 

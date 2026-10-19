@@ -53,7 +53,7 @@ The application never searches for tools and has no fallback compiler. Windows u
 
 ```mermaid
 flowchart TD
-    start(["run_pipeline: repository + SUT"]) --> disc["Agent1 discover<br/>layout, tests, stubs, build system<br/>no LLM"]
+    start(["run_pipeline: repository + SUT<br/>+ requirement documents (A1-RQ1)"]) --> disc["Agent1 discover<br/>layout, tests, stubs, build system,<br/>requirement documents read (A1-RQ2)<br/>no LLM"]
     disc --> capture["Agent3 capture<br/>the project's own build recorded<br/>CMake, Meson, Bazel, Ninja, Make, MSBuild<br/>no LLM; reused per tested commit (ORC-22)"]
     capture --> est{"estimated?"}
     est -- yes --> flags["Agent3 suggest_flags<br/>brain reads the build files,<br/>a compile decides (A3-BD11)"]
@@ -72,7 +72,7 @@ flowchart TD
     end
 
     subgraph stageB ["Stage B: coverage"]
-        builds -- yes --> covPlan["Agent1 coverage plan<br/>facts: gaps, MC/DC vectors, evidence, what was tried<br/>brain suggests scenarios, Agent1 checks (A1-PL)"]
+        builds -- yes --> covPlan["Agent1 coverage plan<br/>facts: gaps, MC/DC vectors, evidence, what was tried<br/>the brain plans from the first plan on,<br/>Agent1 checks (A1-PL, ARCH-24)"]
         covPlan --> kb["KB guidance<br/>fetched by the orchestrator"]
         kb --> gen["Agent2 generate<br/>suites, test cases, stubs"]
         gen --> verify["Agent3 verify<br/>build, run all tests, measure"]
@@ -93,6 +93,7 @@ flowchart TD
     handover --> stop(["incomplete,<br/>with reason"])
     route -- "environment" --> stop
     builds -- "budget exhausted" --> stop
+    covPlan -- "no brain answers, or no scenario<br/>passes the check (A1-PL8)" --> stopped(["stopped: what Agent3 verified<br/>is delivered (ORC-34)"])
 ```
 
 Agent1 is the only agent that sends work to Agent2 [A1-35]. Agent3 decides the routing; the orchestrator executes it [ORC-6].
@@ -208,6 +209,35 @@ flowchart LR
 
 An invalid LLM answer is asked again once and otherwise rejected [ARCH-5].
 
+### 4a. Rule first, brain when the rule fails, the tool decides [ARCH-21 .. ARCH-23]
+
+Every agent runs its deterministic rules first: they are fast and repeatable. A rule that meets code it was
+not written for does not end with "cannot". It hands the case to the brain through BaseAgent's
+`AgentCore.resolve()`, and the tool that rejected the rule's result judges the brain's answer:
+
+```mermaid
+flowchart LR
+    rule["deterministic rule"] -- result --> tool["tool: front end,<br/>compiler, test run"]
+    rule -- "cannot (type, value,<br/>header, generated file)" --> mem{"stored resolution<br/>for this failure?<br/>(ARCH-23)"}
+    tool -- rejects --> mem
+    mem -- yes --> verify["the same tool<br/>checks it"]
+    mem -- no --> brain["brain: the rule, why it failed,<br/>the facts, the tool's message"]
+    brain --> verify
+    verify -- accepted --> keep["used; stored per repository;<br/>meta.escalations"]
+    verify -- "rejected (tool message)" --> brain
+    verify -- "attempts used up / no brain" --> report["reported: rule, attempts,<br/>tool's last message"]
+```
+
+| Agent | Rule that can fail | What the brain gets | The tool that decides |
+|---|---|---|---|
+| Agent1 | a header the front end does not find (A1-DA20); after a search by name with one candidate | candidates with that name, the folders with headers | the front end parses again: the header is found and errors do not grow |
+| Agent2 | a parameter whose value no rule can build (A2-21ac) | the function, the type's declarations, the SUT's functions | declared symbols only, no assertion; then Agent3's build; stored only once tests using it are in the verified suite |
+| Agent3 | the test program does not build in generated files (A3-CL14) | compiler errors, the generated files, the SUT's include lines | the compiler: fewer errors; assertions, test names and calls unchanged |
+| Agent3 | the SUT does not compile on the host after the keyword and assembly tables (A3-BD16) | compiler errors, the SUT, the flags | the compiler: fewer SUT errors; no SUT function defined, no user file changed |
+| Agent4, Agent1 planning | already brain steps (A4-23g, COV-12, A1-PL1) | as before | Agent3's verify |
+
+The result and the report list every case under "Rules that needed the brain".
+
 ## 5. Which brain answers, and how the agents are reached
 
 Every brain call goes to the first available brain in `brain.engine.brain_order` of `ut_config.json` [ARCH-1a].
@@ -251,7 +281,10 @@ flowchart LR
 flowchart TD
     link(["run: repository link, SUT files,<br/>branch (default: the server's default)"]) --> head["git ls-remote: the branch head<br/>= the tested commit (ORC-19)"]
     head --> cache["cache: one bare clone per PC,<br/>later runs only fetch (ORC-20)"]
-    cache --> wt["one git worktree per SUT file<br/>at the tested commit"]
+    cache --> named{"SUT files named?"}
+    named -- no --> select["Agent1 select_files in a worktree<br/>of the tested commit: production files,<br/>no tests, third-party, generated code (ORC-35)"]
+    select --> wt
+    named -- yes --> wt["one git worktree per SUT file<br/>at the tested commit"]
     wt --> pipe["the whole pipeline per SUT file<br/>(one after another, or in parallel, ORC-23)"]
     pipe --> kind{"per SUT file"}
     kind -- "verified, tests only" --> moved{"branch still at<br/>the tested commit?"}
@@ -268,6 +301,17 @@ flowchart TD
 Git uses the login already configured on the PC (Git Credential Manager, SSH key) or a token in the environment
 variable named in `ut_config.json`; it is never written anywhere [ORC-21]. The pipeline never force-pushes,
 rewrites history, or deletes or renames a branch [ORC-31].
+
+## 6a. Requirement documents given for a run [A1-RQ1 .. A1-RQ6]
+
+`--requirements FILE_OR_FOLDER` (repeatable; in the menu of `unittest_generator.bat` one question), the request of
+`run_pipeline` / `run_repository` (paths inside the repository only) or `"requirements"` per repository in
+`ut_config.json`. The orchestrator copies every ReqIF, Markdown, text or CSV document unchanged into
+`<run>/requirements/` and records its SHA-256 in the ledger; Word, PDF and Excel files are reported, not read.
+Agent1 reads them as E1 evidence (an ID stated differently in the repository is a conflict; the given text is
+used), links them by rule or by the brain (A1-PL13), and at the end reports per function which requirements a
+passed test asserts and which functions have no stated behaviour at all (tool `requirement_status`, A1-RQ5).
+The documents never reach the repository.
 
 ## 7. Knowledge packs and the token budget of every brain call
 

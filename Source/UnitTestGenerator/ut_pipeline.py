@@ -231,6 +231,7 @@ class Orchestrator:
         self.layout: uc.LayoutProfile | None = None
         self.suite = ""
         self.token_log: list[dict[str, Any]] = []     # every brain call's token plan [ARCH-15]
+        self.escalation_log: list[dict[str, Any]] = []   # every rule that needed the brain [ARCH-22]
         self.viewer = ViewerConfig.model_validate(self.raw.get("viewer", {}))
         if VIEW_OVERRIDE is not None:
             self.viewer.enabled = VIEW_OVERRIDE
@@ -296,13 +297,16 @@ class Orchestrator:
         if response.status == "success" and role != "kb":
             self._last_agent = agent
         plans = uc.plans_of(response)                              # windows, tokens, packs [ARCH-15, KP-7]
+        escalations = list(response.meta.escalations)               # rules that needed the brain [ARCH-22]
         self.ledger.append(agent=AGENTS[role][0], tool=tool, contract=type(payload).__name__, version="1.0",
                            input_sha256=ba.contract_digest(payload.model_dump(mode="json")),
                            output_contract=response.contract, output_sha256=response.meta.output_sha256,
                            status=response.status, brain=response.meta.brain, llm_calls=response.meta.llm_calls,
                            reason=response.reason or (response.error.code if response.error else ""),
-                           signatures=self.signatures(), token_plans=plans)
+                           signatures=self.signatures(), token_plans=plans,
+                           **({"escalations": escalations} if escalations else {}))
         self.token_log.extend({**plan, "agent": AGENTS[role][0], "tool": tool} for plan in plans)
+        self.escalation_log.extend(escalations)
         if response.status == "rejected":
             raise Rejected(AGENTS[role][0], response.reason or "rejected")
         if response.status == "error":
@@ -354,6 +358,7 @@ class Orchestrator:
         out.mkdir(parents=True, exist_ok=True)
         self.ledger = Ledger(out / "ledger.jsonl")
         self.token_log = []
+        self.escalation_log = []
         state = RunState(req=req, repo=repo, out=out, workspace=workspace)
         state.asil, state.asil_source, state.targets, state.iter_limit = uc.coverage_policy(       # COV-1, COV-2, COV-9
             req.sut_file, self.raw.get("coverage"))
@@ -377,10 +382,15 @@ class Orchestrator:
                 await self.connect(stack, out / "logs")
                 await self._run_start(state)
                 result = await self._run(state)
+                await self._requirement_status(state, result)                            # A1-RQ5
         except Rejected as exc:
             result = state.finish("incomplete", f"{exc.agent} refused: {exc.reason}")
         except ba.AgentFault as exc:
-            result = state.finish("incomplete", f"{exc.code}: {exc.message}")
+            if exc.code in BRAIN_STOP:                 # no brain answered: stop, deliver what was verified [ORC-34]
+                result = state.stopped(f"stopped because no brain gave a usable answer ({exc.code}: {exc.message}) "
+                                       "[ARCH-24, ORC-34]")
+            else:
+                result = state.finish("incomplete", f"{exc.code}: {exc.message}")
         except asyncio.CancelledError:            # Ctrl+C: deliver what was verified, then end [ORC-33]
             task = asyncio.current_task()
             if task is not None:
@@ -400,6 +410,7 @@ class Orchestrator:
                 LOG.exception("pipeline run failed")
                 result = state.stopped(f"ended by an error ({type(exc).__name__}: {exc})"[:400])
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
+        result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         delivered = self._deliver(state, result)
         if self.hub is not None:
             self.hub.emit("run_end", summary=f"{req.sut_file}: {delivered.final_state}", data={
@@ -491,23 +502,85 @@ class Orchestrator:
             "title": "Unit-test generation", "subtitle": f"{repo} - {s.req.sut_file} - ASIL {s.asil} ({s.asil_source})",
             "agents": agents, "metrics": metrics, "orchestrator": orchestrator})
 
+    async def select_files(self, root: Path, out: Path, compile_commands: str = "") -> uc.FileSelection:
+        """ORC-35: Agent1 selects the production files of the working tree when a run names none."""
+        out.mkdir(parents=True, exist_ok=True)
+        self.ledger = Ledger(out / "ledger-select.jsonl")
+        self.token_log, self.escalation_log = [], []
+        self._called, self._last_agent = set(), ""
+        async with contextlib.AsyncExitStack() as stack:
+            await self.connect(stack, out / "logs-select")
+            return await self.call("analyzer", "select_files", uc.SelectRequest(
+                repo_root=str(root), compile_commands=compile_commands), uc.FileSelection)
+
+    def _requirement_documents(self, s: "RunState") -> None:
+        """A1-RQ1, A1-RQ3: the requirement documents given for the run (request, then ut_config.json per
+        repository), copied unchanged into the run's output folder with their SHA-256 in the ledger."""
+        key = s.origin.get("repository") or str(Path(s.repo).resolve())
+        given = list(s.req.requirements) + configured_requirements(self.raw, key)
+        s.requirement_docs, notes = gather_requirements(given, s.workspace, s.out / "requirements")
+        s.notes.extend(notes)
+        for doc in s.requirement_docs:
+            self.ledger.append(agent="ut_pipeline", tool="requirement_document", name=doc.name, sha256=doc.sha256,
+                               origin=doc.origin)
+
+    async def _requirement_status(self, s: "RunState", result: uc.PipelineResult) -> None:
+        """A1-RQ5: per function, the linked requirements, whether a passed test asserts each and whether any
+        expected behaviour is stated - from the delivered suite."""
+        if s.layout is None or s.layout.blocked:
+            return
+        bundle = s.best_bundle or s.bundle
+        verified = s.best_result if s.best_bundle is not None else s.last
+        try:
+            status = await self.call("analyzer", "requirement_status", uc.RequirementStatusRequest(
+                layout=s.layout, suite=uc.suite_of(bundle),
+                passed=[t.name for t in (verified.tests if verified else []) if t.status == "passed"]),
+                uc.RequirementStatus)
+        except (Rejected, ba.AgentFault) as exc:
+            result.open_items.append(f"note: requirement status not determined: {exc}"[:300])
+            return
+        result.requirement_status = status.functions
+
+    async def _brains_available(self) -> str:
+        """ARCH-24: "" when a configured brain is available, else why none is (every brain with its status)."""
+        router = ba.build_router(ba.Settings.model_validate(self.raw.get("brain", {})))
+        try:
+            with contextlib.suppress(ba.AgentFault):
+                await router.start()
+            usable = [n for n in router.names if router.status.get(n) == "available"]
+            if usable:
+                return ""
+            return "; ".join(f"{router.name_of(b)}: {router.status.get(router.name_of(b), 'unavailable')}"
+                             for b in router.brains) or "no brain is configured"
+        finally:
+            with contextlib.suppress(Exception):
+                await router.close()
+
     async def _run(self, s: "RunState") -> uc.PipelineResult:
+        # 0. A run needs a brain: it plans, writes tests and resolves what the rules cannot [ARCH-24]
+        missing = await self._brains_available()
+        if missing:
+            return s.finish("incomplete", "no brain is available, so the run was not started - the brain plans the "
+                            f"tests and resolves what the rules cannot [ARCH-24]. Brains: {missing}")
         # 1. Discovery, build capture, dependency analysis and probe [ORC-3]
+        self._requirement_documents(s)                                                        # A1-RQ1, A1-RQ3
         self.layout = await self.call("analyzer", "discover", uc.DiscoverRequest(
-            repo_root=str(s.workspace), sut_file=s.req.sut_file, test_dir=s.req.test_dir, stub_dir=s.req.stub_dir),
-            uc.LayoutProfile)
+            repo_root=str(s.workspace), sut_file=s.req.sut_file, test_dir=s.req.test_dir, stub_dir=s.req.stub_dir,
+            project=s.origin.get("repository") or str(Path(s.repo).resolve()),                   # ARCH-23
+            requirement_documents=s.requirement_docs), uc.LayoutProfile)
         s.layout = self.layout
+        for note in self.layout.requirement_notes:                                       # A1-RQ2, A1-RQ4, A1-RQ6
+            (s.conflicts if note.startswith("conflict:") else s.notes).append(note)
         if self.layout.blocked:
             return s.finish("incomplete", "layout blocked: " + (self.layout.blocked_reason or ""))
         s.build = await self.call("compilation", "capture", uc.CaptureRequest(
             layout=self.layout, command=s.req.build_command, compile_commands=s.req.compile_commands,
             cache_key=s.origin.get("cache_key", "")), uc.BuildDescription)
-        if s.build.estimated:                                          # A3-BD11..A3-BD13
-            try:
-                s.build = await self.call("compilation", "suggest_flags", uc.FlagRequest(
-                    layout=self.layout, build=s.build), uc.BuildDescription)
-            except (Rejected, ba.AgentFault) as exc:
-                s.notes.append(f"flag suggestion not run: {exc}"[:300])
+        try:                                         # estimated: A3-BD11..A3-BD13; captured: A3-BD16
+            s.build = await self.call("compilation", "suggest_flags", uc.FlagRequest(
+                layout=self.layout, build=s.build), uc.BuildDescription)
+        except (Rejected, ba.AgentFault) as exc:
+            s.notes.append(f"flag suggestion not run: {exc}"[:300])
         await self._dependencies(s, None)
         if self.layout.blocked:
             return s.finish("incomplete", "layout blocked: " + (self.layout.blocked_reason or ""))
@@ -559,7 +632,7 @@ class Orchestrator:
                     plan = await self.call("analyzer", "plan", uc.PlanRequest(
                         layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
                         fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
-                        avoid_brains=sorted(s.avoid_brains)), uc.UTPlan)
+                        avoid_brains=sorted(s.avoid_brains), failed_tests=dict(s.failed_tests)), uc.UTPlan)
                     s.take_plan(plan)
                     s.note_plan(plan, iteration)                                       # COV-6, COV-10
                     fuzz = None
@@ -587,6 +660,12 @@ class Orchestrator:
                     result = await self.call("compilation", "verify", uc.VerifyRequest(
                         layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
                     self.check_result(result, self.layout.sut_sha256)
+                    bundle = self._take_repairs(s, bundle, result)                            # A3-CL14
+                    for t in result.tests:                                   # remembered for the next plans [A1-PL8]
+                        if t.status in ("failed", "crashed", "timeout"):
+                            s.failed_tests[t.name] = f"{t.status}: {t.message}".strip(": ")[:160]
+                        elif t.status == "passed":
+                            s.failed_tests.pop(t.name, None)
                     bundle = await self._drop_quarantined(s, bundle, result, iteration)        # A3-CL12
                     if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
                         before = set(last.coverage.covered_items) if last.coverage else set()
@@ -805,11 +884,18 @@ class Orchestrator:
         if layout.sut_sha256 != self.layout.sut_sha256:
             raise ba.AgentFault("CONTRACT_VIOLATION", "Agent1 analyzed another SUT version [ORC-10].")
         self.layout = s.layout = layout
+        if layout.build is not None:                       # include paths Agent1 found for missing headers [A1-DA20]
+            s.build = layout.build
         s.revise = False
 
     @staticmethod
     def _needs_revision(last: uc.VerificationResult, s: "RunState") -> bool:
         if s.revise:
+            return True
+        real = [d for d in (s.layout.dependencies.entries if s.layout and s.layout.dependencies else [])
+                if d.decision == "real" and d.definition]
+        texts = [" ".join(f.evidence) + " " + f.diagnostic for f in last.failures] + [last.reason]
+        if any(uc.real_source_error(d.definition, t) for d in real for t in texts):          # A1-DA12
             return True
         return any("real dependency" in " ".join(f.evidence) for f in last.failures) or \
             any(f.kind in ("crash", "timeout") for f in last.failures if s.layout and s.layout.dependencies and
@@ -842,10 +928,24 @@ class Orchestrator:
         return fuzz
 
     @staticmethod
+    def _take_repairs(s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult) -> uc.FileActionBundle:
+        """A3-CL14, ORC-4: the generated files Agent3 repaired replace those of the bundle, so the files
+        delivered are the files built and measured."""
+        if not result.repaired_files:
+            return bundle
+        s.notes.append("generated files repaired by the brain and checked by the compiler: "
+                       + ", ".join(sorted(result.repaired_files)) + " [A3-CL14]")
+        return bundle.model_copy(update={"actions": [
+            a.model_copy(update={"content": result.repaired_files[a.path]}) if a.path in result.repaired_files else a
+            for a in bundle.actions]})
+
+    @staticmethod
     def _problems(result: uc.VerificationResult) -> set[str]:
         return {f"{f.classification}|{f.symbol}|{f.diagnostic}" for f in result.failures} | set(result.undefined_symbols)
 
     async def _stage_a_round(self, s: "RunState", last: uc.VerificationResult, rounds: int) -> uc.VerificationResult:
+        if self._needs_revision(last, s):                    # a real dependency that does not build here [A1-DA12]
+            await self._dependencies(s, last)
         plan = await self.call("analyzer", "plan", uc.PlanRequest(
             layout=self.layout, last=last, iteration=0, attempts=s.attempts, existing_suite=self.suite), uc.UTPlan)
         s.take_plan(plan)
@@ -872,6 +972,7 @@ class Orchestrator:
         result = await self.call("compilation", "build_check", uc.VerifyRequest(
             layout=self.layout, stage="build_check", bundle=bundle), uc.VerificationResult)
         self.check_result(result, self.layout.sut_sha256)
+        bundle = self._take_repairs(s, bundle, result)                                    # A3-CL14
         self._accept_bundle(s, bundle)
         s.record(0, f"stage A round {rounds}", result, bundle)
         return result
@@ -1054,8 +1155,9 @@ class Orchestrator:
         target = s.workspace / patch.file
         target.write_bytes(uc.encode_like(target, patch.patched_content))
         self.layout = await self.call("analyzer", "discover", uc.DiscoverRequest(
-            repo_root=str(s.workspace), sut_file=s.req.sut_file, test_dir=s.req.test_dir, stub_dir=s.req.stub_dir),
-            uc.LayoutProfile)
+            repo_root=str(s.workspace), sut_file=s.req.sut_file, test_dir=s.req.test_dir, stub_dir=s.req.stub_dir,
+            project=s.origin.get("repository") or str(Path(s.repo).resolve()),                   # ARCH-23
+            requirement_documents=s.requirement_docs), uc.LayoutProfile)
         s.layout = self.layout
         await self._dependencies(s, None)                  # repeated after a verified fix [A1-DA14]
         s.baseline_findings = list(verification.analyzer_findings)
@@ -1113,10 +1215,9 @@ class Orchestrator:
                 build = await self.call("compilation", "capture", uc.CaptureRequest(
                     layout=self.layout, command=req.build_command, compile_commands=req.compile_commands, cache_key=key),
                     uc.BuildDescription)
-                if build.estimated:
-                    with contextlib.suppress(Rejected, ba.AgentFault):
-                        build = await self.call("compilation", "suggest_flags", uc.FlagRequest(
-                            layout=self.layout, build=build), uc.BuildDescription)
+                with contextlib.suppress(Rejected, ba.AgentFault):   # estimated: A3-BD11; captured: A3-BD16
+                    build = await self.call("compilation", "suggest_flags", uc.FlagRequest(
+                        layout=self.layout, build=build), uc.BuildDescription)
                 self.layout = await self.call("analyzer", "dependencies", uc.DependencyRequest(
                     layout=self.layout, build=build), uc.LayoutProfile)
                 self.suite = uc.suite_of(bundle)
@@ -1280,6 +1381,8 @@ class RunState:
         self.fix_candidates: list[str] = []                   # A4-23g
         self.reviews: list[str] = []                          # A4-23h
         self.fix_details: dict[str, dict[str, Any]] = {}      # per published fix, for the pull request [ORC-25]
+        self.requirement_docs: list[uc.RequirementDocument] = []    # given for the run [A1-RQ1, A1-RQ3]
+        self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
 
     def take_plan(self, plan: uc.UTPlan) -> None:
         """Agent1's records of one plan: open items, who planned what, conflicts, look-ups, disputes."""
@@ -1445,7 +1548,8 @@ class RunState:
             unfinished_tests=[f"{t.name}: {t.status} - {t.message}"[:300] for t in (last.tests if last else [])
                               if t.status in ("crashed", "timeout")],                          # A3-29d
             register_pages=list(last.register_pages) if last else [],                          # A3-HW1
-            host_notes=list(last.host_notes) if last else [],                                  # A3-HW2..HW4
+            host_notes=(list(last.host_notes) if last else []) + [                             # A3-HW2..HW4
+                f"host adaptation by the brain [A3-BD16]: {h}" for h in (self.build.host_adaptation if self.build else [])],
             files_generated=sorted(self.files_generated), files_modified=sorted(self.files_modified),
             characterization_tests=len(bundle.characterization_tests) if bundle else 0,
             oracle_checks=self.oracle_checks, source_fixes=self.source_fixes, open_items=sorted(self.open_items),
@@ -1469,7 +1573,11 @@ class RunState:
             requirement_links=[f"{link.requirement_id} -> {link.function} (p={link.probability:.2f}): \"{link.quote[:100]}\""
                                for link in (self.layout.requirement_links if self.layout else [])],
             suggested_flags=list(self.build.suggested_flags) if self.build else [],
-            fix_candidates=self.fix_candidates, reviews=self.reviews)
+            fix_candidates=self.fix_candidates, reviews=self.reviews,
+            requirement_documents=[f"{d.name} sha256 {d.sha256} (given as {d.origin})" for d in self.requirement_docs])
+
+
+BRAIN_STOP = ("NO_BRAIN_AVAILABLE", "BRAIN_PLAN_FAILED")       # a run that cannot go on without a brain [ORC-34]
 
 
 def report(r: uc.PipelineResult) -> str:
@@ -1546,8 +1654,16 @@ def report(r: uc.PipelineResult) -> str:
                          ("Fix candidates not chosen", r.fix_candidates), ("Second opinions", r.reviews),
                          ("Dependencies", r.dependencies),
                          ("Planning (who planned what)", r.planning), ("Conflicting evidence", r.conflicts),
-                         ("Evidence look-ups", r.lookups), ("Requirements linked by the brain", r.requirement_links),
+                         ("Evidence look-ups", r.lookups),
+                         ("Requirement documents given for the run [A1-RQ3]", r.requirement_documents),
+                         ("Requirements per function [A1-RQ5]", [
+                             f"{f.function}: " + ("; ".join(f.requirements) or "no requirement linked")
+                             for f in r.requirement_status if f.requirements]),
+                         ("Functions without any stated expected behaviour: characterization tests only, they cannot "
+                          "expose a defect [A1-RQ5]", [f.function for f in r.requirement_status if not f.stated]),
+                         ("Requirements linked by the brain", r.requirement_links),
                          ("Flags suggested by the brain (estimated build)", r.suggested_flags),
+                         ("Rules that needed the brain", r.escalations),
                          ("Brain calls and tokens per step", r.token_use),
                          ("Knowledge packs used", r.knowledge_packs),
                          ("Coverage-guided search", r.fuzzing), ("Open items and notes", r.open_items),
@@ -1561,6 +1677,75 @@ def report(r: uc.PipelineResult) -> str:
 # ============================================================================ repository input and delivery [ORC-17 .. ORC-31]
 LINK = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:)", re.I)
 REPORTS = "ut_reports"
+
+
+# ============================================================================ requirement documents [A1-RQ1 .. A1-RQ6]
+REQUIREMENT_FORMATS = (".reqif", ".reqifz", ".md", ".markdown", ".txt", ".csv")     # A1-RQ2
+MAX_REQUIREMENT_MB = 20                                                              # A1-RQ6
+MAX_REQUIREMENT_FILES = 100
+
+
+def configured_requirements(raw: dict[str, Any], repository: str) -> list[str]:
+    """A1-RQ1: fixed requirement documents per repository in ut_config.json: "requirements": {link or folder:
+    [paths]}. A link matches with or without ".git" and a trailing slash, a folder by its full path."""
+    def norm(text: str) -> str:
+        text = text.strip().rstrip("/\\")
+        if is_link(text):
+            return re.sub(r"\.git$", "", text).lower()
+        return str(Path(text).expanduser().resolve()).lower()
+    table = raw.get("requirements") or {}
+    wanted = norm(repository)
+    return [p for key, paths in table.items() if not key.startswith("_") and isinstance(paths, list)
+            and norm(key) == wanted for p in paths if isinstance(p, str)]
+
+
+def gather_requirements(given: list[str], workspace: Path, target: Path) -> tuple[list[uc.RequirementDocument],
+                                                                                  list[str]]:
+    """A1-RQ1, A1-RQ2, A1-RQ3, A1-RQ6: each path - a file or a folder; relative: inside the repository (the tested
+    commit) when it exists there, else from the folder the command was started in - resolved, its documents of
+    an accepted format copied unchanged into ``target``; what cannot be used is returned as a note."""
+    caller = Path(os.environ.get("UT_CALLER") or os.getcwd())
+    docs: list[uc.RequirementDocument] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for entry in dict.fromkeys(p.strip().strip('"') for p in given if p and p.strip()):
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            inside = workspace / entry
+            path = inside if uc.safe_relpath(entry.replace("\\", "/")) and inside.exists() else caller / entry
+        if not path.exists():
+            notes.append(f"requirement document {entry} does not exist; the run continues without it [A1-RQ6]")
+            continue
+        files = sorted(p for p in path.rglob("*") if p.is_file() and not any(part.startswith(".") for part in
+                                                                              p.relative_to(path).parts)) \
+            if path.is_dir() else [path]
+        if len(files) > MAX_REQUIREMENT_FILES:
+            notes.append(f"{entry}: only the first {MAX_REQUIREMENT_FILES} of {len(files)} files are read [A1-RQ6]")
+            files = files[:MAX_REQUIREMENT_FILES]
+        for file in files:
+            if file.suffix.lower() not in REQUIREMENT_FORMATS:
+                notes.append(f"requirement document {file.name} (given as {entry}) is not read: only ReqIF (.reqif, "
+                             ".reqifz), Markdown, plain text or CSV - please give an export in one of them [A1-RQ2]")
+                continue
+            if file.stat().st_size > MAX_REQUIREMENT_MB * 1024 * 1024:
+                notes.append(f"requirement document {file.name} (given as {entry}) is larger than "
+                             f"{MAX_REQUIREMENT_MB} MB and is not read [A1-RQ6]")
+                continue
+            key = str(file.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            target.mkdir(parents=True, exist_ok=True)
+            name = file.name
+            k = 1
+            while (target / name).exists():
+                k += 1
+                name = f"{file.stem}-{k}{file.suffix}"
+            shutil.copyfile(file, target / name)                    # unchanged, never into the repository [A1-RQ3]
+            docs.append(uc.RequirementDocument(name=f"requirements/{name}", path=str((target / name).resolve()),
+                                               sha256=uc.file_sha256(target / name),
+                                               origin=entry if path.is_file() else f"{entry} ({file.name})"))
+    return docs, notes
 
 
 def is_link(text: str) -> bool:
@@ -1945,6 +2130,23 @@ class RepositoryRun:
             self._summary(result, out)
             return result
         result.branch, result.commit = branch, commit
+        if not req.sut_files:                                         # every production file of the commit [ORC-35]
+            selecting = out / "worktrees" / "select"
+            try:
+                await asyncio.to_thread(cache.worktree, commit, selecting)
+                result.selection = await self.orchestrator.select_files(selecting, out / "select", req.compile_commands)
+            except (GitError, ba.AgentFault, Rejected, OSError) as exc:
+                result.reason = f"the production files could not be selected: {exc}"[:600]
+                self._summary(result, out)
+                return result
+            finally:
+                with contextlib.suppress(GitError, OSError):
+                    await asyncio.to_thread(cache.remove_worktree, selecting)
+            req = req.model_copy(update={"sut_files": result.selection.selected})
+            if not req.sut_files:
+                result.reason = "no production file was found to test [ORC-35]"
+                self._summary(result, out)
+                return result
         prs = PullRequests(req.repository, self.cfg.repositories, git)
         previous = cache.load_state()
         runs = [SutRun(sut, out / f"{i + 1:02d}-{slug(sut)}", out / "worktrees" / f"{i + 1:02d}")
@@ -1960,7 +2162,7 @@ class RepositoryRun:
                               "cache_key": key, "previous_review": self._previous(prs, previous.get(r.sut))}
                     pipeline = uc.PipelineRequest(repo_root=str(r.workspace), sut_file=r.sut, test_dir=req.test_dir,
                                                   stub_dir=req.stub_dir, build_command=req.build_command,
-                                                  compile_commands=req.compile_commands)
+                                                  compile_commands=req.compile_commands, requirements=req.requirements)
                     r.result, r.state = await self._orchestrator().run_state(
                         pipeline, workspace=r.workspace, out=r.out, origin=origin)
                 except (GitError, ba.AgentFault, OSError) as exc:          # this SUT file only; the others go on
@@ -1996,10 +2198,19 @@ class RepositoryRun:
     async def _folder(self, req: uc.RepositoryRequest, out: Path) -> uc.RepositoryResult:
         """A local folder (pilots, development) [ORC-17]: each SUT file as before, one after another."""
         result = uc.RepositoryResult(repository=str(Path(req.repository).resolve()), output_dir=str(out))
+        if not req.sut_files:                                                                 # ORC-35
+            result.selection = await self.orchestrator.select_files(Path(req.repository).resolve(), out / "select",
+                                                                    req.compile_commands)
+            req = req.model_copy(update={"sut_files": result.selection.selected})
+            if not req.sut_files:
+                result.reason = "no production file was found to test [ORC-35]"
+                self._summary(result, out)
+                return result
         for sut in req.sut_files:
             r = await self._orchestrator().run(uc.PipelineRequest(
                 repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
-                stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands))
+                stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands,
+                requirements=req.requirements))
             r.delivery = "written to the folder (local folder input)"
             result.results.append(r)
             result.deliveries.append(uc.DeliveryRecord(kind="written_to_folder", sut_files=[sut], reason=r.output_dir))
@@ -2049,6 +2260,11 @@ class RepositoryRun:
         actions = [(r.sut_file, a) for r in result.results for a in r.action_needed]
         if actions:
             rows += ["", "## Action needed", ""] + [f"- {sut}: {a}" for sut, a in actions]
+        if result.selection is not None:                                                      # ORC-35
+            rows += ["", f"## Production files selected ({len(result.selection.selected)}) [ORC-35]", ""]
+            rows += [f"- {f}" for f in result.selection.selected] or ["- none"]
+            rows += ["", f"## Files left out ({len(result.selection.left_out)}) - name a file with --sut to test it",
+                     ""] + [f"- {f}" for f in result.selection.left_out]
         (out / "summary.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -2269,14 +2485,21 @@ class PipelineAgent(ba.AgentCore):
         super().__init__(settings)
 
     def tools(self) -> list[ba.ContractTool]:
+        def documents_pre(req, request):
+            # A1-RQ1: a client of the MCP tools names requirement documents inside the repository; files elsewhere
+            # on this PC are given only on its command line, in its menu or in ut_config.json
+            for entry in req.requirements:
+                if not uc.safe_relpath(entry.replace("\\", "/")):
+                    raise ba.ContractRejected(f"requirement document {entry!r} must be a path inside the repository")
+
         async def run(req: uc.PipelineRequest, request, scratch):
             return await Orchestrator(self.config_path).run(req)
 
         async def run_repo(req: uc.RepositoryRequest, request, scratch):
             return await RepositoryRun(self.config_path).run(req)
-        return [ba.ContractTool("run_pipeline", uc.PipelineRequest, uc.PipelineResult, run,
+        return [ba.ContractTool("run_pipeline", uc.PipelineRequest, uc.PipelineResult, run, documents_pre,
                                 description="Generate, verify and measure unit tests for one C/C++ file of a folder."),
-                ba.ContractTool("run_repository", uc.RepositoryRequest, uc.RepositoryResult, run_repo,
+                ba.ContractTool("run_repository", uc.RepositoryRequest, uc.RepositoryResult, run_repo, documents_pre,
                                 description="A git repository link, its SUT files and a branch: tests generated, "
                                             "verified and committed, or a review pull request [ORC-17..ORC-31].")]
 
@@ -2320,7 +2543,7 @@ async def check_setup(config_path: Path) -> int:
     if usable:
         print(f"Brains used : {', '.join(usable)} - the first available answers each call [ARCH-1a]")
     else:
-        print("No brain is available: deterministic tests still run, LLM tests are skipped.")
+        print("No brain is available: a run would stop at its start [ARCH-24]. Set the API key or start Ollama.")
     print("Setup complete." if ok else "Setup INCOMPLETE - see the lines above.")
     return 0 if ok else 1
 
@@ -2451,12 +2674,16 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="Run the pipeline for SUT files of a repository link or a local folder.")
     run.add_argument("--repo", required=True, help="git repository link (HTTPS or SSH) or a local folder [ORC-17]")
-    run.add_argument("--sut", required=True, action="append", help="SUT file relative to the repository; repeatable")
+    run.add_argument("--sut", action="append", default=[],
+                     help="SUT file relative to the repository; repeatable; none: every production file [ORC-35]")
     run.add_argument("--branch", default="", help="default: the repository's default branch [ORC-18]")
     run.add_argument("--test-dir")
     run.add_argument("--stub-dir")
     run.add_argument("--build-command", default="", help="the project's build command [A3-BD2]")
     run.add_argument("--compile-commands", default="", help="a compile_commands.json from the client [A3-BD2]")
+    run.add_argument("--requirements", action="append", default=[],
+                     help="requirement document or folder (ReqIF, Markdown, text, CSV); repeatable, or several "
+                          "separated by ; [A1-RQ1]")
     run.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     run.add_argument("--view", dest="view", action="store_true", default=None, help="live viewer on [VIEW-3]")
     run.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
@@ -2500,17 +2727,19 @@ def main() -> int:
         if args.command == "run":
             suts = [s.replace("\\", "/") for s in args.sut]
             database = str(Path(args.compile_commands).resolve()) if args.compile_commands else ""
+            documents = [p.strip() for value in args.requirements for p in value.split(";") if p.strip()]   # A1-RQ1
             if not is_link(args.repo) and len(suts) == 1:          # a folder: pilots and development [ORC-17]
                 req = uc.PipelineRequest(repo_root=str(Path(args.repo).resolve()), sut_file=suts[0],
                                          test_dir=args.test_dir, stub_dir=args.stub_dir,
-                                         build_command=args.build_command, compile_commands=database)
+                                         build_command=args.build_command, compile_commands=database,
+                                         requirements=documents)
                 result = asyncio.run(Orchestrator(args.config).run(req))
                 print(report(result))
                 return 0 if result.final_state != "incomplete" else 3
             repo_req = uc.RepositoryRequest(repository=args.repo if is_link(args.repo) else str(Path(args.repo).resolve()),
                                             sut_files=suts, branch=args.branch, test_dir=args.test_dir,
                                             stub_dir=args.stub_dir, build_command=args.build_command,
-                                            compile_commands=database)
+                                            compile_commands=database, requirements=documents)
             outcome = asyncio.run(RepositoryRun(args.config).run(repo_req))
             print((Path(outcome.output_dir) / "summary.md").read_text(encoding="utf-8"))
             for record in outcome.deliveries:

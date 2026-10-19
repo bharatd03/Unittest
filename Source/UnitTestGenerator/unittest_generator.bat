@@ -12,16 +12,19 @@ rem    unittest_generator.bat pilot-cpp         full pipeline on the C++ pilot (
 rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot with dependencies (three SUT files)
 rem    unittest_generator.bat pilot-embedded    full pipeline on the embedded C pilot (registers, superloop, asm; four files)
 rem    unittest_generator.bat pilot-embedded-cpp  full pipeline on the embedded C++ pilot (fakes, exceptions, template; four files)
+rem    unittest_generator.bat pilot-realrepo    full pipeline on patterns of real repositories (include order, T * const, namespaces; five files)
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
 rem                                             seeded-defect benchmark on the pilots, with the knowledge
 rem                                             packs (on, default), without (off) or both to compare them
-rem    unittest_generator.bat run REPO SUT [options]
+rem    unittest_generator.bat run REPO [SUT|all] [options]
 rem                                             REPO = git repository link (https://... or git@...) or a folder
-rem                                             SUT  = file relative to REPO, e.g. src/foo.c
+rem                                             SUT  = file relative to REPO, e.g. src/foo.c;
+rem                                                    all (or none) = every production file [ORC-35]
 rem                                             options: --branch NAME  --sut ANOTHER_FILE
 rem                                                      --build-command "..."  --compile-commands FILE
+rem                                                      --requirements FILE_OR_FOLDER (repeatable) [A1-RQ1]
 rem
 rem  A repository link: the default branch is tested unless --branch names another one. Tests only and
 rem  verified: one commit to that branch. Production source changed, or not verified: a review branch and a
@@ -44,6 +47,8 @@ rem ===========================================================================
 setlocal EnableExtensions
 rem  A relative repository folder is meant from where the command was started [TP-23].
 set "CALLER=%CD%"
+rem  A relative requirement document is meant from there too, unless it is inside the repository [A1-RQ1].
+set "UT_CALLER=%CD%"
 cd /d "%~dp0"
 rem  The exit code is kept in UT_EXIT, never in RC: CMake reads a variable named RC as the Windows
 rem  resource compiler, and every program started from here inherits it [A3-BD15].
@@ -92,9 +97,12 @@ goto prepare
 :pick_run
 set "ACTION=run"
 set /p "REPO=Repository link (https://... or git@...) or folder: "
-set /p "SUT=SUT file, relative to the repository: "
+set "SUT="
+set /p "SUT=SUT file, relative to the repository (Enter = every production file): "
 set "BRANCH="
 set /p "BRANCH=Branch (Enter = the repository's default branch): "
+set "REQS="
+set /p "REQS=Requirement documents, files or folders separated by ; (Enter = none): "
 goto prepare
 
 rem ---------------------------------------------------------------- Python 3.12
@@ -191,9 +199,10 @@ if /i "%ACTION%"=="pilot-cpp" goto pilot_cpp
 if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="pilot-embedded" goto pilot_embedded
 if /i "%ACTION%"=="pilot-embedded-cpp" goto pilot_embedded_cpp
+if /i "%ACTION%"=="pilot-realrepo" goto pilot_realrepo
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, benchmark, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -273,6 +282,12 @@ goto pilot
 :pilot_embedded_cpp
 set "PILOT=cpp_embedded_pilot"
 set "SUTS=--sut src\motor_ctrl.cpp --sut src\counter.cpp --sut src\app_main.cpp --sut include\ring_buffer.hpp"
+goto pilot
+:pilot_realrepo
+rem  The C pilot, then the C++ pilot of the same patterns (NEXT_PILOT).
+set "PILOT=c_realrepo_pilot"
+set "SUTS=--sut kernel\src\klist.c --sut kernel\src\kqueue.c --sut codec\ring.c --sut drivers\crc_drv.c"
+set "NEXT_PILOT=cpp_realrepo_pilot"
 :pilot
 rem  The pipeline writes the generated tests into the repository, so it runs on a fresh copy.
 set "REPO=%~dp0ut_output\pilots\%PILOT%"
@@ -282,7 +297,11 @@ echo.
 echo Running the pipeline on %REPO% - this can take several minutes ...
 "%PY%" ut_pipeline.py run --repo "%REPO%" %SUTS% --config ut_config.json %EXTRA%
 set "UT_EXIT=%errorlevel%"
-goto end
+if not defined NEXT_PILOT goto end
+set "PILOT=%NEXT_PILOT%"
+set "NEXT_PILOT="
+set "SUTS=--sut src\dispatcher.cpp"
+goto pilot
 
 :view_run
 if not defined VIEWDIR (echo Usage: unittest_generator.bat view RUN_FOLDER & set "UT_EXIT=2" & goto end)
@@ -292,17 +311,24 @@ goto end
 
 :run_repo
 if not defined REPO goto run_usage
-if not defined SUT goto run_usage
-set "SUT=%SUT:"=%"
+rem  No SUT file, or "all": Agent1 selects every production file of the tested commit [ORC-35].
+set "SUT_ARG="
+if defined SUT set "SUT=%SUT:"=%"
+if /i "%SUT%"=="all" set "SUT="
+if defined SUT set SUT_ARG=--sut "%SUT%"
+if not defined SUT set "SUT=every production file"
 echo.
 echo Running the pipeline on %REPO% for %SUT% ...
 set "BRANCH_ARG="
 if defined BRANCH set BRANCH_ARG=--branch "%BRANCH%"
-"%PY%" ut_pipeline.py run --repo "%REPO%" --sut "%SUT%" --config ut_config.json %BRANCH_ARG% %EXTRA%
+set "REQ_ARG="
+if defined REQS set "REQS=%REQS:"=%"
+if defined REQS set REQ_ARG=--requirements "%REQS%"
+"%PY%" ut_pipeline.py run --repo "%REPO%" %SUT_ARG% --config ut_config.json %BRANCH_ARG% %REQ_ARG% %EXTRA%
 set "UT_EXIT=%errorlevel%"
 goto end
 :run_usage
-echo Usage: unittest_generator.bat run REPO SUT [--branch NAME] [--sut FILE] [--build-command "..."] [--compile-commands FILE]
+echo Usage: unittest_generator.bat run REPO [SUT^|all] [--branch NAME] [--sut FILE] [--requirements FILE_OR_FOLDER] [--build-command "..."] [--compile-commands FILE]
 echo        REPO is a git repository link or a folder.
 set "UT_EXIT=2"
 goto end

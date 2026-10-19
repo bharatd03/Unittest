@@ -2141,6 +2141,110 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("echo", catalog.structured_content["tools"])
 
 
+# ============================================================================ rule first, brain when a rule fails
+class SeqBrain(GenBrain):
+    """Answers with the next reply of ``replies`` and records every task it was given."""
+    def __init__(self, replies, name="sonnet"):
+        super().__init__(name)
+        self.replies, self.tasks = list(replies), []
+
+    async def generate(self, task, context, schema, validate):
+        self.calls += 1
+        self.tasks.append(task)
+        return {"model": self.model_id, "output": validate(self.replies.pop(0)), "usage": {}}
+
+
+class ResolveTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-21 .. ARCH-23: a failed rule goes to the brain, the tool judges, the memory remembers."""
+    FAILURE = ba.RuleFailure(rule="R-1 build of the value", failure="the rule cannot build this type",
+                             subject="struct list * const", message="x.c:12:3: error: incompatible type 'int'")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.memory = ba.ResolutionMemory(Path(self.tmp.name) / "resolutions.sqlite3", project="repo-a")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def agent(self, brain):
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        agent.resolutions = self.memory
+        return agent
+
+    @staticmethod
+    def tool(accepted: str):
+        """The tool that rejected the rule: accepts only a plan of that name, else returns its message."""
+        seen = []
+
+        def verify(answer):
+            seen.append(answer.name)
+            return "" if answer.name == accepted else f"y.c:3:1: error: '{answer.name}' does not compile"
+        return verify, seen
+
+    async def test_the_tool_message_goes_back_to_the_brain_and_decides(self):
+        brain = SeqBrain([dict(PLAN_REPLY, name="wrong"), dict(PLAN_REPLY, name="right")])
+        agent = self.agent(brain)
+        verify, seen = self.tool("right")
+        answer = await agent.resolve(self.FAILURE, task="Build the value.", context="facts", output_model=GenPlan,
+                                     verify=verify, step="S.value")
+        self.assertEqual((answer.name, seen), ("right", ["wrong", "right"]))
+        self.assertIn("incompatible type", brain.tasks[0])                   # the failure's own message
+        self.assertIn("'wrong' does not compile", brain.tasks[1])            # the tool's verdict on attempt 1
+        (record,) = agent.escalations
+        self.assertEqual((record["outcome"], record["source"], record["brain"]), ("resolved", "brain", "sonnet"))
+        self.assertEqual(len(record["attempts"]), 1)
+
+    async def test_a_stored_resolution_is_used_without_the_brain_and_a_rejected_one_forgotten(self):
+        first = self.agent(SeqBrain([dict(PLAN_REPLY, name="right")]))
+        verify, _ = self.tool("right")
+        await first.resolve(self.FAILURE, task="t", context="c", output_model=GenPlan, verify=verify)
+        silent = SeqBrain([])
+        second = self.agent(silent)
+        # the same failure in another run: other path, other line, other generated name (ARCH-23)
+        again = ba.RuleFailure(rule=self.FAILURE.rule, failure="x", subject=self.FAILURE.subject,
+                               message="other/dir/x.c:99:7: error: incompatible type 'int'")
+        answer = await second.resolve(again, task="t", context="c", output_model=GenPlan, verify=verify)
+        self.assertEqual((answer.name, silent.calls), ("right", 0))
+        self.assertEqual(second.escalations[0]["source"], "memory")
+        verify_other, _ = self.tool("new")
+        third = self.agent(SeqBrain([dict(PLAN_REPLY, name="new")]))
+        answer = await third.resolve(again, task="t", context="c", output_model=GenPlan, verify=verify_other)
+        self.assertEqual(answer.name, "new")
+        self.assertIn("stored resolution rejected", third.escalations[0]["attempts"][0])
+        stored = self.memory.get(third.name, self.FAILURE.rule, again.signature())
+        self.assertEqual([json.loads(s)["name"] for s in stored], ["new"])
+        other_repo = ba.ResolutionMemory(self.memory.path, project="repo-b")       # never shared between repositories
+        self.assertEqual(other_repo.get(third.name, self.FAILURE.rule, again.signature()), [])
+
+    async def test_without_a_brain_the_case_is_recorded_as_needing_one(self):
+        agent = self.agent(GenBrain("qwen", fail="MODEL_UNAVAILABLE"))
+        verify, seen = self.tool("right")
+        answer = await agent.resolve(self.FAILURE, task="t", context="c", output_model=GenPlan, verify=verify)
+        self.assertIsNone(answer)
+        self.assertEqual((agent.escalations[0]["outcome"], seen), ("needs_brain", []))
+        self.assertIn("needs a brain", ba.Escalation(**agent.escalations[0]).text())
+
+    async def test_rejected_after_the_attempts_and_recorded_in_the_contract_metadata(self):
+        brain = SeqBrain([dict(PLAN_REPLY, name="a"), dict(PLAN_REPLY, name="b")])
+        agent = self.agent(brain)
+        verify, seen = self.tool("never")
+
+        class Resolving(EchoAgent):
+            def tools(inner):
+                async def work(payload, request, scratch):
+                    await inner.resolve(self.FAILURE, task="t", context="c", output_model=GenPlan, verify=verify)
+                    return EchoOut(doubled=payload.value * 2)
+                return [ba.ContractTool("echo", EchoIn, EchoOut, work)]
+
+        resolving = Resolving(router=ba.BrainRouter([brain]))
+        response = await resolving.handle("echo", AgentCoreTests().request({"value": 1}))
+        self.assertEqual(response.status, "success", response.error)
+        (record,) = response.meta.escalations
+        self.assertEqual((record["outcome"], len(record["attempts"])), ("rejected", 2))
+        self.assertEqual(seen, ["a", "b"])
+        self.assertIn("not resolved after 2 attempt(s)", ba.Escalation(**record).text())
+
+
 # ============================================================================ adaptive token budget
 class PlanBrain(GenBrain):
     """A generate brain with call_limits(): records the context and plan it was given."""

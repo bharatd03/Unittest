@@ -1,5 +1,26 @@
 # BaseAgent changes
 
+## 2026-10-19 (evening): rule first, brain when a rule fails, the tool decides
+
+**Why.** On 15 files of five open-source code bases, 10 files ended with "cannot": a rule met a pattern it was not written for (include order, `T * const`, a namespace, a target keyword), and no brain was ever asked. Every agent of every application should hand such a case to the brain and let its own tool judge the answer.
+
+* **`AgentCore.resolve(failure, task, context, output_model, verify, ...)` (ARCH-21, ARCH-22).** `failure` is a `RuleFailure(rule, failure, subject, message)`. The order is:
+  1. a stored resolution, if there is one;
+  2. otherwise the brain, with the rule, why it failed, the facts and the tool's message;
+  3. the agent's `check`;
+  4. `verify(answer)`, the tool that rejected the rule's result (sync or async): "" accepts, otherwise its message goes back to the brain.
+
+  This repeats up to `attempts` times. The method returns the accepted answer or `None`; it never raises for a missing brain.
+* **`meta.escalations`.** Every case is recorded as an `Escalation`: agent, step, rule, failure, source (memory or brain, with its name), the tool's message per rejected attempt, and the outcome (`resolved`, `rejected` or `needs_brain`). It is emitted to the live page as an `escalation` event.
+* **`ResolutionMemory(path, project)` (ARCH-23).** SQLite; one row per project, agent, rule and failure signature. The signature is the tool's message with paths, numbers and generated names removed, so the same failure in another run matches. Stored answers are checked by the tool like new ones; a rejected one is deleted. Every error is swallowed. `remember=False` lets an agent store the answer itself, once a later tool accepted it.
+* **Tests.** `ResolveTests` (4):
+  * the tool's message goes back to the brain;
+  * a stored resolution is used without the brain, and a rejected one is forgotten; projects do not share resolutions;
+  * without a brain the case is recorded as needing one;
+  * after the attempts, the case is rejected and recorded in the contract's metadata.
+
+  192 tests in total.
+
 ## 2026-10-16 (night): unusable brain answers, handled once for every agent
 
 **Why.** In the first C++ run with Qwen, one A2.tests call ended with Ollama's HTTP 500 "token repeat limit reached". BaseAgent reported every HTTP 500 as `MODEL_UNAVAILABLE`, so a healthy Qwen was put on a 30 s cooldown and the function got no LLM tests. Each agent also repeated the same item-by-item filtering code.

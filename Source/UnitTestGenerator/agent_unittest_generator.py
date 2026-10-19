@@ -61,7 +61,25 @@ class GeneratorConfig(BaseModel):
     max_llm_tests_per_function: int = 8
     # Expected answer per test, in tokens: sets the answer limit and window [ARCH-11]
     tokens_per_test: int = 380
+    rule_attempts: int = 2                       # brain attempts per rule failure [ARCH-21, ORC-7]
+    max_brain_values: int = 12                   # parameters per request whose value the brain builds [A2-21ac]
 
+
+class ValueRecipe(BaseModel):
+    """A2-21ac: how a test builds a valid value the rules cannot build."""
+    setup: list[str] = Field(description="C/C++ statements that create the value; declared variables start with "
+                                         "ut_r; no assertion, no loop that waits", max_length=12)
+    argument: str = Field(description="the expression passed for the parameter, using the variables of setup")
+
+
+VALUE_TASK = (
+    "A deterministic test generator must call the function below but cannot build a valid value for one of its "
+    "parameters. Write the setup statements that create a valid, fully initialized value and the argument "
+    "expression to pass. Use only the declared types, functions and macros shown (for example the SUT's own init "
+    "function, or a local object a pointer can point to). Name every variable you declare ut_r<something>. "
+    "Return JSON {{\"setup\": [statements], \"argument\": expression}}. The parameter is number {index} "
+    "({name}, type {type}).")
+VALUE_MARK = "/* value of {function}:{param} built by the brain [A2-21ac] */"
 
 # ============================================================================ LLM output contract
 class GeneratedTest(BaseModel):
@@ -110,7 +128,8 @@ def header_macros(layout: uc.LayoutProfile) -> dict[str, str]:
     return macros
 
 
-def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str]) -> dict[str, int]:
+def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str],
+                layout: uc.LayoutProfile | None = None) -> dict[str, int]:
     """A2-21x: stubs the SUT uses like a clock - a call result subtracted from or by another value, as in
     hal_micros() - t0 - and the step each advances by: the largest constant the elapsed time is compared
     with on those lines, divided by 8 (at least 1)."""
@@ -118,6 +137,8 @@ def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str])
     for spec in stubs:
         name = spec.function.split("::")[-1]
         storage = re.sub(r"^const\s+", "", re.sub(r"\b(extern|static|inline|virtual)\b", "", spec.return_type).strip())
+        if layout is not None:
+            storage = resolve_typedefs(storage, layout) or storage                                 # A1-DA21
         if spec.kind not in ("function", "method") or not INTEGRAL.match(storage):
             continue
         call = rf"\b{re.escape(name)}\s*\([^()]*\)"
@@ -135,18 +156,24 @@ def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str])
 def sequence_type(storage: str, layout: uc.LayoutProfile) -> bool:
     """A stub of this return type can return one value per call [A2-21g]: scalars, enums, pointers."""
     s = re.sub(r"\b(enum|const|volatile)\b", "", storage).strip()
+    s = resolve_typedefs(s, layout) or s                                                      # A1-DA21
     return bool(INTEGRAL.match(s) or FLOATING.match(s) or s.endswith("*") or
                 any(e.name.split("::")[-1] == s.split("::")[-1] for e in layout.enums))
 
 
 def _value_type(ptype: str) -> str | None:
+    """The type of a variable that records an argument: top-level const and volatile dropped, so it can be
+    assigned (char const * const -> char const *, const int -> int) [A2-21ad]."""
     t = ptype.replace("&&", "").strip()
     if t.endswith("&"):
         t = t[:-1].strip()
-    t = re.sub(r"^const\s+", "", t)
     if "[" in t or t in ("void", "...") or "(*)" in t:
         return None
-    return t
+    if "*" in t:
+        head, tail = t.rsplit("*", 1)
+        tail = re.sub(r"\b(const|volatile|restrict|__restrict|__restrict__)\b", "", tail).strip()
+        return f"{head.rstrip()} *" + (f" {tail}" if tail else "")
+    return re.sub(r"\s+", " ", re.sub(r"\b(const|volatile)\b", " ", t)).strip() or None
 
 
 def _declarator(ptype: str, name: str) -> str:
@@ -188,7 +215,7 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
     root = Path(layout.repo_root)
     sut_path = root / layout.sut_file
     sut_text = sut_path.read_text(encoding="utf-8", errors="replace") if sut_path.is_file() else ""
-    steps = clock_steps(plan.stubs, sut_text, header_macros(layout))                          # A2-21x
+    steps = clock_steps(plan.stubs, sut_text, header_macros(layout), layout)                  # A2-21x
     decl_lines, def_lines, reset = [], [], []
 
     def clear(var: str, vtype: str) -> None:
@@ -200,6 +227,12 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
 
     for spec in plan.stubs:
         target = spec.qualified_name or spec.function
+        # A2-21ad: a C++ symbol of a namespace is stubbed inside that namespace, so the types of its declaration
+        # resolve as they do there; its control variables are made visible outside with using-declarations
+        ns = spec.namespace if cpp and spec.namespace and target.startswith(spec.namespace + "::") else ""
+        d0, f0 = len(decl_lines), len(def_lines)
+        if ns:
+            target = target[len(ns) + 2:]
         if spec.kind == "variable":
             definition = spec.var_type or f"int {target}"
             if spec.is_const:
@@ -259,6 +292,11 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
         elif spec.kind != "constructor" and ret and ret != "void":
             body.append(f"    return {names['return']};")
         def_lines.append(signature + "\n{\n" + "\n".join(body) + "\n}\n")
+        if ns:
+            names_here = [m.group(1) for line in decl_lines[d0:]
+                          for m in [re.search(r"\b(ut_stub_\w+)\s*(?:\[[^\]]*\])?\s*;", line)] if m]
+            decl_lines[d0:] = [f"namespace {ns} {{", *decl_lines[d0:], "}", *[f"using {ns}::{n};" for n in names_here]]
+            def_lines[f0:] = [f"namespace {ns} {{", *def_lines[f0:], "}"]
     if layout.sut_state:                     # A2-21s: the SUT's state as before the first test
         decl_lines.append(('extern "C" ' if cpp else "") + "void ut_sut_reset(void);")
         reset.insert(0, "    ut_sut_reset();")
@@ -266,8 +304,14 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
     fake_headers, fakes = render_fakes(layout)                                                 # A2-21aa
     if fakes:
         headers = sorted(set(headers) | set(fake_headers))
+    # A2-21ad: the SUT's own prologue first, so headers come in the order (and with the defines) the SUT
+    # compiles with; then the declaring headers the prologue does not reach
+    prologue = uc.sut_prologue(sut_text, layout.functions, layout.header_sut)
+    if prologue:
+        reached = {include_name(h, layout) for h in (layout.dependencies.headers if layout.dependencies else [])}
+        headers = [h for h in headers if h not in reached]
     header = ["/* ut_stubs.h - generated by agent_unittest_generator. Control variables of the stubs. */",
-              f"#ifndef {guard}", f"#define {guard}", *[f'#include "{h}"' for h in headers],
+              f"#ifndef {guard}", f"#define {guard}", *prologue, *[f'#include "{h}"' for h in headers],
               *(["#include <limits.h>", '#include "ut_harness.h"'] if fakes else []),
               "#define UT_STUB_SEQUENCE 16", *decl_lines, *fakes,
               f"#endif /* {guard} */", ""]
@@ -832,19 +876,28 @@ def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_head
             declared |= set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", (root / h).read_text(encoding="utf-8", errors="replace")))
     prototypes = [f.signature.rstrip("{ ") + ";" for f in layout.functions
                   if not f.is_static and "::" not in f.qualified_name and f.name not in declared and f.signature]
+    # A2-21ad: a function of a namespace that no header declares is declared inside its namespace
+    prototypes += [f"namespace {f.qualified_name.rsplit('::', 1)[0]} {{ {f.signature.rstrip('{ ')}; }}"
+                   for f in layout.functions if layout.language == "cpp" and not f.is_static and "::" in f.qualified_name
+                   and "(anonymous" not in f.qualified_name and not _is_member(f, layout)
+                   and f.name.split("::")[-1] not in declared and f.signature and not layout.header_sut]
     lines = [f"/* {Path(layout.suite_file).name} - generated by agent_unittest_generator for {layout.sut_file}.",
              "   Every test states the strongest evidence class behind its assertions [A2-21d]. */",
              '#include "ut_harness.h"']
+    root_text = uc.read_source(Path(layout.repo_root) / layout.sut_file) if (Path(layout.repo_root) / layout.sut_file).is_file() else ""
+    lines += uc.sut_prologue(root_text, layout.functions, layout.header_sut)                    # A2-21ad
     if stub_header:
         lines.append('#include "ut_stubs.h"')
     if layout.header_sut and include_name(layout.sut_file, layout) not in sut_headers:          # A1-DA19
         sut_headers.append(include_name(layout.sut_file, layout))
+    if uc.sut_prologue(root_text, layout.functions, layout.header_sut):
+        sut_headers = [h for h in sut_headers if layout.header_sut and h == include_name(layout.sut_file, layout)]
     lines += [f'#include "{h}"' for h in sut_headers if h != "ut_stubs.h"]
     instances = class_templates(plan)
     if instances:      # the tests use the instrumented instantiation of the sut_access file [A1-DA19]
         lines += ["#include <cstdint>"] + [f"extern template class {q}<{a}>;" for q, a in instances.values()]
     if render_sut_access(plan) is not None:                     # A2-21k
-        prototypes += [wrapper_signature(f) + ";" for f in static_functions(layout)]
+        prototypes += [wrapper_signature(f) + ";" for f in static_functions(layout) if not uses_private_type(f, layout)]
         prototypes += [f"void {state_setter(v)}(long long v);" for v in setter_vars(plan)]    # A2-21z
     lines += [f'#include "{h}"' for h in register_headers(plan) if h not in sut_headers]      # A2-21ab
     helpers = callback_helpers(layout)
@@ -1094,9 +1147,23 @@ def text_auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple
     return out
 
 
+def resolve_typedefs(t: str, layout: uc.LayoutProfile) -> str:
+    """A1-DA21: a project typedef resolved to the type it names (kBase_t -> int32_t), through chains of them."""
+    r = re.sub(r"\s+", " ", re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", t or "")).strip()
+    for _ in range(8):
+        nxt = layout.typedefs.get(r) or layout.typedefs.get(r.split("::")[-1]) if r else None
+        if not nxt or nxt == r:
+            break
+        r = re.sub(r"\s+", " ", re.sub(r"\b(const|volatile)\b", "", nxt)).strip()
+    return r
+
+
 def _observer(ret: str, layout: uc.LayoutProfile) -> str | None:
     """The observation macro for a return type; "" for void, None when nothing can be observed."""
     r = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", ret or "void").strip()
+    resolved = resolve_typedefs(r, layout)
+    if resolved and resolved != r and _observer(resolved, layout.model_copy(update={"typedefs": {}})) is not None:
+        return _observer(resolved, layout.model_copy(update={"typedefs": {}}))
     enums = {e.name for e in layout.enums} | {e.name.split("::")[-1] for e in layout.enums}
     if r == "void":
         return ""
@@ -1111,6 +1178,14 @@ def _observer(ret: str, layout: uc.LayoutProfile) -> str | None:
     if r.endswith("*"):
         return "UT_OBSERVE_PTR"
     return None
+
+
+def uses_private_type(fn: uc.FunctionInfo, layout: uc.LayoutProfile) -> bool:
+    """A2-21ad: the function's signature names a type only the SUT file declares; no test file can call it."""
+    if not layout.private_types:
+        return False
+    words = set(re.findall(r"\b[A-Za-z_]\w*\b", " ".join([fn.return_type, *(p.type for p in fn.params)])))
+    return bool(words & set(layout.private_types))
 
 
 def callee_of(fn: uc.FunctionInfo) -> str:
@@ -1184,13 +1259,23 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
         return [([f"char ut_b{i}[256] = {{0}};"], f"ut_b{i}", [])]
     if p.kind in ("struct", "ptr_struct") and p.fields:
         own = {f.name: field_values(f.name, body, macros or {}) for f in p.fields}           # A2-21r
+        # A2-21ad: a pointer field points to a zeroed local object of its pointee (a handle's Instance)
+        targets = [uc.pointee_object(f.base, f"ut_p{i}_{k}", cpp) if f.kind == "pointer" else None
+                   for k, f in enumerate(p.fields)]
+        # ... and NULL as well when the function compares that field with NULL
         dims = [sorted(set(small) | set(own[f.name])) if f.kind in ("int", "enum") else [0, 1] if f.kind == "bool"
-                else [float(v) for v in small] if f.kind == "float" else ["{0}"] for f in p.fields]
-        inits = ["{" + ", ".join(_c_literal(v) for v in combo) + "}"
+                else [float(v) for v in small] if f.kind == "float" else
+                [targets[k][1]] + (["0"] if uc.null_checked(f.name, body) else []) if f.kind == "pointer"
+                else [0] if f.kind == "callback" else ["{0}"] for k, f in enumerate(p.fields)]
+        # C++ forbids narrowing in a brace initializer: integer fields get their own type [A2-21ad]
+        casts = [f"({f.type})" if cpp and f.kind == "int" and f.type else "" for f in p.fields]
+        inits = ["{" + ", ".join(casts[k] + (f"({_c_literal(v)})" if casts[k] else _c_literal(v))
+                                 for k, v in enumerate(combo)) + "}"
                  for combo in combine(dims, max(6, max(len(d) for d in dims)))]
         base = p.base or t.rstrip("*& ").strip()
         ref = p.kind == "struct" or p.by_ref
-        opts = [([f"{base} ut_v{i} = {init};"], f"ut_v{i}" if ref else f"&ut_v{i}", []) for init in inits]
+        pre = [x[0] for x in targets if x is not None]
+        opts = [([*pre, f"{base} ut_v{i} = {init};"], f"ut_v{i}" if ref else f"&ut_v{i}", []) for init in inits]
         return opts + ([([], null, [])] if p.kind == "ptr_struct" and p.nullable and not p.by_ref else [])
     if p.kind == "callback":
         base = f"ut_cb_{_ident(fn.name)}_{i}"
@@ -1200,7 +1285,8 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
     return None
 
 
-def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple[str, str, str]]:
+def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str],
+               brain_values: dict[tuple[str, int], tuple[list[str], str]] | None = None) -> list[tuple[str, str, str]]:
     """Characterization tests without an LLM [A2-21h]: every parameter kind the front end reports
     (scalars, enums, pointers to scalars, strings, buffers, plain structs, callbacks) gets values from
     the function's own literals and macros, combined pairwise with the controlled stub values;
@@ -1220,7 +1306,8 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple[str,
     wanted = {s.function for s in plan.scenarios if not s.inputs}
     out = []
     for fn in layout.functions:
-        if fn.name not in wanted or (fn.qualified_name.count("::") and _is_member(fn, layout)):
+        if fn.name not in wanted or (fn.qualified_name.count("::") and _is_member(fn, layout)) \
+                or uses_private_type(fn, layout):                                       # A2-21ad
             continue
         observe = _observer(fn.return_type, layout)
         body = "\n".join(sut_lines[fn.line_start - 1: fn.line_end])
@@ -1228,6 +1315,11 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple[str,
                             if g.is_static and g.name in fn.calls and g is not fn)                 # A2-21r
         values = literal_values(body + "\n" + helpers, macros)
         options = [_options(fn, i, p, values, layout, body, macros) for i, p in enumerate(fn.params)]
+        for i, p in enumerate(fn.params):                       # A2-21ac: a value the rules cannot build
+            recipe = (brain_values or {}).get((fn.qualified_name, i))
+            if options[i] is None and recipe is not None:
+                null = "nullptr" if layout.language == "cpp" else "NULL"
+                options[i] = [(list(recipe[0]), recipe[1], [])] + ([([], null, [])] if p.nullable else [])
         endless = endless_loop(body)                                                       # A2-21y
         if any(o is None for o in options) or (observe is None and not endless):
             continue
@@ -1241,7 +1333,8 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple[str,
         called = list(dict.fromkeys([*fn.calls, *(c for g in layout.functions if g.is_static and g.name in fn.calls
                                                    and g is not fn for c in g.calls)]))
         controlled = [stubs[c] for c in called if c in stubs and stubs[c].return_type not in ("void", "")
-                      and (INTEGRAL.match(stubs[c].return_type) or FLOATING.match(stubs[c].return_type))]
+                      and (INTEGRAL.match(resolve_typedefs(stubs[c].return_type, layout))
+                           or FLOATING.match(resolve_typedefs(stubs[c].return_type, layout)))]
         dims = [list(range(len(o))) for o in options] + [_stub_choices(s, body + "\n" + helpers, values, layout)
                                                          for s in controlled]
         dims += [[0, 1] for _ in polls] + [vals for _, vals in state] + ([[0, 1]] if asm else [])
@@ -1292,7 +1385,7 @@ def _stub_choices(spec: uc.StubSpec, body: str, values: list[int], layout: uc.La
     choices: list[Any] = list(values)
     calls = len(re.findall(r"\b" + re.escape(spec.function.split("::")[-1]) + r"\s*\(", body))
     storage = re.sub(r"^const\s+", "", re.sub(r"\b(extern|static|inline|virtual)\b", "", spec.return_type).strip())
-    if calls > 1 and INTEGRAL.match(storage) and sequence_type(storage, layout):
+    if calls > 1 and INTEGRAL.match(resolve_typedefs(storage, layout) or storage) and sequence_type(storage, layout):
         positive = [v for v in values if v > 0][-6:]
         choices += [(0,) * (calls - 1) + (v,) for v in positive] + [(v,) + (0,) * (calls - 1) for v in positive[-2:]]
     return choices
@@ -1555,6 +1648,15 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str) -> str | None
             lines += [f"{controls['returns_len']} = {len(sv.returns)};", f"{controls['return']} = {sv.returns[-1]};"]
     lines += [f"{v.name} = {v.value};" for v in sc.variables]
     lines += [s.strip() if s.strip().endswith((";", "}")) else s.strip() + ";" for s in sc.setup if s.strip()]
+    sut = Path(layout.repo_root) / layout.sut_file
+    body = "\n".join(sut.read_text(encoding="utf-8", errors="replace").splitlines()[fn.line_start - 1: fn.line_end]) \
+        if sut.is_file() else ""
+    waits = register_waits(fn, body)                         # the brain's test ends a register wait too [A2-21ab]
+    if waits:
+        given_setup = " ".join(sc.setup)
+        preset = {(reg, mask) for reg, mask, _ in waits
+                  if re.search(re.escape(reg) + r"\s*(\|=|=)[^;]*\b" + re.escape(mask) + r"\b", given_setup)}
+        lines += wait_setup(waits, preset)
     call = f"{callee_of(fn)}({', '.join(given[n] for n in names)})"
     full = return_of(fn)
     ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", full or "void").strip()
@@ -1771,7 +1873,8 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
             static = bool(re.match(r"^\s*static\b", fn.signature)) or ("static" in ret.split())
             calls = set(fn.calls) | set(ctor.calls if ctor else [])
             controlled = [stubs[c] for c in sorted(calls) if c in stubs and
-                          (INTEGRAL.match(stubs[c].return_type) or FLOATING.match(stubs[c].return_type))]
+                          (INTEGRAL.match(resolve_typedefs(stubs[c].return_type, layout))
+                           or FLOATING.match(resolve_typedefs(stubs[c].return_type, layout)))]
             # value at construction; at the calls a single value or one value per call [A2-21g, A2-21r]
             steps = [v for v in values if v > 1][-6:]
             at_calls = [list(values) + ([(0, v, 2 * v) for v in steps] if sequence_type(
@@ -1892,6 +1995,8 @@ class GeneratorAgent(ba.AgentCore):
                  router: ba.BrainRouter | None = None):
         self.cfg = config or GeneratorConfig()
         super().__init__(settings, router=router)
+        self._recipes: dict[tuple[str, int], tuple[tuple[list[str], str], ba.RuleFailure, str]] = {}   # A2-21ac
+        self._confirmed: set[tuple[str, int]] = set()
 
     def tools(self) -> list[ba.ContractTool]:
         def pre(payload: uc.GenerationRequest, request):
@@ -1968,7 +2073,9 @@ class GeneratorAgent(ba.AgentCore):
             if self.cfg.mode in ("deterministic_then_llm", "deterministic") and not any(
                     n.endswith(tuple(f"_auto_{i}" for i in range(1, 3))) for n in names) and \
                     not any(sc.inputs for sc in plan.scenarios):
-                auto = auto_tests(plan, self.cfg.max_auto_tests_per_function, names)
+                values = await self._brain_values(plan, self._allowed_symbols(plan, self._headers_text(layout),
+                                                                              stub_header), existing_text, notes)
+                auto = auto_tests(plan, self.cfg.max_auto_tests_per_function, names, values)
                 if layout.language == "cpp":
                     auto += auto_class_tests(plan, self.cfg.max_auto_tests_per_function, names)
                 if auto:
@@ -2211,6 +2318,77 @@ class GeneratorAgent(ba.AgentCore):
                     linked.add(name)
         return out, notes, linked
 
+    async def _brain_values(self, plan: uc.UTPlan, allowed: set[str], existing_text: str,
+                            notes: list[str]) -> dict[tuple[str, int], tuple[list[str], str]]:
+        """A2-21ac, ARCH-21: parameters whose value no rule can build are handed to the brain. The answer is checked
+        here (declared symbols only, no assertion) and by Agent3's build; it is stored in the resolution memory
+        (ARCH-23) only once tests using it are part of the verified suite, so only a value that compiled and ran
+        is reused without the brain."""
+        layout = plan.layout
+        uc.resolution_project(self, layout)
+        recipes = getattr(self, "_recipes", None)
+        if recipes is None:
+            recipes = self._recipes = {}
+        for key, (recipe, failure, answer) in list(recipes.items()):           # confirmed by the verified suite
+            mark = VALUE_MARK.format(function=key[0], param=key[1])
+            if mark in existing_text and self.resolutions is not None and key not in self._confirmed:
+                self.resolutions.put(self.name, failure.rule, failure.signature(), answer)
+                self._confirmed.add(key)
+        root = Path(layout.repo_root)
+        sut_lines = uc.read_source(root / layout.sut_file).splitlines() if (root / layout.sut_file).is_file() else []
+        wanted = {s.function for s in plan.scenarios if not s.inputs}
+        headers = self._headers_text(layout)
+        out: dict[tuple[str, int], tuple[list[str], str]] = {}
+        asked = 0
+        for fn in layout.functions:
+            if fn.name not in wanted or (fn.qualified_name.count("::") and _is_member(fn, layout)):
+                continue
+            for i, p in enumerate(fn.params):
+                if _options(fn, i, p, [0, 1], layout) is not None:
+                    continue
+                key = (fn.qualified_name, i)
+                if key in recipes:
+                    out[key] = recipes[key][0]
+                    continue
+                if asked >= self.cfg.max_brain_values:
+                    continue
+                asked += 1
+                body = "\n".join(sut_lines[fn.line_start - 1: fn.line_end])
+                type_name = re.sub(r"\b(const|volatile|struct|union|enum|class)\b|[*&\[\]]", " ", p.type).split()
+                where = [m.start() for t in type_name[-1:] for m in re.finditer(r"\b" + re.escape(t) + r"\b", headers)][:3]
+                defs = "\n...\n".join(headers[max(0, k - 800): k + 1200] for k in where)
+                context = [uc.part("function", body[:6000]),
+                           uc.part("parameter", f"{p.name}: {p.type} (after typedefs: {p.canonical or p.type})"),
+                           uc.part("declarations of the type", defs[:8000] or "(not found in the headers)",
+                                   priority=uc.P_EVIDENCE),
+                           uc.part("functions of the SUT", "\n".join(f.signature for f in layout.functions)[:4000],
+                                   priority=uc.P_EVIDENCE)]
+                failure = ba.RuleFailure(rule="A2-21ac value", failure=f"no rule builds a value of {p.type} for "
+                                         f"parameter {p.name} of {fn.name}", subject=p.canonical or p.type)
+
+                def check(answer: ValueRecipe) -> str:
+                    text = "\n".join(answer.setup) + "\n" + answer.argument + ";"
+                    if not answer.argument.strip():
+                        return "the argument expression is empty"
+                    if re.search(r"\bUT_(EXPECT|OBSERVE)", text):
+                        return "the setup must not assert or observe anything"
+                    return self._body_problem(text, allowed | setup_names(answer.setup))
+
+                answer = await self.resolve(failure, task=VALUE_TASK.format(index=i, name=p.name, type=p.type),
+                                            context=context, output_model=ValueRecipe, verify=check, step="A2.value",
+                                            attempts=self.cfg.rule_attempts, project=layout.repo_root, remember=False,
+                                            need=ba.OutputNeed(items=1, tokens_per_item=300, overhead=200))
+                if answer is None:
+                    notes.append(f"{fn.name}: parameter {p.name} ({p.type}): no rule builds its value and the brain "
+                                 "gave none that passed the checks; no rule-based tests for it [A2-21ac]")
+                    continue
+                recipe = ([VALUE_MARK.format(function=key[0], param=i), *answer.setup], answer.argument)
+                recipes[key] = (recipe, failure, answer.model_dump_json())
+                out[key] = recipe
+        if out:
+            notes.append(f"{len(out)} parameter value(s) built by the brain where no rule could [A2-21ac]")
+        return out
+
     @staticmethod
     def _allowed_symbols(plan: uc.UTPlan, headers: str, stub_header: str) -> set[str]:
         allowed = set(HARNESS_MACROS) | SAFE_CALLS
@@ -2369,7 +2547,8 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
             kind, oid, expr = m.groups()
             if oid not in observed:
                 missing.append(oid)
-                lines.append(line[: m.start()] + f"{expr};  /* not observed: test did not reach this point */")
+                # (void): a bare `ns::f(&x);` would be read by C++ as the declaration of a reference x [A2-21ad]
+                lines.append(line[: m.start()] + f"(void)({expr});  /* not observed: test did not reach this point */")
                 continue
             value = observed[oid]
             if kind == "STR":
@@ -2382,6 +2561,22 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
     out.observations = []
     if missing:
         out.notes.append(f"{len(missing)} observation(s) not reached: {', '.join(missing[:5])}")
+    # A2-21f: a new characterization test none of whose observations was reached (the function crashed or did not
+    # return) asserts nothing and would fail every verify: it is left out, and its call is reported
+    suites = [a.content for a in out.actions if a.role == "testsuite"]
+    sources = {name: src for text in suites for name, src in uc.test_sources(text).items()}
+    unreached = []
+    for name in set(out.new_tests) & set(out.characterization_tests):
+        src = sources.get(name, "")
+        ids = re.findall(r"/\* not observed: test did not reach this point \*/", src)
+        if ids and not re.search(r"\bUT_EXPECT", src):
+            unreached.append(name)
+    if unreached:
+        calls = [m.group(1).strip() for n in sorted(unreached)
+                 for m in [re.search(r"\(void\)\((.*)\);\s*/\* not observed", sources[n])] if m]
+        out = uc.without_tests(out, sorted(unreached), f"{len(unreached)} characterization test(s) left out: the "
+                               "function crashed or did not return before any observation (input that crashes the SUT, "
+                               f"characterization only), e.g. {'; '.join(calls[:3])} [A2-21f]"[:600])
     out.characterization_tests = sorted(set(out.characterization_tests))
     return out
 
@@ -2392,6 +2587,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Genera
         section = json.loads(Path(config_path).read_text(encoding="utf-8")).get("generator", {})
     agent = GeneratorAgent(settings, config=GeneratorConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
+    agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
     return agent
 
 

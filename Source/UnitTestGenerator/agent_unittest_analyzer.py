@@ -12,9 +12,9 @@ stub, real or system. Only the stub-or-real decision may ask the LLM [A1-DA8], a
 prose may be linked to functions by the brain, checked here [A1-PL13].
 
 Coverage planning [A1-PL1 .. A1-PL14]: Agent1 determines the facts (gaps, path conditions, stubs, evidence,
-what earlier tests reached); from the second plan on the brain suggests the scenarios per function, and
-Agent1 checks every one deterministically before Agent2 receives it. Without a brain, or when nothing
-passes the check, the rules plan the function [A1-PL8].
+what earlier tests reached); from the first coverage plan on the brain plans the scenarios per function, and
+Agent1 checks every one deterministically before Agent2 receives it. When nothing passes the check, the next
+brain is asked; the rules never plan in the brain's place - without a usable plan the run stops [A1-PL8, ARCH-24].
 
 Tools (MCP, each a contract): discover, dependencies, plan, collect_evidence.
 Run as an MCP server:  python agent_unittest_analyzer.py serve [--config ut_config.json]
@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
+import csv
+import functools
 import itertools
 import json
 import os
@@ -67,7 +70,6 @@ class AnalyzerConfig(BaseModel):
     real_dependency_depth: int = 2           # A1-DA10, ORC-7
     max_definition_units: int = 40           # translation units parsed to find one definition [A1-DA5]
     requirement_files: list[str] = []        # glob patterns, relative to the repository [A1-25x]
-    brain_planning: bool = True              # A1-PL1
     max_brain_calls_per_function: int = 2    # re-ask included [A1-PL9, ORC-7]
     max_brain_scenarios: int = 8
     max_lookups_per_function: int = 6        # A1-PL6, ORC-7
@@ -77,6 +79,26 @@ class AnalyzerConfig(BaseModel):
     max_requirements_to_link: int = 40
     min_link_probability: float = 0.6
     propose_declarations: bool = True        # A1-PL14
+    rule_attempts: int = 2                   # brain attempts per rule failure [ARCH-21, ORC-7]
+    # CSV requirement documents: the column of the ID and of the text, first match by name [A1-RQ2]
+    requirement_id_columns: list[str] = ["id", "requirement id", "req id", "req-id", "identifier", "key",
+                                         "reqif.foreignid"]
+    requirement_text_columns: list[str] = ["text", "requirement", "requirement text", "description",
+                                           "reqif.text", "summary"]
+    max_selected_files: int = 200            # production files selected when a run names none [ORC-35, ORC-7]
+
+
+class HeaderFolder(BaseModel):
+    """A1-DA20: the folder, relative to the repository, to add as an include path for a missing header."""
+    folder: str = Field(description="a folder of the repository, relative to its root ('.' for the root)")
+    reason: str = Field(description="one sentence: why the project finds the header there")
+
+
+HEADER_TASK = (
+    "The C/C++ front end cannot find a header the file includes: {header}. Choose the folder of this repository "
+    "that the project's build adds as an include path for it - from CANDIDATES when there are any (files with "
+    "that name), otherwise from the folders listed. Return JSON {{\"folder\": \"...\", \"reason\": \"...\"}}.")
+HEADER_SKIP = {".git", ".svn", ".hg", "node_modules", ".venv", "__pycache__", "ut_output", "ut_work", "ut_cache"}
 
 
 # ============================================================================ C/C++ source helpers
@@ -207,6 +229,11 @@ def function_name(header: str) -> str:
 
 def find_declarations(text: str) -> dict[str, str]:
     """Function declarations (prototypes) in a header: name -> declaration text."""
+    return dict(_declarations(text))
+
+
+@functools.lru_cache(maxsize=4096)                 # the same headers are read in every plan [A1-31b]
+def _declarations(text: str) -> tuple[tuple[str, str], ...]:
     code = strip_comments(text)
     decls = {}
     for m in re.finditer(r"(?:^|[;}\n])\s*((?:extern\s+)?[A-Za-z_][\w\s\*&:<>,]*?\b([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*(?:const\s*)?);",
@@ -215,7 +242,7 @@ def find_declarations(text: str) -> dict[str, str]:
         if name in KEYWORDS or decl.startswith(("return", "typedef", "#")) or "=" in decl.split("(")[0]:
             continue
         decls.setdefault(name, decl)
-    return decls
+    return tuple(decls.items())
 
 
 def parse_declaration(decl: str) -> tuple[str, list[list[str]]]:
@@ -446,8 +473,38 @@ SYSTEM_QUESTION = {
         "system": "Its result does not influence SUT decisions, so the system implementation is fine."})}
 
 
+TRAILING_QUALIFIERS = re.compile(r"(?:\s*\b(?:const|volatile|restrict|__restrict|__restrict__)\b)+\s*$")
+
+
+def pointer_core(t: str) -> str:
+    """A1-DA21: the type without the qualifiers of the pointer itself ('List_t *const' -> 'List_t *')."""
+    return TRAILING_QUALIFIERS.sub("", t.strip())
+
+
+def _unqualified(t: str) -> str:
+    """A type as a test declares a variable of it: qualifiers removed, struct/union/enum kept (C needs them)."""
+    t = re.sub(r"\b_Atomic\s*\(([^()]*)\)", r"\1", t)
+    t = re.sub(r"\b(const|volatile|restrict|__restrict|__restrict__|_Atomic)\b", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def qualify_type(t: str, scoped: dict[str, str], namespace: str) -> str:
+    """A2-21ad: a type as written inside a namespace ('const Evt *const' in namespace fw), with the names declared
+    in a namespace qualified ('const fw::Evt *const'), so a test outside the namespace can use it."""
+    if not t or not scoped or not namespace:
+        return t
+    def one(m: re.Match) -> str:
+        name = m.group(0)
+        start = m.start()
+        if start >= 2 and t[start - 2: start] == "::":
+            return name                                   # already qualified
+        return scoped.get(name, name)
+    return re.sub(r"\b[A-Za-z_]\w*\b", one, t)
+
+
 def _plain_type(t: str) -> str:
-    t = re.sub(r"\b(const|volatile|struct|union|enum|class|restrict|__restrict)\b", " ", t)
+    t = re.sub(r"\b_Atomic\s*\(([^()]*)\)", r"\1", t)                   # A1-DA21: _Atomic(unsigned long)
+    t = re.sub(r"\b(const|volatile|struct|union|enum|class|restrict|__restrict|_Atomic)\b", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -556,6 +613,18 @@ class AstIndex:
         if owner and owner in self.qualified and "::" not in name:
             name = f"{self.qualified[owner]}::{node.get('name', '')}"
         return name
+
+    def namespace_of(self, node: dict) -> str:
+        """The named namespaces around a declaration, outermost first ("QP::detail") [A2-21ad]."""
+        names, nid = [], self.parent.get(node.get("id", ""))
+        while nid:
+            parent = self.nodes.get(nid, {})
+            if parent.get("kind") == "NamespaceDecl":
+                if not parent.get("name"):
+                    return ""                                   # an anonymous namespace: not nameable
+                names.append(parent["name"])
+            nid = self.parent.get(nid)
+        return "::".join(reversed(names))
 
     def decl_location(self, decl_id: str) -> tuple[str, int]:
         offset = self.ids.get(decl_id)
@@ -672,6 +741,19 @@ class FrontEnd:
             out.append((node, self.ast.qualified_name(node)))
         return out
 
+    def private_types(self) -> list[str]:
+        """A2-21ad: names of the types (struct, union, enum, typedef) the SUT file itself declares: a test in another
+        file cannot name them, so no rule-based test or wrapper prototype may use them."""
+        out = []
+        for nid, node in self.ast.nodes.items():
+            if node.get("kind") not in ("RecordDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl") \
+                    or not node.get("name") or node.get("isImplicit"):
+                continue
+            offset = self.ast.ids.get(nid)
+            if offset is not None and self.ast.node_file(offset) == self.path:
+                out.append(node["name"])
+        return sorted(set(out))
+
     def local_statics(self) -> list[tuple[str, str, str]]:
         """A1-DA18: (function, variable, type) of every static variable defined inside a function of this
         file, C and C++ (a static object inside a function included)."""
@@ -770,6 +852,34 @@ class FrontEnd:
                                         header=self.ast.rel(path) if path else "", methods=methods))
         return out
 
+    def typedefs(self) -> dict[str, str]:
+        """A1-DA21: every typedef and type alias of the repository's headers -> the type it names (one level,
+        as the front end prints it), by short and by qualified name; a test resolves chains of them."""
+        if getattr(self, "_typedef_map", None) is not None:
+            return self._typedef_map
+        out: dict[str, str] = {}
+        self._typedef_map = out
+        for nid, node in self.ast.nodes.items():
+            if node.get("kind") in ("TypedefDecl", "TypeAliasDecl") and node.get("name") and not node.get("isImplicit"):
+                t = node.get("type") or {}
+                target = t.get("desugaredQualType") or t.get("qualType", "")
+                if target and target != node["name"]:
+                    out.setdefault(node["name"], target)
+                    out.setdefault(self.ast.qualified.get(nid, node["name"]), target)
+        return out
+
+    def scoped_types(self) -> dict[str, str]:
+        """A2-21ad: short name -> qualified name of the records, enums and type aliases declared in a C++ namespace
+        (only names that are unique), so tests outside the namespace can name them."""
+        seen: dict[str, set[str]] = {}
+        for nid, node in self.ast.nodes.items():
+            if node.get("kind") in ("RecordDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl",
+                                    "ClassTemplateDecl") and node.get("name") and not node.get("isImplicit"):
+                qualified = self.ast.qualified.get(nid, node["name"])
+                if "::" in qualified and "(anonymous" not in qualified:
+                    seen.setdefault(node["name"], set()).add(qualified)
+        return {name: next(iter(q)) for name, q in seen.items() if len(q) == 1}
+
     def enums(self) -> list[uc.EnumInfo]:
         out = []
         typedefs = {}                                   # unnamed enum id -> typedef name
@@ -827,10 +937,15 @@ class FrontEnd:
                 continue
             t = (c.get("type") or {}).get("desugaredQualType") or (c.get("type") or {}).get("qualType", "")
             info = uc.FieldInfo(name=c.get("name", ""), type=(c.get("type") or {}).get("qualType", t))
-            base = _plain_type(t)
+            base = self._through_typedefs(_plain_type(t), {})                          # A1-DA21
             m = re.match(r"^(.*?)\s*\[(\d+)\]$", base)
             if m:
                 info.kind, info.array_len = "array", int(m.group(2))
+            elif "(*)" in t:
+                info.kind = "callback"                       # a function pointer field: NULL by default [A1-DA21]
+            elif pointer_core(t).endswith("*"):
+                qt_field = (c.get("type") or {}).get("qualType", t)
+                info.kind, info.base = "pointer", _unqualified(pointer_core(qt_field)[:-1])    # A1-DA21
             elif base in ("bool", "_Bool"):
                 info.kind = "bool"
             elif INTEGRAL_T.match(base):
@@ -851,6 +966,22 @@ class FrontEnd:
             out.append(info)
         return out
 
+    def _through_typedefs(self, base: str, enums: dict[str, uc.EnumInfo]) -> str:
+        """A1-DA21: a base type the rules do not know, resolved through the repository's typedefs until it is a
+        builtin, an integer typedef of the standard library, a known record or an enum (typedef struct pb_istream_s
+        pb_istream_t names the record pb_istream_s)."""
+        seen = set()
+        while base and base not in seen and not (base in ("bool", "_Bool", "void") or INTEGRAL_T.match(base)
+                                                 or FLOAT_T.match(base) or base in self._records() or base in enums):
+            seen.add(base)
+            nxt = self.typedefs().get(base)
+            if not nxt:
+                break
+            base = _plain_type(pointer_core(nxt)) if not pointer_core(nxt).endswith("*") else base
+            if base in seen:
+                break
+        return base
+
     def param_info(self, parm: dict, enums: dict[str, uc.EnumInfo], body: str) -> uc.ParamInfo:
         qt = (parm.get("type") or {}).get("qualType", "")
         dt = (parm.get("type") or {}).get("desugaredQualType") or qt
@@ -867,12 +998,13 @@ class FrontEnd:
             info.callback_params = [p.strip() for p in m.group(2).split(",") if p.strip() and p.strip() != "void"]
             return info
         by_ref = t.endswith("&") and not t.endswith("&&")
-        pointer = t.endswith("*") or by_ref
-        base_dt = t.rstrip("*&").strip() if pointer else t
-        base = _plain_type(base_dt)
-        info.base = _plain_type(qt.rstrip("*&").strip()) if pointer else _plain_type(qt)
+        core, qcore = pointer_core(t), pointer_core(qt)                       # A1-DA21: T * const is a pointer
+        pointer = core.endswith("*") or by_ref
+        base_dt = core.rstrip("*&").strip() if pointer else t
+        base = self._through_typedefs(_plain_type(base_dt), enums)                    # A1-DA21: pb_byte_t -> uint8_t
+        info.base = _unqualified(qcore.rstrip("*&").strip()) if pointer else _unqualified(qt)
         info.by_ref = by_ref
-        enum = enums.get(base) or enums.get(_plain_type(qt.rstrip("*&")))
+        enum = enums.get(base) or enums.get(_plain_type(qcore.rstrip("*&")))
         if pointer and base in ("char", "signed char", "unsigned char") and not by_ref:
             info.kind = "cstring" if base_dt.startswith("const") or "const char" in qt else "buffer"
         elif pointer and base == "void" and not by_ref:
@@ -1212,22 +1344,156 @@ def block_lines(lines: list[str], line: int, branch: str) -> tuple[int, int, int
     return None
 
 
+# ============================================================================ production files [ORC-35]
+TEST_PARTS = {"test", "tests", "testing", "unittest", "unittests", "unit_tests", "unit-tests", "ut", "utest", "gtest",
+              "googletest", "googlemock", "gmock", "unity", "cmocka", "cpputest", "catch2", "doctest", "mock", "mocks",
+              "fake", "fakes", "stub", "stubs", "testdata", "test_data"}
+OTHER_PARTS = {"example", "examples", "sample", "samples", "demo", "demos", "doc", "docs", "documentation"}
+THIRD_PARTY_PARTS = {"third_party", "thirdparty", "third-party", "3rdparty", "vendor", "vendors", "external",
+                     "externals", "extern", "deps", "_deps"}
+TEST_NAME = re.compile(r"(?:^|[_\-.])(?:test|tests|unittest|mock|mocks|stub|stubs|fake|fakes)(?:$|[_\-.])|"
+                       r"[a-z0-9](?:Test|Tests|Mock|Stub|Fake)$", re.I)
+LICENSE_NAME = re.compile(r"^(licen[cs]e|copying)(\b|[._-])", re.I)
+DEFINITION = re.compile(r"(?m)^[ \t]*(?:[A-Za-z_][\w:<>,~]*[ \t*&]+)+[A-Za-z_~][\w:~]*[ \t]*\([^;{}]*\)[ \t\n]*"
+                        r"(?:const[ \t\n]*)?(?:noexcept[ \t\n]*)?(?:->[^;{]+)?\{")
+
+
+def _build_part(part: str) -> bool:
+    low = part.lower()
+    return low in ("out", "bin", "obj", "build") or low.startswith(("build-", "build_", "cmake-build"))
+
+
+def select_production_files(root: Path, compile_commands: str = "", limit: int = 200) -> uc.FileSelection:
+    """ORC-35: the production files of a working tree - C and C++ sources that are not tests, the pipeline's own
+    files, examples or documentation, build output, third-party or generated code, and define a function."""
+    submodules = set()
+    gitmodules = root / ".gitmodules"
+    if gitmodules.is_file():
+        submodules = {m.strip().strip("/").replace("\\", "/") for m in
+                      re.findall(r"^\s*path\s*=\s*(.+)$", gitmodules.read_text(encoding="utf-8", errors="replace"), re.M)}
+    in_database: set[str] | None = None
+    if compile_commands:
+        try:
+            entries = json.loads(Path(compile_commands).read_text(encoding="utf-8"))
+            in_database = set()
+            for e in entries:
+                path = Path(e.get("file", ""))
+                path = path if path.is_absolute() else Path(e.get("directory", "")) / path
+                with contextlib.suppress(ValueError, OSError):
+                    in_database.add(str(path.resolve().relative_to(root.resolve())).replace("\\", "/"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            in_database = None
+    licensed: dict[Path, bool] = {}
+
+    def has_license(folder: Path) -> bool:
+        if folder not in licensed:
+            licensed[folder] = any(LICENSE_NAME.match(p.name) for p in folder.iterdir() if p.is_file())
+        return licensed[folder]
+
+    selected, left_out = [], []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in HEADER_SKIP and not d.startswith("."))
+        folder = Path(dirpath)
+        rel_dir = folder.relative_to(root)
+        for name in sorted(filenames):
+            if Path(name).suffix.lower() not in C_EXT + CPP_EXT:
+                continue
+            rel = (rel_dir / name).as_posix()
+            parts = [p.lower() for p in rel_dir.parts]
+            reason = ""
+            if any(rel == m or rel.startswith(m + "/") for m in submodules):
+                reason = "third-party code (git submodule)"
+            elif any(p in THIRD_PARTY_PARTS for p in parts):
+                reason = "third-party code (folder name)"
+            elif any(has_license(root.joinpath(*rel_dir.parts[: k + 1])) for k in range(len(rel_dir.parts))):
+                reason = "third-party code (a folder with its own license file)"
+            elif any(p in TEST_PARTS for p in parts) or TEST_NAME.search(Path(name).stem):
+                reason = "test code"
+            elif any(p in OTHER_PARTS for p in parts):
+                reason = "example or documentation"
+            elif any(_build_part(p) for p in rel_dir.parts):
+                reason = "build output"
+            elif in_database is not None and rel not in in_database:
+                reason = "not compiled by the build (compile database)"
+            if not reason:
+                try:
+                    text = (folder / name).read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    text, reason = "", f"not readable ({exc.__class__.__name__})"
+                head = "\n".join(text.splitlines()[:30]).lower()
+                if not reason and "generated by agent_unittest_generator" in head:
+                    reason = "the pipeline's own file"
+                elif not reason and re.search(r"auto-?generated|generated (by|from|with)", head) and \
+                        re.search(r"do not (edit|modify)|don't (edit|modify)", head):
+                    reason = "generated code"
+                elif not reason and not DEFINITION.search(strip_comments(text)):
+                    reason = "no function definition"
+            if reason:
+                left_out.append(f"{rel}: {reason}")
+            elif len(selected) >= limit:
+                left_out.append(f"{rel}: over the limit of {limit} files (ORC-7)")
+            else:
+                selected.append(rel)
+    return uc.FileSelection(selected=selected, left_out=left_out)
+
+
 # ============================================================================ requirement documents [A1-25x]
 REQ_ID = re.compile(r"\b([A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)*[-_]\d+[a-z]?)\b")
 
 
-def read_requirements(root: Path, files: list[str]) -> list[tuple[str, str, str, int]]:
-    """(requirement id, text, file, line) from ReqIF (.reqif, .reqifz) and Markdown/text documents."""
+REQUIREMENT_FORMATS = (".reqif", ".reqifz", ".md", ".markdown", ".txt", ".csv")       # A1-RQ2
+DOCUMENT_ERRORS = (OSError, ValueError, KeyError, StopIteration, UnicodeError, csv.Error, zipfile.BadZipFile,
+                   ET.ParseError)
+Columns = tuple[tuple[str, ...], tuple[str, ...]]
+DEFAULT_COLUMNS: Columns = (tuple(AnalyzerConfig().requirement_id_columns), tuple(AnalyzerConfig().requirement_text_columns))
+
+
+def read_document(path: Path, label: str, columns: Columns = DEFAULT_COLUMNS) -> list[tuple[str, str, str, int]]:
+    """(requirement id, text, label, line) of one document: ReqIF, CSV, else Markdown or plain text [A1-RQ2]."""
+    suffix = path.suffix.lower()
+    if suffix in (".reqif", ".reqifz"):
+        return _reqif(path, label)
+    if suffix == ".csv":
+        return _csv_requirements(path.read_text(encoding="utf-8-sig", errors="replace"), label, columns)
+    return _markdown_requirements(path.read_text(encoding="utf-8", errors="replace"), label)
+
+
+def read_requirements(root: Path, files: list[str], given: list[uc.RequirementDocument] | None = None,
+                      columns: Columns = DEFAULT_COLUMNS) -> list[tuple[str, str, str, int]]:
+    """(requirement id, text, file, line) from the documents given for the run (A1-RQ1) and those of the
+    repository (A1-25x). An ID a given document states is taken from there only [A1-RQ4]."""
     out = []
-    for rel in files:
-        path = root / rel
+    for doc in given or []:
         try:
-            if path.suffix.lower() in (".reqif", ".reqifz"):
-                out += _reqif(path, rel)
-            else:
-                out += _markdown_requirements(path.read_text(encoding="utf-8", errors="replace"), rel)
-        except (OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
+            out += read_document(Path(doc.path), doc.name, columns)
+        except DOCUMENT_ERRORS as exc:
+            LOG.warning("requirement document %s not readable: %s", doc.name, exc)
+    stated = {r[0] for r in out}
+    for rel in files:
+        try:
+            out += [r for r in read_document(root / rel, rel, columns) if r[0] not in stated]
+        except DOCUMENT_ERRORS as exc:
             LOG.warning("requirement document %s not readable: %s", rel, exc)
+    return out
+
+
+def _csv_requirements(text: str, rel: str, columns: Columns) -> list[tuple[str, str, str, int]]:
+    """A1-RQ2: CSV with an ID column and a text column (names configurable); the line is the row's line."""
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    rows = csv.reader(text.splitlines(), dialect)
+    header = [h.strip().lower() for h in next(rows, [])]
+    id_col = next((header.index(c) for c in columns[0] if c in header), None)
+    text_col = next((header.index(c) for c in columns[1] if c in header), None)
+    if id_col is None or text_col is None:
+        raise ValueError(f"no ID column ({', '.join(columns[0])}) or no text column ({', '.join(columns[1])}) "
+                         f"in the first row")
+    out = []
+    for number, row in enumerate(rows, 2):
+        if len(row) > max(id_col, text_col) and row[id_col].strip() and row[text_col].strip():
+            out.append((row[id_col].strip(), re.sub(r"\s+", " ", row[text_col]).strip()[:1500], rel, number))
     return out
 
 
@@ -1290,6 +1556,7 @@ def stub_spec(dep: uc.Dependency) -> uc.StubSpec | None:
         var_type = f"{m.group(1)} {name}{m.group(2)}" if m else f"{dep.type} {name}"
         return uc.StubSpec(function=dep.name, declaration=dep.declaration, return_type="", header=header,
                            kind="variable", qualified_name=dep.qualified_name, var_type=var_type.strip(),
+                           namespace=dep.namespace,
                            is_const=dep.is_const, initializer="{0}" if dep.is_const else "")
     if dep.return_type or dep.params or dep.kind == "constructor":
         return_type, params = dep.return_type, [list(p) for p in dep.params]
@@ -1300,7 +1567,8 @@ def stub_spec(dep: uc.Dependency) -> uc.StubSpec | None:
             return None
     return_type = re.sub(r"\b(static|virtual|inline|extern|explicit)\b", "", return_type).strip()
     return uc.StubSpec(function=dep.name, declaration=dep.declaration, return_type=return_type, params=params,
-                       header=header, kind=dep.kind, qualified_name=dep.qualified_name, method_suffix=dep.method_suffix)
+                       header=header, kind=dep.kind, qualified_name=dep.qualified_name, method_suffix=dep.method_suffix,
+                       namespace=dep.namespace)
 
 
 # ============================================================================ brain planning [A1-PL1 .. A1-PL14]
@@ -1413,8 +1681,10 @@ PLAN_FORBIDDEN = re.compile(r"#\s*include|\bmain\s*\(|\bsystem\s*\(|\bpopen\s*\(
                             r"\bremove\s*\(|\bunlink\s*\(|\bwhile\b|\bfor\s*\(|\bgoto\b|__asm|\basm\b|\breturn\b")
 PLAN_SAFE_CALLS = {"sizeof", "strlen", "strcmp", "memset", "memcpy", "strcpy", "strncpy", "snprintf", "static_cast",
                    "reinterpret_cast", "const_cast"}
+# A declaration: type words, then a separator (blank, *, &), then the name - the separator keeps a name such as
+# "list" in "List_t list;" from being split into a second type word "lis" and a name "t".
 LOCAL_DECL = re.compile(r"^\s*(?:(?:const|static|struct|enum|union|unsigned|signed|volatile)\s+)*[A-Za-z_][\w:<>]*"
-                        r"(?:\s+[A-Za-z_]\w*)?\s*[*&\s]*\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*\s*(?:=|;|\{|\()")
+                        r"(?:\s+[A-Za-z_]\w*)?(?:\s*[*&]+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*\s*(?:=|;|\{|\()")
 
 
 def norm_text(text: str) -> str:
@@ -1544,6 +1814,7 @@ class AnalyzerAgent(ba.AgentCore):
         self.cfg = config or AnalyzerConfig()
         self._link_cache: dict[str, list[uc.RequirementLink]] = {}
         self._variant_cache: dict[str, list[tuple[uc.BuildVariant, dict[str, int]]]] = {}   # A1-37a, A1-37e
+        self._sources: dict[str, dict[str, tuple[tuple[int, int], str]]] = {}                # A1-31b
         super().__init__(settings, router=router)
 
     def tools(self) -> list[ba.ContractTool]:
@@ -1576,6 +1847,20 @@ class AnalyzerAgent(ba.AgentCore):
         async def evidence(payload: uc.EvidenceRequest, request, scratch):
             return self.collect_evidence(payload.layout, payload.function)
 
+        def select_pre(payload: uc.SelectRequest, request):
+            if not Path(payload.repo_root).is_dir():
+                raise ba.ContractRejected("repository root does not exist")
+
+        async def select(payload: uc.SelectRequest, request, scratch):
+            return select_production_files(Path(payload.repo_root), payload.compile_commands,
+                                           self.cfg.max_selected_files)
+
+        def status_pre(payload: uc.RequirementStatusRequest, request):
+            uc.check_signature(payload.layout, request)
+
+        async def status(payload: uc.RequirementStatusRequest, request, scratch):
+            return self.requirement_status(payload)
+
         def deps_pre(payload: uc.DependencyRequest, request):
             uc.check_signature(payload.layout, request)
             sut = Path(payload.layout.repo_root) / payload.layout.sut_file
@@ -1600,7 +1885,14 @@ class AnalyzerAgent(ba.AgentCore):
                                 description="Setup-repair or coverage plan for Agent2; scenarios suggested by the "
                                             "brain and checked here [A1-22, A1-26, A1-PL1..A1-PL14]."),
                 ba.ContractTool("collect_evidence", uc.EvidenceRequest, uc.EvidenceResult, evidence, evidence_pre,
-                                read_only=True, description="Expected-behaviour evidence for one function [A1-25j].")]
+                                read_only=True, description="Expected-behaviour evidence for one function [A1-25j]."),
+                ba.ContractTool("select_files", uc.SelectRequest, uc.FileSelection, select, select_pre, read_only=True,
+                                description="The production files of a working tree when a run names none; no "
+                                            "LLM [ORC-35]."),
+                ba.ContractTool("requirement_status", uc.RequirementStatusRequest, uc.RequirementStatus, status,
+                                status_pre, read_only=True,
+                                description="Per function: the linked requirements, whether a passed test asserts "
+                                            "each, and whether any expected behaviour is stated [A1-RQ5].")]
 
     @staticmethod
     def _plan_post(payload: uc.PlanRequest, plan: uc.UTPlan) -> None:
@@ -1677,6 +1969,7 @@ class AnalyzerAgent(ba.AgentCore):
         suite = f"{default_test_dir.rstrip('/')}/test_{sut.stem}.{'cpp' if language == 'cpp' else 'c'}"
         build = self._build_system(root, component)
         requirement_files = self._requirement_files(root, files)
+        given, requirement_notes = self._given_requirements(req.requirement_documents, root, requirement_files)
         blocked, reason = False, None
         if not functions:
             blocked, reason = True, "no function definitions found in the SUT"
@@ -1689,7 +1982,8 @@ class AnalyzerAgent(ba.AgentCore):
             writable_stub_dir=default_stub_dir, suite_file=suite, framework="ut_harness", existing_tests=existing,
             executable_tests=[t for t in executable if t != suite], functions=functions,
             sut_sha256=uc.file_sha256(sut), blocked=blocked, blocked_reason=reason,
-            requirement_files=requirement_files, header_sut=header_sut)
+            requirement_files=requirement_files, header_sut=header_sut, project=req.project,
+            given_requirements=given, requirement_notes=requirement_notes)
 
     @staticmethod
     def _build_system(root: Path, component: Path) -> str:
@@ -1714,6 +2008,49 @@ class AnalyzerAgent(ba.AgentCore):
                 p.suffix.lower() in (".md", ".txt") and re.search(r"req|spec", p.stem, re.I))]
         rel = lambda p: str(p.relative_to(root)).replace("\\", "/")
         return sorted({rel(p) for p in found if "ut_output" not in p.relative_to(root).parts})[:20]
+
+    @property
+    def _columns(self) -> Columns:
+        return tuple(c.lower() for c in self.cfg.requirement_id_columns), \
+            tuple(c.lower() for c in self.cfg.requirement_text_columns)
+
+    def _given_requirements(self, docs: list[uc.RequirementDocument], root: Path, repo_files: list[str]
+                            ) -> tuple[list[uc.RequirementDocument], list[str]]:
+        """A1-RQ2, A1-RQ4, A1-RQ6: the documents given for the run that can be read and state requirement IDs;
+        the others and every ID stated differently in the repository become notes for the final result."""
+        given, notes, stated = [], [], {}
+        for doc in docs:
+            if Path(doc.name).suffix.lower() not in REQUIREMENT_FORMATS:
+                notes.append(f"{doc.name} (given as {doc.origin or doc.name}) is not read: only ReqIF (.reqif, "
+                             ".reqifz), Markdown, plain text or CSV - please give an export in one of them [A1-RQ2]")
+                continue
+            try:
+                entries = read_document(Path(doc.path), doc.name, self._columns)
+            except DOCUMENT_ERRORS as exc:
+                notes.append(f"{doc.name} (given as {doc.origin or doc.name}) cannot be read: {exc}"[:400]
+                             + "; the run continues without it [A1-RQ6]")
+                continue
+            if not entries:
+                notes.append(f"{doc.name} (given as {doc.origin or doc.name}) contains no requirement ID; the run "
+                             "continues without it - IDs are never invented [A1-RQ6]")
+                continue
+            given.append(doc)
+            for rid, text, source, line in entries:
+                stated.setdefault(rid, (text, source, line))
+        for rel in repo_files:
+            try:
+                entries = read_document(root / rel, rel, self._columns)
+            except DOCUMENT_ERRORS:
+                continue
+            for rid, text, source, line in entries:
+                if rid in stated and " ".join(text.split()) != " ".join(stated[rid][0].split()):
+                    notes.append(f"conflict: {rid} is stated differently in {stated[rid][1]}:{stated[rid][2]} (given "
+                                 f"for the run, used) and {source}:{line} [A1-RQ4, A1-25e]")
+        return given, notes
+
+    def _requirements(self, layout: uc.LayoutProfile) -> list[tuple[str, str, str, int]]:
+        return read_requirements(Path(layout.repo_root), layout.requirement_files, layout.given_requirements,
+                                 self._columns)
 
     @staticmethod
     def _component_root(root: Path, sut: Path) -> Path:
@@ -1754,7 +2091,7 @@ class AnalyzerAgent(ba.AgentCore):
                 cleaned = re.sub(r"^\s*(/\*\*?|\*/|\*|//)", "", comment, flags=re.M).replace("*/", "")
                 add("E2", header, line, re.sub(r"\s+", " ", cleaned))
         tags = {r.text.split(":", 1)[0] for r in refs if r.evidence_class == "E1"}
-        for rid, text, source, line in read_requirements(root, layout.requirement_files):
+        for rid, text, source, line in self._requirements(layout):
             if rid in tags or re.search(r"\b" + re.escape(short) + r"\b", text):
                 add("E1", source, line, f"{rid}: {text}")             # requirement document [A1-25x]
         body = "\n".join(sut_text.splitlines()[fn.line_start - 1: fn.line_end])
@@ -1776,17 +2113,19 @@ class AnalyzerAgent(ba.AgentCore):
                     if re.search(r"(EXPECT|ASSERT|TEST_ASSERT|assert)\w*\s*\(", lines[number]) and short in lines[number]:
                         add("E5", case.file, number + 1, lines[number])
         callers = 0
-        for path in Path(layout.repo_root).rglob("*"):
-            if callers >= self.cfg.max_callers or not path.is_file() or path.suffix.lower() not in C_EXT + CPP_EXT:
-                continue
-            rel = str(path.relative_to(root)).replace("\\", "/")
-            if rel == layout.sut_file or rel in layout.test_files:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for m in re.finditer(r"[^\n]*\b" + re.escape(short) + r"\s*\([^\n]*", text):
-                add("E6", rel, line_of(text, m.start()), m.group(0))
-                callers += 1
+        call = re.compile(r"\b" + re.escape(short) + r"\s*\(")
+        skip = {layout.sut_file, *layout.test_files}
+        for rel, text in self._source_texts(root):                       # read once per run [A1-31b]
+            if callers >= self.cfg.max_callers:
                 break
+            if rel in skip or short not in text:
+                continue
+            m = call.search(text)
+            if m:
+                start = text.rfind("\n", 0, m.start()) + 1
+                end = text.find("\n", m.end())
+                add("E6", rel, line_of(text, start), text[start: end if end >= 0 else len(text)])
+                callers += 1
         for link in layout.requirement_links:                      # last, so the other ids stay stable [A1-PL13]
             if link.function == fn.name:
                 add("E1", link.source, link.line, f"{link.requirement_id}: {link.quote}",
@@ -1794,7 +2133,110 @@ class AnalyzerAgent(ba.AgentCore):
         return uc.EvidenceResult(function=fn.name, evidence=refs, exhausted=True)
 
 
+    def requirement_status(self, req: uc.RequirementStatusRequest) -> uc.RequirementStatus:
+        """A1-RQ5: a requirement counts as asserted when a test that passed cites its evidence item and asserts
+        something, and is not a characterization test (E8)."""
+        blocks = {}
+        for m in re.finditer(r"/\*\s*evidence:\s*(E\d)[^*]*\*/\s*UT_TEST\((\w+)\)\s*\{(.*?)\n\}", req.suite, re.S):
+            blocks[m.group(2)] = (m.group(1), m.group(3))
+        passed = set(req.passed)
+        out = []
+        for fn in req.layout.functions:
+            evidence = self.collect_evidence(req.layout, fn.name).evidence
+            lines, seen = [], set()
+            for e in evidence:
+                if e.evidence_class != "E1":
+                    continue
+                rid = e.text.split(":", 1)[0].strip()
+                if (rid, e.source) in seen:
+                    continue
+                seen.add((rid, e.source))
+                cite = re.compile(r"\b" + re.escape(e.evidence_id) + r"\b")
+                by = sorted(name for name, (cls, body) in blocks.items() if name in passed and cls != "E8"
+                            and cite.search(body) and re.search(r"\bUT_(EXPECT|ASSERT)\w*\s*\(", body))
+                lines.append(f"{rid} ({e.linked_by or 'rule'}) {uc.evidence_key(e)}: "
+                             + (f"asserted by {', '.join(by[:5])}" if by else "not asserted by a test"))
+            out.append(uc.FunctionRequirements(function=fn.qualified_name or fn.name, requirements=lines,
+                                               stated=any(e.evidence_class in ("E1", "E2", "E3") for e in evidence)))
+        return uc.RequirementStatus(functions=out)
+
+    def _source_texts(self, root: Path) -> list[tuple[str, str]]:
+        """The C and C++ sources of the working copy, read once and again only when a file changed [A1-31b]."""
+        cache = self._sources.setdefault(str(root), {})
+        out = []
+        for path in root.rglob("*"):
+            if path.suffix.lower() not in C_EXT + CPP_EXT or not path.is_file():
+                continue
+            rel = str(path.relative_to(root)).replace("\\", "/")
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            stamp = (st.st_mtime_ns, st.st_size)
+            if rel not in cache or cache[rel][0] != stamp:
+                cache[rel] = (stamp, path.read_text(encoding="utf-8", errors="replace"))
+            out.append((rel, cache[rel][1]))
+        return out
+
     # ---------------------------------------------------------------- dependency analysis [A1-DA1 .. A1-DA14]
+    async def _find_headers(self, layout: uc.LayoutProfile, build: uc.BuildDescription, repo: Path,
+                            tools: uc.Tools, sut: "FrontEnd") -> tuple["FrontEnd", uc.BuildDescription]:
+        """A1-DA20: a header the front end does not find is searched by name in the working copy; one candidate is
+        taken, several (or none) go to the brain; every folder is kept only when the parse then finds the header
+        and has no more errors. The build description itself stays as captured; the folder is recorded."""
+        uc.resolution_project(self, layout)
+        files = [p for p in repo.rglob("*") if p.is_file() and p.suffix.lower() in HEADER_EXT + (".inc", ".def")
+                 and not any(part in HEADER_SKIP for part in p.relative_to(repo).parts)]
+        flags = list(build.sut_flags)
+        notes: list[str] = []
+        for header in list(dict.fromkeys(sut.missing)):
+            spelled = header.replace("\\", "/")
+            candidates = sorted({str(p.relative_to(repo)).replace("\\", "/")[: -len(spelled)].rstrip("/") or "."
+                                 for p in files if str(p.relative_to(repo)).replace("\\", "/").endswith("/" + spelled)
+                                 or str(p.relative_to(repo)).replace("\\", "/") == spelled})
+            best: dict[str, Any] = {}
+
+            def parse_with(folder: str) -> str:
+                path = (repo / folder).resolve()
+                if not path.is_dir() or not path.is_relative_to(repo):
+                    return f"{folder} is not a folder of the repository"
+                trial = FrontEnd(tools, repo, layout.sut_file, flags + [f"-I{uc.REPO_TOKEN}/{folder}".rstrip("/.")
+                                                                         if folder != "." else f"-I{uc.REPO_TOKEN}"],
+                                 layout.language)
+                trial.parse()
+                if header in trial.missing:
+                    return f"with -I{folder} the front end still does not find {header}"
+                if len(trial.missing) + len(trial.errors) > len(sut.missing) + len(sut.errors):
+                    return f"with -I{folder} the front end reports more errors: " + "; ".join(trial.errors[:3])
+                best.update(folder=folder, front=trial)
+                return ""
+
+            if len(candidates) == 1 and not await asyncio.to_thread(parse_with, candidates[0]):
+                notes.append(f"{header}: found in {candidates[0]} by its name [A1-DA20]")
+            else:
+                failure = ba.RuleFailure(rule="A1-DA20 header", failure=f"the header {header} is not on the include "
+                                         "paths" + (f"; {len(candidates)} files have its name" if candidates else
+                                                    " and no file of the repository has its name"), subject=header)
+                folders = sorted({str(p.parent.relative_to(repo)).replace("\\", "/") for p in files})[:400]
+                context = [uc.part("facts", f"FILE: {layout.sut_file}\nMISSING HEADER: {header}\nCANDIDATES:\n"
+                                   + ("\n".join(candidates) or "- none") + "\nINCLUDE PATHS USED:\n"
+                                   + (" ".join(f for f in flags if f.startswith("-I")) or "-")),
+                           uc.part("folders", "FOLDERS WITH HEADERS:\n" + "\n".join(folders), uc.P_TRIED, min_chars=800)]
+                answer = await self.resolve(
+                    failure, task=HEADER_TASK.format(header=header), context=context, output_model=HeaderFolder,
+                    verify=lambda a: asyncio.to_thread(parse_with, a.folder.strip().strip("/") or "."),
+                    step="A1.header", attempts=self.cfg.rule_attempts, project=layout.repo_root,
+                    need=ba.OutputNeed(items=1, tokens_per_item=60, overhead=60))
+                if answer is None or "folder" not in best:
+                    continue
+                notes.append(f"{header}: folder {best['folder']} chosen by the brain, checked by the front end [A1-DA20]")
+            folder = best["folder"]
+            flags.append(f"-I{uc.REPO_TOKEN}/{folder}".rstrip("/.") if folder != "." else f"-I{uc.REPO_TOKEN}")
+            sut = best["front"]
+        if notes:
+            build = build.model_copy(update={"sut_flags": flags, "notes": list(build.notes) + notes})
+        return sut, build
+
     async def dependencies(self, req: uc.DependencyRequest) -> uc.LayoutProfile:
         layout = req.layout.model_copy(deep=True)
         build = req.build
@@ -1809,6 +2251,10 @@ class AnalyzerAgent(ba.AgentCore):
             return layout
         sut = FrontEnd(tools, repo, layout.sut_file, build.sut_flags, layout.language)
         ok = await asyncio.to_thread(sut.parse)
+        if sut.missing:                                                           # A1-DA20, ARCH-21
+            sut, build = await self._find_headers(layout, build, repo, tools, sut)
+            ok = not sut.missing
+            layout.build, layout.compile_flags = build, list(build.sut_flags)
         if sut.ast is None:
             layout = self._text_dependencies(layout, "the front end could not parse the SUT: " +
                                              "; ".join(sut.errors)[:300], sut.missing)
@@ -1819,6 +2265,20 @@ class AnalyzerAgent(ba.AgentCore):
             layout.functions = functions                                          # A1-DA2
             layout.blocked, layout.blocked_reason = False, None
         layout.enums = sut.enums()
+        layout.typedefs = sut.typedefs()                                          # A1-DA21
+        layout.private_types = [] if layout.header_sut else sut.private_types()    # A2-21ad
+        if layout.language == "cpp":                                               # A2-21ad
+            scoped = sut.scoped_types()
+            for fn in layout.functions:
+                namespace = fn.qualified_name.rsplit("::", 1)[0] if "::" in fn.qualified_name else ""
+                fn.return_type = qualify_type(fn.return_type, scoped, namespace)
+                for p in fn.params:
+                    p.type, p.base = qualify_type(p.type, scoped, namespace), qualify_type(p.base, scoped, namespace)
+                    todo = list(p.fields)
+                    while todo:                                   # the fields' types too (casts, pointees)
+                        f = todo.pop()
+                        f.type, f.base = qualify_type(f.type, scoped, namespace), qualify_type(f.base, scoped, namespace)
+                        todo += f.fields
         plan = uc.DependencyPlan(headers=sut.headers)
         if sut.missing:                                                           # A1-DA13
             searched = [f for f in uc.expand_flags(build.sut_flags, repo) if f.startswith(("-I", "-isystem"))]
@@ -1949,7 +2409,8 @@ class AnalyzerAgent(ba.AgentCore):
         if system:
             rel = ""
         dep = uc.Dependency(name=name, qualified_name=qualified if qualified != name else "", kind=kind,
-                            type=ref.get("type", ""), header=rel, system=system, depth=depth)
+                            type=ref.get("type", ""), header=rel, system=system, depth=depth,
+                            namespace=fe.ast.namespace_of(node) if node else "")
         if node:
             src = fe.source_bytes(path)
             b, e = _offset(node.get("range", {}).get("begin", {})), _end_offset(node.get("range", {}).get("end", {}))
@@ -1963,7 +2424,8 @@ class AnalyzerAgent(ba.AgentCore):
                 if kind != "constructor" and "(" in qt:
                     dep.return_type = qt[: qt.index("(")].strip()
                 m = re.search(r"\)\s*((?:const|volatile|noexcept|&|&&|\s)+)$", qt)
-                dep.method_suffix = (" " + m.group(1).strip()) if m and kind == "method" else ""
+                dep.method_suffix = (" " + m.group(1).strip()) if m and kind == "method" else \
+                    " noexcept" if m and "noexcept" in m.group(1) else ""        # a noexcept function [A2-21ad]
                 dep.params = [[(p.get("type") or {}).get("qualType", ""), p.get("name") or f"arg{i}"]
                               for i, p in enumerate(c for c in node.get("inner", []) if c.get("kind") == "ParmVarDecl")]
         # A1-DA16: a definition in a header (inline function, member defined in its class, constexpr or inline
@@ -2137,6 +2599,11 @@ class AnalyzerAgent(ba.AgentCore):
                     f"real dependency {dep.name}" in text or (dep.definition and dep.definition in text) or
                     f.symbol == dep.name):
                 return f"the real definition failed to build or link ({f.diagnostic[:120]}): stubbed [A1-DA12]"
+            if dep.definition and uc.real_source_error(dep.definition, text):     # target code that is not for the host
+                return (f"the file of the real definition does not compile here ({f.diagnostic[:120]}): stubbed "
+                        "[A1-DA12]")
+        if dep.definition and uc.real_source_error(dep.definition, last.reason):
+            return f"the file of the real definition does not compile here ({last.reason[:120]}): stubbed [A1-DA12]"
             if f.kind in ("crash", "timeout") and dep.name in (f.affected_function, f.symbol):
                 return "the real definition crashed or hung a test: stubbed [A1-DA12]"
         return ""
@@ -2452,7 +2919,11 @@ class AnalyzerAgent(ba.AgentCore):
                 uc.part("evidence", "EVIDENCE:\n" + ("\n".join(ev_rows) or
                                                      "- none: every scenario is characterization_gap"), uc.P_EVIDENCE),
                 uc.part("tried", "TRIED (earlier tests of this function and the items each reached):\n"
-                        + ("\n".join(tried_rows) or "- none"), uc.P_TRIED),
+                        + ("\n".join(tried_rows) or "- none")
+                        + "".join(f"\n- {name}: FAILED in this run ({why}) - do not plan it again unchanged"
+                                  for name, why in sorted(req.failed_tests.items())
+                                  if re.search(r"(?:^|_)" + re.escape(fn.name.split("::")[-1]) + r"(?:_|$)", name)),
+                        uc.P_TRIED),
                 uc.part("style", "EXISTING TEST STYLE:\n" + ("\n---\n".join(style) or f"- {layout.framework}"),
                         uc.P_EXAMPLES)]
 
@@ -2469,7 +2940,7 @@ class AnalyzerAgent(ba.AgentCore):
             if (root / rel).is_file():
                 self.knowledge.add_text(rel, (root / rel).read_text(encoding="utf-8", errors="replace"),
                                         kind="E2" if rel != layout.sut_file else "E3", lines_per_chunk=8)
-        for rid, text, source, line in read_requirements(root, layout.requirement_files):
+        for rid, text, source, line in self._requirements(layout):
             self.knowledge.chunks.append({"source": source, "kind": "E1", "line": line, "text": f"{rid}: {text}",
                                           "tokens": set(ba.tokens(f"{rid} {text}"))})
         for rel in layout.test_files[:20]:
@@ -2516,9 +2987,21 @@ class AnalyzerAgent(ba.AgentCore):
         accepted: list[uc.Scenario] = []
         extra, calls, brain = "", 0, ""
         dropped: list[str] = []
+        failures: list[str] = []
+        tried: set[str] = set()
         if not open_ids:
             return []                                                        # nothing to plan [ARCH-16]
-        while calls < self.cfg.max_brain_calls_per_function:
+        limit = self.cfg.max_brain_calls_per_function
+        available = await self._available_brains()
+
+        def next_brains() -> list[str] | None:
+            """COV-6: the next available brain in the brain order; none left - the same brains again with the
+            facts of what was tried. A1-PL8: a brain whose scenarios all failed the check is not asked again."""
+            if not (req.avoid_brains or tried):
+                return None
+            pool = [b for b in available if b not in tried]
+            return [b for b in pool if b not in req.avoid_brains] or pool
+        while calls < limit:
             calls += 1
             context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence)
             if extra:
@@ -2529,19 +3012,28 @@ class AnalyzerAgent(ba.AgentCore):
             # as many scenarios as the answer limit was planned for, not the configured maximum [ARCH-11a]
             task = PLAN_TASK.format(fn=fn.qualified_name, limit=need.items)
             try:
-                avoid = set(req.avoid_brains)                                      # COV-6: the next brain
-                allowed = [b for b in self.allowed_brains if b not in avoid] if avoid else None
+                allowed = next_brains()                                            # COV-6, A1-PL8: the next brain
+                if allowed is not None and not allowed:
+                    raise ba.AgentFault("NO_BRAIN_AVAILABLE", "every allowed brain was tried")
                 answer = await self.generate(task, context, PlannedScenarios, need=need, step="A1.plan",
                                              project=layout.repo_root, allowed=allowed)
             except ba.AgentFault as exc:
-                plan_notes["planning"].append(f"{fn.name}: rules - no usable brain answer ({exc.code}) [A1-PL8]"
-                                              if not accepted else f"{fn.name}: re-ask failed ({exc.code})")
+                failures.append(f"{exc.code}: {exc.message}"[:300])
+                if exc.code in ba.NO_BRAIN_CODES and not accepted and not brain:
+                    raise ba.AgentFault("NO_BRAIN_AVAILABLE", f"{fn.qualified_name}: no brain answered the planning "
+                                        f"({exc.code}: {exc.message}) [ARCH-24, A1-PL8]")
+                if not accepted:
+                    plan_notes["planning"].append(f"{fn.name}: no usable brain answer ({exc.code})")
                 break
             used = self.brain_of_call()                             # this call's brain, not another's [ARCH-18]
             brain = f"brain:{used.get('brain', '')}/{used.get('model_id', '')}"
             ev_map = {e.evidence_id: e for e in evidence}
             problems, sought = [], []
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
+                if planned.name in req.failed_tests:                         # A1-PL8: not again unchanged
+                    problems.append(f"- scenario {k} ({planned.name}): its test {req.failed_tests[planned.name]} "
+                                    "earlier in this run; plan other inputs or set-up under another name")
+                    continue
                 scenario, reasons = self._check_planned(planned, fn, open_ids, infeasible, ev_map, stubs, constants,
                                                         known, layout)
                 if scenario is None:
@@ -2572,7 +3064,12 @@ class AnalyzerAgent(ba.AgentCore):
             evidence += found
             covered = {g for s in accepted for g in s.gap_ids}
             remaining = sorted(open_ids - covered)
-            if not (problems or found) or not remaining or calls >= self.cfg.max_brain_calls_per_function:
+            if not accepted and calls >= limit and not tried:     # A1-PL8: once more with the next brain
+                tried.add(used.get("brain", ""))
+                if not next_brains():
+                    break                                         # no other brain is available
+                limit += self.cfg.max_brain_calls_per_function
+            elif not (problems or found) and accepted or not remaining or calls >= limit:
                 break
             extra = ("\n\nYOUR PREVIOUS ANSWER WAS CHECKED. Scenarios already accepted cover: "
                      + (", ".join(sorted(covered)) or "nothing") + ". Plan only these gaps now: " + ", ".join(remaining)
@@ -2582,13 +3079,18 @@ class AnalyzerAgent(ba.AgentCore):
                          for e in found) if found else ""))
         for index, scenario in enumerate(accepted, 1):
             scenario.scenario_id = f"S-brain-{fn.name.replace('::', '_')}-{req.iteration}-{index}"
-        if brain and not accepted and not dropped:
-            plan_notes["planning"].append(f"{fn.name}: rules - {brain.split(':', 1)[1]} suggested no scenario [A1-PL8]")
-        elif brain and not accepted:
-            plan_notes["planning"].append(
-                f"{fn.name}: rules - no scenario of {brain.split(':', 1)[1]} passed the check"
-                + (f" ({' | '.join(d[2:120] for d in dropped[:2])})" if dropped else "") + " [A1-PL8]")
-        elif brain:
+        if not accepted and all(g.startswith("EVIDENCE:") for g in open_ids):
+            # only a documented-behaviour check was asked: it stays in the plan for Agent2's brain [A1-PL1, A2-21n]
+            plan_notes["planning"].append(f"{fn.name}: the documented behaviour is left to the test writer: no "
+                                          f"scenario of the brain passed the check [A1-PL1]")
+            return []
+        if not accepted:                                     # no rule plan in the brain's place [A1-PL8, ARCH-24]
+            why = (" | ".join(d[2:160] for d in dropped[:3]) if dropped else
+                   "; ".join(failures[:2]) if failures else "the brain suggested no scenario")
+            raise ba.AgentFault("BRAIN_PLAN_FAILED", f"{fn.qualified_name}: no scenario of "
+                                f"{', '.join(sorted(tried | {brain.split(':', 1)[-1].split('/')[0]} - {''})) or 'any brain'} "
+                                f"passed the check after {calls} call(s): {why} [A1-PL8]"[:900])
+        if brain:
             plan_notes["planning"].append(
                 f"{fn.name}: {len(accepted)} scenario(s) by {brain.split(':', 1)[1]} "
                 f"({sum(not s.characterization for s in accepted)} asserting stated behaviour), {calls} call(s)"
@@ -2598,10 +3100,10 @@ class AnalyzerAgent(ba.AgentCore):
 
     async def _link_requirements(self, layout: uc.LayoutProfile) -> list[uc.RequirementLink]:
         """A1-PL13: requirements written in prose, linked by the brain and checked here."""
-        if not self.cfg.link_requirements or not layout.requirement_files:
+        if not self.cfg.link_requirements or not (layout.requirement_files or layout.given_requirements):
             return []
         root = Path(layout.repo_root)
-        reqs = read_requirements(root, layout.requirement_files)
+        reqs = self._requirements(layout)
         shorts = {f.name.split("::")[-1]: f for f in layout.functions}
         tags = set()
         for rel in [layout.sut_file] + layout.headers:
@@ -2722,8 +3224,8 @@ class AnalyzerAgent(ba.AgentCore):
         stubs = self._stubs(layout, last)
         disputed = set(req.disputed_evidence)
         notes: dict[str, list[str]] = {"planning": [], "conflicts": [], "lookups": []}
-        # The brain plans once the deterministic tests have been measured [A1-PL1].
-        brain_ok = self.cfg.brain_planning and last is not None and last.stage == "verify" and last.coverage is not None
+        # The brain plans from the first coverage plan on; the rule tests are extra tests and facts [A1-PL1, ARCH-24].
+        brain_ok = last is not None
         if last is not None and last.decision == "complete":
             pending = self._evidence_scenarios(layout, req, disputed)
             if pending and brain_ok:                                       # A1-25y with the brain [A1-PL1]
@@ -2866,11 +3368,19 @@ class AnalyzerAgent(ba.AgentCore):
     def _open_gaps(last: uc.VerificationResult) -> bool:
         return last.coverage is not None and any(fc.gaps for fc in last.coverage.functions)
 
+    async def _available_brains(self) -> list[str]:
+        """The allowed brains this run can still reach, in the brain order (ARCH-1a)."""
+        try:
+            router = await self._brains()
+        except ba.AgentFault:
+            return []
+        return [b for b in router.available if b in self.allowed_brains]
+
     async def _with_brain(self, scenarios: list[uc.Scenario], active_by_fn: dict[str, list[uc.GapItem]],
                           infeasible: set[str], layout: uc.LayoutProfile, req: uc.PlanRequest, stubs: list[uc.StubSpec],
                           disputed: set[str], notes: dict[str, list[str]]) -> list[uc.Scenario]:
-        """Per planned function: the brain's checked scenarios replace the rule scenarios; the
-        coverage-guided search inputs stay; without a usable answer the rules stay [A1-PL1, A1-PL8]."""
+        """Per planned function: the brain's checked scenarios replace the rule scenarios; the coverage-guided search
+        inputs stay. Without a usable answer the planning fails (BRAIN_PLAN_FAILED) and the run stops [A1-PL8]."""
         sut_text = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         out = list(scenarios)
         work = []
@@ -2899,16 +3409,26 @@ class AnalyzerAgent(ba.AgentCore):
                 return found, own, before
             return run
         results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
+        failed = [r for r in results if isinstance(r, ba.AgentFault) and r.code == "BRAIN_PLAN_FAILED"]
+        if work and len(failed) == len(work):                     # no function got a scenario: the run stops [ORC-34]
+            raise failed[0] if len(failed) == 1 else ba.AgentFault(
+                "BRAIN_PLAN_FAILED", " | ".join(f.message[:300] for f in failed[:3]) + " [A1-PL8]")
         for (name, *_), result in zip(work, results):
+            if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
+                # A1-PL8: this function gets no scenario in this plan - never a rule plan; the other functions go on
+                notes["planning"].append(f"{name}: no scenario this time - {result.message[:400]}")
+                out = [s for s in out if s.function != name or s.inputs]
+                continue
             if isinstance(result, BaseException):
                 raise result
             brain, own, before = result
             for key, lines in own.items():
                 notes.setdefault(key, []).extend(lines[before[key]:])
-            if brain:
-                out = [s for s in out if s.function != name or s.inputs] + brain
-            elif not any(line.startswith(f"{name}:") for line in notes["planning"]):
-                notes["planning"].append(f"{name}: rules - no scenario of the brain passed the check [A1-PL8]")
+            # The brain's plan replaces the rule scenarios of the function [A1-PL1]; a documented-behaviour check the
+            # brain did not plan stays, and Agent2's brain writes its test (A1-25y, A2-21n).
+            behaviour = any(f"EVIDENCE:{name}" in s.gap_ids and not s.characterization for s in brain)
+            out = [s for s in out if s.function != name or s.inputs
+                   or (s.scenario_id.startswith("S-evidence-") and not behaviour)] + brain
         return out
 
     @staticmethod
@@ -3211,6 +3731,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Analyz
         section.setdefault("tools_manifest", str(uc.manifest_path(config_path)))
     agent = AnalyzerAgent(settings, config=AnalyzerConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
+    agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
     return agent
 
 

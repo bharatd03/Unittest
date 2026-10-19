@@ -69,11 +69,21 @@ def files_signature(root: Path, files: list[str]) -> str:
 
 
 # ============================================================================ discovery (Agent1)
+class RequirementDocument(Contract):
+    """A1-RQ1, A1-RQ3: a requirement document given for the run, copied unchanged into the run's output folder."""
+    name: str                                      # "requirements/<file>": the source that evidence and tests cite
+    path: str                                      # the copy in the run's output folder
+    sha256: str
+    origin: str = ""                               # the path the user gave
+
+
 class DiscoverRequest(Contract):
     repo_root: str
     sut_file: str                                  # relative to repo_root
+    project: str = ""                              # the tested repository: link or source folder [ARCH-23]
     test_dir: str | None = None                    # override where tests are written
     stub_dir: str | None = None
+    requirement_documents: list[RequirementDocument] = Field(default_factory=list)   # given for the run [A1-RQ1]
 
 
 ParamKind = Literal["int", "bool", "enum", "float", "cstring", "buffer", "ptr_scalar", "struct", "ptr_struct",
@@ -83,8 +93,9 @@ ParamKind = Literal["int", "bool", "enum", "float", "cstring", "buffer", "ptr_sc
 class FieldInfo(Contract):
     name: str
     type: str
-    kind: str = "other"                  # int | bool | enum | float | array | struct | other
+    kind: str = "other"                  # int | bool | enum | float | array | struct | pointer | callback | other
     array_len: int = 0
+    base: str = ""                       # pointer: the pointee type, qualifiers removed [A1-DA21]
     fields: list["FieldInfo"] = Field(default_factory=list)      # nested struct
 
 
@@ -158,6 +169,7 @@ class BuildDescription(Contract):
     suggested_flags: list[str] = Field(default_factory=list)   # "flag (file: text)" kept from the brain [A3-BD13]
     reused: bool = False                 # taken from the build-capture cache of this commit [ORC-22]
     variants: list[BuildVariant] = Field(default_factory=list)  # two or more ways the SUT is compiled [A3-BD14]
+    host_adaptation: list[str] = Field(default_factory=list)   # host definitions by the brain, kept [A3-BD16]
 
 
 class Dependency(Contract):
@@ -182,6 +194,7 @@ class Dependency(Contract):
     return_type: str = ""                # from the front end, fully qualified
     params: list[list[str]] = Field(default_factory=list)   # [[type, name], ...]
     method_suffix: str = ""              # C++: " const" etc.
+    namespace: str = ""                  # C++: the namespace that declares it, e.g. "QP" [A2-21ad]
 
 
 class DependencyPlan(Contract):
@@ -316,6 +329,93 @@ def unreachable_lines(sut_text: str, functions: list["FunctionInfo"]) -> set[int
     return out
 
 
+SCALAR_TYPE = re.compile(r"^(?:(?:unsigned|signed|short|long|int|char|float|double|bool|_Bool)\b\s*)+$|^(?:std::)?u?int\w*_t$|"
+                         r"^(?:std::)?size_t$|^.*\*$")
+
+
+def pointee_object(base: str, var: str, cpp: bool) -> tuple[str, str]:
+    """(definition, address) of a zeroed local object that a pointer field of a struct argument points to - a
+    handle's Instance gets a register block of its own [A2-21ad, A3-FZ2]."""
+    base = (base or "").strip()
+    if base in ("", "void"):
+        return f"unsigned char {var}[64] = {{0}};", var
+    if base in ("char", "signed char", "unsigned char"):
+        return f"{base} {var}[256] = {{0}};", var
+    if cpp:
+        return f"{base} {var}{{}};", f"&{var}"
+    return f"{base} {var} = {'0' if SCALAR_TYPE.match(base) else '{0}'};", f"&{var}"
+
+
+def null_checked(field: str, body: str) -> bool:
+    """The function compares a struct field with NULL (x->buf == NULL, !x->buf, NULL != x.buf) [A2-21ad]."""
+    f = re.escape(field)
+    return bool(re.search(r"(?:->|\.)\s*" + f + r"\s*[!=]=\s*(?:NULL|nullptr|0)\b|\b(?:NULL|nullptr)\s*[!=]=\s*[\w\[\]]+\s*"
+                          r"(?:->|\.)\s*" + f + r"\b|!\s*\(?\s*[\w\[\]]+\s*(?:->|\.)\s*" + f + r"\b", body))
+
+
+PROLOGUE_DIRECTIVE = re.compile(r"^#\s*(include|define|undef|if|ifdef|ifndef|elif|elifdef|elifndef|else|endif|pragma)\b(.*)$")
+
+
+def without_comments(text: str) -> str:
+    """Comments replaced by blanks (newlines kept); string and character literals kept as they are."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        elif text[i] in "\"'":
+            j = i + 1
+            while j < n and text[j] != text[i] and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i: j + 1])
+            i = j + 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def sut_prologue(sut_text: str, functions: list["FunctionInfo"], header_sut: bool = False) -> list[str]:
+    """A2-21ad: the SUT's preprocessor prologue - its #include, #define, #undef and conditional directives
+    before its first function definition, in their order, without includes of source files. Conditionals still
+    open there are closed. A header SUT has none: its directives start with its own include guard."""
+    if header_sut:
+        return []
+    first = min((f.line_start for f in functions if f.line_start > 0), default=0)
+    rows = without_comments(sut_text).split("\n")
+    rows = rows[: first - 1] if first > 0 else rows
+    out, depth, i = [], 0, 0
+    while i < len(rows):
+        line = rows[i].strip()
+        while line.endswith("\\") and i + 1 < len(rows):
+            i += 1
+            line = line[:-1].rstrip() + " " + rows[i].strip()
+        i += 1
+        m = PROLOGUE_DIRECTIVE.match(line)
+        if not m:
+            continue
+        kind, rest = m.group(1), m.group(2)
+        if kind == "include" and re.search(r"[\"<][^\">]+\.(?:c|cc|cpp|cxx|c\+\+)[\">]", rest, re.I):
+            continue                                              # never a source file [A2-21w]
+        if kind == "pragma" and re.match(r"\s*once\b", rest):
+            continue
+        if kind in ("if", "ifdef", "ifndef"):
+            depth += 1
+        elif kind == "endif":
+            if depth == 0:
+                continue
+            depth -= 1
+        out.append("#" + kind + rest)
+    return out + ["#endif"] * depth
+
+
 class InterfaceMethod(Contract):
     """A pure virtual method of an injected interface [A1-DA17]."""
     name: str
@@ -366,6 +466,11 @@ class LayoutProfile(Contract):
     header_sut: bool = False                                     # the SUT is a header [A1-DA19]
     requirement_files: list[str] = Field(default_factory=list)  # ReqIF / Markdown requirement documents [A1-25x]
     requirement_links: list[RequirementLink] = Field(default_factory=list)   # linked by the brain [A1-PL13]
+    project: str = ""                                            # the tested repository [ARCH-23]
+    typedefs: dict[str, str] = Field(default_factory=dict)      # typedef -> the type it names [A1-DA21]
+    private_types: list[str] = Field(default_factory=list)      # types only the SUT file declares [A2-21ad]
+    given_requirements: list[RequirementDocument] = Field(default_factory=list)   # given for the run [A1-RQ1]
+    requirement_notes: list[str] = Field(default_factory=list)  # not read, no ID, conflicts [A1-RQ2, RQ4, RQ6]
     blocked: bool = False
     blocked_reason: str | None = None
 
@@ -589,6 +694,7 @@ class VerificationResult(Contract):
     quarantined: list[Failure] = Field(default_factory=list)
     register_pages: list[str] = Field(default_factory=list)   # target register pages in host memory [A3-HW1]
     host_notes: list[str] = Field(default_factory=list)       # target keywords, target asm, data model [A3-HW2..HW4]
+    repaired_files: dict[str, str] = Field(default_factory=dict)   # generated files repaired by the brain [A3-CL14]
 
 
 # ============================================================================ planning (Agent1)
@@ -620,6 +726,7 @@ class StubSpec(Contract):
     var_type: str = ""               # variable: the declaration without "extern", e.g. "const int calib[4]"
     is_const: bool = False
     initializer: str = ""            # const variable: its value for the whole test program [A2-21j]
+    namespace: str = ""              # C++: the declaring namespace; its types resolve there [A2-21ad]
 
 
 class FuzzInput(Contract):
@@ -737,6 +844,7 @@ class PlanRequest(Contract):
     test_items: dict[str, list[str]] = Field(default_factory=dict)   # what each test reached [A1-PL7, A1-PL12]
     disputed_evidence: list[str] = Field(default_factory=list)       # A1-PL13
     avoid_brains: list[str] = Field(default_factory=list)            # COV-6: ask the next brain
+    failed_tests: dict[str, str] = Field(default_factory=dict)   # test -> why it failed in this run [A1-PL8]
 
 
 class DependencyRequest(Contract):
@@ -774,6 +882,23 @@ class EvidenceRequest(Contract):
     layout: LayoutProfile
     function: str
     question: str = ""
+
+
+class RequirementStatusRequest(Contract):
+    """A1-RQ5: the requirement status per function, from the delivered suite and the tests that passed."""
+    layout: LayoutProfile
+    suite: str = ""
+    passed: list[str] = Field(default_factory=list)
+
+
+class FunctionRequirements(Contract):
+    function: str
+    requirements: list[str] = Field(default_factory=list)  # "REQ-1 (rule|brain p=0.80) source:line: asserted by ..."
+    stated: bool = False                                   # any stated expected behaviour (E1 to E3)
+
+
+class RequirementStatus(Contract):
+    functions: list[FunctionRequirements] = Field(default_factory=list)
 
 
 class EvidenceResult(Contract):
@@ -1047,18 +1172,21 @@ class PipelineRequest(Contract):
     stub_dir: str | None = None
     build_command: str = ""          # overrides the derived build command [A3-BD2]
     compile_commands: str = ""       # a compile_commands.json supplied by the client [A3-BD2]
+    requirements: list[str] = Field(default_factory=list)   # requirement documents: files or folders [A1-RQ1]
 
 
 class RepositoryRequest(Contract):
     """ORC-17: a git repository link (or a local folder for pilots and development), one or more
-    SUT files relative to it and optionally a branch (default: the server's default branch)."""
+    SUT files relative to it - none: every production file (ORC-35) - and optionally a branch (default: the
+    server's default branch)."""
     repository: str
-    sut_files: list[str] = Field(min_length=1)
+    sut_files: list[str] = Field(default_factory=list)
     branch: str = ""
     test_dir: str | None = None
     stub_dir: str | None = None
     build_command: str = ""
     compile_commands: str = ""
+    requirements: list[str] = Field(default_factory=list)   # requirement documents: files or folders [A1-RQ1]
 
 
 class IterationRecord(Contract):
@@ -1172,11 +1300,14 @@ class PipelineResult(Contract):
     conflicts: list[str] = Field(default_factory=list)         # A1-PL5
     lookups: list[str] = Field(default_factory=list)           # A1-25s
     requirement_links: list[str] = Field(default_factory=list)  # linked by the brain [A1-PL13]
+    requirement_documents: list[str] = Field(default_factory=list)   # "name sha256 (given as ...)" [A1-RQ3]
+    requirement_status: list[FunctionRequirements] = Field(default_factory=list)   # per function [A1-RQ5]
     suggested_flags: list[str] = Field(default_factory=list)   # A3-BD13
     fix_candidates: list[str] = Field(default_factory=list)    # candidates not chosen, with the reason [A4-23g]
     reviews: list[str] = Field(default_factory=list)           # second opinions [A4-23h]
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
+    escalations: list[str] = Field(default_factory=list)       # rules that needed the brain, with outcome [ARCH-22]
 
 
 class DeliveryRecord(Contract):
@@ -1190,10 +1321,22 @@ class DeliveryRecord(Contract):
     skipped: list[str] = Field(default_factory=list)      # not overwritten [ORC-14]
 
 
+class SelectRequest(Contract):
+    """ORC-35: the production files of a working tree, selected by Agent1 without an LLM."""
+    repo_root: str
+    compile_commands: str = ""                     # the client's compile database: only its files [A3-BD2]
+
+
+class FileSelection(Contract):
+    selected: list[str] = Field(default_factory=list)       # relative to the repository, in path order
+    left_out: list[str] = Field(default_factory=list)       # "path: reason"
+
+
 class RepositoryResult(Contract):
     repository: str
     branch: str = ""
     commit: str = ""
+    selection: FileSelection | None = None         # when the request named no SUT file [ORC-35]
     results: list[PipelineResult] = Field(default_factory=list)
     deliveries: list[DeliveryRecord] = Field(default_factory=list)
     output_dir: str = ""
@@ -1283,6 +1426,13 @@ def check_suite_signature(suite: str, request: Any) -> None:
     expected = (getattr(request, "signatures", None) or {}).get("test_suite")
     if expected and expected != hashlib.sha256(suite.encode("utf-8")).hexdigest():
         raise ba.ContractRejected("stale test-suite signature [ORC-10]")
+
+
+def real_source_error(definition: str, text: str) -> bool:
+    """A1-DA12: a compiler error located in the file of a real definition (by path, or by its file name as the
+    compiler prints it from the file's folder)."""
+    name = re.escape(Path(definition).name)
+    return bool(re.search(r"(?:^|[\s/\\(])" + name + r":\d+(?::\d+)?:\s*(?:fatal\s+)?error\b", text))
 
 
 def safe_relpath(path: str) -> bool:
@@ -1410,7 +1560,8 @@ def manifest_path(config_path: str | Path | None, section: dict[str, Any] | None
 # ============================================================================ brain context [ARCH-11..17, KP]
 # The brain steps of this application (KP-2); a knowledge pack names the steps it is for.
 KNOWLEDGE_STEPS = ["A1.dependency", "A1.plan", "A1.links", "A1.declaration", "A2.tests", "A3.root_cause",
-                   "A3.flags", "A4.candidates", "A4.review", "A4.suggest"]
+                   "A3.flags", "A4.candidates", "A4.review", "A4.suggest",
+                   "A1.header", "A2.value", "A3.repair", "A3.host"]     # rule failures [ARCH-21]
 # Priorities of the context parts of a brain call (ARCH-17): 0 is never shortened; the highest
 # number is shortened or left out first when a call does not fit the brain's window.
 P_FACTS, P_EVIDENCE, P_PACKS, P_TRIED, P_EXAMPLES = 0, 1, 2, 3, 4
@@ -1419,6 +1570,26 @@ APP_DIR = Path(__file__).resolve().parent
 
 def part(name: str, text: str, priority: int = P_FACTS, min_chars: int = 0) -> ba.ContextPart:
     return ba.ContextPart(name=name, text=text, priority=priority, min_chars=min_chars)
+
+
+def resolution_memory(config_path: str | Path | None) -> ba.ResolutionMemory:
+    """ARCH-23: the resolution memory, kb.resolutions_path of ut_config.json, by default next to the KB's database.
+    The project is set per request (resolution_project)."""
+    section: dict[str, Any] = {}
+    if config_path and Path(config_path).is_file():
+        import json as _json
+        section = _json.loads(Path(config_path).read_text(encoding="utf-8")).get("kb", {}) or {}
+    path = section.get("resolutions_path") or str(Path(section.get("db_path") or "ut_kb.sqlite3").parent
+                                                  / "ut_resolutions.sqlite3")
+    base = Path(config_path).resolve().parent if config_path and Path(config_path).is_file() else APP_DIR
+    path = Path(path) if Path(path).is_absolute() else base / path              # like the KB's db_path
+    return ba.ResolutionMemory(path)
+
+
+def resolution_project(agent: ba.AgentCore, layout: "LayoutProfile") -> None:
+    """The tested repository the agent's resolutions belong to (ARCH-23): never shared between repositories."""
+    if agent.resolutions is not None:
+        agent.resolutions.project = layout.project or str(Path(layout.repo_root).resolve())
 
 
 def knowledge_packs(config_path: str | Path | None) -> ba.KnowledgePacks | None:
@@ -1497,6 +1668,16 @@ def view_summary(label: str, model: Any) -> str | None:
         return f"{label}: {model.stage}: {model.passed} of {model.total} tests passed{pct(model)}"
     if isinstance(model, FuzzResult):
         return f"{label}: coverage-guided search found {len(model.inputs)} new inputs"
+    if isinstance(model, SelectRequest):
+        return f"{label}: select the production files to test"
+    if isinstance(model, FileSelection):
+        return f"{label}: {_n(len(model.selected), 'production file')} selected, {len(model.left_out)} left out"
+    if isinstance(model, RequirementStatusRequest):
+        return f"{label}: requirement status per function"
+    if isinstance(model, RequirementStatus):
+        asserted = sum(1 for f in model.functions for r in f.requirements if ": asserted by" in r)
+        return (f"{label}: {asserted} requirement(s) asserted by passed tests; "
+                f"{sum(1 for f in model.functions if not f.stated)} function(s) without stated behaviour")
     if isinstance(model, CandidateSet):
         return f"{label}: {len(model.patches)} candidate source fixes"
     if isinstance(model, SuggestionSet):

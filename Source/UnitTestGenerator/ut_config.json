@@ -46,9 +46,11 @@
     }
   },
   "analyzer": {"max_attempts_per_gap": 2, "max_scenarios_per_function": 12, "real_dependency_depth": 2,
-               "requirement_files": [], "brain_planning": true, "max_brain_calls_per_function": 2,
-               "max_lookups_per_function": 6, "link_requirements": true, "propose_declarations": true},
-  "generator": {"mode": "deterministic_then_llm", "max_auto_tests_per_function": 24, "max_llm_tests_per_function": 8},
+               "requirement_files": [], "max_brain_calls_per_function": 2,
+               "max_lookups_per_function": 6, "link_requirements": true, "propose_declarations": true,
+               "rule_attempts": 2},
+  "generator": {"mode": "deterministic_then_llm", "max_auto_tests_per_function": 24, "max_llm_tests_per_function": 8,
+                "rule_attempts": 2, "max_brain_values": 12},
   "compilation": {
     "tools_manifest": "tools/toolchain.json",
     "required_metrics": ["LC", "SC", "BC", "DC", "MCDC"],
@@ -63,12 +65,16 @@
     "fuzz_seconds": 60,
     "flag_rounds": 2,
     "quarantine_rounds": 2,
+    "repair_rounds": 2,
+    "rule_attempts": 2,
+    "search_restarts": 20,
     "test_time_limit_ms": 2000,
     "target_data_model": "",
     "build_commands": {}
   },
   "corrector": {"max_fragment_lines": 30, "min_independent_evidence": 2, "candidates": 3, "suggestions": 3},
-  "kb": {"db_path": "ut_kb.sqlite3"},
+  "kb": {"db_path": "ut_kb.sqlite3", "resolutions_path": "ut_resolutions.sqlite3"},
+  "requirements": {"_comment": "A1-RQ1: requirement documents per repository - {\"repository link or folder\": [\"file or folder\", ...]}; relative paths: inside the repository"},
   "knowledge": {"enabled": true, "dirs": ["knowledge"], "project_dir": ".ut/knowledge"},
   "setup": {
     "tools_dir": "tools",

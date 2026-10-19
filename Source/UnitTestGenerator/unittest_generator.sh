@@ -6,14 +6,15 @@
 #    ./unittest_generator.sh check             show the tools, Python packages and brains in use
 #    ./unittest_generator.sh test              the component tests (a few minutes), results in test_results.txt
 #    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
-#    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp
+#    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp | pilot-realrepo
 #                                              every SUT file of a pilot, one live viewer page for all
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 #    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 #    ./unittest_generator.sh benchmark [on|off|both]
 #                                              seeded-defect benchmark on the pilots, with the knowledge
 #                                              packs (on, default), without (off) or both to compare them
-#    ./unittest_generator.sh run REPO SUT [--branch NAME] [--sut FILE] [--build-command "..."] [--compile-commands FILE]
+#    ./unittest_generator.sh run REPO [SUT|all] [--branch NAME] [--sut FILE] [--requirements FILE_OR_FOLDER]
+#                                [--build-command "..."] [--compile-commands FILE]
 #                                              REPO = git repository link (https://... or git@...) or a folder
 #
 #  A repository link: the default branch is tested unless --branch names another one. Tests only and
@@ -31,6 +32,7 @@
 # ===========================================================================
 set -u
 CALLER="$(pwd)"                                 # a relative repository folder is meant from here [TP-23]
+export UT_CALLER="$CALLER"                       # and a relative requirement document outside it [A1-RQ1]
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 export PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1
@@ -41,7 +43,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|benchmark|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -156,10 +158,16 @@ case "$ACTION" in
   pilot-deps) pilot c_deps_pilot src/ctrl.c src/brake_ctrl.c src/steer_assist.c "$@" ;;
   pilot-embedded) pilot c_embedded_pilot src/gpio_driver.c src/scheduler.c src/critical.c src/main_loop.c "$@" ;;
   pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
+  pilot-realrepo) pilot c_realrepo_pilot kernel/src/klist.c kernel/src/kqueue.c codec/ring.c drivers/crc_drv.c "$@" && pilot cpp_realrepo_pilot src/dispatcher.cpp "$@" ;;
   benchmark) "$PY" ut_pipeline.py benchmark --config ut_config.json --knowledge "${1:-on}" ;;
   run)
-    if [ $# -lt 2 ]; then echo "Usage: $0 run REPO SUT [options]"; exit 2; fi
-    REPO="${1%/}"; SUT="$2"; shift 2
-    "$PY" ut_pipeline.py run --repo "$REPO" --sut "$SUT" --config ut_config.json "$@" ;;
+    if [ $# -lt 1 ]; then echo "Usage: $0 run REPO [SUT|all] [options]"; exit 2; fi
+    REPO="${1%/}"; shift
+    SUT_ARGS=()                                 # no SUT, or "all": every production file [ORC-35]
+    if [ $# -ge 1 ] && [ "${1#--}" = "$1" ]; then
+      if [ "$1" != "all" ]; then SUT_ARGS=(--sut "$1"); fi
+      shift
+    fi
+    "$PY" ut_pipeline.py run --repo "$REPO" "${SUT_ARGS[@]}" --config ut_config.json "$@" ;;
   *) echo "Unknown option $ACTION"; exit 2 ;;
 esac

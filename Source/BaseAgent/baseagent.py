@@ -3108,6 +3108,8 @@ class ContractMeta(StrictModel):
     # One record per brain call of this request: window, tokens, parts shortened or left out,
     # knowledge packs used (ARCH-15, KP-7).
     token_plans: list[dict[str, Any]] = Field(default_factory=list)
+    # Every case a rule of this request handed to the brain, with its outcome (ARCH-22).
+    escalations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ContractResponse(StrictModel):
@@ -3401,6 +3403,102 @@ class AgentGraphState(TypedDict, total=False):
     rejected: str
 
 
+# ---------------------------------------------------------------- rule first, brain when a rule fails
+# ARCH-21 .. ARCH-23 of the unit-test generator, generic for every application: an agent's rule that
+# cannot produce its result hands the case to the brain; the tool that rejected the rule's result
+# checks the brain's proposal; an accepted proposal is remembered per project.
+NO_BRAIN_CODES = frozenset({"NO_BRAIN_AVAILABLE", "BRAIN_NO_ACCESS", "MODEL_UNAVAILABLE", "BRAIN_RATE_LIMITED",
+                            "DEPENDENCY_MISSING"})
+
+
+@dataclass
+class RuleFailure:
+    """What a rule could not do: the rule, why, the type/header/symbol concerned and the tool's message."""
+    rule: str
+    failure: str
+    subject: str = ""
+    message: str = ""
+
+    def signature(self) -> str:
+        """The same failure in another run: paths, numbers and generated names removed (ARCH-23)."""
+        text = re.sub(r"(?:[A-Za-z]:)?(?:[\w.~-]*[/\\])+[\w.-]+|\b[\w-]+(?:\.[\w-]+)*\.(?:[ch]|cc|cpp|cxx|c\+\+|hh|hpp|hxx|"
+                      r"inc|ipp|tpp|s|asm|o|obj)\b", "<path>", self.message)
+        text = re.sub(r"\but_\w+", "<gen>", text)
+        text = re.sub(r"\b0x[0-9a-fA-F]+\b|\b\d+\b", "<n>", text)
+        text = " ".join(text.split())[:600]
+        return hashlib.sha256(f"{self.rule}|{self.subject}|{text}".encode()).hexdigest()[:32]
+
+
+class Escalation(StrictModel):
+    """One case a rule handed to the brain (ARCH-22): where the resolution came from and the tool's verdicts."""
+    agent: str
+    step: str = ""
+    rule: str
+    failure: str
+    subject: str = ""
+    source: Literal["", "memory", "brain"] = ""
+    brain: str = ""
+    attempts: list[str] = Field(default_factory=list)           # the tool's message per rejected attempt
+    outcome: Literal["resolved", "rejected", "needs_brain"] = "rejected"
+
+    def text(self) -> str:
+        how = {"resolved": f"resolved by the {'stored resolution' if self.source == 'memory' else self.brain or 'brain'}",
+               "rejected": f"not resolved after {len(self.attempts)} attempt(s)",
+               "needs_brain": "needs a brain (none was usable)"}[self.outcome]
+        last = f"; last tool message: {self.attempts[-1][:200]}" if self.attempts and self.outcome != "resolved" else ""
+        return f"{self.agent} {self.step or self.rule}: {self.failure}" + (f" ({self.subject})" if self.subject else "") \
+            + f" - {how}{last}"
+
+
+class ResolutionMemory:
+    """Accepted resolutions per project (ARCH-23): SQLite, one row per agent, rule and failure signature.
+    Every error is swallowed: losing the memory never fails a run."""
+    def __init__(self, path: str | Path, project: str = ""):
+        self.path = Path(path)
+        self.project = project
+        self._lock = threading.Lock()
+
+    def _db(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(self.path, timeout=10)
+        con.execute("CREATE TABLE IF NOT EXISTS resolutions (project TEXT, agent TEXT, rule TEXT, signature TEXT, "
+                    "answer TEXT, uses INTEGER DEFAULT 0, created TEXT, PRIMARY KEY (project, agent, rule, signature))")
+        return con
+
+    def get(self, agent: str, rule: str, signature: str) -> list[str]:
+        with self._lock, contextlib.suppress(Exception):
+            con = self._db()
+            try:
+                return [r[0] for r in con.execute(
+                    "SELECT answer FROM resolutions WHERE project=? AND agent=? AND rule=? AND signature=?",
+                    (self.project, agent, rule, signature))]
+            finally:
+                con.close()
+        return []
+
+    def put(self, agent: str, rule: str, signature: str, answer: str) -> None:
+        with self._lock, contextlib.suppress(Exception):
+            con = self._db()
+            try:
+                con.execute("INSERT INTO resolutions (project, agent, rule, signature, answer, uses, created) "
+                            "VALUES (?, ?, ?, ?, ?, 1, ?) ON CONFLICT (project, agent, rule, signature) DO UPDATE "
+                            "SET answer=excluded.answer, uses=uses+1",
+                            (self.project, agent, rule, signature, answer, datetime.now(timezone.utc).isoformat()))
+                con.commit()
+            finally:
+                con.close()
+
+    def forget(self, agent: str, rule: str, signature: str) -> None:
+        with self._lock, contextlib.suppress(Exception):
+            con = self._db()
+            try:
+                con.execute("DELETE FROM resolutions WHERE project=? AND agent=? AND rule=? AND signature=?",
+                            (self.project, agent, rule, signature))
+                con.commit()
+            finally:
+                con.close()
+
+
 @dataclass
 class ContractTool:
     name: str
@@ -3452,6 +3550,9 @@ class AgentCore:
         # Knowledge packs for the brains (KP); the application sets them, e.g.
         # KnowledgePacks(["knowledge"], steps=[...], project_dir=".ut/knowledge").
         self.packs: KnowledgePacks | None = None
+        # Rule failures handed to the brain (ARCH-21 .. ARCH-23): the application sets the memory.
+        self.resolutions: ResolutionMemory | None = None
+        self.escalations: list[dict[str, Any]] = []
 
     # ---------------------------------------------------------------- subclass API
     def tools(self) -> list[ContractTool]:
@@ -3596,6 +3697,80 @@ class AgentCore:
         self._brain_used(router, brain, skipped)
         return result["output"]
 
+    async def resolve(self, failure: RuleFailure, *, task: str, context: str | list[ContextPart],
+                      output_model: type[BaseModel], verify: Callable[[BaseModel], Any], step: str = "",
+                      attempts: int = 2, need: OutputNeed | None = None, project: str | Path | None = None,
+                      check: Callable[[BaseModel], Any] | None = None, remember: bool = True) -> BaseModel | None:
+        """A rule failed: stored resolution first, then the brain, each judged by ``verify`` (ARCH-21, ARCH-22).
+
+        ``verify(answer)`` runs the tool that rejected the rule's result (sync or async) and returns "" when it
+        accepts the answer, else the tool's message, which the brain gets with the next attempt. Returns the
+        accepted answer or None; the case is recorded in ``self.escalations`` (meta.escalations) either way.
+        A brain is never a reason to fail: without one the case is recorded as needing a brain. ``remember=False``
+        when ``verify`` is not yet the final tool: the agent stores the answer itself once that tool accepted it."""
+        signature = failure.signature()
+        record = Escalation(agent=self.name, step=step, rule=failure.rule, failure=failure.failure[:300],
+                            subject=failure.subject[:200])
+
+        async def judge(answer: BaseModel) -> str:
+            try:
+                verdict = verify(answer)
+                if inspect.isawaitable(verdict):
+                    verdict = await verdict
+            except AgentFault as exc:
+                verdict = exc.message
+            return str(verdict or "")
+
+        def done(answer: BaseModel | None) -> BaseModel | None:
+            self.escalations.append(record.model_dump())
+            self.emit("escalation", data=record.model_dump(), summary=f"{self.view_label}: {record.text()}"[:200])
+            return answer
+
+        memory = self.resolutions
+        if memory is not None:                                                          # ARCH-23
+            for stored in memory.get(self.name, failure.rule, signature):
+                try:
+                    answer = output_model.model_validate_json(stored)
+                except ValidationError:
+                    memory.forget(self.name, failure.rule, signature)
+                    continue
+                verdict = await judge(answer)
+                if not verdict:
+                    memory.put(self.name, failure.rule, signature, stored)
+                    record.source, record.outcome = "memory", "resolved"
+                    return done(answer)
+                record.attempts.append(f"stored resolution rejected: {verdict}"[:600])
+                memory.forget(self.name, failure.rule, signature)
+        messages = [failure.message] if failure.message else []
+        for _ in range(max(1, attempts)):
+            prompt = (f"{task}\n\nA deterministic rule could not do this ({failure.rule}): {failure.failure}"
+                      + (f"\nConcerned: {failure.subject}" if failure.subject else "")
+                      + "".join(f"\nTool message{' (after your previous answer)' if k else ''}:\n{m[:4000]}"
+                                for k, m in enumerate(messages)))
+            try:
+                answer = await self.generate(prompt, context, output_model, need=need, step=step, project=project,
+                                             check=check)
+            except AgentFault as exc:
+                if exc.code in NO_BRAIN_CODES or exc.code == "NO_WORK":
+                    if record.source != "brain":
+                        record.outcome = "needs_brain"
+                    record.attempts.append(f"no brain answer: {exc.code}")
+                    return done(None)
+                record.source = "brain"
+                record.attempts.append(f"brain answer not usable: {exc.code}: {exc.message}"[:600])
+                continue
+            record.source, record.brain = "brain", self.brain_of_call().get("brain", "")
+            verdict = await judge(answer)
+            if not verdict:
+                if memory is not None and remember:
+                    memory.put(self.name, failure.rule, signature, answer.model_dump_json())
+                record.outcome = "resolved"
+                return done(answer)
+            record.attempts.append(verdict[:600])
+            messages.append(verdict)
+        record.outcome = "rejected"
+        return done(None)
+
     # ---------------------------------------------------------------- graph per tool
     def _graph(self, tool: ContractTool):
         if tool.name in self._graphs:
@@ -3684,6 +3859,7 @@ class AgentCore:
         meta = ContractMeta(agent=self.name, tool=tool_name)
         calls_before = self.llm_calls
         self.token_plans = []
+        self.escalations = []
         try:
             json_dumps(raw_request, max_bytes=CONTRACT_WIRE_BYTES)
             request = ContractRequest.model_validate(raw_request)
@@ -3753,6 +3929,7 @@ class AgentCore:
         response.meta.model_invoked = response.meta.llm_calls > 0
         if not response.meta.replayed:
             response.meta.token_plans = list(self.token_plans)
+            response.meta.escalations = list(self.escalations)
         if self.last_brain:
             response.meta.brain = self.last_brain.get("brain", "")
             response.meta.model_id = self.last_brain.get("model_id", "")
@@ -3932,7 +4109,7 @@ class AgentClient:
 # the file named by BASEAGENT_EVENTS; the hub serves it to the page.
 VIEW_ENV = "BASEAGENT_EVENTS"
 VIEW_KINDS = ("run_start", "stage", "run_end", "tool_start", "tool_end", "handoff", "brain_call", "brain_answer",
-              "program", "metric")
+              "program", "metric", "escalation")
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
 
 
@@ -4364,6 +4541,7 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="program"){var ap=S.agents[ev.agent];if(ap){ap.programs=ap.programs||{};ap.programs[d.program]=(ap.programs[d.program]||0)+1}
   if(d.outcome&&d.outcome!=="ok")feed(ev,ev.summary||(labelOf(ev.agent)+" ran "+(d.program||"")),famOf(ev.agent));return}
  if(k==="metric"){setMetric(d.id,d);return}
+ if(k==="escalation"){feed(ev,ev.summary||(labelOf(ev.agent)+": a rule needed the brain"),d.outcome==="resolved"?"purple":"gray");return}
  if(k==="stage"){feed(ev,ev.summary||d.stage||"stage","gray");return}
  if(k==="run_end"){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
    if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)});

@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.15)
+project(cpp_realrepo_pilot CXX)
+add_library(fw STATIC src/dispatcher.cpp)
+target_include_directories(fw PRIVATE include)
+set_target_properties(fw PROPERTIES CXX_STANDARD 17)

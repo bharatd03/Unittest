@@ -163,7 +163,7 @@ class UTBrain:
 
     def __init__(self, tests=None, patch=None, root_cause="source_behavior_defect", fail=None, dependency="real",
                  plans=None, links=None, declarations=None, flags=None, review="agree", candidates=None,
-                 name="qwen", suggestions=None):
+                 name="qwen", suggestions=None, repairs=None, values=None, headers=None, host=None):
         self.tests = CANNED_TESTS if tests is None else tests
         self.patch = patch or {"original_fragment": "return 99;", "corrected_fragment": "return 100;",
                                "rationale": "EV-clamp_percent-1 (E2): the value is limited to 0..100."}
@@ -171,7 +171,17 @@ class UTBrain:
         self.plans, self.links, self.declarations = plans or {}, links or [], declarations or {}
         self.flags, self.review, self.candidates = flags or [], review, candidates
         self.brain_name, self.suggestions = name, suggestions
+        # rule failures handed to the brain [ARCH-21]: a reply, a list of replies (one per call) or a function
+        self.rule_replies = {"repair": repairs, "value": values, "header": headers, "host": host}
         self.generate_calls, self.decide_calls, self.questions = [], 0, []
+
+    def _rule_reply(self, kind, task, context):
+        reply = self.rule_replies[kind]
+        if callable(reply):
+            return reply(task, context)
+        if isinstance(reply, list):
+            return reply.pop(0) if reply else {}
+        return reply or {}
 
     async def start(self):
         return None
@@ -193,14 +203,24 @@ class UTBrain:
         self.generate_calls.append(task)
         if self.fail:
             raise ba.AgentFault(self.fail, "scripted failure", self.fail in ba.AVAILABILITY_FAULTS)
-        if "could not reach the ITEMS NOT REACHED" in task:                         # COV-12
+        if task.startswith("The unit-test program does not build"):                 # A3-CL14
+            reply = self._rule_reply("repair", task, context)
+        elif task.startswith("A deterministic test generator must call"):            # A2-21ac
+            reply = self._rule_reply("value", task, context)
+        elif task.startswith("The C/C++ front end cannot find a header"):           # A1-DA20
+            reply = self._rule_reply("header", task, context)
+        elif task.startswith("This C/C++ file is target code"):                     # A3-BD16
+            reply = self._rule_reply("host", task, context)
+        elif "could not reach the ITEMS NOT REACHED" in task:                       # COV-12
             found = self.suggestions(context) if callable(self.suggestions) else (self.suggestions or [])
             reply = {"suggestions": found}
         elif "smallest change" in task:
             reply = {"candidates": self.candidates or [self.patch]}
         elif task.startswith("Plan unit-test scenarios"):
             fn = re.search(r"for the function (\S+)", task).group(1).split("::")[-1]
-            plans = self.plans.get(fn, [])
+            plans = self.plans.get(fn)
+            if plans is None:                       # ARCH-24: the brain always plans; a plain, valid scenario
+                plans = scripted_plan(fn, context)
             reply = {"scenarios": plans(context) if callable(plans) else plans}
         elif "REQUIREMENTS below" in task:
             reply = {"links": self.links}
@@ -214,6 +234,41 @@ class UTBrain:
             reply = {"tests": next((t for name, t in self.tests.items() if re.search(r"\b" + name + r"\s*\(", header)),
                                    [])}
         return {"model": self.model_id, "output": validate(reply), "usage": {}}
+
+
+def scripted_plan(fn: str, context: str) -> list[dict]:
+    """The scripted brain's own plan for a function it has no canned plan for (ARCH-24: the brain always plans):
+    one characterization scenario for the first open gap, with a plain value for every parameter, built only from
+    the facts Agent1 gives the brain (OPEN GAPS, PARAMETERS)."""
+    gaps = re.findall(r"^- (EVIDENCE:\S+): check|^- (\S+) \[", context, re.M)
+    ids = [a or b for a, b in gaps]
+    if not ids:
+        return []
+    block = re.search(r"PARAMETERS:\n((?:- .*\n?)*)", context)
+    args, setup = [], []
+    for k, row in enumerate(re.findall(r"^- (\w+): (.*?) \((\w+)(?:; (.*))?\)$", block.group(1) if block else "", re.M)):
+        name, ptype, kind, extra = row
+        base = re.sub(r"\b(const|volatile)\b", "", ptype).replace("&", "").strip()
+        value = "0"
+        if kind == "enum":
+            m = re.search(r"enumerators ([^,;]+)", extra)
+            value = m.group(1).strip() if m else "0"
+        elif kind == "cstring":
+            value = '""'
+        elif kind in ("buffer", "ptr_void"):
+            setup.append(f"unsigned char ut_s{k}[64] = {{0}};" if kind == "ptr_void" else f"char ut_s{k}[16] = {{0}};")
+            value = f"ut_s{k}"
+        elif kind in ("ptr_scalar", "ptr_struct", "struct"):
+            target = base.rstrip("*").strip() if kind != "struct" else base
+            setup.append(f"{target} ut_s{k} = {{0}};")
+            value = f"ut_s{k}" if kind == "struct" else f"&ut_s{k}"
+        elif kind not in ("int", "float", "bool"):
+            value = "nullptr" if "C++" in context.split("\n", 1)[0] else "NULL"
+        args.append({"name": name, "value": value})
+    return [{"gap_ids": ids[:1], "name": f"test_{fn}_scripted", "purpose": "reach the first open gap",
+             "args": args, "setup": setup, "stubs": [], "variables": [], "expected_return": "", "expected_after": [],
+             "evidence_ids": [], "quotes": [], "classification": "characterization_gap", "conflict": "",
+             "information_sought": ""}]
 
 
 class DownBrain(UTBrain):
@@ -1077,6 +1132,202 @@ int channel_gate(int ch)
 """
 
 
+class RuleFailureTests(unittest.TestCase):
+    """ARCH-21 .. ARCH-23 in the agents: a rule that fails hands the case to the brain, the tool decides; and the
+    rule fixes found on real repositories (A1-DA20, A1-DA21, A2-21ac, A2-21ad, A3-BD16, A3-CL14, A3-FZ12)."""
+
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.d = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_prologue_keeps_the_sut_order_and_closes_its_conditionals(self):
+        text = ('/* header */\n#define MPU_FROM_API 1\n#include "kernel.h"\n#include "klist.c"\n#ifdef HAL_ENABLED\n'
+                '#include "klist.h" // the list\n#define LOCAL(x) \\\n  ((x) + 1)\nstatic int helper(void);\n'
+                'int f(void) { return 0; }\n#endif\n')
+        fn = uc.FunctionInfo(name="f", qualified_name="f", signature="int f(void)", file="a.c", line_start=10, line_end=10)
+        self.assertEqual(uc.sut_prologue(text, [fn]), ['#define MPU_FROM_API 1', '#include "kernel.h"', '#ifdef HAL_ENABLED',
+                                                       '#include "klist.h"', '#define LOCAL(x) ((x) + 1)', '#endif'])
+        self.assertEqual(uc.sut_prologue(text, [fn], header_sut=True), [])          # a header's own guard stays out
+
+    def test_argument_variables_drop_only_top_level_qualifiers(self):
+        cases = {"char const * const": "char const *", "const QEvt *const": "const QEvt *", "const int": "int",
+                 "volatile uint32_t": "uint32_t", "int (*)(int)": None, "int[4]": None}
+        for ptype, expected in cases.items():
+            self.assertEqual(a2._value_type(ptype), expected, ptype)
+
+    def test_types_come_from_the_syntax_tree(self):
+        """A1-DA21: T * const is a pointer; a pointer field has its pointee; a function pointer field is a callback;
+        _Atomic(size_t) is an integer; typedefs are resolved."""
+        repo = copy_pilot("c_realrepo_pilot", self.d)
+        a1_agent, a3_agent = a1.AnalyzerAgent(), a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w")))
+        kinds = {}
+        for sut in ("kernel/src/klist.c", "codec/ring.c", "drivers/crc_drv.c"):
+            layout = a1_agent.discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=sut))
+            build = a3_agent.capture(uc.CaptureRequest(layout=layout))
+            layout = run(a1_agent.dependencies(uc.DependencyRequest(layout=layout, build=build)))
+            for f in layout.functions:
+                for p in f.params:
+                    kinds[(f.name, p.name)] = (p.kind, {x.name: (x.kind, x.base) for x in p.fields})
+            if sut.endswith("klist.c"):
+                self.assertIn(layout.typedefs.get("kBase_t"), ("int32_t", "int"))
+        kind, fields = kinds[("klist_insert_end", "list")]
+        self.assertEqual(kind, "ptr_struct")
+        self.assertEqual(fields["index"], ("pointer", "kItem_t"))
+        kind, fields = kinds[("ring_free", "rb")]
+        self.assertEqual((kind, fields["r"][0], fields["evt"][0]), ("ptr_struct", "int", "callback"))
+        self.assertEqual(kinds[("crc_calc", "hcrc")][1]["Instance"], ("pointer", "CRC_Regs"))
+        self.assertEqual(kinds[("crc_calc", "buf")][0], "ptr_scalar")
+
+    # ------------------------------------------------------------ A3-CL14: generated files repaired by the brain
+    STUB = ('#include "ut_harness.h"\n#include "sensor.h"\nstatic const int ut_stub_read_sensor_return;\n'
+            'int read_sensor(int channel) { (void)channel; return ut_stub_read_sensor_return; }\n'
+            'void ut_before_each(void) { ut_stub_read_sensor_return = 0; }\n')
+
+    def _thermostat(self):
+        repo = copy_pilot("c_pilot", self.d)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        suite = ('#include "ut_harness.h"\n#include "thermostat.h"\nextern int ut_stub_read_sensor_return;\n'
+                 '/* evidence: E8 */\nUT_TEST(test_heat)\n{\n    ut_stub_read_sensor_return = 10;\n'
+                 '    UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);\n}\n\nUT_SUITE_BEGIN\n    UT_CASE(test_heat)\nUT_SUITE_END\n')
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[
+            uc.FileAction(path="tests/stubs/ut_stubs.c", action="create", role="stub", content=self.STUB),
+            uc.FileAction(path="tests/test_thermostat.c", action="create", role="testsuite", content=suite)])
+        return layout, bundle
+
+    def _agent3(self, b):
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "work")),
+                                    router=ba.BrainRouter([b], 0.0))
+        agent.resolutions = ba.ResolutionMemory(self.d / "resolutions.sqlite3", project="pilot")
+        return agent
+
+    def test_a_generated_file_the_compiler_rejects_is_repaired_by_the_brain(self):
+        """A3-CL14: the stub's const control variable is assigned; the brain's edit makes it build; an edit that
+        changes an assertion is refused; the same failure in a later run is resolved from memory (ARCH-23)."""
+        layout, bundle = self._thermostat()
+        bad = {"edits": [{"path": "tests/test_thermostat.c", "old": "thermostat_command(20, 2), 1)",
+                          "new": "thermostat_command(20, 2), 0)"}], "reason": "weaker"}
+        good = {"edits": [{"path": "tests/stubs/ut_stubs.c", "old": "static const int ut_stub_read_sensor_return;",
+                           "new": "int ut_stub_read_sensor_return;"}], "reason": "the control variable must be writable"}
+        scripted = UTBrain(repairs=[bad, good])
+        agent = self._agent3(scripted)
+        req = uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle)
+        response = run(agent.call_local("verify", req, signatures={"sut": layout.sut_sha256}))
+        self.assertEqual(response.status, "success", response.error)
+        result = uc.VerificationResult.model_validate(response.data)
+        self.assertTrue(result.link_ok, result.reason)
+        self.assertEqual((result.total, result.passed), (1, 1))
+        self.assertIn("int ut_stub_read_sensor_return;", result.repaired_files["tests/stubs/ut_stubs.c"])
+        (record,) = response.meta.escalations
+        self.assertEqual((record["rule"], record["outcome"], record["source"]), ("A3-CL14 generated files", "resolved", "brain"))
+        self.assertIn("UT_EXPECT", record["attempts"][0])                     # the weakening edit was refused
+        later = self._agent3(UTBrain(repairs=[]))                             # another run, same failure, no answer
+        again = run(later.call_local("verify", req, signatures={"sut": layout.sut_sha256}))
+        self.assertTrue(uc.VerificationResult.model_validate(again.data).link_ok)
+        self.assertEqual(again.meta.escalations[0]["source"], "memory")
+
+    def test_without_a_brain_the_build_failure_stays_and_is_recorded(self):
+        layout, bundle = self._thermostat()
+        agent = self._agent3(DownBrain())
+        response = run(agent.call_local("verify", uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle),
+                                        signatures={"sut": layout.sut_sha256}))
+        result = uc.VerificationResult.model_validate(response.data)
+        self.assertFalse(result.link_ok)
+        self.assertEqual(response.meta.escalations[0]["outcome"], "needs_brain")
+
+    # ------------------------------------------------------------ A3-BD16: host adaptation of target code
+    def test_target_code_the_tables_do_not_know_gets_host_definitions_from_the_brain(self):
+        repo = self.d / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "ccm.c").write_text("#include <stdint.h>\n__ccm_data uint32_t ccm_buf[4];\n"
+                                            "uint32_t ccm_first(void) { return ccm_buf[0]; }\n")
+        database = repo / "compile_commands.json"
+        database.write_text(json.dumps([{"directory": str(repo), "file": "src/ccm.c",
+                                         "arguments": ["arm-none-eabi-gcc", "-mcpu=cortex-m4", "-c", "src/ccm.c"]}]))
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/ccm.c"))
+        scripted = UTBrain(host=[{"flags": ["-DNOPE=1"], "compat_header": "", "reason": "wrong"},
+                                 {"flags": [], "compat_header": "#define __ccm_data", "reason": "a section attribute"}])
+        agent = self._agent3(scripted)
+        build = agent.capture(uc.CaptureRequest(layout=layout, compile_commands=str(database)))
+        self.assertFalse(build.estimated)
+        adapted = run(agent.suggest_flags(uc.FlagRequest(layout=layout, build=build)))
+        self.assertEqual(len(adapted.host_adaptation), 1, adapted.notes)
+        self.assertIn("ut_target_compat.h", " ".join(adapted.sut_flags))
+        probe = layout.model_copy(update={"compile_flags": adapted.sut_flags, "build": adapted})
+        self.assertEqual(agent._sut_errors(probe, repo, agent.toolchain(), []), [])
+        self.assertEqual(agent.escalations[-1]["outcome"], "resolved")
+        self.assertEqual(len(agent.escalations[-1]["attempts"]), 1)            # the first answer did not help
+
+    # ------------------------------------------------------------ A1-DA20: missing headers
+    def test_a_missing_header_is_found_by_name_or_chosen_by_the_brain(self):
+        repo = copy_pilot("c_realrepo_pilot", self.d)
+        a3_agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w")))
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="kernel/src/klist.c"))
+        build = uc.BuildDescription(source="compile_commands", estimated=False, sut_flags=[],
+                                    entries=[uc.CompileEntry(file="kernel/src/klist.c", flags=[])])
+        layout = layout.model_copy(update={"include_dirs": []})
+        analyzer = a1.AnalyzerAgent(router=ba.BrainRouter([DownBrain()], 0.0))
+        found = run(analyzer.dependencies(uc.DependencyRequest(layout=layout, build=build)))
+        self.assertIn("-I{repo}/kernel/include", found.build.sut_flags)            # one file of that name
+        self.assertFalse(found.dependencies.missing_headers)
+        (repo / "legacy").mkdir()
+        (repo / "legacy" / "kernel.h").write_text("#error the old kernel\n")
+        chooser = UTBrain(headers=[{"folder": "legacy", "reason": "wrong"},
+                                   {"folder": "kernel/include", "reason": "the kernel's headers"}])
+        analyzer = a1.AnalyzerAgent(router=ba.BrainRouter([chooser], 0.0))
+        chosen = run(analyzer.dependencies(uc.DependencyRequest(layout=layout, build=build)))
+        self.assertIn("-I{repo}/kernel/include", chosen.build.sut_flags)
+        self.assertEqual(analyzer.escalations[-1]["outcome"], "resolved")
+        self.assertEqual(len(analyzer.escalations[-1]["attempts"]), 1)          # legacy/ gave more errors
+
+    # ------------------------------------------------------------ A2-21ac: values the rules cannot build
+    def test_a_value_no_rule_builds_comes_from_the_brain(self):
+        repo = copy_pilot("c_realrepo_pilot", self.d)
+        a1_agent = a1.AnalyzerAgent()
+        layout = a1_agent.discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="kernel/src/klist.c"))
+        build = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w"))).capture(
+            uc.CaptureRequest(layout=layout))
+        layout = run(a1_agent.dependencies(uc.DependencyRequest(layout=layout, build=build)))
+        for f in layout.functions:                    # as if the rules could not classify the list parameter
+            for p in f.params:
+                if f.name == "klist_count":
+                    p.kind, p.fields = "other", []
+        plan = run(a1_agent.plan(uc.PlanRequest(layout=layout)))
+        recipe = {"setup": ["kList_t ut_r_list;", "klist_init(&ut_r_list);"], "argument": "&ut_r_list"}
+        generator = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic"),
+                                      router=ba.BrainRouter([UTBrain(values=[{"setup": ["UT_EXPECT_TRUE(1);"],
+                                                                              "argument": "0"}, recipe])], 0.0))
+        bundle = run(generator.generate_bundle(uc.GenerationRequest(plan=plan)))
+        suite = next(a.content for a in bundle.actions if a.role == "testsuite")
+        self.assertIn("klist_init(&ut_r_list);", suite)
+        self.assertIn("klist_count(&ut_r_list)", suite)
+        self.assertIn("built by the brain [A2-21ac]", suite)
+        record = generator.escalations[-1]
+        self.assertEqual((record["rule"], record["outcome"]), ("A2-21ac value", "resolved"))
+        self.assertIn("must not assert", record["attempts"][0])
+
+    # ------------------------------------------------------------ A3-FZ12: fuzzing with registers
+    def test_fuzz_targets_map_registers_and_go_on_after_a_crash(self):
+        repo = self.d / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "regs.c").write_text(
+            "#include <stdint.h>\nuint32_t reg_read(uint32_t sel)\n{\n    if (sel == 3U) {\n"
+            "        return *(volatile uint32_t *)0x10U;\n    }\n    if (sel == 77U) {\n"
+            "        *(volatile uint32_t *)0x40021000U = 5U;\n        return *(volatile uint32_t *)0x40021000U;\n"
+            "    }\n    return 0U;\n}\n")
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/regs.c"))
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w"), search_executions=40_000))
+        layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(layout=layout, build=agent.capture(
+            uc.CaptureRequest(layout=layout)))))
+        gap = uc.GapItem(gap_id="LC:reg_read:8", metric="LC", function="reg_read", line=8, detail="line never executed")
+        result = agent.fuzz(uc.FuzzRequest(layout=layout, functions=["reg_read"], gaps=[gap], seconds=20))
+        self.assertFalse(result.unsupported, result.unsupported)
+        self.assertTrue(any("reg_read" in c for c in result.crashes), result.crashes)       # sel == 3 crashed ...
+        self.assertTrue(any(i.function == "reg_read" for i in result.inputs), result.reason)  # ... and sel == 77 found
+
+
 class EmbeddedRuleTests(unittest.TestCase):
     """The rules for embedded code that need no compiler: endless loops, register polling, state, fakes,
     templates, exceptions, target assembly and the data model (A2-21y..ab, A2-21aa, A1-DA19, A3-45e, A3-HW3/4)."""
@@ -1837,6 +2088,8 @@ class PipelineTests(unittest.TestCase):
         """A1-PL1, A1-25y, A2-21m: after the deterministic tests, the brain plans a check of the stated
         behaviour; Agent1 checks it and Agent2 assembles it into an asserting test."""
         def clamp_plan(context):
+            if "EVIDENCE:clamp_percent" not in context:                  # the coverage gaps first
+                return scripted_plan("clamp_percent", context)
             ev = re.search(r"- (EV-clamp_percent-\d+) E2 [^\n]*0\.\.100", context)
             return [planned(gap_ids=["EVIDENCE:clamp_percent"], name="test_clamp_percent_limits_high_values",
                             purpose="values above 100 are limited to 100", args=[{"name": "value", "value": "150"}],
@@ -1853,11 +2106,36 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
 
+    def test_requirement_documents_given_for_the_run(self):
+        """A1-RQ1, A1-RQ3, A1-RQ5: a document from outside the repository is copied, recorded in the ledger,
+        linked and reported per function; the repository does not receive it."""
+        repo = copy_pilot("c_pilot", self.d)
+        spec = self.d / "spec.md"
+        spec.write_text("- REQ-TH-30: clamp_percent limits the value to the range 0..100.\n")
+        with brain(UTBrain()):
+            result = run(up.Orchestrator(pipeline_config(self.d)).run(uc.PipelineRequest(
+                repo_root=str(repo), sut_file="src/thermostat.c", requirements=[str(spec), "docs/none.md"])))
+        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        self.assertEqual(result.requirement_documents, [f"requirements/spec.md sha256 {uc.file_sha256(spec)} "
+                                                        f"(given as {spec})"])
+        copied = Path(result.output_dir) / "requirements" / "spec.md"
+        self.assertEqual(copied.read_bytes(), spec.read_bytes())
+        entries = [json.loads(line) for line in Path(result.ledger).read_text().splitlines()]
+        self.assertTrue(any(e["tool"] == "requirement_document" and e.get("sha256") == uc.file_sha256(spec)
+                            for e in entries))
+        status = {f.function: f for f in result.requirement_status}
+        self.assertTrue(status["clamp_percent"].requirements[0].startswith("REQ-TH-30 (rule) requirements/spec.md:1"))
+        self.assertTrue(any("docs/none.md" in item and "does not exist" in item for item in result.open_items))
+        text = up.report(result)
+        self.assertIn("## Requirement documents given for the run [A1-RQ3]", text)
+        self.assertIn("## Requirements per function [A1-RQ5]", text)
+        self.assertFalse((repo / "requirements").exists())
+
     def test_embedded_driver_with_a_polled_clock_reaches_its_targets_without_a_brain(self):
         """The first embedded-driver run (19 Oct 2026): a HAL header with an enum before its functions, a timeout
         loop on a stubbed microsecond clock and the stubs of static helpers. A2-21w, A2-21x, A2-21r, A3-45a/b."""
         repo = copy_pilot("c_hal_pilot", self.d)
-        with brain(DownBrain()):
+        with brain(UTBrain()):
             result = self.run_pipeline(repo, "src/echo_sensor.c")
         self.assertEqual(result.final_state, "verified_measured", up.report(result))
         self.assertEqual(result.unfinished_tests, [])
@@ -1876,7 +2154,7 @@ class PipelineTests(unittest.TestCase):
                 d.mkdir()
                 repo = copy_pilot("c_embedded_pilot", d)
                 orchestrator = up.Orchestrator(pipeline_config(d))
-                with brain(DownBrain()):
+                with brain(UTBrain()):
                     result = run(orchestrator.run(uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
                 self.assertEqual(result.final_state, "verified_measured", up.report(result))
                 suite = (repo / "tests" / f"test_{Path(sut).stem}.c").read_text()
@@ -1907,7 +2185,7 @@ class PipelineTests(unittest.TestCase):
                 d.mkdir()
                 repo = copy_pilot("cpp_embedded_pilot", d)
                 orchestrator = up.Orchestrator(pipeline_config(d))
-                with brain(DownBrain()):
+                with brain(UTBrain()):
                     result = run(orchestrator.run(uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
                 self.assertEqual(result.final_state, "verified_measured", up.report(result))
                 self.assertEqual(result.language, "cpp")
@@ -1923,6 +2201,44 @@ class PipelineTests(unittest.TestCase):
                     self.assertIn("cpsid i", " ".join(result.host_notes))
                 else:
                     self.assertIn("UT_EXPECT_NO_RETURN(main());", suite)
+
+    def test_real_repository_patterns_reach_their_targets_without_a_brain(self):
+        """Patterns of five open-source code bases, rebuilt from scratch: a header that needs its configuration
+        header first, T * const parameters, a header found only next to the SUT, _Atomic fields and a callback
+        field, a handle whose Instance points to registers, typedef'd return types, C++ namespaces with const
+        pointers to const data (A2-21ad, A1-DA21, A2-21f)."""
+        for pilot, sut, check in (("c_realrepo_pilot", "kernel/src/klist.c", "order"),
+                                  ("c_realrepo_pilot", "kernel/src/kqueue.c", "typedef"),
+                                  ("c_realrepo_pilot", "codec/ring.c", "neighbour"),
+                                  ("c_realrepo_pilot", "drivers/crc_drv.c", "handle"),
+                                  ("cpp_realrepo_pilot", "src/dispatcher.cpp", "namespace")):
+            with self.subTest(sut=sut):
+                d = self.d / Path(sut).stem
+                d.mkdir()
+                repo = copy_pilot(pilot, d)
+                with brain(UTBrain()):
+                    result = run(up.Orchestrator(pipeline_config(d)).run(uc.PipelineRequest(repo_root=str(repo),
+                                                                                            sut_file=sut)))
+                self.assertEqual(result.final_state, "verified_measured", up.report(result))
+                stubs = (repo / "tests/stubs/ut_stubs.h").read_text() if (repo / "tests/stubs/ut_stubs.h").exists() else ""
+                suite = next((repo / "tests").glob(f"test_{Path(sut).stem}.c*")).read_text()
+                if check == "order":                                   # the SUT's own order, kernel.h first
+                    self.assertLess(suite.index('#include "kernel.h"'), suite.index('#include "klist.h"'))
+                    self.assertIn("kList_t ut_v0 = {", suite)
+                elif check == "typedef":
+                    self.assertLess(stubs.index('#include "kernel.h"'), stubs.index('#include "ktask.h"'))
+                    self.assertIn("UT_EXPECT_EQ_INT(kqueue_wait(", suite)
+                elif check == "neighbour":
+                    self.assertIn('#include "ring_util.h"', suite)
+                elif check == "handle":
+                    self.assertRegex(suite, r"CRC_Regs ut_p0_0 = \{0\};")
+                    self.assertIn("left out: the function crashed", " ".join(result.open_items))
+                else:
+                    self.assertIn("namespace fw {", stubs)
+                    self.assertIn("extern const fw::Evt * ut_stub_fw_post_e;".replace("fw::", ""), stubs)
+                    self.assertIn("using fw::ut_stub_fw_post_e;", stubs)
+                    self.assertIn("namespace fw { int dispatch(", suite)
+                    self.assertIn("fw::Evt ut_v0 = {(std::uint16_t)(", suite)
 
     def test_a_brain_test_that_does_not_compile_costs_no_iteration(self):
         """A3-CL12: one generated test does not compile; the others are still run and measured in the same
@@ -2015,7 +2331,7 @@ class PipelineTests(unittest.TestCase):
         d = self.d / Path(sut).stem
         d.mkdir()
         repo = copy_pilot(pilot, d)
-        with brain(DownBrain()):
+        with brain(UTBrain()):
             result = run(up.Orchestrator(pipeline_config(d, fuzz_seconds=10)).run(
                 uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
         self.assertEqual(result.final_state, "verified_measured", up.report(result))
@@ -2077,13 +2393,21 @@ class StdioPipelineTests(unittest.TestCase):
             raw = json.loads(config.read_text())
             raw["generator"]["mode"] = "deterministic"
             config.write_text(json.dumps(raw))
-            result = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo), sut_file="src/thermostat.c")))
+            # The agent processes have no brain (TP-21). As if the orchestrator had found one, the run goes over
+            # stdio through discovery, capture, the probe and Stage A, and stops at the first plan [ARCH-24, ORC-34].
+            with mock.patch.object(up.Orchestrator, "_brains_available", mock.AsyncMock(return_value="")):
+                result = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo),
+                                                                            sut_file="src/thermostat.c")))
             print("\n" + up.report(result))
-            self.assertGreater(len(result.iterations), 2, result.reason)
-            self.assertGreater(result.passed, 0)
+            self.assertGreaterEqual(len(result.iterations), 2, result.reason)          # probe and Stage A over stdio
+            self.assertIn("ORC-34", result.reason)
+            self.assertIn("NO_BRAIN_AVAILABLE", result.reason)
             self.assertTrue(up.Ledger.verify(Path(result.ledger)))
             logs = list((Path(result.output_dir) / "logs").glob("*.log"))
             self.assertEqual(len(logs), 5)                                          # five agent processes
+            stopped = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo), sut_file="src/thermostat.c")))
+            self.assertIn("no brain is available, so the run was not started", stopped.reason)     # ARCH-24
+            self.assertEqual(stopped.iterations, [])
 
 
 # ============================================================================ 8b. the brain where it adds quality
@@ -2192,16 +2516,76 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertTrue(s.characterization)                                             # A1-25h, A1-PL4 c)
         self.assertEqual(s.expected_return, "")
 
-    def test_first_plan_and_no_brain_use_the_rules(self):
+    def test_first_plan_by_the_brain_and_without_a_brain_the_planning_stops(self):
+        """A1-PL1: before anything is measured the rules estimate the obligations; from the first coverage plan
+        on the brain plans. A1-PL8, ARCH-24: no brain answers -> NO_BRAIN_AVAILABLE, never a rule plan instead."""
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout)))          # nothing measured yet
-        self.assertFalse(b.generate_calls)                                              # A1-PL1
+        self.assertFalse(b.generate_calls)
         self.assertTrue(all(s.made_by == "rule" for s in plan.scenarios))
-        with brain(DownBrain()):
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
-                                                      iteration=2)))
-        self.assertTrue(all(s.made_by == "rule" for s in plan.scenarios))              # A1-PL8
-        self.assertTrue(any("rules - no usable brain answer" in p for p in plan.planning))
+                                                      iteration=1)))                   # the first coverage plan
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
+        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
+        with brain(DownBrain()):                                                       # a new agent, a new router
+            with self.assertRaises(ba.AgentFault) as caught:
+                run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
+                                                           iteration=2)))
+        self.assertEqual(caught.exception.code, "NO_BRAIN_AVAILABLE")
+        self.assertIn("ARCH-24", caught.exception.message)
+
+    def test_a_function_without_a_usable_scenario_does_not_stop_the_others(self):
+        """A1-PL8: the function gets no scenario this time (never a rule plan); the other functions are planned."""
+        clamp = planned(gap_ids=["LC:clamp_percent:19"], name="test_clamp_percent_negative", purpose="below 0",
+                        args=[{"name": "value", "value": "-5"}])
+        gaps = self.gaps + [uc.GapItem(gap_id="LC:clamp_percent:19", function="clamp_percent", metric="LC", line=19)]
+        with brain(UTBrain(plans={"thermostat_command": [], "clamp_percent": [clamp]})):
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                              iteration=2)))
+        planned_fns = {s.function for s in plan.scenarios if not s.inputs}
+        self.assertIn("clamp_percent", planned_fns)
+        self.assertNotIn("thermostat_command", planned_fns)                                # no rule plan instead
+        self.assertTrue(all(s.made_by.startswith("brain:qwen") for s in plan.scenarios if s.function == "clamp_percent"))
+        self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning),
+                        plan.planning)
+
+    def test_when_no_function_gets_a_scenario_the_planning_fails(self):
+        """A1-PL8, ORC-34: no function of the plan got a scenario that passed the check - BRAIN_PLAN_FAILED."""
+        gaps = [uc.GapItem(gap_id=f"LC:{fn}:{line}", function=fn, metric="LC", line=line)
+                for fn, line in (("thermostat_command", 11), ("clamp_percent", 19), ("select_mode", 30))]
+        with brain(UTBrain(plans={"thermostat_command": [], "clamp_percent": [], "select_mode": []})):
+            with self.assertRaises(ba.AgentFault) as caught:
+                run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                           iteration=2)))
+        self.assertEqual(caught.exception.code, "BRAIN_PLAN_FAILED")
+        self.assertIn("clamp_percent", caught.exception.message)
+
+    def test_a_scenario_whose_test_failed_is_not_accepted_again(self):
+        """A1-PL8: the brain sees the failed test among the facts; the same scenario again is refused by name."""
+        contexts = []
+
+        def again(context):
+            contexts.append(context)
+            return [self.good()]
+        req = uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps), iteration=3,
+                             failed_tests={"test_thermostat_command_sensor_error": "crashed: signal 11 (SIGSEGV)"})
+        with brain(UTBrain(plans={"thermostat_command": again})):
+            plan = run(a1.AnalyzerAgent().plan(req))
+        self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs])
+        self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") and "crashed: signal 11" in p
+                            for p in plan.planning), plan.planning)
+        self.assertIn("test_thermostat_command_sensor_error: FAILED in this run (crashed: signal 11 (SIGSEGV))",
+                      contexts[0])
+
+    def test_without_a_next_brain_the_same_brain_is_asked_again(self):
+        """COV-6: the next AVAILABLE brain; when the brain that planned last is the only one, it is asked again
+        with the facts of what was tried, and the run goes on."""
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
+                                                              iteration=4, avoid_brains=["qwen"])))
+        self.assertTrue(any(s.made_by.startswith("brain:qwen") for s in plan.scenarios), plan.planning)
+        self.assertTrue(b.generate_calls)
 
     def test_hard_gap_shows_what_was_tried(self):
         suite = ('/* evidence: E8 */\nUT_TEST(test_thermostat_command_auto_1)\n{\n    ut_stub_read_sensor_return = 5;\n'
@@ -2212,7 +2596,9 @@ class BrainPlanningTests(unittest.TestCase):
             test_items={"test_thermostat_command_auto_1": ["LC:6", "LC:13", "BC:7:9:F"]})
         contexts = []
         with brain(UTBrain(plans={"thermostat_command": lambda ctx: contexts.append(ctx) or []})):
-            run(self.agent.plan(req))
+            plan = run(self.agent.plan(req))
+        self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs])
+        self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning))  # A1-PL8
         self.assertIn("TRIED 2 time(s)", contexts[0])                                   # A1-PL12
         self.assertIn("reached: LC:6, LC:13, BC:7:9:F", contexts[0])                    # A1-PL7
         self.assertIn("PATH CONDITIONS", contexts[0])
@@ -2255,7 +2641,7 @@ class BrainPlanningTests(unittest.TestCase):
                              classification="requirement_mismatch", route="agent1",
                              affected_test="test_thermostat_command_heater_off", affected_function="thermostat_command")
         last = measured(layout, self.gaps, decision="failures").model_copy(update={"failures": [failure]})
-        with brain(DownBrain()):
+        with brain(UTBrain()):
             plan = run(self.agent.plan(uc.PlanRequest(layout=layout, last=last, existing_suite=suite, iteration=2)))
         self.assertEqual(plan.disputed_evidence, ["docs/requirements.md:1"])            # A1-PL13
         self.assertEqual(plan.repairs[0].action, "drop")
@@ -2542,6 +2928,31 @@ class RepositoryTests(unittest.TestCase):
 
     def branches(self) -> list[str]:
         return git_cmd(self.d / "server.git", "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+
+    def test_without_sut_files_every_production_file_is_tested(self):
+        """ORC-35: no SUT file named - Agent1 selects the production files of the tested commit; the summary
+        lists them and every file left out with its reason."""
+        work = copy_pilot("c_pilot", self.d / "dev")
+        (work / "tests").mkdir()
+        (work / "tests/legacy_test.c").write_text("int legacy(void)\n{\n    return 0;\n}\n")
+        (work / "third_party/minilib").mkdir(parents=True)
+        (work / "third_party/minilib/mini.c").write_text("int mini(void)\n{\n    return 1;\n}\n")
+        server = self.d / "server.git"
+        git_cmd(self.d, "init", "-q", "--bare", "-b", "main", str(server))
+        git_cmd(work, "init", "-q", "-b", "main")
+        git_cmd(work, "add", "-A")
+        git_cmd(work, "commit", "-q", "-m", "base")
+        git_cmd(work, "push", "-q", str(server), "main")
+        with brain(UTBrain()):
+            result = self.run_repo(server.as_uri(), [])
+        self.assertEqual(result.selection.selected, ["src/thermostat.c"])
+        self.assertEqual(sorted(result.selection.left_out), ["tests/legacy_test.c: test code",
+                                                             "third_party/minilib/mini.c: third-party code (folder name)"])
+        self.assertEqual([r.sut_file for r in result.results], ["src/thermostat.c"])
+        summary = (Path(result.output_dir) / "summary.md").read_text()
+        self.assertIn("## Production files selected (1) [ORC-35]", summary)
+        self.assertIn("- tests/legacy_test.c: test code", summary)
+        self.assertFalse((Path(result.output_dir) / "worktrees" / "select").exists())
 
     def test_tests_only_are_committed_to_the_default_branch(self):
         url = self.server()
@@ -2963,14 +3374,17 @@ class HandOverTests(unittest.TestCase):
         self.assertIn("| MCDC | 0 | 0 | NA | not applicable |", text)                       # guard.c has no such decision
         self.assertTrue(any("could not reach the ITEMS NOT REACHED" in c for c in b.generate_calls))
 
-    def test_without_a_brain_the_evidence_is_still_handed_over(self):
+    def test_without_a_brain_the_run_is_not_started(self):
+        """ARCH-24, ORC-34: the brain plans; without one the run does not start and nothing is written."""
+        before = sorted(p.relative_to(self.repo).as_posix() for p in self.repo.rglob("*") if ".git" not in p.parts)
         with brain(DownBrain()):
             result = run(up.Orchestrator(pipeline_config(self.d, coverage=cov(2))).run(
                 uc.PipelineRequest(repo_root=str(self.repo), sut_file="src/guard.c")))
         self.assertEqual(result.final_state, "incomplete")
-        self.assertTrue(result.not_reached and result.action_needed)
-        self.assertEqual(result.suggestions, [])
-        self.assertTrue(any("Change the source" in a for a in result.action_needed), result.action_needed)
+        self.assertIn("no brain is available, so the run was not started", result.reason)
+        self.assertFalse(result.iterations)
+        self.assertEqual(sorted(p.relative_to(self.repo).as_posix() for p in self.repo.rglob("*")
+                                if ".git" not in p.parts), before)
 
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
@@ -3093,6 +3507,177 @@ class RequirementsTests(unittest.TestCase):
             agent = module.build_agent(ba.Settings())
             self.assertEqual(agent.name, name)
             self.assertTrue(agent.contract_catalog()["tools"])
+
+
+class RequirementDocumentTests(unittest.TestCase):
+    """A1-RQ1 .. A1-RQ6: requirement documents given for a run - read, copied, linked and reported."""
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.d = Path(self.tmp.name)
+        self.repo = copy_pilot("c_pilot", self.d)
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs/requirements.md").write_text("- REQ-TH-20: clamp_percent keeps 0..99 only.\n")
+        self.outside = self.d / "spec"
+        self.outside.mkdir()
+        (self.outside / "srs.csv").write_text("Req ID;Requirement\nREQ-TH-20;clamp_percent limits the value to 0..100\n"
+                                              "REQ-TH-21;select_mode returns MODE_ECO when nobody is home\n")
+        (self.outside / "notes.md").write_text("# Notes\n\nNothing with an ID here.\n")
+        (self.outside / "srs.docx").write_bytes(b"PK\x03\x04 not read")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_documents_are_copied_unchanged_and_what_cannot_be_read_is_reported(self):
+        target = self.d / "out" / "requirements"
+        docs, notes = up.gather_requirements([str(self.outside), "docs/requirements.md", "missing.reqif"],
+                                             self.repo, target)
+        names = sorted(doc.name for doc in docs)
+        self.assertEqual(names, ["requirements/notes.md", "requirements/requirements.md", "requirements/srs.csv"])
+        csv_doc = next(doc for doc in docs if doc.name.endswith("srs.csv"))
+        self.assertEqual(Path(csv_doc.path).read_bytes(), (self.outside / "srs.csv").read_bytes())    # A1-RQ3
+        self.assertEqual(csv_doc.sha256, uc.file_sha256(self.outside / "srs.csv"))
+        self.assertTrue(any("srs.docx" in n and "A1-RQ2" in n for n in notes), notes)
+        self.assertTrue(any("missing.reqif" in n and "does not exist" in n for n in notes), notes)  # A1-RQ6
+        self.assertFalse(any(p.name == "srs.csv" for p in self.repo.rglob("*")))         # never into the repository
+
+    def test_documents_per_repository_in_the_configuration(self):
+        raw = {"requirements": {"_comment": "x", "https://git.example.com/team/fw.git/": ["docs/srs.reqif"],
+                                str(self.repo): ["docs/requirements.md"]}}
+        self.assertEqual(up.configured_requirements(raw, "https://git.example.com/team/fw"), ["docs/srs.reqif"])
+        self.assertEqual(up.configured_requirements(raw, str(self.repo) + "/"), ["docs/requirements.md"])
+        self.assertEqual(up.configured_requirements(raw, "https://git.example.com/team/other"), [])
+
+    def test_given_documents_are_e1_evidence_and_win_a_conflict(self):
+        docs, _ = up.gather_requirements([str(self.outside)], self.repo, self.d / "out" / "requirements")
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/thermostat.c",
+                                                   requirement_documents=docs))
+        self.assertEqual([d.name for d in layout.given_requirements], ["requirements/srs.csv"])
+        notes = " | ".join(layout.requirement_notes)
+        self.assertIn("notes.md", notes)                                                    # no requirement ID
+        self.assertIn("A1-RQ6", notes)
+        self.assertIn("conflict: REQ-TH-20 is stated differently in requirements/srs.csv:2", notes)   # A1-RQ4
+        self.assertIn("docs/requirements.md:1", notes)
+        ev = agent.collect_evidence(layout, "clamp_percent").evidence
+        e1 = [e for e in ev if e.evidence_class == "E1"]
+        self.assertEqual([(e.source, e.line) for e in e1], [("requirements/srs.csv", 2)])  # the given text is used
+        self.assertIn("0..100", e1[0].text)
+
+    def test_status_per_function_counts_only_asserting_tests_that_passed(self):
+        docs, _ = up.gather_requirements([str(self.outside / "srs.csv")], self.repo, self.d / "out" / "requirements")
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/thermostat.c",
+                                                   requirement_documents=docs))
+        e1 = next(e for e in agent.collect_evidence(layout, "clamp_percent").evidence if e.evidence_class == "E1")
+        suite = (f"/* evidence: E1 */\nUT_TEST(test_clamp_high)\n{{\n    /* S-1: high [{e1.evidence_id}] */\n"
+                 f"    UT_EXPECT_EQ_INT(clamp_percent(150), 100);\n}}\n\n"
+                 f"/* evidence: E8 */\nUT_TEST(test_clamp_seen)\n{{\n    /* S-2: seen [{e1.evidence_id}] */\n"
+                 f"    UT_EXPECT_EQ_INT(clamp_percent(5), 5);\n}}\n")
+        status = {f.function: f for f in agent.requirement_status(uc.RequirementStatusRequest(
+            layout=layout, suite=suite, passed=["test_clamp_high", "test_clamp_seen"])).functions}
+        self.assertEqual(status["clamp_percent"].requirements,
+                         ["REQ-TH-20 (rule) requirements/srs.csv:2: asserted by test_clamp_high"])
+        self.assertTrue(status["clamp_percent"].stated)
+        failed = {f.function: f for f in agent.requirement_status(uc.RequirementStatusRequest(
+            layout=layout, suite=suite, passed=[])).functions}
+        self.assertIn("not asserted by a test", failed["clamp_percent"].requirements[0])   # a failed test counts not
+        (self.repo / "src/plain.c").write_text("int plain(int x)\n{\n    return x + 1;\n}\n")
+        plain = agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/plain.c"))
+        listed = agent.requirement_status(uc.RequirementStatusRequest(layout=plain)).functions
+        self.assertEqual([(f.function, f.requirements, f.stated) for f in listed], [("plain", [], False)])
+
+    def test_mcp_clients_name_documents_inside_the_repository_only(self):
+        tools = {t.name: t for t in up.PipelineAgent().tools()}
+        for name, model in (("run_pipeline", uc.PipelineRequest(repo_root=str(self.repo), sut_file="src/thermostat.c",
+                                                                 requirements=[str(self.outside / "srs.csv")])),
+                            ("run_repository", uc.RepositoryRequest(repository=str(self.repo), sut_files=["src/a.c"],
+                                                                    requirements=["../spec/srs.csv"]))):
+            with self.assertRaises(ba.ContractRejected):
+                tools[name].precondition(model, None)
+        tools["run_pipeline"].precondition(uc.PipelineRequest(repo_root=str(self.repo), sut_file="src/thermostat.c",
+                                                              requirements=["docs/requirements.md"]), None)
+
+
+class SelectionTests(unittest.TestCase):
+    """ORC-35: the production files of a working tree, without an LLM."""
+    def test_production_files_and_the_reasons_for_the_others(self):
+        with tmpdir() as d:
+            root = Path(d)
+            files = {
+                "src/motor.c": "int motor(int x)\n{\n    return x;\n}\n",
+                "src/Engine.cpp": "namespace fw {\nint Engine::run(int a) const\n{\n    return a;\n}\n}\n",
+                "src/tables.c": "const int table[3] = {1, 2, 3};\n",
+                "src/gen_regs.c": "/* Auto-generated by regtool - DO NOT EDIT */\nint regs(void)\n{\n    return 0;\n}\n",
+                "src/motor_test.c": "int t(void)\n{\n    return 0;\n}\n",
+                "src/MotorTest.cpp": "int t2(void)\n{\n    return 0;\n}\n",
+                "src/old_suite.c": "/* test_x.c - generated by agent_unittest_generator for src/x.c */\nint o(void)\n{\n    return 0;\n}\n",
+                "unit_tests/check.c": "int c(void)\n{\n    return 0;\n}\n",
+                "examples/demo.c": "int main(void)\n{\n    return 0;\n}\n",
+                "build-arm/obj.c": "int b(void)\n{\n    return 0;\n}\n",
+                "lib/fatfs/LICENSE.txt": "BSD",
+                "lib/fatfs/ff.c": "int ff(void)\n{\n    return 0;\n}\n",
+                "ext/sub/s.c": "int s(void)\n{\n    return 0;\n}\n",
+                "include/motor.h": "int motor(int x);\n",
+                ".gitmodules": "[submodule \"ext/sub\"]\n\tpath = ext/sub\n\turl = https://example.com/sub.git\n",
+                "LICENSE": "MIT",
+            }
+            for rel, text in files.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            sel = a1.select_production_files(root)
+            self.assertEqual(sel.selected, ["src/Engine.cpp", "src/motor.c"])
+            why = dict(line.split(": ", 1) for line in sel.left_out)
+            self.assertEqual(why, {
+                "build-arm/obj.c": "build output", "examples/demo.c": "example or documentation",
+                "ext/sub/s.c": "third-party code (git submodule)",
+                "lib/fatfs/ff.c": "third-party code (a folder with its own license file)",
+                "src/MotorTest.cpp": "test code", "src/gen_regs.c": "generated code", "src/motor_test.c": "test code",
+                "src/old_suite.c": "the pipeline's own file", "src/tables.c": "no function definition",
+                "unit_tests/check.c": "test code"})
+            (root / "compile_commands.json").write_text(json.dumps([{"directory": str(root / "build"),
+                                                                     "file": "../src/motor.c", "command": "cc"}]))
+            sel = a1.select_production_files(root, str(root / "compile_commands.json"), limit=5)
+            self.assertEqual(sel.selected, ["src/motor.c"])
+            self.assertIn("src/Engine.cpp: not compiled by the build (compile database)", sel.left_out)
+            sel = a1.select_production_files(root, limit=1)
+            self.assertEqual(sel.selected, ["src/Engine.cpp"])
+            self.assertIn("src/motor.c: over the limit of 1 files (ORC-7)", sel.left_out)
+
+
+class TargetDependencyTests(unittest.TestCase):
+    """A1-DA12: a real dependency whose file does not compile on the host (an RTOS port) is stubbed."""
+    def test_error_in_the_file_of_a_real_definition(self):
+        port = "FreeRTOS-Kernel/portable/GCC/ARM_CM4F/port.c"
+        message = ("the build did not link: port.c:38:6: error: This port can only be used when the project options "
+                   "are configured to enable hardware floating point support.")
+        self.assertTrue(uc.real_source_error(port, message))
+        self.assertTrue(uc.real_source_error(port, "/w/FreeRTOS-Kernel/portable/GCC/ARM_CM4F/port.c:12: fatal error: x"))
+        self.assertFalse(uc.real_source_error(port, "export.c:38:6: error: x"))
+        self.assertFalse(uc.real_source_error(port, "port.c:38:6: warning: unused"))
+        dep = uc.Dependency(name="vPortEnterCritical", declaration="void vPortEnterCritical(void);", decision="real",
+                            decided_by="llm", definition=port)
+        last = uc.VerificationResult(run_id="r", stage="build_check", sut_sha256="x", suite_sha256="", build_ok=False,
+                                     decision="setup_blocked", reason=message)
+        self.assertIn("does not compile here", a1.AnalyzerAgent._revision(dep, last, None))
+
+
+class ReadOnceTests(unittest.TestCase):
+    """A1-31b: the working copy is read once per run; a changed file is read again."""
+    def test_sources_are_read_again_only_when_changed(self):
+        with tmpdir() as d:
+            repo = copy_pilot("c_pilot", Path(d))
+            (repo / "src/caller.c").write_text("void tick(void) { (void)clamp_percent(3); }\n")
+            agent = a1.AnalyzerAgent()
+            layout = agent.discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+            first = [e for e in agent.collect_evidence(layout, "clamp_percent").evidence if e.evidence_class == "E6"]
+            self.assertEqual([(e.source, e.text) for e in first], [("src/caller.c", "void tick(void) { (void)clamp_percent(3); }")])
+            with mock.patch.object(Path, "read_text", side_effect=AssertionError("read again")) as reads:
+                agent._source_texts(repo)                                                 # nothing changed
+            self.assertFalse(reads.called)
+            time.sleep(0.01)
+            (repo / "src/caller.c").write_text("void tick(void)\n{\n    (void)clamp_percent(4);\n}\n")
+            again = [e for e in agent.collect_evidence(layout, "clamp_percent").evidence if e.evidence_class == "E6"]
+            self.assertEqual([(e.line, e.text) for e in again], [(3, "(void)clamp_percent(4);")])
 
 
 # ============================================================================ the parallel runner [TP-20]

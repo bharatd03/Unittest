@@ -698,8 +698,11 @@ class CompilationConfig(BaseModel):
     search_executions: int = 200_000   # ut_search without libFuzzer: executions per function [A3-FZ10]
     search_seed: int = 1               # its fixed pseudo-random seed [A3-FZ10]
     search_input_timeout: int = 5      # seconds one input may run before it counts as a hang [A3-FZ10]
+    search_restarts: int = 20          # ut_search starts again after a crash, at most this often [A3-FZ12]
     flag_rounds: int = 2               # A3-BD12, ORC-7
     flag_context_chars: int = 12_000   # build files given to the brain [A3-BD11]
+    repair_rounds: int = 2             # brain repairs of the generated files per build [A3-CL14, ORC-7]
+    rule_attempts: int = 2             # brain attempts per rule failure, re-ask included [ARCH-21, ORC-7]
 
 
 class FlagSuggestion(BaseModel):
@@ -711,6 +714,44 @@ class FlagSuggestion(BaseModel):
 class FlagSuggestions(BaseModel):
     flags: list[FlagSuggestion]
 
+
+class FileEdit(BaseModel):
+    path: str = Field(description="a generated file named in GENERATED FILES, relative to the repository")
+    old: str = Field(description="text copied exactly from that file; it must occur exactly once")
+    new: str = Field(description="its replacement")
+
+
+class BuildRepair(BaseModel):
+    edits: list[FileEdit] = Field(description="edits of the generated files only", max_length=12)
+    reason: str = Field(description="one sentence: what was wrong and what the edits change")
+
+
+REPAIR_TASK = (
+    "The unit-test program does not build. The errors are in files this pipeline GENERATED (stub header and "
+    "source, the includes and declarations of the test suite, the SUT access file) or in a project header those "
+    "files reach in the wrong way. Repair the GENERATED FILES only. Return JSON {\"edits\": [{\"path\", \"old\", "
+    "\"new\"}], \"reason\"}: old is copied exactly from that file and occurs once in it. Typical causes: headers "
+    "included in an order the project does not use (the SUT's own include lines show the order it compiles with), "
+    "a type that needs its namespace, a variable declared const and then assigned, an initializer the type does "
+    "not accept, a declaration that conflicts with the project's. Never change a UT_EXPECT or UT_OBSERVE line, a "
+    "UT_TEST name, or which SUT functions a test calls; never touch the SUT, the harness or a project file.")
+
+class HostAdaptation(BaseModel):
+    """A3-BD16: what lets the target code compile on the host, without changing it."""
+    flags: list[str] = Field(default_factory=list, description="-DNAME[=value], -UNAME, -I<folder>, -std=...",
+                             max_length=20)
+    compat_header: str = Field(default="", description="content of ut_target_compat.h, force-included: only "
+                               "#define/#undef/#if, typedefs and declarations or static inline definitions")
+    reason: str = Field(description="one sentence: what the target code uses that the host compiler lacks")
+
+
+HOST_TASK = (
+    "This C/C++ file is target code (an embedded compiler, a vendor SDK). With the project's own build flags it "
+    "does not compile on the host compiler (clang) used for its unit tests. Give host definitions that let it "
+    "compile WITHOUT changing the file: flags (-D, -U, -I, -std) and/or the content of a compatibility header "
+    "that is force-included (for example #define __ramfunc, a typedef the target header gets from the compiler, "
+    "a static inline version of a compiler intrinsic). Never define a function the file itself defines. Return "
+    "JSON {\"flags\": [...], \"compat_header\": \"...\", \"reason\": \"...\"}.")
 
 FLAG_TASK = (
     "The project's build could not be run, so the C/C++ file below is compiled without its defines and include "
@@ -2064,6 +2105,82 @@ int main(int argc, char **argv) {
 """
 SEARCH_FLAGS = ["-fsanitize-coverage=trace-pc,trace-cmp"]   # comparison operands, no section symbols [A3-FZ9]
 
+# A3-FZ12: the register windows of A3-HW1 in fuzz targets and their replay programs. Installed at the first input,
+# after the fuzzer's own handlers, which it calls for an access outside the windows (a real crash).
+FUZZ_REGISTERS = r"""
+#ifndef UT_REG_WINDOWS
+#define UT_REG_WINDOWS 0x40000000ULL, 0x60000000ULL, 0xE0000000ULL, 0xE0100000ULL
+#endif
+static const unsigned long long ut_fz_windows[] = { UT_REG_WINDOWS };
+#define UT_FZ_MAX_PAGES 256
+static void *ut_fz_pages[UT_FZ_MAX_PAGES];
+static volatile int ut_fz_npages;
+static size_t ut_fz_page = 4096;
+static int ut_fz_installed;
+static int ut_fz_in_window(unsigned long long a) {
+    size_t k;
+    for (k = 0; k + 1 < sizeof ut_fz_windows / sizeof ut_fz_windows[0]; k += 2)
+        if (a >= ut_fz_windows[k] && a < ut_fz_windows[k + 1]) return 1;
+    return 0;
+}
+#if defined(_WIN32)
+#include <windows.h>
+static LONG WINAPI ut_fz_fault(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->ExceptionRecord->NumberParameters >= 2) {
+        unsigned long long a = (unsigned long long)e->ExceptionRecord->ExceptionInformation[1];
+        if (ut_fz_in_window(a) && ut_fz_npages < UT_FZ_MAX_PAGES) {
+            void *base = (void *)(uintptr_t)(a & ~(unsigned long long)(ut_fz_page - 1));
+            void *p = VirtualAlloc(base, ut_fz_page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p == base) { ut_fz_pages[ut_fz_npages++] = p; return EXCEPTION_CONTINUE_EXECUTION; }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+static struct sigaction ut_fz_prev_segv, ut_fz_prev_bus;
+static void ut_fz_fault(int sig, siginfo_t *si, void *ctx) {
+    unsigned long long a = (unsigned long long)(uintptr_t)si->si_addr;
+    struct sigaction *prev = sig == SIGBUS ? &ut_fz_prev_bus : &ut_fz_prev_segv;
+    if (ut_fz_in_window(a) && ut_fz_npages < UT_FZ_MAX_PAGES) {
+        void *base = (void *)(uintptr_t)(a & ~(unsigned long long)(ut_fz_page - 1));
+        void *p = mmap(base, ut_fz_page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_FIXED_NOREPLACE
+                       | MAP_FIXED_NOREPLACE
+#endif
+                       , -1, 0);
+        if (p == base) { ut_fz_pages[ut_fz_npages++] = p; return; }
+        if (p != MAP_FAILED) munmap(p, ut_fz_page);
+    }
+    if ((prev->sa_flags & SA_SIGINFO) && prev->sa_sigaction) { prev->sa_sigaction(sig, si, ctx); return; }
+    if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN && prev->sa_handler) { prev->sa_handler(sig); return; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+static void ut_fz_registers(void) {
+    int k;
+    if (!ut_fz_installed) {
+        ut_fz_installed = 1;
+#if defined(_WIN32)
+        ut_fz_page = 0x10000;
+        AddVectoredExceptionHandler(1, ut_fz_fault);
+#else
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        ut_fz_page = (size_t)sysconf(_SC_PAGESIZE);
+        sa.sa_sigaction = ut_fz_fault;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigaction(SIGSEGV, &sa, &ut_fz_prev_segv);
+        sigaction(SIGBUS, &sa, &ut_fz_prev_bus);
+#endif
+    }
+    for (k = 0; k < ut_fz_npages; ++k) memset(ut_fz_pages[k], 0, ut_fz_page);
+}
+"""
+
 
 def _plain(t: str) -> str:
     return re.sub(r"\s+", " ", t.replace("const ", "").replace("volatile ", "")).strip()
@@ -2082,9 +2199,21 @@ class FuzzPlan:
         self.budget = budget
         self.lines: list[str] = []
         self.prints: list[str] = []
+        self.pointees: dict[str, list[str]] = {}       # struct label -> objects its pointer fields point to
+        self.body = ""                                  # the function's source: which fields it checks for NULL
         self.size = 0
         self.problem = ""
-        self.controls = [(n, _plain(t)) for n, t in controls if SCALAR.match(_plain(t)) and _plain(t) != "void"]
+        self.controls = [(n, r) for n, t in controls for r in [self._resolve(_plain(t))]
+                         if SCALAR.match(r) and r != "void"]
+
+    def _resolve(self, t: str) -> str:
+        """A1-DA21: a project typedef resolved to the type it names (kTick_t -> uint32_t)."""
+        for _ in range(8):
+            nxt = self.layout.typedefs.get(t) or self.layout.typedefs.get(t.split("::")[-1])
+            if not nxt or _plain(nxt) == t:
+                break
+            t = _plain(nxt)
+        return t
 
     def take(self, var: str, ctype: str) -> None:
         self.lines.append(f"    {ctype} {var}; ut_take(&{var}, sizeof {var});")
@@ -2103,7 +2232,7 @@ class FuzzPlan:
     def sanitize_float(self, expr: str) -> None:
         self.lines.append(f"    if (!(({expr}) == ({expr})) || ({expr}) > 1e15 || ({expr}) < -1e15) {expr} = 0;")
 
-    def fields(self, base: str, fields: list[uc.FieldInfo], label: str) -> bool:
+    def fields(self, base: str, fields: list[uc.FieldInfo], label: str, top: bool = True) -> bool:
         """Prints a struct as an aggregate initializer {a, b, {c, d}}; scalar fields only."""
         self.prints.append('printf("{");')
         for k, f in enumerate(fields):
@@ -2122,8 +2251,22 @@ class FuzzPlan:
                     self._print_raw(f"{expr}[{j}]", re.sub(r"\[.*$", "", f.type), "float" if FLOAT_T.search(f.type) else "int")
                 self.prints.append('printf("}");')
             elif f.kind == "struct" and f.fields:
-                if not self.fields(expr, f.fields, label):
+                if not self.fields(expr, f.fields, label, top=False):
                     return False
+            elif f.kind == "callback":                         # no function to call: NULL [A1-DA21]
+                self.lines.append(f"    {expr} = 0;")
+                self.prints.append('printf("0");')
+            elif f.kind == "pointer" and top:                   # a zeroed object of its own [A3-FZ2, A2-21ad]
+                var = f"ut_p{label[1:]}_{k}"
+                definition, address = uc.pointee_object(f.base, var, self.cpp)
+                self.pointees.setdefault(label, []).append(definition)
+                if uc.null_checked(f.name, self.body):           # NULL too, chosen by an input byte
+                    self.take(f"{var}_z", "unsigned char")
+                    self.lines.append(f"    {definition} {expr} = ({var}_z % 4u) == 0 ? 0 : {address};")
+                    self.prints.append(f'printf("%s", ({var}_z % 4u) == 0 ? "0" : "{address}");')
+                else:
+                    self.lines.append(f"    {definition} {expr} = {address};")
+                    self.prints.append(f'printf("{address}");')
             else:
                 self.problem = f"field {f.name} of type {f.type} cannot be generated"
                 return False
@@ -2173,7 +2316,7 @@ class FuzzPlan:
                 table = ", ".join(names)
                 self.lines.append(f"    static const {t} {var}_t[] = {{{table}}};")
                 args.append(f"{var}_t[{var}_i]")
-            elif p.kind == "ptr_scalar" and SCALAR.match(_plain(p.base)):
+            elif p.kind == "ptr_scalar" and SCALAR.match(self._resolve(_plain(p.base))):
                 base = _plain(p.base)
                 self.take(f"{var}_v", "unsigned char" if "bool" in base else base)
                 if FLOAT_T.search(base):
@@ -2206,8 +2349,11 @@ class FuzzPlan:
         include_stubs = "#include \"ut_stubs.h\"\n" if any(n.startswith("ut_stub_") for n, _ in self.controls) else ""
         return "\n".join([
             "/* libFuzzer target generated by agent_unittest_compilation [A3-FZ2]. */",
+            "#if !defined(_WIN32) && !defined(_GNU_SOURCE)\n#define _GNU_SOURCE 1\n#endif",       # sigaction, mmap [A3-FZ12]
+            "#if !defined(_WIN32) && !defined(_DARWIN_C_SOURCE)\n#define _DARWIN_C_SOURCE 1\n#endif",
             "#include <stdint.h>", "#include <stddef.h>", "#include <string.h>", "#include <stdio.h>",
             "#include <stdlib.h>", "#include <setjmp.h>", "" if self.cpp else "#include <stdbool.h>",
+            FUZZ_REGISTERS,                                                                           # A3-FZ12
             '#include "ut_harness.h"', include_stubs + f'#include "{str(sut).replace(chr(92), "/")}"',
             # an input that keeps calling stubs ends like a test over its call budget [A3-45b]
             "static jmp_buf ut_fz_jump; static unsigned long ut_fz_calls; static volatile int ut_fz_active;",
@@ -2222,6 +2368,7 @@ class FuzzPlan:
             "(unsigned)(unsigned char)*s); printf(\"\\\"\"); }",
             ('extern "C" ' if self.cpp else "") + "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {",
             "    ut_p = data; ut_left = size;",
+            "    ut_fz_registers();",                                                                  # A3-FZ12
             "    ut_before_each();",
             "    ut_fz_calls = 0;",
             "    if (setjmp(ut_fz_jump) != 0) { ut_fz_active = 0; return 0; }",
@@ -2264,6 +2411,7 @@ class FuzzPlan:
                     args.append(f"&ut_v{i}")
             elif p.kind in ("struct", "ptr_struct"):
                 base = _plain(p.base or p.type)
+                setup += self.pointees.get(f"T{i}", [])                                    # A3-FZ2, A2-21ad
                 setup.append(f"{base} ut_v{i} = {values.get(f'T{i}', '{0}')};")
                 args.append(f"&ut_v{i}" if p.kind == "ptr_struct" else f"ut_v{i}")
             elif p.kind == "cstring":
@@ -2340,6 +2488,7 @@ class CompilationAgent(ba.AgentCore):
         def run(stage):
             async def work(payload: uc.VerifyRequest, request, scratch):
                 result = await asyncio.to_thread(self.execute, payload)
+                result = await self._repair_generated(result, payload)                      # A3-CL14
                 return await self._refine(result, payload)
             return work
 
@@ -2540,10 +2689,92 @@ class CompilationAgent(ba.AgentCore):
             return ([f"-I{token}"] if m.group(1) == "-I" else ["-include", token]), ""
         return [], f"{flag}: only -D, -U, -I, -include and -std= are accepted [A3-BD12]"
 
+    def _host_problem(self, answer: HostAdaptation, layout: uc.LayoutProfile, repo: Path) -> str:
+        """A3-BD16: only flags of A3-BD12's kinds inside the working copy, and a header that defines none of the
+        SUT's own functions and includes no source file."""
+        for flag in answer.flags:
+            f = flag.strip()
+            if not re.match(r"^(-D[A-Za-z_]\w*(=.*)?|-U[A-Za-z_]\w*|-I\S+|-std=\S+)$", f):
+                return f"flag {f!r} is not -D, -U, -I or -std"
+            if f.startswith("-I"):
+                folder = (repo / f[2:]).resolve()
+                if not folder.is_dir() or not folder.is_relative_to(repo):
+                    return f"include folder {f[2:]} is not a folder of the working copy"
+        text = uc.without_comments(answer.compat_header)
+        if re.search(r'#\s*include\s*["<][^">]+\.(c|cc|cpp|cxx)[">]', text):
+            return "the compatibility header must not include a source file"
+        own = {f.name.split("::")[-1] for f in layout.functions}
+        defined = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{", text)}
+        clash = sorted(own & defined)
+        if clash:
+            return f"the compatibility header defines functions of the SUT: {', '.join(clash[:4])}"
+        if not answer.flags and not answer.compat_header.strip():
+            return "no flag and no header"
+        return ""
+
+    async def _host_adaptation(self, build: uc.BuildDescription, layout: uc.LayoutProfile, repo: Path,
+                               chain: "Toolchain", errors: list[str]) -> uc.BuildDescription:
+        """A3-BD16, ARCH-21: a captured build whose SUT does not compile on the host after the tables of A3-HW2 and
+        A3-HW3: the brain proposes host definitions, the compiler decides. The user's files are never changed."""
+        uc.resolution_project(self, layout)
+        folder = Path(self.cfg.work_dir).resolve() / "host" / layout.sut_sha256[:16]
+        kept: dict[str, Any] = {}
+
+        def extra_of(answer: HostAdaptation) -> list[str]:
+            extra = [f.strip() for f in answer.flags]
+            if answer.compat_header.strip():
+                folder.mkdir(parents=True, exist_ok=True)
+                header = folder / "ut_target_compat.h"
+                header.write_text("/* ut_target_compat.h - host definitions for target code, proposed by the brain "
+                                  "and kept because the SUT then compiles with fewer errors [A3-BD16]. */\n"
+                                  + answer.compat_header.strip() + "\n", encoding="utf-8")
+                extra += ["-include", str(header).replace("\\", "/")]
+            return extra
+
+        async def compile_with(answer: HostAdaptation) -> str:
+            problem = self._host_problem(answer, layout, repo)
+            if problem:
+                return problem
+            extra = extra_of(answer)
+            left = await asyncio.to_thread(self._sut_errors, layout, repo, chain, extra)
+            if len(left) < len(errors):
+                kept.update(extra=extra, left=left, reason=answer.reason)
+                return ""
+            return "with these definitions the SUT still does not compile:\n" + "\n".join(left[:12])
+
+        failure = ba.RuleFailure(rule="A3-BD16 host adaptation", failure="the SUT does not compile on the host with "
+                                 "the captured flags and the tables of target keywords and assembly",
+                                 subject=Path(layout.sut_file).suffix, message="\n".join(errors[:12]))
+        sut_text = uc.read_source(repo / layout.sut_file)
+        context = [uc.part("facts", "\n\n".join([
+            f"SUT: {layout.sut_file} ({'C++' if layout.language == 'cpp' else 'C'})",
+            "COMPILER ERRORS:\n" + "\n".join(errors[:40]),
+            "FLAGS ALREADY USED:\n" + (" ".join(build.sut_flags) or "-")])),
+            uc.part("SUT", sut_text[:12_000], uc.P_EVIDENCE, min_chars=3000)]
+        answer = await self.resolve(failure, task=HOST_TASK, context=context, output_model=HostAdaptation,
+                                    verify=compile_with, step="A3.host", attempts=self.cfg.rule_attempts,
+                                    project=layout.repo_root, need=ba.OutputNeed(items=1, tokens_per_item=500, overhead=200))
+        if answer is None or "extra" not in kept:
+            build.notes.append("the SUT does not compile on the host and no host adaptation was found [A3-BD16]: "
+                               + "; ".join(errors[:3]))
+            return build
+        build.sut_flags = list(build.sut_flags) + kept["extra"]
+        for entry in build.entries:
+            if entry.file == layout.sut_file:
+                entry.flags = list(entry.flags) + kept["extra"]
+        build.host_adaptation = [f"{' '.join(kept['extra'])} - {kept['reason']}"[:400]]
+        build.notes.append(f"host adaptation by the brain: {' '.join(kept['extra'])}; {len(kept['left'])} SUT "
+                           "error(s) left [A3-BD16]")
+        return build
+
     async def suggest_flags(self, req: uc.FlagRequest) -> uc.BuildDescription:
         build = req.build.model_copy(deep=True)
-        if not build.estimated:
-            return build
+        if not build.estimated:                                   # A3-BD16: a captured build that the host rejects
+            chain = self.toolchain()
+            repo = Path(req.layout.repo_root).resolve()
+            layout = req.layout.model_copy(update={"compile_flags": list(build.sut_flags), "build": build})
+            errors = await asyncio.to_thread(self._sut_errors, layout, repo, chain, [])
+            return await self._host_adaptation(build, layout, repo, chain, errors) if errors else build
         chain = self.toolchain()
         repo = Path(req.layout.repo_root).resolve()
         layout = req.layout.model_copy(update={"compile_flags": list(build.sut_flags), "build": build})
@@ -2923,7 +3154,8 @@ class CompilationAgent(ba.AgentCore):
         sut_flags = self.sut_flags(layout, repo)
         std = [] if any(f.startswith("-std=") for f in sut_flags) else \
             [f"-std={self.cfg.cxx_std}" if is_cpp else f"-std={self.cfg.c_std}"]
-        test_incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}"]
+        test_incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}",
+                     f"-iquote{repo / Path(layout.sut_file).parent}"]        # the SUT's neighbouring headers [A2-21ad]
         actions = list(req.bundle.actions) if req.bundle else []
         access = next((a for a in actions if a.role == "sut_access"), None)
         # (path, role, instrument, flags) - only the SUT, or the file that includes it, is instrumented
@@ -3393,6 +3625,108 @@ class CompilationAgent(ba.AgentCore):
                 return name
         return ""
 
+    # ---------------------------------------------------------------- repair of the generated files [A3-CL14]
+    GENERATED_ROLES = ("stub", "helper", "sut_access", "testsuite")
+
+    def _repairable(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> list[uc.Diagnostic]:
+        """The build errors a repair of the generated files may fix: none in the SUT itself (that is the host
+        adaptation of A3-BD16 or a source defect), none that only a second SUT object explains (A3-CL13)."""
+        if result.link_ok or not req.bundle or req.source_overrides or req.stage not in ("build_check", "verify", "observe"):
+            return []
+        if any("[A3-CL13]" in e for f in result.failures for e in f.evidence):
+            return []
+        errors = [d for d in result.diagnostics if d.severity in ("error", "fatal")]
+        if not errors or any(d.role == "sut" for d in errors):
+            return []
+        return errors
+
+    @staticmethod
+    def _apply_edits(bundle: uc.FileActionBundle, repair: BuildRepair) -> tuple[uc.FileActionBundle | None, str]:
+        """The bundle with the brain's edits, or the reason they are refused: only generated files, a fragment
+        that occurs once, and no change to what a test asserts, observes or is called [A3-CL14, A3-85a]."""
+        actions = {a.path: a for a in bundle.actions}
+        changed: dict[str, str] = {}
+        for e in repair.edits:
+            path = e.path.replace("\\", "/").lstrip("./")
+            action = actions.get(path) or next((a for p, a in actions.items() if p.endswith("/" + path)), None)
+            if action is None:
+                return None, f"{e.path} is not a generated file of this build"
+            text = changed.get(action.path, action.content)
+            if not e.old or text.count(e.old) != 1:
+                return None, f"the fragment to replace does not occur exactly once in {action.path}"
+            changed[action.path] = text.replace(e.old, e.new, 1)
+        for path, text in changed.items():
+            before = actions[path].content
+            checks = lambda t: (sorted(line.strip() for line in t.splitlines() if re.search(r"\bUT_(EXPECT|OBSERVE)", line)),
+                                sorted(uc.test_sources(t)))
+            if checks(text) != checks(before):
+                return None, f"{path}: a UT_EXPECT / UT_OBSERVE line or a test name would change [A3-CL14]"
+        if not changed:
+            return None, "no edit"
+        return bundle.model_copy(update={"actions": [a.model_copy(update={"content": changed[a.path]})
+                                                     if a.path in changed else a for a in bundle.actions]}), ""
+
+    def _context_of_repair(self, req: uc.VerifyRequest, result: uc.VerificationResult) -> list[ba.ContextPart]:
+        layout = req.layout
+        sut = Path(layout.repo_root) / layout.sut_file
+        prologue = uc.sut_prologue(uc.read_source(sut) if sut.is_file() else "", layout.functions, layout.header_sut)
+        messages = "\n".join(f"{d.file}:{d.line}:{d.column}: {d.severity}: {d.message}" for d in result.diagnostics
+                             if d.severity in ("error", "fatal"))[:6000]
+        parts = [uc.part("compiler errors", messages), uc.part("SUT include lines (the order it compiles with)",
+                                                               "\n".join(prologue) or "(none)")]
+        for action in req.bundle.actions:
+            text = action.content
+            if action.role == "testsuite":                 # its includes and declarations, then a few tests
+                first = re.search(r"^(?:/\*\s*evidence:.*\n)?UT_TEST\(", text, re.M)
+                head = text[: first.start()] if first else text
+                text = head + "\n/* ... tests ... */\n" + text[first.start(): first.start() + 1500] if first else head
+            parts.append(uc.part(f"GENERATED FILE {action.path}", text[:12_000],
+                                 priority=uc.P_FACTS if action.role != "testsuite" else uc.P_EVIDENCE))
+        return parts
+
+    async def _repair_generated(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> uc.VerificationResult:
+        """A3-CL14: the rules (A3-CL12, A3-CL13, A3-HW2, A3-HW3) left the build failing in generated files: the
+        brain repairs them, the compiler decides (ARCH-21). The repaired files go back to the orchestrator."""
+        errors = self._repairable(result, req)
+        if not errors:
+            return result
+        uc.resolution_project(self, req.layout)
+        bundle, current = req.bundle, result
+        for _ in range(max(1, self.cfg.repair_rounds)):
+            first = errors[0]
+            failure = ba.RuleFailure(
+                rule="A3-CL14 generated files", failure="the test program does not build: the errors are in files the "
+                "pipeline generated", subject=f"{Path(first.file).name}: {first.category} {first.symbol}".strip(),
+                message="\n".join(f"{Path(d.file).name}:{d.line}: {d.message}" for d in errors[:8]))
+            trial: dict[str, Any] = {}
+
+            async def build_with(repair: BuildRepair) -> str:
+                candidate, problem = self._apply_edits(bundle, repair)
+                if candidate is None:
+                    return problem
+                attempt = await asyncio.to_thread(self.execute, req.model_copy(update={"bundle": candidate}))
+                left = [d for d in attempt.diagnostics if d.severity in ("error", "fatal")]
+                if attempt.link_ok or len(left) < len(errors):
+                    trial.update(bundle=candidate, result=attempt, errors=left)
+                    return ""
+                return "with these edits the build still fails:\n" + "\n".join(
+                    f"{Path(d.file).name}:{d.line}: {d.message}" for d in left[:8])
+
+            answer = await self.resolve(failure, task=REPAIR_TASK, context=self._context_of_repair(req.model_copy(
+                update={"bundle": bundle}), current), output_model=BuildRepair, verify=build_with, step="A3.repair",
+                attempts=self.cfg.rule_attempts, project=req.layout.repo_root,
+                need=ba.OutputNeed(items=4, tokens_per_item=300, overhead=300))
+            if answer is None or "result" not in trial:
+                break
+            bundle, current, errors = trial["bundle"], trial["result"], trial["errors"]
+            if current.link_ok:
+                break
+        if current is result:
+            return result
+        current.repaired_files = {a.path: a.content for a in bundle.actions
+                                  if a.content != next(b.content for b in req.bundle.actions if b.path == a.path)}
+        return current
+
     async def _refine(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> uc.VerificationResult:
         """Hybrid step [A3-152..176]: deterministic facts first (execute), then one typed decision
         by the brain for each remaining test failure. No brain -> undetermined, never a guess."""
@@ -3468,7 +3802,10 @@ class CompilationAgent(ba.AgentCore):
         sut_flags = self.sut_flags(layout, repo)
         std = [] if any(f.startswith("-std=") for f in sut_flags) else \
             [f"-std={self.cfg.cxx_std}" if cpp else f"-std={self.cfg.c_std}"]
-        incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}"]
+        windows = ",".join(f"0x{int(v):X}ULL" for pair in self.cfg.register_windows for v in pair[:2])
+        incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}",
+                f"-iquote{repo / Path(layout.sut_file).parent}",                    # A2-21ad
+                *([f"-DUT_REG_WINDOWS={windows}"] if windows else [])]              # A3-FZ12
         result = uc.FuzzResult(engine=engine)
         # Objects every target links: stubs and real dependencies (not instrumented).
         support = run_dir / "fuzz_support"
@@ -3504,6 +3841,7 @@ class CompilationAgent(ba.AgentCore):
             used = [(n, t) for n, t in controls if (n.startswith("ut_stub_") and n[8:-7] in calls) or
                     (not n.startswith("ut_stub_") and re.search(r"\b" + re.escape(n.split("::")[-1]) + r"\b", body))]
             plan = FuzzPlan(fn, layout, used, self.cfg.stub_call_budget)
+            plan.body = body
             source = plan.build(repo / layout.sut_file)
             if source is None:
                 result.unsupported.append(f"{fn.qualified_name}: {plan.problem}")
@@ -3530,7 +3868,8 @@ class CompilationAgent(ba.AgentCore):
                 continue
             (d / "fuzz.log").write_text(text, encoding="utf-8")
             m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text)
-            result.executions += int(m.group(1)) if m else 0
+            forked = re.findall(r"^#(\d+):\s+cov:", text, re.M)                  # -fork=1 prints progress only
+            result.executions += int(m.group(1)) if m else int(forked[-1]) if forked else 0
             # Every corpus input is measured (not only libFuzzer's merged set): the last condition of a
             # decision has no branch of its own, so its value is invisible to libFuzzer's features.
             replay = d / f"replay{EXE}"
@@ -3556,6 +3895,8 @@ class CompilationAgent(ba.AgentCore):
                                           f"{'crashed' if crash.name.startswith('crash') else 'timed out'}")
             inputs = sorted(corpus.iterdir(), key=lambda f: (not f.name.startswith("seed_"),        # A3-FZ10: in order
                                                              0 if engine == "ut_search" else f.stat().st_mtime, f.name))
+            if engine == "libFuzzer" and len(inputs) > self.cfg.max_fuzz_replays:
+                inputs = self._replay_order(inputs, d, chain)                                   # A3-FZ4
             result.inputs += self._select_inputs(fn, plan, inputs[: self.cfg.max_fuzz_replays],
                                                  replay, d, repo, layout, chain, gaps_by_fn.get(fn.name, []) +
                                                  gaps_by_fn.get(fn.qualified_name, []) if fn.name != fn.qualified_name
@@ -3563,6 +3904,22 @@ class CompilationAgent(ba.AgentCore):
         result.reason = (f"{len(result.inputs)} input(s) reach uncovered items; {result.executions} executions"
                          if result.functions else "no function could be fuzzed")
         return result
+
+    def _replay_order(self, inputs: list[Path], d: Path, chain: "Toolchain") -> list[Path]:
+        """A3-FZ4: more inputs than the replay limit - the seeds first, then the inputs libFuzzer's merge (with value
+        profiles) keeps because each adds a feature, then the newest of the others: an input found late, after
+        millions of executions, is the one that reached what the earlier ones did not."""
+        merged = d / "merged"
+        shutil.rmtree(merged, ignore_errors=True)
+        merged.mkdir()
+        _run([str(d / f"fuzz{EXE}"), "-merge=1", "-use_value_profile=1", "-timeout=5", str(merged), str(d / "corpus")],
+             d, 300, chain.env())
+        kept = {p.name for p in merged.iterdir()}            # merge names its copies by content (SHA-1)
+        by_hash = {hashlib.sha1(p.read_bytes()).hexdigest(): p for p in inputs}
+        first = [p for p in inputs if p.name.startswith("seed_")]
+        chosen = first + [by_hash[h] for h in sorted(kept) if h in by_hash and by_hash[h] not in first]
+        rest = [p for p in reversed(inputs) if p not in chosen]
+        return chosen + rest
 
     def _libfuzzer(self, chain: "Toolchain", compiler: str, cpp: bool, sut_flags: list[str], std: list[str],
                    incs: list[str], harness: Path, objects: list[str], d: Path, corpus: Path, seconds: int,
@@ -3579,7 +3936,7 @@ class CompilationAgent(ba.AgentCore):
         # -use_value_profile=1: comparison operands guide the search too; a decision that clang emits as a
         # select (a ?: with constant arms) has no branch edge of its own [A3-FZ1]
         code, text = _run([str(fuzzer), str(corpus), f"-max_total_time={seconds}", "-seed=1", "-len_control=0",
-                           "-use_value_profile=1",
+                           "-use_value_profile=1", "-fork=1", "-ignore_crashes=1", "-ignore_timeouts=1",   # A3-FZ12
                            f"-max_len={max(64, plan.size + 16)}", "-timeout=5", "-rss_limit_mb=2048",
                            f"-artifact_prefix={d}{os.sep}", "-print_final_stats=1"], d, seconds + 120, chain.env())
         return "", text
@@ -3601,13 +3958,28 @@ class CompilationAgent(ba.AgentCore):
             code, text = _run(cmd, cwd, self.cfg.compile_timeout * 2, chain.env())
             if code != 0:
                 return f"ut_search target does not build: {text.strip()[-200:]}", ""
-        seeds = sorted(str(p) for p in corpus.glob("seed_*"))
-        code, text = _run([str(search), str(corpus), str(seconds), str(self.cfg.search_executions),
-                           str(self.cfg.search_seed), str(self.cfg.search_input_timeout), *seeds], d, seconds + 120,
-                          chain.env(LLVM_PROFILE_FILE=str(d / "search.profraw")))
-        if BLOCKED_RUN.search(text or ""):
-            return BLOCKED_HINT.format(name=search.name), ""
-        return "", text
+        # A3-FZ12: a crash ends only that input: the search starts again, with the inputs it kept and the next seed,
+        # in the time and executions left (deterministic: the same restarts in the same order)
+        started, executions, logs = time.monotonic(), 0, []
+        for restart in range(self.cfg.search_restarts + 1):
+            left = seconds - (time.monotonic() - started)
+            if left < 1 or executions >= self.cfg.search_executions:
+                break
+            for kept in sorted(corpus.glob("s_*")):                  # keep the inputs of the earlier round
+                kept.rename(corpus / f"r{restart}_{kept.name}")
+            seeds = sorted(str(p) for p in corpus.glob("seed_*")) + sorted(str(p) for p in corpus.glob("r*_s_*"))
+            code, text = _run([str(search), str(corpus), f"{left:.0f}", str(self.cfg.search_executions - executions),
+                               str(self.cfg.search_seed + restart), str(self.cfg.search_input_timeout), *seeds], d,
+                              left + 120, chain.env(LLVM_PROFILE_FILE=str(d / f"search{restart}.profraw")))
+            if BLOCKED_RUN.search(text or ""):
+                return BLOCKED_HINT.format(name=search.name), ""
+            m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text or "")
+            executions += int(m.group(1)) if m else 0
+            logs.append(text or "")
+            if "stat::crash" not in (text or "") and "stat::timeout" not in (text or ""):
+                break
+        merged = re.sub(r"stat::number_of_executed_units:\s*\d+\n?", "", "\n".join(logs))
+        return "", merged + f"\nstat::number_of_executed_units: {executions}\n"
 
     @staticmethod
     def _controls(layout: uc.LayoutProfile, repo: Path, actions: list[uc.FileAction]) -> list[tuple[str, str]]:
@@ -3975,6 +4347,7 @@ def _replace_suite(bundle: uc.FileActionBundle, path: str, content: str) -> uc.F
 def build_agent(settings: ba.Settings, config_path: str | None = None) -> CompilationAgent:
     agent = CompilationAgent(settings, config=CompilationConfig(**load_section(config_path, "compilation")))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
+    agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
     return agent
 
 
