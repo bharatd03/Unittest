@@ -11,6 +11,7 @@ rem    unittest_generator.bat pilot-c           full pipeline on the C pilot
 rem    unittest_generator.bat pilot-cpp         full pipeline on the C++ pilot (three SUT files)
 rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot with dependencies (three SUT files)
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
+rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
 rem                                             seeded-defect benchmark on the pilots, with the knowledge
 rem                                             packs (on, default), without (off) or both to compare them
@@ -39,6 +40,8 @@ rem  or set BASEAGENT_PYTHON. ANTHROPIC_API_KEY stays an environment variable; i
 rem  to a file.
 rem ===========================================================================
 setlocal EnableExtensions
+rem  A relative repository folder is meant from where the command was started [TP-23].
+set "CALLER=%CD%"
 cd /d "%~dp0"
 rem  The exit code is kept in UT_EXIT, never in RC: CMake reads a variable named RC as the Windows
 rem  resource compiler, and every program started from here inherits it [A3-BD15].
@@ -107,6 +110,15 @@ if not defined REPO goto repo_clean
 set "REPO=%REPO:"=%"
 if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
 :repo_clean
+rem  TP-23: a relative folder (not a link, not a drive or network path) is resolved from the caller's folder.
+if not defined REPO goto repo_done
+if /i "%REPO:~0,4%"=="http" goto repo_done
+if /i "%REPO:~0,4%"=="git@" goto repo_done
+if /i "%REPO:~0,6%"=="ssh://" goto repo_done
+if "%REPO:~1,1%"==":" goto repo_done
+if "%REPO:~0,2%"=="\\" goto repo_done
+if exist "%CALLER%\%REPO%" for %%I in ("%CALLER%\%REPO%") do set "REPO=%%~fI"
+:repo_done
 set "PY="
 if defined BASEAGENT_PYTHON set "PY=%BASEAGENT_PYTHON%"
 if defined PY goto have_python
@@ -129,6 +141,7 @@ goto end
 :have_baseagent
 
 if /i "%ACTION%"=="view" goto view_run
+if /i "%ACTION%"=="baseagent-test" goto baseagent_tests
 
 rem ---------------------------------------------------------------- tools [TP-12]
 set "SETUP_ARGS=ensure"
@@ -176,7 +189,7 @@ if /i "%ACTION%"=="pilot-cpp" goto pilot_cpp
 if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -214,6 +227,20 @@ if /i "%ACTION%"=="test-full" findstr /b /c:"Summary:" "%RESULTS%"
 if /i not "%ACTION%"=="test-full" findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
 echo Full results: %RESULTS%
 if not "%UT_EXIT%"=="0" echo Some tests failed. Send test_results.txt to Claude.
+goto end
+
+:baseagent_tests
+rem  TP-24: the BaseAgent tests with this application's Python environment (baseagent.bat test is unchanged).
+set "BA_RESULTS=%~dp0test_results_baseagent.txt"
+echo.
+echo Running the BaseAgent tests ...
+pushd "%TESTS%"
+"%PY%" -u -m unittest -v test_baseagent > "%BA_RESULTS%" 2>&1
+set "UT_EXIT=%errorlevel%"
+popd
+findstr /b /c:"FAIL:" /c:"ERROR:" "%BA_RESULTS%"
+findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%BA_RESULTS%"
+echo Full results: %BA_RESULTS%
 goto end
 
 :benchmark

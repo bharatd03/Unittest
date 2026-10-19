@@ -27,7 +27,7 @@ if _BASEAGENT_HOME not in sys.path:
 import baseagent as ba  # noqa: E402  (path set above)
 
 CONTRACTS_VERSION = "1.0"
-HARNESS_VERSION = "ut_harness 1.0"
+HARNESS_VERSION = "ut_harness 1.1"
 METRICS = ("LC", "SC", "BC", "DC", "MCDC")
 FAILURE_CATEGORIES = ("test_generation_defect", "stub_defect", "test_framework_defect",
                       "build_configuration_defect", "source_compilation_defect", "source_behavior_defect",
@@ -1042,6 +1042,7 @@ class PipelineResult(Contract):
     total_tests: int = 0
     passed: int = 0
     failed: int = 0
+    unfinished_tests: list[str] = Field(default_factory=list)   # "name: crashed/timeout - signal or limit" [A3-29d]
     files_generated: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
     characterization_tests: int = 0

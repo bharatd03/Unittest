@@ -9,6 +9,7 @@
 #    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps
 #                                              every SUT file of a pilot, one live viewer page for all
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
+#    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 #    ./unittest_generator.sh benchmark [on|off|both]
 #                                              seeded-defect benchmark on the pilots, with the knowledge
 #                                              packs (on, default), without (off) or both to compare them
@@ -29,6 +30,7 @@
 #  after the command switches it off. Settings: "viewer" in ut_config.json.
 # ===========================================================================
 set -u
+CALLER="$(pwd)"                                 # a relative repository folder is meant from here [TP-23]
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 export PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1
@@ -39,10 +41,27 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|pilot-c|pilot-cpp|pilot-deps|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|benchmark|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
+
+# TP-23: a relative folder (not a link, not an absolute path) is resolved from the caller's folder
+from_caller() {
+  case "$1" in
+    http://*|https://*|git@*|ssh://*|/*|"") printf '%s' "$1" ;;
+    *) if [ -e "$CALLER/$1" ]; then (cd "$CALLER" && cd "$(dirname "$1")" && printf '%s/%s' "$(pwd)" "$(basename "$1")")
+       else printf '%s' "$1"; fi ;;
+  esac
+}
+if [ "$ACTION" = run ] && [ $# -ge 1 ]; then
+  REPO_ARG="$(from_caller "${1%/}")"; shift
+  set -- "$REPO_ARG" "$@"
+fi
+if [ "$ACTION" = view ] && [ $# -ge 1 ]; then
+  VIEW_ARG="$(from_caller "${1%/}")"; shift
+  set -- "$VIEW_ARG" "$@"
+fi
 
 # ---------------------------------------------------------------- Python 3.12
 PY="${BASEAGENT_PYTHON:-$BASEAGENT_HOME/.venv/bin/python}"
@@ -63,6 +82,15 @@ fi
 if [ "$ACTION" = view ]; then                  # an earlier run: no tools, no brain needed
   if [ $# -lt 1 ]; then echo "Usage: $0 view RUN_FOLDER"; exit 2; fi
   exec "$PY" ut_pipeline.py view "$@"
+fi
+if [ "$ACTION" = baseagent-test ]; then        # TP-24: the BaseAgent tests (no tools, no brain needed)
+  RESULTS="$HERE/test_results_baseagent.txt"
+  echo "Running the BaseAgent tests ..."
+  (cd "$TESTS" && "$PY" -u -m unittest -v test_baseagent "$@") > "$RESULTS" 2>&1
+  RC=$?
+  grep -E "^(FAIL|ERROR):|^Ran [0-9]+ test|^OK|^FAILED" "$RESULTS"
+  echo "Full results: $RESULTS"
+  exit $RC
 fi
 
 # ---------------------------------------------------------------- tools [TP-12]

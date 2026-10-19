@@ -12,6 +12,7 @@ ut_work/
 *.sqlite3-shm
 *.sqlite3-wal
 test_results.txt
+test_results_*.txt
 
 # BaseAgent's local service state: data, principals and client.token (a credential).
 # baseagent.bat creates it again (init-demo, renew-token).

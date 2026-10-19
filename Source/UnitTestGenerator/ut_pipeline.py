@@ -528,6 +528,11 @@ class Orchestrator:
         while not last.link_ok or last.decision == "setup_blocked":
             if rounds >= self.cfg.stage_a_rounds:
                 return s.finish("incomplete", "setup or build issues remain after the Stage A budget: " + last.reason)
+            twice = [f for f in last.failures if any("[A3-CL13]" in e for e in f.evidence)]
+            if twice and len(twice) == len(last.failures):          # no repair round can change it [A3-CL13]
+                return s.finish("incomplete", "the SUT is compiled into more than one object, so the test program "
+                                "cannot link: " + "; ".join(e for e in twice[0].evidence if "[A3-CL13]" in e)
+                                + " | " + last.reason)
             rounds += 1
             s.current = f"Stage A round {rounds}"
             before = self._problems(last)
@@ -1437,6 +1442,8 @@ class RunState:
             compiler=f"{last.compiler} {last.compiler_version}".strip() if last else "",
             iterations=self.iterations, metrics=last.coverage.file_metrics if last and last.coverage else None,
             total_tests=last.total if last else 0, passed=last.passed if last else 0, failed=last.failed if last else 0,
+            unfinished_tests=[f"{t.name}: {t.status} - {t.message}"[:300] for t in (last.tests if last else [])
+                              if t.status in ("crashed", "timeout")],                          # A3-29d
             files_generated=sorted(self.files_generated), files_modified=sorted(self.files_modified),
             characterization_tests=len(bundle.characterization_tests) if bundle else 0,
             oracle_checks=self.oracle_checks, source_fixes=self.source_fixes, open_items=sorted(self.open_items),
@@ -1474,6 +1481,11 @@ def report(r: uc.PipelineResult) -> str:
     rows += [f"- Reason: {r.reason}", f"- Compiler: {r.compiler or '-'}; harness: {r.framework}",
             f"- Tests: {r.total_tests} total, {r.passed} passed, {r.failed} failed; "
             f"{r.characterization_tests} characterization-only (E8)", ""]
+    if r.unfinished_tests:                                                               # A3-45a, A3-29d
+        rows += [f"Tests that did not finish ({len(r.unfinished_tests)}) [A3-45a, A3-45b]:", ""]
+        rows += [f"- {line}" for line in r.unfinished_tests[:40]]
+        rows += ([f"- ... and {len(r.unfinished_tests) - 40} more (see result.json)"] if len(r.unfinished_tests) > 40 else [])
+        rows.append("")
     if r.metrics:
         rows += ["| Metric | Covered | Total | % | Status |", "| --- | --- | --- | --- | --- |"]
         for name in uc.METRICS:

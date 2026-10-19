@@ -77,7 +77,55 @@ class GeneratedTests(BaseModel):
 def stub_names(spec: uc.StubSpec) -> dict[str, str]:
     base = f"ut_stub_{uc.stub_base(spec)}"
     return {"return": f"{base}_return", "calls": f"{base}_calls", "returns": f"{base}_returns",
-            "returns_len": f"{base}_returns_len"}
+            "returns_len": f"{base}_returns_len", "step": f"{base}_step"}
+
+
+SOURCE_FILE = re.compile(r"\.(c|cc|cpp|cxx|c\+\+)$", re.I)
+
+
+def _int_value(token: str, macros: dict[str, str], depth: int = 0) -> int | None:
+    """An integer literal or an integer macro (followed through other macros), else None."""
+    token = token.strip().strip("()").strip()
+    m = re.fullmatch(r"(0[xX][0-9a-fA-F]+|\d+)[uUlL]*", token)
+    if m:
+        return int(m.group(1), 0)
+    if depth < 4 and token in macros:
+        return _int_value(re.sub(r"/\*.*?\*/|//.*", "", macros[token]), macros, depth + 1)
+    return None
+
+
+def header_macros(layout: uc.LayoutProfile) -> dict[str, str]:
+    """#define NAME value of the SUT's headers and of the SUT file itself."""
+    root = Path(layout.repo_root)
+    macros: dict[str, str] = {}
+    for h in [*layout.headers, layout.sut_file]:
+        if (root / h).is_file():
+            for m in re.finditer(r"#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+([^\n]+)",
+                                 (root / h).read_text(encoding="utf-8", errors="replace")):
+                macros.setdefault(m.group(1), m.group(2).strip())
+    return macros
+
+
+def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str]) -> dict[str, int]:
+    """A2-21x: stubs the SUT uses like a clock - a call result subtracted from or by another value, as in
+    hal_micros() - t0 - and the step each advances by: the largest constant the elapsed time is compared
+    with on those lines, divided by 8 (at least 1)."""
+    out = {}
+    for spec in stubs:
+        name = spec.function.split("::")[-1]
+        storage = re.sub(r"^const\s+", "", re.sub(r"\b(extern|static|inline|virtual)\b", "", spec.return_type).strip())
+        if spec.kind not in ("function", "method") or not INTEGRAL.match(storage):
+            continue
+        call = rf"\b{re.escape(name)}\s*\([^()]*\)"
+        lines = [line for line in sut_text.splitlines()
+                 if re.search(call + r"\s*-(?!-|>|=)", line) or re.search(r"(?<![-+])-\s*" + call, line)]
+        if not lines:
+            continue
+        limits = [_int_value(m.group(1), macros) for line in lines
+                  for m in re.finditer(r"(?:[<>]=?)\s*\(?\s*([A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+)[uUlL]*", line)]
+        limits = [v for v in limits if v and v > 0]
+        out[spec.function] = max(1, max(limits) // 8) if limits else 1
+    return out
 
 
 def sequence_type(storage: str, layout: uc.LayoutProfile) -> bool:
@@ -131,7 +179,12 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
     cpp = layout.language == "cpp"
     ext = "cpp" if cpp else "c"
     stub_dir = layout.writable_stub_dir.rstrip("/")
-    headers = sorted({include_name(s.header, layout) for s in plan.stubs if s.header})
+    # A2-21w: only header files; a declaration placed in a source file is never reached by #include
+    headers = sorted({include_name(s.header, layout) for s in plan.stubs if s.header and not SOURCE_FILE.search(s.header)})
+    root = Path(layout.repo_root)
+    sut_path = root / layout.sut_file
+    sut_text = sut_path.read_text(encoding="utf-8", errors="replace") if sut_path.is_file() else ""
+    steps = clock_steps(plan.stubs, sut_text, header_macros(layout))                          # A2-21x
     decl_lines, def_lines, reset = [], [], []
 
     def clear(var: str, vtype: str) -> None:
@@ -169,6 +222,11 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
         decl_lines.append(f"extern int {names['calls']};")
         def_lines.append(f"int {names['calls']};")
         reset.append(f"    {names['calls']} = 0;")
+        step = steps.get(spec.function) if spec.kind != "constructor" and ret and ret != "void" else None
+        if step is not None:                        # a clock advances by default [A2-21x]
+            decl_lines.append(f"extern {storage} {names['step']};   /* clock: advance per call (0 holds it) */")
+            def_lines.append(f"{storage} {names['step']};")
+            reset.append(f"    {names['step']} = {step};")
         params, stores = [], []
         for index, (ptype, pname) in enumerate(spec.params):
             pname = pname or f"arg{index}"
@@ -187,10 +245,14 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
             signature = f"{target}({arglist})"
         else:
             signature = f"{ret} {target}({arglist}){spec.method_suffix}"
-        body = [f"    ++{names['calls']};", *stores]
+        # the counter stops at INT_MAX instead of overflowing; every call counts against the test's budget
+        body = [f"    if ({names['calls']} < INT_MAX) ++{names['calls']};", "    ut_stub_call();", *stores]   # A2-21g, A3-45b
         if seq:
-            body.append(f"    if ({names['calls']} <= {names['returns_len']}) return {names['returns']}[{names['calls']} - 1];")
-        if spec.kind != "constructor" and ret and ret != "void":
+            body.append(f"    if ({names['calls']} >= 1 && {names['calls']} <= {names['returns_len']} && "
+                        f"{names['returns_len']} <= UT_STUB_SEQUENCE) return {names['returns']}[{names['calls']} - 1];")
+        if step is not None:
+            body.append(f"    return ({storage})({names['return']} + ({storage}){names['step']} * ({storage})({names['calls']} - 1));")
+        elif spec.kind != "constructor" and ret and ret != "void":
             body.append(f"    return {names['return']};")
         def_lines.append(signature + "\n{\n" + "\n".join(body) + "\n}\n")
     if layout.sut_state:                     # A2-21s: the SUT's state as before the first test
@@ -202,7 +264,8 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
               "#define UT_STUB_SEQUENCE 16", *decl_lines,
               f"#endif /* {guard} */", ""]
     source = ["/* ut_stubs - generated by agent_unittest_generator from the declarations [A2-21g]. */",
-              "#include <string.h>", '#include "ut_harness.h"', '#include "ut_stubs.h"', "", *def_lines,
+              "#include <string.h>", "#include <limits.h>", '#include "ut_harness.h"', '#include "ut_stubs.h"', "",
+              *def_lines,
               ('extern "C" ' if cpp else "") + "void ut_before_each(void)", "{", *reset, "}", ""]
     return f"{stub_dir}/ut_stubs.{ext}", "\n".join(source), "\n".join(header)
 
@@ -656,9 +719,13 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple[str,
         options = [_options(fn, i, p, values, layout, body, macros) for i, p in enumerate(fn.params)]
         if any(o is None for o in options) or observe is None:
             continue
-        controlled = [stubs[c] for c in fn.calls if c in stubs and stubs[c].return_type not in ("void", "")
+        # the function's own stubs and those of the static helpers it calls [A2-21r]
+        called = list(dict.fromkeys([*fn.calls, *(c for g in layout.functions if g.is_static and g.name in fn.calls
+                                                   and g is not fn for c in g.calls)]))
+        controlled = [stubs[c] for c in called if c in stubs and stubs[c].return_type not in ("void", "")
                       and (INTEGRAL.match(stubs[c].return_type) or FLOATING.match(stubs[c].return_type))]
-        dims = [list(range(len(o))) for o in options] + [_stub_choices(s, body, values, layout) for s in controlled]
+        dims = [list(range(len(o))) for o in options] + [_stub_choices(s, body + "\n" + helpers, values, layout)
+                                                         for s in controlled]
         neutral = [[" ".join(o[k][0]) + " " + o[k][1] for k in range(len(o))] for o in options] + dims[len(options):]
         for index, combo in enumerate(combine(dims, cap, neutral), 1):
             name = f"test_{fn.name.replace('::', '_')}_auto_{index}"
@@ -1339,7 +1406,9 @@ class GeneratorAgent(ba.AgentCore):
                     # A2-21v: only the controls that exist; without stubs no ut_stub_ pattern at all
                     uc.part("stubs", ("STUB CONTROL (only the names declared below exist; set them before calling; "
                                       "they are reset before every test; an array ..._returns[i] with ..._returns_len "
-                                      f"gives one return value per call):\n{stub_header}")
+                                      "gives one return value per call; a clock stub with ..._step returns ..._return "
+                                      "plus step per call, so timeouts expire - 0 holds the clock [A2-21x]):\n"
+                                      f"{stub_header}")
                             if "ut_stub_" in stub_header else
                             "STUB CONTROL: none. No function this code calls is replaced by a stub, so no ut_stub_ "
                             "name exists: do not use one. Call the function under test directly."),

@@ -436,6 +436,34 @@ class RuleValueTests(unittest.TestCase):
         combos = a2.combine([[0, -2, 50], [0, 6, (0, 6)]], 4)
         self.assertIn((50, (0, 6)), combos)                                        # a sequence with an input
 
+    def test_stubs_used_like_a_clock_advance_and_never_include_a_source_file(self):
+        """A2-21x: hal_micros() - t0 compared with ECHO_START_US / ECHO_MAX_US advances by 30000 / 8 per call;
+        A2-21w: a declaration placed in the SUT .c file is never included; A2-21g: the counter stops at INT_MAX."""
+        with tmpdir() as d:
+            repo = copy_pilot("c_hal_pilot", Path(d))
+            layout = uc.LayoutProfile(repo_root=str(repo), sut_file="src/echo_sensor.c", language="c",
+                                      component_root=".", writable_test_dir="tests", writable_stub_dir="tests/stubs",
+                                      suite_file="tests/test_echo_sensor.c", sut_sha256="0" * 64,
+                                      headers=["include/echo_sensor.h", "include/hal.h"],
+                                      compile_flags=["-I{repo}/include"])
+            specs = [uc.StubSpec(function="hal_micros", declaration="uint32_t hal_micros(void)", return_type="uint32_t",
+                                 header="include/hal.h"),
+                     uc.StubSpec(function="hal_echo_read", declaration="int hal_echo_read(void)", return_type="int",
+                                 header="include/hal.h"),
+                     uc.StubSpec(function="hal_trig_write", declaration="void hal_trig_write(hal_level_t level)",
+                                 return_type="void", params=[["hal_level_t", "level"]], header="src/echo_sensor.c")]
+            sut = (repo / "src/echo_sensor.c").read_text()
+            self.assertEqual(a2.clock_steps(specs, sut, a2.header_macros(layout)), {"hal_micros": 3750})
+            _, source, header = a2.render_stubs(uc.UTPlan(plan_id="p", stage="coverage", layout=layout, stubs=specs))
+        self.assertNotIn(".c\"", header)
+        self.assertIn('#include "hal.h"', header)
+        self.assertIn("extern uint32_t ut_stub_hal_micros_step;", header)
+        self.assertIn("    ut_stub_hal_micros_step = 3750;", source)
+        self.assertIn("return (uint32_t)(ut_stub_hal_micros_return + (uint32_t)ut_stub_hal_micros_step * "
+                      "(uint32_t)(ut_stub_hal_micros_calls - 1));", source)
+        self.assertNotIn("ut_stub_hal_echo_read_step", source)                  # not used like a clock
+        self.assertIn("if (ut_stub_hal_echo_read_calls < INT_MAX) ++ut_stub_hal_echo_read_calls;", source)
+
     def test_every_test_starts_from_the_initial_sut_state(self):
         layout = uc.LayoutProfile(repo_root=".", sut_file="src/a.c", language="c", component_root=".",
                                   writable_test_dir="tests", writable_stub_dir="tests/stubs", suite_file="tests/test_a.c",
@@ -738,7 +766,8 @@ class CompilationTests(unittest.TestCase):
         r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(tests)))
         self.assertFalse(r.link_ok)
         self.assertEqual(r.quarantined, [])
-        self.assertEqual(r.reason, "the build did not link")
+        self.assertTrue(r.reason.startswith("the build did not link: "), r.reason)
+        self.assertIn("no_such_value", r.reason)                           # the compiler's own message [A3-29d]
         only = ('UT_TEST(test_broken) { UT_EXPECT_EQ_INT(no_such_value, 1); }\n'
                 'UT_SUITE_BEGIN\nUT_CASE(test_broken)\nUT_SUITE_END\n')            # nothing would be left
         r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(only)))
@@ -752,6 +781,61 @@ class CompilationTests(unittest.TestCase):
                                                 source_overrides={"src/thermostat.c": source}))
         self.assertFalse(r.link_ok)                                     # a source-fix trial is never quarantined
         self.assertEqual(r.quarantined, [])
+
+    HANG_STUB = ('#include "ut_harness.h"\n#include "sensor.h"\nint ut_stub_read_sensor_return;\n'
+                 'int read_sensor(int channel) { (void)channel; ut_stub_call(); return ut_stub_read_sensor_return; }\n'
+                 'void ut_before_each(void) { ut_stub_read_sensor_return = 0; }\n')
+
+    def hang_bundle(self, tests: str):
+        b = self.bundle(tests)
+        b.actions[0].content = self.HANG_STUB
+        return b
+
+    def test_a_test_over_its_stub_call_budget_ends_and_the_next_one_runs(self):          # A3-45b
+        tests = ('UT_TEST(test_waits_forever) { while (read_sensor(0) == 0) { } }\n'
+                 'UT_TEST(test_after) { UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_waits_forever)\nUT_CASE(test_after)\nUT_SUITE_END\n')
+        agent = a3.CompilationAgent(config=self.agent.cfg.model_copy(update={"stub_call_budget": 1000}))
+        r = agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.hang_bundle(tests)))
+        status = {t.name: t for t in r.tests}
+        self.assertEqual(status["test_waits_forever"].status, "timeout")
+        self.assertIn("stub call budget exceeded (1000 calls)", status["test_waits_forever"].message)
+        self.assertEqual(status["test_after"].status, "passed")
+        self.assertTrue(r.run_ok)                                          # the program itself ended normally
+
+    def test_after_an_abnormal_end_every_test_runs_alone(self):                           # A3-45a
+        tests = ('UT_TEST(test_first) { UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                 'UT_TEST(test_crash) { volatile int *p = 0; *p = 1; }\n'
+                 'UT_TEST(test_spins) { volatile int k = 1; while (k) { } }\n'
+                 'UT_TEST(test_last) { UT_EXPECT_EQ_INT(clamp_percent(-5), 0); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_first)\nUT_CASE(test_crash)\nUT_CASE(test_spins)\nUT_CASE(test_last)\n'
+                 'UT_SUITE_END\n')
+        agent = a3.CompilationAgent(config=self.agent.cfg.model_copy(update={"run_timeout": 5, "test_timeout": 2}))
+        with self.assertLogs(level="WARNING") as logs:
+            r = agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.hang_bundle(tests)))
+        status = {t.name: t for t in r.tests}
+        self.assertEqual(set(status), {"test_first", "test_crash", "test_spins", "test_last"})   # none lost
+        self.assertEqual((status["test_first"].status, status["test_last"].status), ("passed", "passed"))
+        self.assertEqual(status["test_crash"].status, "crashed")
+        if os.name != "nt":
+            self.assertIn("SIGSEGV", status["test_crash"].message)
+        self.assertEqual(status["test_spins"].status, "timeout")
+        self.assertIn("within 2 s", status["test_spins"].message)
+        self.assertTrue(any("one by one [A3-45a]" in line for line in logs.output))
+        self.assertIsNotNone(r.coverage)                                   # the tests after the crash count
+
+    def test_a_sut_compiled_twice_is_named_with_the_linker_message(self):                # A3-CL13, A3-29d
+        tests = ('UT_TEST(test_a) { UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_a)\nUT_SUITE_END\n')
+        b = self.bundle(tests)
+        b.actions[0].content = '#include "../../src/thermostat.c"\n' + self.STUB    # what issue 1 produced
+        r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=b))
+        self.assertFalse(r.link_ok)
+        self.assertRegex(r.reason, r"the build did not link: .*(multiple definition|duplicate symbol)")
+        twice = [f for f in r.failures if any("[A3-CL13]" in e for e in f.evidence)]
+        self.assertTrue(twice, [f.model_dump() for f in r.failures])
+        self.assertEqual({f.classification for f in twice}, {"test_framework_defect"})
+        self.assertTrue((Path(r.run_dir) / "build_output.txt").is_file())
 
     def test_e2_failure_is_decided_by_the_brain(self):
         b = self.bundle('UT_TEST(test_clamp) { UT_EXPECT_EQ_INT(clamp_percent(150), 99); }\n'
@@ -1159,6 +1243,16 @@ class CaptureAndDependencyTests(unittest.TestCase):
         build = self.a3.capture(uc.CaptureRequest(layout=layout, **capture))
         return build, run(self.a1.dependencies(uc.DependencyRequest(layout=layout, build=build)))
 
+    def test_nested_included_from_does_not_change_the_file(self):
+        """A1-DA1: clang prints a location's file only when it changes; an "includedFrom" block nested deep
+        inside an enum of a header is not a change of file. hal_trig_write follows such an enum in hal.h and
+        must be declared there, not in the SUT .c file (which a stub header would then include)."""
+        repo = copy_pilot("c_hal_pilot", self.d)
+        _, layout = self.analyze(repo, "src/echo_sensor.c")
+        deps = {e.name: e for e in layout.dependencies.entries}
+        for name in ("hal_trig_write", "hal_echo_read", "hal_micros", "hal_delay_us"):
+            self.assertEqual(deps[name].header, "include/hal.h", (name, deps[name]))
+
     @unittest.skipUnless(have_tool("cmake") and have_tool("ninja"), "cmake and ninja are not in the tool manifest")
     def test_cmake_build_is_captured(self):
         repo = copy_pilot("c_deps_pilot", self.d)
@@ -1520,6 +1614,18 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 100);", suite)
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
+
+    def test_embedded_driver_with_a_polled_clock_reaches_its_targets_without_a_brain(self):
+        """The first embedded-driver run (19 Oct 2026): a HAL header with an enum before its functions, a timeout
+        loop on a stubbed microsecond clock and the stubs of static helpers. A2-21w, A2-21x, A2-21r, A3-45a/b."""
+        repo = copy_pilot("c_hal_pilot", self.d)
+        with brain(DownBrain()):
+            result = self.run_pipeline(repo, "src/echo_sensor.c")
+        self.assertEqual(result.final_state, "verified_measured", up.report(result))
+        self.assertEqual(result.unfinished_tests, [])
+        header = (repo / "tests/stubs/ut_stubs.h").read_text()
+        self.assertNotRegex(header, r'#include "[^"]+\.c"')
+        self.assertIn("ut_stub_hal_micros_step", header)
 
     def test_a_brain_test_that_does_not_compile_costs_no_iteration(self):
         """A3-CL12: one generated test does not compile; the others are still run and measured in the same
@@ -1903,8 +2009,11 @@ class BrainGenerationTests(unittest.TestCase):
     def test_stub_returns_a_sequence(self):
         _, source, header = a2.render_stubs(self.plan)
         self.assertIn("extern int ut_stub_read_sensor_returns[UT_STUB_SEQUENCE];", header)       # A2-21g
-        self.assertIn("if (ut_stub_read_sensor_calls <= ut_stub_read_sensor_returns_len) "
+        self.assertIn("if (ut_stub_read_sensor_calls >= 1 && ut_stub_read_sensor_calls <= ut_stub_read_sensor_returns_len "
+                      "&& ut_stub_read_sensor_returns_len <= UT_STUB_SEQUENCE) "
                       "return ut_stub_read_sensor_returns[ut_stub_read_sensor_calls - 1];", source)
+        self.assertIn("if (ut_stub_read_sensor_calls < INT_MAX) ++ut_stub_read_sensor_calls;", source)   # never overflows
+        self.assertIn("    ut_stub_call();", source)                                                 # A3-45b
 
     def test_checked_brain_scenario_is_assembled_without_llm(self):
         plan = self.plan.model_copy(update={"stage": "coverage", "scenarios": [self.scenario()]})

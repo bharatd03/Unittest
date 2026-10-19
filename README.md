@@ -73,8 +73,11 @@ Run without a command, the `.bat` shows a menu.
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
 | `run REPO SUT [--branch NAME]` | a git repository link or a folder, and the source file to test |
 | `view RUN_FOLDER` | replay an earlier run in the viewer |
+| `baseagent-test` | the BaseAgent tests (Windows and Linux); results in `test_results_baseagent.txt` |
 
-BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`.
+BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`; on Linux the BaseAgent tests run with `Source/UnitTestGenerator/unittest_generator.sh baseagent-test`.
+
+`run` accepts a folder relative to the folder you start the command from.
 
 Results of a run go to `Source/UnitTestGenerator/ut_output/`.
 

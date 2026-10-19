@@ -455,7 +455,10 @@ class AstIndex:
         self.text, self.cwd, self.repo = text, cwd, repo.resolve()
         self.files: list[tuple[int, str]] = []
         for m in re.finditer(r'"file": "((?:[^"\\]|\\.)*)"', text):
-            if re.search(r'"includedFrom": \{\s*$', text[max(0, m.start() - 40): m.start()]):
+            j = m.start()                                 # any indentation: includedFrom can be deeply nested
+            while j > 0 and text[j - 1] in " \t\r\n":
+                j -= 1
+            if text.endswith('"includedFrom": {', 0, j):
                 continue
             self.files.append((m.start(), self._resolve(json.loads('"' + m.group(1) + '"'))))
         self.file_offsets = [o for o, _ in self.files]
