@@ -27,7 +27,7 @@ if _BASEAGENT_HOME not in sys.path:
 import baseagent as ba  # noqa: E402  (path set above)
 
 CONTRACTS_VERSION = "1.0"
-HARNESS_VERSION = "ut_harness 1.1"
+HARNESS_VERSION = "ut_harness 1.2"
 METRICS = ("LC", "SC", "BC", "DC", "MCDC")
 FAILURE_CATEGORIES = ("test_generation_defect", "stub_defect", "test_framework_defect",
                       "build_configuration_defect", "source_compilation_defect", "source_behavior_defect",
@@ -77,7 +77,7 @@ class DiscoverRequest(Contract):
 
 
 ParamKind = Literal["int", "bool", "enum", "float", "cstring", "buffer", "ptr_scalar", "struct", "ptr_struct",
-                    "callback", "object", "other"]
+                    "callback", "object", "other", "ptr_void", "interface"]
 
 
 class FieldInfo(Contract):
@@ -100,6 +100,7 @@ class ParamInfo(Contract):
     by_ref: bool = False                 # C++ reference: pass the variable, not its address
     callback_return: str = ""            # callback: its return type
     callback_params: list[str] = Field(default_factory=list)
+    canonical: str = ""                  # the type with typedefs resolved (u32_t -> unsigned long) [A3-HW4]
 
 
 class FunctionInfo(Contract):
@@ -238,6 +239,98 @@ def sut_reset_source(state: list[StateVar], cpp: bool) -> str:
     return "\n".join(rows)
 
 
+# ============================================================================ endless loops [A2-21y, A3-HW5]
+ENDLESS_LOOP = re.compile(r"\bfor\s*\(\s*;\s*;\s*\)|\bwhile\s*\(\s*(?:1[uUlL]*|true|TRUE)\s*\)")
+_LEAVES = re.compile(r"\b(return|goto|longjmp|siglongjmp|exit|_Exit|abort|throw)\b")
+
+
+def _statement_end(text: str, k: int) -> int:
+    """End of the statement that starts at or after index k: a balanced block or up to the next semicolon."""
+    while k < len(text) and text[k] in " \t\r\n":
+        k += 1
+    if k < len(text) and text[k] == "{":
+        depth = 0
+        for j in range(k, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            if depth == 0:
+                return j + 1
+        return len(text)
+    j = text.find(";", k)
+    return len(text) if j < 0 else j + 1
+
+
+def _without_nested(loop: str) -> str:
+    """The loop body without the bodies of nested switch statements and loops: a break there does not
+    leave the outer loop."""
+    out, k = [], 0
+    for m in re.finditer(r"\b(switch|for|while|do)\b", loop):
+        if m.start() < k:
+            continue
+        j = m.end()
+        if m.group(1) != "do":
+            while j < len(loop) and loop[j] in " \t\r\n":
+                j += 1
+            if j < len(loop) and loop[j] == "(":
+                depth = 0
+                for q in range(j, len(loop)):
+                    depth += {"(": 1, ")": -1}.get(loop[q], 0)
+                    if depth == 0:
+                        j = q + 1
+                        break
+        end = _statement_end(loop, j)
+        out.append(loop[k: m.start()])
+        k = end
+    out.append(loop[k:])
+    return "".join(out)
+
+
+def endless_loop_end(body: str) -> int | None:
+    """A2-21y: the end (index in ``body``) of an endless loop - for (;;), while (1), while (true) - that nothing
+    in its body leaves (no break of its own, no return, goto, longjmp, exit, abort or throw), or None."""
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: re.sub(r"[^\n]", " ", m.group(0)), body, flags=re.S)
+    for m in ENDLESS_LOOP.finditer(code):
+        end = _statement_end(code, m.end())
+        loop = code[m.end(): end]
+        if _LEAVES.search(loop) or re.search(r"\bbreak\b", _without_nested(loop.strip()[1:-1] if loop.strip().startswith("{") else loop)):
+            continue
+        return end
+    return None
+
+
+def unreachable_lines(sut_text: str, functions: list["FunctionInfo"]) -> set[int]:
+    """A3-HW5: lines of code after an endless loop. No test can execute them; LLVM's coverage counts the
+    region after a loop from the loop's entry count, so a test the harness ends inside the loop would show
+    them as executed - they are reported as not covered instead."""
+    lines = sut_text.splitlines()
+    out: set[int] = set()
+    for fn in functions:
+        body = "\n".join(lines[fn.line_start - 1: fn.line_end])
+        end = endless_loop_end(body)
+        if end is None:
+            continue
+        first = fn.line_start + body[:end].count("\n") + 1
+        for number in range(first, fn.line_end + 1):
+            text = re.sub(r"/\*.*?\*/|//.*", "", lines[number - 1]).strip() if number - 1 < len(lines) else ""
+            if text and text.strip("}; ") != "":
+                out.add(number)
+    return out
+
+
+class InterfaceMethod(Contract):
+    """A pure virtual method of an injected interface [A1-DA17]."""
+    name: str
+    return_type: str = "void"
+    params: list[list[str]] = Field(default_factory=list)   # [[type, name], ...]
+    suffix: str = ""                                         # " const", " noexcept" ...
+
+
+class InterfaceInfo(Contract):
+    """A1-DA17: a C++ class with pure virtual methods that the SUT receives by reference or pointer."""
+    name: str                                                # qualified, e.g. "hw::IEncoder"
+    header: str = ""
+    methods: list[InterfaceMethod] = Field(default_factory=list)
+
+
 class LayoutProfile(Contract):
     """A1-16: everything later agents need to know about the repository."""
     repo_root: str
@@ -268,6 +361,9 @@ class LayoutProfile(Contract):
     dependencies: DependencyPlan | None = None
     enums: list[EnumInfo] = Field(default_factory=list)
     sut_state: list[StateVar] = Field(default_factory=list)      # A1-DA15, A2-21s
+    local_statics: list[StateVar] = Field(default_factory=list)  # "function::variable" [A1-DA18, A3-45c]
+    interfaces: list[InterfaceInfo] = Field(default_factory=list)   # injected interfaces [A1-DA17, A2-21aa]
+    header_sut: bool = False                                     # the SUT is a header [A1-DA19]
     requirement_files: list[str] = Field(default_factory=list)  # ReqIF / Markdown requirement documents [A1-25x]
     requirement_links: list[RequirementLink] = Field(default_factory=list)   # linked by the brain [A1-PL13]
     blocked: bool = False
@@ -491,6 +587,8 @@ class VerificationResult(Contract):
     verified: bool = False
     # generated tests that did not compile: left out of this run, which measured the others [A3-CL12]
     quarantined: list[Failure] = Field(default_factory=list)
+    register_pages: list[str] = Field(default_factory=list)   # target register pages in host memory [A3-HW1]
+    host_notes: list[str] = Field(default_factory=list)       # target keywords, target asm, data model [A3-HW2..HW4]
 
 
 # ============================================================================ planning (Agent1)
@@ -1043,6 +1141,8 @@ class PipelineResult(Contract):
     passed: int = 0
     failed: int = 0
     unfinished_tests: list[str] = Field(default_factory=list)   # "name: crashed/timeout - signal or limit" [A3-29d]
+    register_pages: list[str] = Field(default_factory=list)     # target register pages in host memory [A3-HW1]
+    host_notes: list[str] = Field(default_factory=list)         # target keywords, asm, data model [A3-HW2..HW4]
     files_generated: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
     characterization_tests: int = 0

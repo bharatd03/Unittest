@@ -10,6 +10,8 @@ rem    unittest_generator.bat test-full         every test incl. whole pipeline 
 rem    unittest_generator.bat pilot-c           full pipeline on the C pilot
 rem    unittest_generator.bat pilot-cpp         full pipeline on the C++ pilot (three SUT files)
 rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot with dependencies (three SUT files)
+rem    unittest_generator.bat pilot-embedded    full pipeline on the embedded C pilot (registers, superloop, asm; four files)
+rem    unittest_generator.bat pilot-embedded-cpp  full pipeline on the embedded C++ pilot (fakes, exceptions, template; four files)
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
@@ -187,9 +189,11 @@ if /i "%ACTION%"=="test-full" goto run_tests
 if /i "%ACTION%"=="pilot-c" goto pilot_c
 if /i "%ACTION%"=="pilot-cpp" goto pilot_cpp
 if /i "%ACTION%"=="pilot-deps" goto pilot_deps
+if /i "%ACTION%"=="pilot-embedded" goto pilot_embedded
+if /i "%ACTION%"=="pilot-embedded-cpp" goto pilot_embedded_cpp
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, benchmark, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -261,6 +265,14 @@ goto pilot
 :pilot_deps
 set "PILOT=c_deps_pilot"
 set "SUTS=--sut src\ctrl.c --sut src\brake_ctrl.c --sut src\steer_assist.c"
+goto pilot
+:pilot_embedded
+set "PILOT=c_embedded_pilot"
+set "SUTS=--sut src\gpio_driver.c --sut src\scheduler.c --sut src\critical.c --sut src\main_loop.c"
+goto pilot
+:pilot_embedded_cpp
+set "PILOT=cpp_embedded_pilot"
+set "SUTS=--sut src\motor_ctrl.cpp --sut src\counter.cpp --sut src\app_main.cpp --sut include\ring_buffer.hpp"
 :pilot
 rem  The pipeline writes the generated tests into the repository, so it runs on a fresh copy.
 set "REPO=%~dp0ut_output\pilots\%PILOT%"

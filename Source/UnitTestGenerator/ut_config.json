@@ -63,6 +63,8 @@
     "fuzz_seconds": 60,
     "flag_rounds": 2,
     "quarantine_rounds": 2,
+    "test_time_limit_ms": 2000,
+    "target_data_model": "",
     "build_commands": {}
   },
   "corrector": {"max_fragment_lines": 30, "min_independent_evidence": 2, "candidates": 3, "suggestions": 3},

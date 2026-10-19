@@ -6,7 +6,7 @@
 #    ./unittest_generator.sh check             show the tools, Python packages and brains in use
 #    ./unittest_generator.sh test              the component tests (a few minutes), results in test_results.txt
 #    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
-#    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps
+#    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp
 #                                              every SUT file of a pilot, one live viewer page for all
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 #    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
@@ -41,7 +41,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|benchmark|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -154,6 +154,8 @@ case "$ACTION" in
   pilot-c) pilot c_pilot src/thermostat.c "$@" ;;
   pilot-cpp) pilot cpp_pilot src/rate_limiter.cpp src/steering_monitor.cpp src/torque_map.cpp "$@" ;;
   pilot-deps) pilot c_deps_pilot src/ctrl.c src/brake_ctrl.c src/steer_assist.c "$@" ;;
+  pilot-embedded) pilot c_embedded_pilot src/gpio_driver.c src/scheduler.c src/critical.c src/main_loop.c "$@" ;;
+  pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
   benchmark) "$PY" ut_pipeline.py benchmark --config ut_config.json --knowledge "${1:-on}" ;;
   run)
     if [ $# -lt 2 ]; then echo "Usage: $0 run REPO SUT [options]"; exit 2; fi

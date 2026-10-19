@@ -70,6 +70,7 @@ Run without a command, the `.bat` shows a menu.
 | `test` | the component tests, a few minutes; results in `test_results.txt` |
 | `test-full` | every test, including whole pipeline runs, in parallel processes (release validation) |
 | `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
+| `pilot-embedded`, `pilot-embedded-cpp` | the full pipeline on the embedded pilots: registers, register polling, a superloop, interrupt flags, target keywords and assembly; an injected interface, exceptions, a static object in a function and a header-only template |
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
 | `run REPO SUT [--branch NAME]` | a git repository link or a folder, and the source file to test |
 | `view RUN_FOLDER` | replay an earlier run in the viewer |
@@ -80,6 +81,8 @@ BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`;
 `run` accepts a folder relative to the folder you start the command from.
 
 Results of a run go to `Source/UnitTestGenerator/ut_output/`.
+
+Embedded code runs on the host: target registers are mapped in host memory, target compiler keywords get host definitions and target assembly is replaced in the run's copy of the source (never in your files); the report lists all of it under "Target code on the host". When the target is 32-bit and the build was not captured from its cross-compiler, set `compilation.target_data_model` to `ILP32` in `ut_config.json`, so the report names the functions whose `long` arithmetic differs on the host.
 
 With a Claude model, the brain is asked about several functions at the same time (`brain.anthropic.parallel_calls` in `ut_config.json`, default 4; match it to your API quota); with Qwen one at a time. The results are combined in a fixed order, so the same input gives the same tests.
 

@@ -970,6 +970,96 @@ class CompilationTests(unittest.TestCase):
             self.assertEqual([s[4] for s in sites][: self.agent.cfg.max_mutants],
                              [text for _, text in self.agent.mutants(source, fn)])
 
+    # ---------------------------------------------------------------- ut_harness 1.2: embedded targets
+    def test_target_registers_live_in_host_memory_cleared_before_each_test(self):            # A3-HW1
+        tests = ('UT_TEST(test_write) { UT_REG32(0x40021010u) = 5u; UT_EXPECT_EQ_INT(UT_REG32(0x40021010u), 5); }\n'
+                 'UT_TEST(test_cleared) { UT_EXPECT_EQ_INT(UT_REG32(0x40021010u), 0); }\n'
+                 'UT_TEST(test_outside) { UT_REG32(0x10u) = 1u; }\n'
+                 'UT_TEST(test_after) { UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_write)\nUT_CASE(test_cleared)\nUT_CASE(test_outside)\nUT_CASE(test_after)\n'
+                 'UT_SUITE_END\n')
+        with self.assertLogs(level="WARNING"):
+            r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(tests)))
+        status = {t.name: t.status for t in r.tests}
+        self.assertEqual((status["test_write"], status["test_cleared"], status["test_after"]),
+                         ("passed", "passed", "passed"), r.tests)
+        self.assertEqual(status["test_outside"], "crashed")                 # outside every window: a real fault
+        self.assertTrue(any(p.endswith("40021000") for p in r.register_pages), r.register_pages)
+
+    def test_an_endless_loop_is_expected_and_a_spin_ends_at_the_time_limit(self):        # A2-21y, A3-45d
+        tests = ('UT_TEST(test_superloop) { UT_EXPECT_NO_RETURN(for (;;) { (void)clamp_percent(1); }); }\n'
+                 'UT_TEST(test_spins) { volatile int k = 1; while (k) { } }\n'
+                 'UT_TEST(test_returns) { UT_EXPECT_NO_RETURN((void)clamp_percent(1)); }\n'
+                 'UT_TEST(test_after) { UT_EXPECT_EQ_INT(clamp_percent(-5), 0); }\n'
+                 'UT_TEST(test_ready_later) { UT_REG_SET_LATER(UT_REG32(0x40021000u), 0x20u, 20);\n'
+                 '    while ((UT_REG32(0x40021000u) & 0x20u) == 0u) { }\n'
+                 '    UT_EXPECT_EQ_INT(UT_REG32(0x40021000u), 0x20); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_superloop)\nUT_CASE(test_spins)\nUT_CASE(test_returns)\nUT_CASE(test_after)\n'
+                 'UT_CASE(test_ready_later)\nUT_SUITE_END\n')
+        agent = a3.CompilationAgent(config=self.agent.cfg.model_copy(update={"test_time_limit_ms": 500}))
+        with contextlib.ExitStack() as stack:
+            if os.name == "nt":
+                stack.enter_context(self.assertLogs(level="WARNING"))
+            r = agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(tests)))
+        status = {t.name: t for t in r.tests}
+        self.assertEqual(status["test_superloop"].status, "passed")
+        self.assertEqual(status["test_spins"].status, "timeout")
+        self.assertEqual(status["test_returns"].status, "failed")           # it returned: not an endless loop
+        self.assertEqual(status["test_ready_later"].status, "passed")       # the "hardware" set the bit [A2-21ab]
+        self.assertEqual(status["test_after"].status, "passed")
+        if os.name != "nt":
+            self.assertIn("time limit", status["test_spins"].message)
+            self.assertTrue(r.run_ok)                                        # the program itself went on
+
+    def test_function_local_statics_run_every_test_in_its_own_process(self):               # A3-45c
+        tests = ('static int ut_count;\n'
+                 'UT_TEST(test_first) { UT_EXPECT_EQ_INT(++ut_count, 1); }\n'
+                 'UT_TEST(test_second) { UT_EXPECT_EQ_INT(++ut_count, 1); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_first)\nUT_CASE(test_second)\nUT_SUITE_END\n')
+        shared = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=self.bundle(tests)))
+        self.assertEqual({t.name: t.status for t in shared.tests}["test_second"], "failed")
+        layout = self.layout.model_copy(update={"local_statics": [uc.StateVar(name="f::count", type="int")]})
+        isolated = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(tests)))
+        self.assertEqual({t.name: t.status for t in isolated.tests}, {"test_first": "passed", "test_second": "passed"})
+        self.assertIsNotNone(isolated.coverage)                     # the child processes' profiles are merged
+
+    def test_code_after_an_endless_loop_is_never_counted_as_executed(self):                # A3-HW5
+        repo = Path(self.layout.repo_root)
+        sut = repo / "src" / "thermostat.c"
+        sut.write_text(sut.read_text() + "\nint superloop(void)\n{\n    for (;;) {\n        (void)clamp_percent(1);\n"
+                       "    }\n    return 3;\n}\n")
+        dead = len(sut.read_text().splitlines()) - 1                       # the line "return 3;"
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        tests = ('int superloop(void);\n'
+                 'UT_TEST(test_loop) { UT_EXPECT_NO_RETURN(superloop()); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_loop)\nUT_SUITE_END\n')
+        r = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(tests)))
+        self.assertEqual([t.status for t in r.tests], ["passed"])
+        gaps = {g.line: g for f in r.coverage.functions for g in f.gaps if g.metric == "LC"}
+        self.assertIn(dead, gaps)                                  # LLVM alone would report it as executed
+        self.assertIn("A3-HW5", gaps[dead].detail)
+        self.assertNotIn(dead - 2, gaps)                           # the loop body did run
+
+    def test_replaced_target_assembly_takes_its_result_from_the_test(self):                # A3-HW3
+        repo = Path(self.layout.repo_root)
+        (repo / "include" / "core.h").write_text(
+            "#ifndef CORE_H\n#define CORE_H\nstatic inline unsigned get_primask(void)\n{\n    unsigned r;\n"
+            "    __asm volatile (\"MRS %0, primask\" : \"=r\" (r));\n    return r;\n}\n#endif\n")
+        sut = repo / "src" / "thermostat.c"
+        sut.write_text(sut.read_text().replace('#include "thermostat.h"', '#include "thermostat.h"\n#include "core.h"', 1)
+                       + "\nint irq_masked(void) { return get_primask() & 1u; }\n")
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        tests = ('int irq_masked(void);\n'
+                 'UT_TEST(test_zero) { UT_EXPECT_EQ_INT(irq_masked(), 0); }\n'
+                 'UT_TEST(test_set) { ut_asm_value = 1; UT_EXPECT_EQ_INT(irq_masked(), 1); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_zero)\nUT_CASE(test_set)\nUT_SUITE_END\n')
+        r = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(tests)))
+        if not any("MRS" in n for n in r.host_notes):
+            self.skipTest("the host assembler accepts the instruction: " + "; ".join(r.host_notes))
+        self.assertEqual({t.name: t.status for t in r.tests}, {"test_zero": "passed", "test_set": "passed"}, r.reason)
+        self.assertIn("include/core.h:6", " ".join(r.host_notes))
+        self.assertIn("MRS %0, primask", (repo / "include" / "core.h").read_text())   # the user's file is unchanged
+
 
 # ============================================================================ build variants [A3-BD14, A1-37a..e]
 CHAN_C = """#include "chan.h"
@@ -986,6 +1076,154 @@ int channel_gate(int ch)
 }
 """
 
+
+class EmbeddedRuleTests(unittest.TestCase):
+    """The rules for embedded code that need no compiler: endless loops, register polling, state, fakes,
+    templates, exceptions, target assembly and the data model (A2-21y..ab, A2-21aa, A1-DA19, A3-45e, A3-HW3/4)."""
+    C = ROOT / "Test" / "pilots" / "c_embedded_pilot"
+    CPP = ROOT / "Test" / "pilots" / "cpp_embedded_pilot"
+
+    @staticmethod
+    def body(path: Path, name: str) -> str:
+        text = path.read_text()
+        start = re.search(r"\b" + re.escape(name) + r"\s*\([^;{]*\)\s*\{", text).start()
+        depth, k = 0, text.index("{", start)
+        for k in range(k, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[k], 0)
+            if depth == 0:
+                break
+        return text[start: k + 1]
+
+    @staticmethod
+    def fn(name: str, params: list[tuple[str, str]] = ()) -> uc.FunctionInfo:
+        return uc.FunctionInfo(name=name, qualified_name=name, signature=f"int {name}()", file="x.c", line_start=1,
+                               line_end=1, params=[uc.ParamInfo(name=n, type=t) for t, n in params])
+
+    def test_endless_loops_are_found_and_bounded_loops_are_not(self):                     # A2-21y
+        main = self.body(self.C / "src" / "main_loop.c", "main")
+        self.assertTrue(a2.endless_loop(main))
+        self.assertFalse(a2.endless_loop(self.body(self.C / "src" / "main_loop.c", "app_step")))
+        self.assertFalse(a2.endless_loop("void f(void) { for (;;) { if (g()) break; } }"))
+        self.assertTrue(a2.endless_loop("void f(void) { for (;;) { switch (s) { case 1: break; } while (k) { break; } } }"))
+        self.assertFalse(a2.endless_loop("void f(void) { while (1) { if (g()) return; } }"))
+        # code after an endless loop is never reached; LLVM would count it from the loop's entry [A3-HW5]
+        main = "int main(void)\n{\n    for (;;) {\n        step();\n    }\n    return 0;\n}"
+        fn = uc.FunctionInfo(name="main", qualified_name="main", signature="int main(void)", file="m.c",
+                             line_start=1, line_end=7)
+        self.assertEqual(uc.unreachable_lines(main, [fn]), {6})
+
+    def test_register_bits_a_function_waits_for(self):                                    # A2-21ab
+        gpio = self.C / "src" / "gpio_driver.c"
+        wait = self.body(gpio, "gpio_wait_ready")
+        self.assertEqual(a2.register_polls(self.fn("gpio_wait_ready", [("uint32_t", "max_loops")]), wait),
+                         [("GPIOA->IDR", "READY_PIN")])
+        self.assertEqual(a2.register_waits(self.fn("gpio_wait_ready", [("uint32_t", "max_loops")]), wait), [])  # bounded
+        put = self.body(gpio, "uart_put")
+        self.assertEqual(a2.register_waits(self.fn("uart_put", [("uint8_t", "c")]), put), [("UART1_SR", "UART_TXE", True)])
+        sync = self.body(self.CPP / "src" / "motor_ctrl.cpp", "MotorCtrl::sync")
+        self.assertEqual(a2.register_waits(self.fn("sync"), sync), [("hw::tim2()->SR", "hw::SR_UIF", True)])
+        busy = "void tx(void) { while ((UART_SR & BUSY) != 0u) { } }"
+        self.assertEqual(a2.register_waits(self.fn("tx"), busy), [("UART_SR", "BUSY", False)])
+        # the "hardware" changes the bit while the function waits, so the call returns [A2-21ab]
+        self.assertEqual(a2.wait_setup([("UART1_SR", "UART_TXE", True)], set()),
+                         ["UT_REG_SET_LATER(UART1_SR, UART_TXE, 20);   /* the hardware sets the bit after 20 ms [A2-21ab] */"])
+        self.assertEqual(a2.wait_setup([("UART1_SR", "UART_TXE", True)], {("UART1_SR", "UART_TXE")}), [])
+        self.assertIn("UT_REG_CLEAR_LATER(UART_SR, BUSY, 20);", a2.wait_setup([("UART_SR", "BUSY", False)],
+                                                                                {("UART_SR", "BUSY")})[0])
+        # a parameter's bits are an input, not a register
+        self.assertEqual(a2.register_polls(self.fn("f", [("struct s *", "p")]), "int f(struct s *p) { if ((p->flags & 4u) != 0u) return 1; return 0; }"), [])
+
+    def test_state_read_in_decisions_gets_values_and_call_sequences(self):                 # A2-21z
+        repo = self.C
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/scheduler.c"))
+        layout = layout.model_copy(update={"sut_state": [uc.StateVar(name="g_tick_flag", type="volatile int")],
+                                           "local_statics": [uc.StateVar(name="sched_debounce::state", type="int")]})
+        poll = self.body(repo / "src" / "scheduler.c", "sched_poll")
+        state = a2.decision_state(self.fn("sched_poll"), poll, layout, {})
+        self.assertEqual([(v.name, vals) for v, vals in state], [("g_tick_flag", [0, 1])])
+        self.assertEqual(a2.setter_source(state[0][0]), "void ut_state_set_g_tick_flag(long long v) { g_tick_flag = (int)v; }")
+        debounce = self.body(repo / "src" / "scheduler.c", "sched_debounce")
+        self.assertEqual(a2.repeat_count(self.fn("sched_debounce"), debounce, layout, {}), 4)   # compares with 3
+        self.assertEqual(a2.repeat_count(self.fn("sched_sat_add"), "u32_t sched_sat_add(u32_t a, u32_t b) { return a; }",
+                                         layout, {}), 1)
+
+    def test_a_fake_implements_an_injected_interface(self):                                 # A2-21aa
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(self.CPP), sut_file="src/motor_ctrl.cpp"))
+        iface = uc.InterfaceInfo(name="IEncoder", header="include/encoder.hpp", methods=[
+            uc.InterfaceMethod(name="position", return_type="std::int32_t", suffix=" const"),
+            uc.InterfaceMethod(name="fault", return_type="bool", suffix=" const"),
+            uc.InterfaceMethod(name="reset", return_type="void", params=[["int", "level"]])])
+        layout = layout.model_copy(update={"interfaces": [iface]})
+        headers, rows = a2.render_fakes(layout)
+        text = "\n".join(rows)
+        self.assertEqual(headers, ["encoder.hpp"])
+        self.assertIn("class ut_fake_IEncoder : public IEncoder {", text)
+        self.assertIn("std::int32_t position() const override {", text)
+        self.assertIn("mutable std::int32_t position_returns[UT_STUB_SEQUENCE]{};", text)
+        self.assertIn("void reset(int level) override {", text)
+        self.assertIn("reset_level = level;", text)
+        self.assertIn("ut_stub_call();", text)                                   # counts against the budget
+        p = uc.ParamInfo(name="enc", type="IEncoder &", kind="interface", base="IEncoder", by_ref=True)
+        options = a2._fake_options(p, 0, layout, [0, 1, 5])
+        self.assertIn(["ut_fake_IEncoder ut_f0;", "ut_f0.position_return = 0;", "ut_f0.fault_return = false;"],
+                      [o[0] for o in options])
+        self.assertTrue(all(o[1] == "ut_f0" for o in options))                   # passed by reference
+        ref = uc.InterfaceInfo(name="IBus", methods=[uc.InterfaceMethod(name="buf", return_type="int &")])
+        self.assertFalse(a2.fake_supported(ref))                                 # no fake for reference results
+
+    def test_class_templates_of_a_header_sut_are_instantiated_as_the_repository_uses_them(self):   # A1-DA19
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(self.CPP), sut_file="include/ring_buffer.hpp"))
+        self.assertTrue(layout.header_sut)
+        self.assertEqual(layout.language, "cpp")                                # by the content, not ".hpp" alone
+        plan = mock.Mock(layout=layout)
+        self.assertEqual(a2.class_templates(plan), {"RingBuffer": ("RingBuffer", "std::int32_t, 4")})
+        self.assertIn("template class RingBuffer<std::int32_t, 4>;", a2.template_instances(plan))
+        p = a2._instantiate_param(uc.ParamInfo(name="v", type="const T &", kind="other", base="T", by_ref=True),
+                                  {"T": "std::int32_t", "N": "4"})
+        self.assertEqual((p.kind, p.type, p.base), ("ptr_scalar", "const std::int32_t &", "std::int32_t"))
+        self.assertTrue(a1.cpp_content("namespace a { int f(); }"))
+        self.assertFalse(a1.cpp_content("/* class */ int f(void);"))
+
+    def test_observed_exceptions_become_assertions(self):                                   # A3-45e, A2-21f
+        suite = ('UT_TEST(t) {\n'
+                 '    UT_OBSERVE_THROW("t_r1_x", UT_OBSERVE_INT("t_r1", ut_obj.step(-100001)));\n'
+                 '    UT_OBSERVE_THROW("t_r2_x", UT_OBSERVE_INT("t_r2", ut_obj.step(5)));\n'
+                 '    UT_OBSERVE_THROW("t_r3_x", ut_obj.push(1));\n'
+                 '}\n')
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+            path="tests/t.cpp", action="create", role="testsuite", content=suite)], tests=["t"])
+        observed = {"t_r1_x": "std::invalid_argument", "t_r2_x": "none", "t_r2": "7", "t_r3_x": "Overflow"}
+        out = a2.finalize_bundle(bundle, observed).actions[0].content
+        self.assertIn("UT_EXPECT_THROW(ut_obj.step(-100001), std::invalid_argument);", out)
+        self.assertIn("UT_EXPECT_EQ_INT(ut_obj.step(5), 7);", out)
+        self.assertIn("try { ut_obj.push(1); } catch (...) { ut_thrown = true; } UT_EXPECT_TRUE(ut_thrown);", out)
+        self.assertNotIn("UT_OBSERVE", out)
+        self.assertEqual(observed["t_r2"], "7")                                  # the caller's observations unchanged
+
+    def test_target_assembly_is_replaced_line_for_line(self):                                # A3-HW3
+        text = (self.C / "include" / "cmsis_compat.h").read_text()
+        new, replaced = a3.neutralize_asm(text, mnemonics={"MRS"})
+        self.assertEqual(new.count("\n"), text.count("\n"))
+        self.assertEqual([what for _, what in replaced], ["MRS %0, primask"])
+        self.assertIn("(result) = (__typeof__((result)))ut_asm_result()", new)
+        self.assertIn('"cpsid i"', new)                                          # only the named instruction
+        new, replaced = a3.neutralize_asm(text, line=6)
+        self.assertEqual(replaced, [(6, "cpsid i")])
+        macro = '#define NOP() __asm volatile ( \\\n    "nop" )\nint x;\n'
+        new, _ = a3.neutralize_asm(macro, line=1)
+        self.assertEqual(new.count("\\\n"), 1)                                   # the continuation stays
+        self.assertTrue(a2.uses_target_asm(self.fn("critical_irq_enabled"), "return (__get_PRIMASK() & 1u);",
+                                           a1.AnalyzerAgent().discover(uc.DiscoverRequest(
+                                               repo_root=str(self.C), sut_file="src/critical.c"))))
+
+    def test_data_model_of_the_target(self):                                                # A3-HW4
+        cross = uc.BuildDescription(source="make", command="arm-none-eabi-gcc -mcpu=cortex-m4 -c src/x.c")
+        self.assertEqual(a3.target_data_model("", cross), "ILP32")
+        self.assertEqual(a3.target_data_model("lp64", cross), "LP64")
+        self.assertEqual(a3.target_data_model("", uc.BuildDescription(source="make", command="gcc -c x.c")), "")
+        long_param = uc.ParamInfo(name="a", type="u32_t", kind="int", canonical="unsigned long")
+        self.assertEqual(a2.width_values(long_param), [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF])
+        self.assertEqual(a2.width_values(uc.ParamInfo(name="a", type="int", kind="int", canonical="int")), [])
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 class BuildVariantTests(unittest.TestCase):
@@ -1626,6 +1864,65 @@ class PipelineTests(unittest.TestCase):
         header = (repo / "tests/stubs/ut_stubs.h").read_text()
         self.assertNotRegex(header, r'#include "[^"]+\.c"')
         self.assertIn("ut_stub_hal_micros_step", header)
+
+    @full_run
+    def test_embedded_c_files_reach_their_targets_without_a_brain(self):
+        """Registers in host memory, register polling, a superloop main, interrupt flags, function-local statics,
+        target keywords and inline assembly of the target (A3-HW1..HW3, A2-21y, A2-21z, A2-21ab, A3-45c)."""
+        for sut, check in (("src/gpio_driver.c", "register"), ("src/critical.c", "asm"),
+                           ("src/main_loop.c", "superloop"), ("src/scheduler.c", "state")):
+            with self.subTest(sut=sut):
+                d = self.d / Path(sut).stem
+                d.mkdir()
+                repo = copy_pilot("c_embedded_pilot", d)
+                orchestrator = up.Orchestrator(pipeline_config(d))
+                with brain(DownBrain()):
+                    result = run(orchestrator.run(uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
+                self.assertEqual(result.final_state, "verified_measured", up.report(result))
+                suite = (repo / "tests" / f"test_{Path(sut).stem}.c").read_text()
+                if check == "register":
+                    self.assertTrue(result.register_pages)
+                    self.assertIn("UT_REG_SET_LATER(UART1_SR, UART_TXE, 20);", suite)
+                    self.assertNotIn("UT_EXPECT_NO_RETURN", suite)
+                elif check == "asm":
+                    notes = " ".join(result.host_notes)
+                    self.assertIn("__packed", notes)
+                    self.assertIn("cpsid i", notes)
+                    self.assertIn("ut_asm_value = 1;", suite)
+                    self.assertIn("__packed", (repo / "include" / "critical.h").read_text())   # never changed
+                elif check == "superloop":
+                    self.assertIn("UT_EXPECT_NO_RETURN(main());", suite)
+                else:
+                    self.assertIn("ut_state_set_g_tick_flag(1);", suite)
+                self.assertEqual(result.unfinished_tests, [])
+
+    @full_run
+    def test_embedded_cpp_files_reach_their_targets_without_a_brain(self):
+        """An injected interface and its fake, exceptions, a static object in a function, a register wait,
+        a header-only template, inline assembly and a superloop (A2-21aa, A3-45e, A3-45c, A1-DA19, A3-HW3)."""
+        for sut, check in (("src/motor_ctrl.cpp", "motor"), ("include/ring_buffer.hpp", "template"),
+                           ("src/counter.cpp", "asm"), ("src/app_main.cpp", "superloop")):
+            with self.subTest(sut=sut):
+                d = self.d / Path(sut).stem
+                d.mkdir()
+                repo = copy_pilot("cpp_embedded_pilot", d)
+                orchestrator = up.Orchestrator(pipeline_config(d))
+                with brain(DownBrain()):
+                    result = run(orchestrator.run(uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
+                self.assertEqual(result.final_state, "verified_measured", up.report(result))
+                self.assertEqual(result.language, "cpp")
+                suite = (repo / "tests" / f"test_{Path(sut).stem}.cpp").read_text()
+                if check == "motor":
+                    self.assertIn("class ut_fake_IEncoder : public IEncoder", (repo / "tests/stubs/ut_stubs.h").read_text())
+                    self.assertIn("std::invalid_argument);", suite)
+                    self.assertIn("UT_REG_SET_LATER(hw::tim2()->SR, hw::SR_UIF, 20);", suite)
+                elif check == "template":
+                    self.assertIn("extern template class RingBuffer<std::int32_t, 4>;", suite)
+                    self.assertIn("std::overflow_error);", suite)
+                elif check == "asm":
+                    self.assertIn("cpsid i", " ".join(result.host_notes))
+                else:
+                    self.assertIn("UT_EXPECT_NO_RETURN(main());", suite)
 
     def test_a_brain_test_that_does_not_compile_costs_no_iteration(self):
         """A3-CL12: one generated test does not compile; the others are still run and measured in the same

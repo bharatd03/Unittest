@@ -1444,6 +1444,8 @@ class RunState:
             total_tests=last.total if last else 0, passed=last.passed if last else 0, failed=last.failed if last else 0,
             unfinished_tests=[f"{t.name}: {t.status} - {t.message}"[:300] for t in (last.tests if last else [])
                               if t.status in ("crashed", "timeout")],                          # A3-29d
+            register_pages=list(last.register_pages) if last else [],                          # A3-HW1
+            host_notes=list(last.host_notes) if last else [],                                  # A3-HW2..HW4
             files_generated=sorted(self.files_generated), files_modified=sorted(self.files_modified),
             characterization_tests=len(bundle.characterization_tests) if bundle else 0,
             oracle_checks=self.oracle_checks, source_fixes=self.source_fixes, open_items=sorted(self.open_items),
@@ -1486,6 +1488,10 @@ def report(r: uc.PipelineResult) -> str:
         rows += [f"- {line}" for line in r.unfinished_tests[:40]]
         rows += ([f"- ... and {len(r.unfinished_tests) - 40} more (see result.json)"] if len(r.unfinished_tests) > 40 else [])
         rows.append("")
+    if r.host_notes:                                                                     # A3-HW2..HW4
+        rows += ["Target code on the host [A3-HW2, A3-HW3, A3-HW4]:", ""] + [f"- {n}" for n in r.host_notes[:40]] + [""]
+    if r.register_pages:                                                                 # A3-HW1
+        rows += [f"Target register pages the tests used in host memory [A3-HW1]: {', '.join(r.register_pages[:30])}", ""]
     if r.metrics:
         rows += ["| Metric | Covered | Total | % | Status |", "| --- | --- | --- | --- | --- |"]
         for name in uc.METRICS:

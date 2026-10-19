@@ -43,6 +43,14 @@ from ut_contracts import ba
 LOG = ba.logging.getLogger("ut.agent1")
 C_EXT = (".c",)
 CPP_EXT = (".cpp", ".cc", ".cxx", ".c++")
+
+
+def cpp_content(text: str) -> bool:
+    """A1-DA19: C++ constructs in a file (comments and strings removed)."""
+    code = re.sub(r"/\*.*?\*/|//[^\n]*|\"(?:[^\"\\\n]|\\.)*\"", " ", text, flags=re.S)
+    return bool(re.search(r"\b(class|namespace|template\s*<|public\s*:|private\s*:|protected\s*:|constexpr|nullptr|"
+                          r"typename|operator\s*\W|static_cast|using\s+\w+\s*=)\b|\w::\w|#\s*include\s*<c(stdint|stddef|"
+                          r"stdio|string|stdlib|math)>|#\s*include\s*<(vector|string|array|memory|stdexcept|cstddef)>", code))
 HEADER_EXT = (".h", ".hpp", ".hh", ".hxx")
 KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "do", "else", "case", "catch", "new", "delete",
             "static_cast", "reinterpret_cast", "const_cast", "dynamic_cast", "defined", "alignof", "decltype"}
@@ -523,6 +531,9 @@ class AstIndex:
     def _index(self, node: dict, scope: str, parent: str) -> None:
         nid, kind, name = node.get("id"), node.get("kind", ""), node.get("name", "")
         qualified = f"{scope}::{name}" if scope and name else name
+        if kind == "CXXRecordDecl" and name and scope.rsplit("::", 1)[-1] == name and \
+                self.nodes.get(parent, {}).get("kind") == "ClassTemplateDecl":
+            qualified = scope                     # the record of a class template is the template itself
         if nid:
             self.nodes[nid] = node
             if parent:
@@ -594,6 +605,8 @@ class FrontEnd:
                *(self.tools.cxx_flags if cpp else []), *uc.expand_flags(self.flags, self.repo), self.path]
         if not any(f.startswith("-std=") for f in self.flags):
             cmd.insert(1, "-std=c++17" if cpp else "-std=c11")
+        if Path(self.path).suffix.lower() in HEADER_EXT + (".inl", ".ipp", ".tpp"):
+            cmd[-1:-1] = ["-x", "c++" if cpp else "c"]          # a header SUT parsed as a source [A1-DA19]
         try:
             proc = subprocess.run(cmd, cwd=str(self.repo), capture_output=True, timeout=timeout,
                                   stdin=subprocess.DEVNULL, env={**os.environ, **self.tools.env()})
@@ -659,6 +672,18 @@ class FrontEnd:
             out.append((node, self.ast.qualified_name(node)))
         return out
 
+    def local_statics(self) -> list[tuple[str, str, str]]:
+        """A1-DA18: (function, variable, type) of every static variable defined inside a function of this
+        file, C and C++ (a static object inside a function included)."""
+        out = []
+        for node, qualified in self.definitions():
+            if node.get("kind") == "VarDecl":
+                continue
+            for sub in _walk([c for c in node.get("inner", []) or [] if c.get("kind") == "CompoundStmt"]):
+                if sub.get("kind") == "VarDecl" and sub.get("storageClass") == "static" and sub.get("name"):
+                    out.append((qualified or node.get("name", ""), sub["name"], (sub.get("type") or {}).get("qualType", "")))
+        return out
+
     def _locals(self) -> set[str]:
         if not hasattr(self, "_local_ids"):
             ids = set()
@@ -712,6 +737,39 @@ class FrontEnd:
         return ""
 
     # ------------------------------------------------------------ types for test inputs
+    def _abstract(self) -> set[str]:
+        """Names (short and qualified) of the classes with pure virtual methods."""
+        if not hasattr(self, "_abstract_names"):
+            names = set()
+            for i in self.interfaces():
+                names |= {i.name, i.name.split("::")[-1]}
+            self._abstract_names = names
+        return self._abstract_names
+
+    def interfaces(self) -> list[uc.InterfaceInfo]:
+        """A1-DA17: classes of the repository with pure virtual methods (injected interfaces)."""
+        out = []
+        for nid, node in self.ast.nodes.items():
+            if node.get("kind") != "CXXRecordDecl" or not node.get("completeDefinition"):
+                continue
+            pure = [c for c in node.get("inner", []) or [] if c.get("kind") == "CXXMethodDecl" and c.get("pure")]
+            if not pure:
+                continue
+            methods = []
+            for m in pure:
+                qt = (m.get("type") or {}).get("qualType", "")
+                ret = qt[: qt.index("(")].strip() if "(" in qt else "void"
+                suffix = re.search(r"\)\s*((?:const|volatile|noexcept|&|&&|\s)*)$", qt)
+                methods.append(uc.InterfaceMethod(
+                    name=m.get("name", ""), return_type=ret,
+                    params=[[(p.get("type") or {}).get("qualType", ""), p.get("name") or f"arg{i}"]
+                            for i, p in enumerate(c for c in m.get("inner", []) or [] if c.get("kind") == "ParmVarDecl")],
+                    suffix=(" " + suffix.group(1).strip()) if suffix and suffix.group(1).strip() else ""))
+            path, _ = self.ast.decl_location(nid)
+            out.append(uc.InterfaceInfo(name=self.ast.qualified.get(nid, node.get("name", "")),
+                                        header=self.ast.rel(path) if path else "", methods=methods))
+        return out
+
     def enums(self) -> list[uc.EnumInfo]:
         out = []
         typedefs = {}                                   # unnamed enum id -> typedef name
@@ -797,7 +855,7 @@ class FrontEnd:
         qt = (parm.get("type") or {}).get("qualType", "")
         dt = (parm.get("type") or {}).get("desugaredQualType") or qt
         name = parm.get("name", "")
-        info = uc.ParamInfo(name=name, type=qt)
+        info = uc.ParamInfo(name=name, type=qt, canonical=dt)
         t = dt.strip()
         if name and re.search(r"(\b" + re.escape(name) + r"\s*[!=]=\s*(NULL|nullptr|0)\b|\b(NULL|nullptr)\s*[!=]=\s*"
                               + re.escape(name) + r"\b|!\s*" + re.escape(name) + r"\b|if\s*\(\s*" + re.escape(name)
@@ -817,8 +875,10 @@ class FrontEnd:
         enum = enums.get(base) or enums.get(_plain_type(qt.rstrip("*&")))
         if pointer and base in ("char", "signed char", "unsigned char") and not by_ref:
             info.kind = "cstring" if base_dt.startswith("const") or "const char" in qt else "buffer"
-        elif pointer and base == "void":
-            info.kind = "other"
+        elif pointer and base == "void" and not by_ref:
+            info.kind = "ptr_void"                                                  # A2-21h: a zeroed buffer
+        elif pointer and base in self._abstract():
+            info.kind = "interface"                                                 # A1-DA17: a fake is passed
         elif pointer:
             if base in ("bool", "_Bool") or INTEGRAL_T.match(base) or FLOAT_T.match(base) or enum:
                 info.kind = "ptr_scalar"
@@ -1558,6 +1618,9 @@ class AnalyzerAgent(ba.AgentCore):
         sut = root / sut_rel
         language = "cpp" if sut.suffix.lower() in CPP_EXT else "c"
         source = sut.read_text(encoding="utf-8", errors="replace")
+        header_sut = sut.suffix.lower() in HEADER_EXT + (".inl", ".ipp", ".tpp")              # A1-DA19
+        if header_sut and cpp_content(source):
+            language = "cpp"                                       # decided by the content, not the extension
         component = self._component_root(root, sut)
         files = [p for p in root.rglob("*") if p.is_file() and ".git" not in p.parts and "ut_work" not in p.parts]
         rel = lambda p: str(p.relative_to(root)).replace("\\", "/")
@@ -1626,7 +1689,7 @@ class AnalyzerAgent(ba.AgentCore):
             writable_stub_dir=default_stub_dir, suite_file=suite, framework="ut_harness", existing_tests=existing,
             executable_tests=[t for t in executable if t != suite], functions=functions,
             sut_sha256=uc.file_sha256(sut), blocked=blocked, blocked_reason=reason,
-            requirement_files=requirement_files)
+            requirement_files=requirement_files, header_sut=header_sut)
 
     @staticmethod
     def _build_system(root: Path, component: Path) -> str:
@@ -1764,6 +1827,7 @@ class AnalyzerAgent(ba.AgentCore):
             plan.notes.append("front-end errors: " + "; ".join(sut.errors[:3]))
         sut_names = {f.qualified_name for f in functions} | {f.name for f in functions}
         layout.sut_state = []
+        classes = {f.qualified_name.rsplit("::", 1)[0] for f in functions if f.member}
         for node, qualified in sut.definitions():          # the SUT's own globals are part of the SUT [A1-DA15]
             if node.get("kind") != "VarDecl":
                 continue
@@ -1772,8 +1836,15 @@ class AnalyzerAgent(ba.AgentCore):
             const = (qt.startswith("const ") and "*" not in qt) or bool(re.search(r"\*\s*const\s*$", qt)) or \
                 node.get("constexpr")
             plain = qualified.replace("(anonymous namespace)::", "")
-            if not const and node.get("storageClass") != "extern" and "::" not in plain and node.get("name"):
-                layout.sut_state.append(uc.StateVar(name=node["name"], type=qt))
+            # namespace variables count too; static data members of a class do not (private, reset by the class)
+            scope = plain.rsplit("::", 1)[0] if "::" in plain else ""
+            if not const and node.get("storageClass") != "extern" and node.get("name") and scope not in classes:
+                layout.sut_state.append(uc.StateVar(name=plain, type=qt))
+        layout.local_statics = [uc.StateVar(name=f"{fn}::{var}", type=t) for fn, var, t in sut.local_statics()]   # A1-DA18
+        if layout.language == "cpp":                                                     # A1-DA17
+            used = " ".join(" ".join(p.type for p in f.params) + " " + f.signature for f in functions)
+            layout.interfaces = [i for i in sut.interfaces()
+                                 if re.search(r"\b" + re.escape(i.name.split("::")[-1]) + r"\s*[&*]", used)]
         sut_text = (repo / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         units: dict[str, FrontEnd | None] = {layout.sut_file: sut}
         queue = [(ref, 0, "") for node in nodes.values() for ref in sut.references(node)]
@@ -1788,7 +1859,7 @@ class AnalyzerAgent(ba.AgentCore):
             key = dep.qualified_name or dep.name
             old = previous.get(dep.name)
             dep.attempts = old.attempts if old else 0
-            if not dep.system:
+            if not dep.system and not dep.definition.lower().endswith(HEADER_EXT):
                 dep.existing_stub = self._existing_stub(layout, dep)
                 if not dep.existing_stub:
                     found = await asyncio.to_thread(self._find_definition, dep, layout, build, tools, units)
@@ -1800,7 +1871,7 @@ class AnalyzerAgent(ba.AgentCore):
                 dep.decision, dep.decided_by, dep.reason = "stub", "revision", revision
                 dep.attempts += 1
             decided[key] = dep
-            if dep.decision == "real":
+            if dep.decision == "real" and not dep.definition.lower().endswith(HEADER_EXT):
                 if dep.definition not in real_units:
                     real_units[dep.definition] = key
                     unit = units.get(dep.definition)
@@ -1813,7 +1884,8 @@ class AnalyzerAgent(ba.AgentCore):
                 dep.decision, dep.decided_by = "real", "rule"
                 dep.reason = f"defined in {dep.definition}, which is linked for {real_units[dep.definition]} [A1-DA10]"
         plan.entries = sorted(decided.values(), key=lambda d: (d.depth, d.name))
-        plan.real_sources = sorted({d.definition for d in plan.entries if d.decision == "real" and d.definition})
+        plan.real_sources = sorted({d.definition for d in plan.entries if d.decision == "real" and d.definition
+                                    and not d.definition.lower().endswith(HEADER_EXT)})            # A1-DA16
         # declarations proposed earlier for symbols without one stay in the plan [A1-PL14]
         plan.entries += [d for d in previous.values() if d.name not in {e.name for e in plan.entries}
                          and (d.decided_by.startswith("brain declaration") or "[A1-PL14]" in d.reason)]
@@ -1894,6 +1966,12 @@ class AnalyzerAgent(ba.AgentCore):
                 dep.method_suffix = (" " + m.group(1).strip()) if m and kind == "method" else ""
                 dep.params = [[(p.get("type") or {}).get("qualType", ""), p.get("name") or f"arg{i}"]
                               for i, p in enumerate(c for c in node.get("inner", []) if c.get("kind") == "ParmVarDecl")]
+        # A1-DA16: a definition in a header (inline function, member defined in its class, constexpr or inline
+        # variable, template) is part of every translation unit that includes it: never a dependency to stub.
+        if node and rel and rel.lower().endswith(HEADER_EXT) and (
+                any(c.get("kind") == "CompoundStmt" for c in node.get("inner", []) or []) or
+                (kind == "variable" and (node.get("constexpr") or node.get("inline") or node.get("init")))):
+            dep.definition = rel
         pattern = re.compile(r"\b" + re.escape(name) + r"\b")
         decision_line = re.compile(r"\b(if|while|switch|for)\b|\?|&&|\|\||[<>]=?|[!=]=|\breturn\b")
         dep.used_in_decision = any(pattern.search(line) and decision_line.search(line) for line in sut_text.splitlines())
@@ -1967,6 +2045,16 @@ class AnalyzerAgent(ba.AgentCore):
                 if answer and answer[0] == "stub":
                     dep.decision, dep.decided_by = "stub", f"llm p={answer[1]:.2f}"
                     dep.reason = "non-deterministic system service whose result controls SUT decisions [A1-DA8]"
+            return
+        owner = (dep.qualified_name or "").rsplit("::", 1)[0]
+        if dep.kind == "method" and owner and any(i.name == owner or i.name.endswith("::" + owner)
+                                                  for i in layout.interfaces):
+            dep.decision = "real"                                                          # A1-DA17, A2-21aa
+            dep.reason = f"pure virtual method of the injected interface {owner}: the test passes a fake [A2-21aa]"
+            return
+        if dep.definition.lower().endswith(HEADER_EXT):                                    # A1-DA16
+            dep.decision = "real"
+            dep.reason = f"defined in a header ({dep.definition}), so part of every translation unit [A1-DA16]"
             return
         if dep.existing_stub:
             dep.decision, dep.reason = "stub", f"the existing stub {dep.existing_stub} is reused [A1-DA7]"
