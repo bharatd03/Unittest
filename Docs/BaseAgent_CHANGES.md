@@ -20,6 +20,7 @@
   * Model not served: `MODEL_NOT_FOUND`.
   * The answer cut at its limit: as before (re-ask with more room, then salvage).
 * **Proxy.** The remote server is reached through the system proxy settings; the local Ollama still never is.
+* **User-Agent.** Requests carry `User-Agent: BaseAgent/1.0` (`qwen_remote.user_agent`). On the user's PC, the server refused Python's default `Python-urllib/3.12` with HTTP 403 while the same key worked with curl.
 * **Unchanged.** `qwen` (Ollama on the loopback address), the Claude models, and configurations that name their own `brain_order`. A configuration that lists `brain_order` without `qwen_remote` does not use the remote server.
 * **baseagent.bat.** Shows whether `QWEN_REMOTE_API_KEY` is set; the brain list names `qwen_remote`.
 * **Tests.**

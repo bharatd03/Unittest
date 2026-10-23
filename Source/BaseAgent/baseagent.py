@@ -1055,6 +1055,9 @@ class QwenRemoteSettings(QwenSettings):
     base_url: str = "https://llm.openroute-ai.com/v1"
     model: str = Field(default="qwen3-8b", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
     api_key_env: str = Field(default="QWEN_REMOTE_API_KEY", pattern=r"^[A-Z_][A-Z0-9_]{0,63}$")
+    # Sent as User-Agent. Protection layers in front of servers (e.g. Cloudflare) often refuse Python's
+    # default "Python-urllib/3.x" with HTTP 403, while they let a named client through.
+    user_agent: str = Field(default="BaseAgent/1.0", pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._/()+;:-]{0,99}$")
     no_think_tag: bool = True
     # JSON-schema output (response_format json_schema); a server without it gets json_object, then none.
     json_schema: bool = True
@@ -2265,9 +2268,10 @@ class RemoteHTTP(OllamaHTTP):
     environment at every request and goes only into the Authorization header."""
     LABEL = "The remote Qwen server"
 
-    def __init__(self, base_url: str, api_key_env: str, opener: Any = None):
+    def __init__(self, base_url: str, api_key_env: str, opener: Any = None, user_agent: str = "BaseAgent/1.0"):
         super().__init__(base_url, opener or urllib.request.build_opener())
         self.api_key_env = api_key_env
+        self.user_agent = user_agent
 
     def key(self) -> str:
         key = os.environ.get(self.api_key_env, "").strip()
@@ -2276,7 +2280,7 @@ class RemoteHTTP(OllamaHTTP):
         return key
 
     def headers(self) -> dict[str, str]:
-        return {**super().headers(), "Authorization": "Bearer " + self.key()}
+        return {**super().headers(), "Authorization": "Bearer " + self.key(), "User-Agent": self.user_agent}
 
 
 REMOTE_FORMATS = ("json_schema", "json_object", "none")
@@ -2295,7 +2299,7 @@ class QwenRemoteEngine(QwenEngine):
     def __init__(self, settings: QwenRemoteSettings, *, opener: Any = None):
         super().__init__(settings, opener=opener)
         self.model_id = "openai:" + settings.model
-        self.http = RemoteHTTP(settings.base_url, settings.api_key_env, opener)
+        self.http = RemoteHTTP(settings.base_url, settings.api_key_env, opener, settings.user_agent)
         self.format_mode = "json_schema" if settings.json_schema else "json_object"
 
     @staticmethod

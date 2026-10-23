@@ -246,6 +246,7 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
     defaults = dict(models=["qwen3-8b"], status=200, replies=None, finish_reason="stop", reject_schema=False,
                     max_model_len=32768)
     calls: list = []
+    agents: list = []
 
     def log_message(self, *_):
         pass
@@ -259,6 +260,9 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _authorized(self):
+        if "Python-urllib" in self.headers.get("User-Agent", ""):        # like a protection layer in front of it
+            self._send(403, {"error": {"message": "forbidden"}})
+            return False
         if self.headers.get("Authorization") != "Bearer test-key":
             self._send(401, {"error": {"message": "invalid api key", "type": "auth"}})
             return False
@@ -266,6 +270,7 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         FakeOpenAI.calls.append((self.path, None, self.headers.get("Authorization")))
+        FakeOpenAI.agents.append(self.headers.get("User-Agent", ""))
         if not self._authorized():
             return
         if self.path == "/v1/models":
@@ -299,6 +304,7 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
         for key, value in cls.defaults.items():
             setattr(cls, key, list(value) if isinstance(value, list) else value)
         cls.calls = []
+        cls.agents = []
 
     @classmethod
     def chat_bodies(cls):
@@ -907,6 +913,7 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_shape_key_and_thinking_off(self):
         engine = self.engine()
         await engine.start()
+        self.assertEqual(FakeOpenAI.agents, ["BaseAgent/1.0"])                     # not Python-urllib (refused: 403)
         self.assertEqual(engine.server_window, 32768)                              # what the server reports
         raw = await engine.predict('{"issue":"double charge"}', PROFILE.brain_questions())
         clean = ba.validate_answers(raw, PROFILE)
