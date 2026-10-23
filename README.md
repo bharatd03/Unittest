@@ -25,7 +25,8 @@ UnitTest/
 * **A brain** (optional for the tests):
   * `ANTHROPIC_API_KEY` as an environment variable – the Claude models the key can access are
     used in the order of `ut_config.json`. The key is never written to a file.
-  * otherwise Qwen3 8B through [Ollama](https://ollama.com) (`ollama pull qwen3:8b`).
+  * otherwise Qwen3 8B on the remote server in `brain.qwen_remote` of `ut_config.json` (OpenAI-compatible API; its key as the environment variable `QWEN_REMOTE_API_KEY`, never in a file),
+  * otherwise Qwen3 8B through [Ollama](https://ollama.com) on this PC (`ollama pull qwen3:8b`).
 
 Nothing else needs to be installed by hand.
 

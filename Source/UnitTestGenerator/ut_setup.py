@@ -848,6 +848,9 @@ class Setup:
         key = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
         log("Claude      : " + ("ANTHROPIC_API_KEY is set; the models it can access are used first"
                                 if key else "ANTHROPIC_API_KEY is not set: no Claude model"))
+        remote = bool(os.environ.get("QWEN_REMOTE_API_KEY", "").strip())
+        log("Remote Qwen : " + ("QWEN_REMOTE_API_KEY is set; the remote server is tried before Ollama"
+                                if remote else "QWEN_REMOTE_API_KEY is not set: the remote server is skipped"))
         model = os.environ.get("BASEAGENT_QWEN_MODEL", "qwen3:8b")
         ollama = shutil.which("ollama")
         if not ollama:

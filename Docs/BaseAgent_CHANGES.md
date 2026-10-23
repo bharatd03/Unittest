@@ -1,5 +1,37 @@
 # BaseAgent changes
 
+## 2026-10-23: Qwen on a remote server before the local Ollama
+
+**Why.** Qwen3 8B now also runs on a server with an OpenAI-compatible API. BaseAgent should use it whenever no Claude model is available, and fall back to Ollama on this PC only when that server cannot be reached.
+
+* **New brain `qwen_remote` (`QwenRemoteEngine`).** The default order is opus, fable, sonnet, haiku, **qwen_remote**, qwen. Everything above the transport is the local Qwen's: prompts, the `_analysis` lead, re-asks, repetition handling, token budgets. The request goes to `{base_url}/chat/completions`.
+* **Settings `qwen_remote`.**
+  * `base_url` (default `https://llm.openroute-ai.com/v1`); https only, http only on this computer, no credentials in the URL.
+  * `model` (default `qwen3-8b`).
+  * `api_key_env` (default `QWEN_REMOTE_API_KEY`). The key is read from that environment variable at every request and goes only into the `Authorization` header. It is never in a configuration file, log, result or error message.
+  * `windows` (default 16,384; the server's `max_model_len` wins when `/models` reports one).
+  * `max_concurrency` (default 1).
+  * `json_schema`, `no_think_tag`, and the usual answer limits and timeouts.
+* **Thinking off.** Every request carries `chat_template_kwargs: {"enable_thinking": false}`, and `/no_think` at the end of the last user message (switch it off with `no_think_tag: false`). With `think: true` both are left out.
+* **Output format.** JSON schema (`response_format` `json_schema`). A server that refuses it gets `json_object`, then no format. The choice is kept for the following calls. BaseAgent validates every answer either way.
+* **Fallback.**
+  * No key, or the key refused (401/403): `BRAIN_NO_ACCESS`, skipped for the run.
+  * Unreachable, 429 or 5xx, or too slow: `MODEL_UNAVAILABLE` / `MODEL_TIMEOUT`. The router skips it for the cooldown, and Qwen through Ollama answers the same call.
+  * Model not served: `MODEL_NOT_FOUND`.
+  * The answer cut at its limit: as before (re-ask with more room, then salvage).
+* **Proxy.** The remote server is reached through the system proxy settings; the local Ollama still never is.
+* **Unchanged.** `qwen` (Ollama on the loopback address), the Claude models, and configurations that name their own `brain_order`. A configuration that lists `brain_order` without `qwen_remote` does not use the remote server.
+* **baseagent.bat.** Shows whether `QWEN_REMOTE_API_KEY` is set; the brain list names `qwen_remote`.
+* **Tests.**
+  * `QwenRemoteEngineTests` (6) run against a fake OpenAI-compatible server. They cover:
+    * the request shape, the key in the header and thinking off;
+    * no key and a refused key;
+    * the format fallback;
+    * a cut answer and an unknown model;
+    * the local Qwen answering only when the remote one is not available (overloaded or unreachable).
+  * `QwenRemoteLiveTests` asks the real server one question, only when `QWEN_REMOTE_API_KEY` is set. The key is removed from the environment of every other test.
+  * 199 tests in total.
+
 ## 2026-10-19 (evening): rule first, brain when a rule fails, the tool decides
 
 **Why.** On 15 files of five open-source code bases, 10 files ended with "cannot": a rule met a pattern it was not written for (include order, `T * const`, a namespace, a target keyword), and no brain was ever asked. Every agent of every application should hand such a case to the brain and let its own tool judge the answer.

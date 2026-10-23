@@ -2,7 +2,8 @@
 rem ===========================================================================
 rem  BaseAgent on Windows: runs the tests and/or starts BaseAgent.
 rem  Brains: the Claude models your ANTHROPIC_API_KEY can access (Opus 5.5, Fable 5.1,
-rem  Sonnet 5.5, Haiku 5.5, in that order), else Qwen3 8B through Ollama.
+rem  Sonnet 5.5, Haiku 5.5, in that order), else Qwen3 8B on the remote server (key in
+rem  QWEN_REMOTE_API_KEY, address in qwen_remote of the configuration), else Qwen3 8B through Ollama.
 rem  No WSL. Needs Windows Python 3.11+; Ollama for Windows for the Qwen fallback.
 rem
 rem    baseagent.bat          menu
@@ -14,12 +15,16 @@ rem    baseagent.bat check    show which brains are available and ask each one q
 rem
 rem  Optional settings, set before running:
 rem    set BASEAGENT_QWEN_MODEL=qwen3:8b   Ollama tag of your model, see: ollama list
+rem    set QWEN_REMOTE_API_KEY=sk-...      key of the remote Qwen server; without it the remote
+rem                                        Qwen is skipped and Ollama on this PC is used
 rem    set BASEAGENT_BRAIN=auto            auto = the first Claude model the key can access,
-rem                                        Qwen when none is; or one brain: opus, fable,
-rem                                        sonnet, haiku or qwen
+rem                                        then the remote Qwen, then Qwen through Ollama;
+rem                                        or one brain: opus, fable, sonnet, haiku,
+rem                                        qwen_remote or qwen
 rem    set BASEAGENT_PYTHON=C:\path\python.exe   use this Python instead of .venv
 rem    set BASEAGENT_QWEN_THINK=1          live Qwen tests with thinking mode - slower
-rem    ANTHROPIC_API_KEY stays an environment variable; it is never written to a file.
+rem    ANTHROPIC_API_KEY and QWEN_REMOTE_API_KEY stay environment variables; they are never
+rem    written to a file.
 rem ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -160,6 +165,8 @@ goto qwen_checked
 echo Ollama is not installed. Get it from https://ollama.com/download/windows
 :qwen_checked
 if not defined QWEN_READY echo Qwen   : NOT available - the live Qwen tests will be skipped; BaseAgent uses the Claude models the API key can access.
+if defined QWEN_REMOTE_API_KEY echo Remote : QWEN_REMOTE_API_KEY is set - the remote Qwen is tried before Ollama on this PC
+if not defined QWEN_REMOTE_API_KEY echo Remote : QWEN_REMOTE_API_KEY is not set - the remote Qwen is skipped
 
 if /i "%ACTION%"=="start" goto start_server
 if /i "%ACTION%"=="check" goto check

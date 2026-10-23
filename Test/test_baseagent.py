@@ -65,6 +65,9 @@ PROFILE = ba.UseCase(domain="support", questions={
     "urgency": ba.Question(type="score", instructions="How urgent?", criteria=["calm", "firm", "angry", "furious"]),
     "refund": ba.Question(type="noul", instructions="Refund requested?")})
 # What a brain returns: one probability per allowed answer (Opus and Qwen alike).
+# The remote Qwen server is reached only by QwenRemoteLiveTests; every other test runs without its key.
+REMOTE_KEY = os.environ.pop("QWEN_REMOTE_API_KEY", "")
+
 OPUS_REPLY = {"queue": {"billing": 0.9, "tech": 0.05, "other": 0.05},
               "urgency": {"0": 0.1, "1": 0.2, "2": 0.4, "3": 0.3},
               "refund": {"false": 0.2, "true": 0.8}}
@@ -238,6 +241,73 @@ def start_fake_ollama():
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
+class FakeOpenAI(http.server.BaseHTTPRequestHandler):
+    """An OpenAI-compatible server (/v1/models, /v1/chat/completions) for QwenRemoteEngine; key "test-key"."""
+    defaults = dict(models=["qwen3-8b"], status=200, replies=None, finish_reason="stop", reject_schema=False,
+                    max_model_len=32768)
+    calls: list = []
+
+    def log_message(self, *_):
+        pass
+
+    def _send(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authorized(self):
+        if self.headers.get("Authorization") != "Bearer test-key":
+            self._send(401, {"error": {"message": "invalid api key", "type": "auth"}})
+            return False
+        return True
+
+    def do_GET(self):
+        FakeOpenAI.calls.append((self.path, None, self.headers.get("Authorization")))
+        if not self._authorized():
+            return
+        if self.path == "/v1/models":
+            return self._send(200, {"object": "list", "data": [{"id": m, "object": "model",
+                                                                 "max_model_len": FakeOpenAI.max_model_len}
+                                                                for m in FakeOpenAI.models]})
+        self._send(404, {"error": {"message": "unknown path"}})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeOpenAI.calls.append((self.path, body, self.headers.get("Authorization")))
+        cls = FakeOpenAI
+        if not self._authorized():
+            return
+        if self.path != "/v1/chat/completions":
+            return self._send(404, {"error": {"message": "unknown path"}})
+        if cls.reject_schema and body.get("response_format", {}).get("type") == "json_schema":
+            return self._send(400, {"error": {"message": "response_format type json_schema is not supported"}})
+        if cls.status != 200:
+            return self._send(cls.status, {"error": {"message": "server overloaded"}})
+        chats = sum(1 for path, _, _ in cls.calls if path == "/v1/chat/completions")
+        replies = cls.replies or [json.dumps(QWEN_REPLY)]
+        content = replies[min(chats, len(replies)) - 1]
+        self._send(200, {"id": "c1", "object": "chat.completion", "model": body["model"],
+                         "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                                      "finish_reason": cls.finish_reason}],
+                         "usage": {"prompt_tokens": 150, "completion_tokens": 30, "total_tokens": 180}})
+
+    @classmethod
+    def reset(cls):
+        for key, value in cls.defaults.items():
+            setattr(cls, key, list(value) if isinstance(value, list) else value)
+        cls.calls = []
+
+    @classmethod
+    def chat_bodies(cls):
+        return [body for path, body, _ in cls.calls if path == "/v1/chat/completions"]
+
+
+FakeOpenAI.reset()
+
+
 # ---------------------------------------------------------------- builders
 def make_principal(principal_id="agent-a", tenant="t1", groups=("engineering",), use_cases=("uc.v1",),
                    token=None, expires_in=3600, disabled=False):
@@ -361,7 +431,7 @@ class ContractModelTests(unittest.TestCase):
                 ba.Question(instructions="x", **kwargs)
 
     def test_use_case_brains(self):
-        self.assertEqual(PROFILE.allowed_brains, ["opus", "fable", "sonnet", "haiku", "qwen"])
+        self.assertEqual(PROFILE.allowed_brains, ["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"])
         both = ba.UseCase(domain="d", questions=PROFILE.questions, allowed_brains=["claude", "qwen"])
         self.assertEqual(both.allowed_brains, ["opus", "fable", "sonnet", "haiku", "qwen"])   # "claude" = all four
         with self.assertRaises(ba.ValidationError):
@@ -746,7 +816,7 @@ class DemoEngineTests(unittest.IsolatedAsyncioTestCase):
     def test_mode_selection(self):
         self.assertEqual(ba.EngineSettings(mode="demo").brain_names(), ["demo"])
         self.assertEqual(ba.EngineSettings(mode="qwen").brain_names(), ["qwen"])
-        self.assertEqual(ba.EngineSettings().brain_names(), ["opus", "fable", "sonnet", "haiku", "qwen"])
+        self.assertEqual(ba.EngineSettings().brain_names(), ["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"])
         self.assertEqual(ba.EngineSettings(mode="haiku").brain_names(), ["haiku"])
         for mode in ("laya-x", "gpt"):
             with self.subTest(mode), self.assertRaises(ba.ValidationError):
@@ -797,6 +867,109 @@ class OpusEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(schema["properties"]["urgency"]["required"], ["0", "1", "2", "3"])
         self.assertEqual(schema["properties"]["refund"]["required"], ["false", "true"])
+
+
+# ============================================================================ Qwen brain (remote server)
+class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
+    """QwenRemoteEngine against a fake OpenAI-compatible server; the key only in the environment."""
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAI)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        FakeOpenAI.reset()
+        patcher = mock.patch.dict(os.environ, {"BASEAGENT_TEST_REMOTE_KEY": "test-key"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def engine(self, **changes):
+        settings = ba.QwenRemoteSettings(**{"base_url": self.url, "api_key_env": "BASEAGENT_TEST_REMOTE_KEY", **changes})
+        return ba.QwenRemoteEngine(settings, opener=urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
+    def test_settings_and_order(self):
+        self.assertEqual(ba.BRAIN_NAMES[-2:], ("qwen_remote", "qwen"))              # before the local Ollama
+        settings = ba.Settings()
+        self.assertEqual(settings.qwen_remote.base_url, "https://llm.openroute-ai.com/v1")
+        self.assertEqual((settings.qwen_remote.model, settings.qwen_remote.api_key_env), ("qwen3-8b", "QWEN_REMOTE_API_KEY"))
+        self.assertNotIn("sk-", json.dumps(settings.model_dump()))                  # no key in any configuration
+        for bad in ("http://llm.example.com/v1", "ftp://x/v1", "https://user:pw@x/v1", "https://x/v1?key=1"):
+            with self.subTest(bad), self.assertRaises(ba.ValidationError):
+                ba.QwenRemoteSettings(base_url=bad)
+        router = ba.build_router(ba.Settings(anthropic=ba.AnthropicSettings(enabled=False)))
+        self.assertEqual(router.names, ["qwen_remote", "qwen"])
+
+    async def test_request_shape_key_and_thinking_off(self):
+        engine = self.engine()
+        await engine.start()
+        self.assertEqual(engine.server_window, 32768)                              # what the server reports
+        raw = await engine.predict('{"issue":"double charge"}', PROFILE.brain_questions())
+        clean = ba.validate_answers(raw, PROFILE)
+        self.assertEqual(clean["queue"]["choice"], "billing")
+        self.assertEqual(raw["model"], "openai:qwen3-8b")
+        path, body, auth = FakeOpenAI.calls[-1]
+        self.assertEqual((path, auth), ("/v1/chat/completions", "Bearer test-key"))
+        self.assertEqual(body["model"], "qwen3-8b")
+        self.assertIs(body["stream"], False)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertTrue(body["messages"][-1]["content"].endswith("/no_think"))
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertEqual((body["temperature"], body["seed"]), (0.0, 42))
+        await engine.close()
+
+    async def test_without_or_with_a_refused_key_the_brain_is_skipped_for_the_run(self):
+        os.environ.pop("BASEAGENT_TEST_REMOTE_KEY")
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await self.engine().start()
+        self.assertEqual(ctx.exception.code, "BRAIN_NO_ACCESS")
+        self.assertFalse(FakeOpenAI.calls)                                          # nothing was sent
+        os.environ["BASEAGENT_TEST_REMOTE_KEY"] = "wrong-key"
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await self.engine().start()
+        self.assertEqual(ctx.exception.code, "BRAIN_NO_ACCESS")
+        self.assertNotIn("wrong-key", ctx.exception.message)
+
+    async def test_server_without_json_schema_gets_json_object(self):
+        FakeOpenAI.reject_schema = True
+        engine = self.engine()
+        raw = await engine.predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")
+        formats = [b.get("response_format", {}).get("type") for b in FakeOpenAI.chat_bodies()]
+        self.assertEqual(formats, ["json_schema", "json_object"])
+        self.assertEqual(engine.format_mode, "json_object")                        # kept for the next calls
+
+    async def test_cut_answer_and_unknown_model(self):
+        FakeOpenAI.finish_reason = "length"
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await self.engine(output_retries=0).predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
+        FakeOpenAI.reset()
+        FakeOpenAI.models = ["llama3"]
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await self.engine().start()
+        self.assertEqual(ctx.exception.code, "MODEL_NOT_FOUND")
+
+    async def test_the_local_qwen_answers_only_when_the_remote_one_is_not_available(self):
+        class LocalQwen(ba.DemoEngine):
+            brain_name = "qwen"
+        questions = PROFILE.brain_questions()
+        for case, status, url in (("available", 200, None), ("overloaded", 503, None),
+                                  ("unreachable", 200, "http://127.0.0.1:9/v1")):
+            with self.subTest(case):
+                FakeOpenAI.reset()
+                FakeOpenAI.status = status
+                remote = self.engine(**({"base_url": url, "startup_timeout": 2} if url else {}))
+                router = ba.BrainRouter([remote, LocalQwen()], cooldown=30)
+                await router.start()
+                raw, brain, skipped = await router.decide("{}", questions, ["qwen_remote", "qwen"])
+                self.assertEqual(router.name_of(brain), "qwen_remote" if case == "available" else "qwen")
+                self.assertEqual(skipped, [] if case == "available" else ["qwen_remote"])
+                await router.close()
 
 
 # ============================================================================ Qwen brain (local Ollama)
@@ -1229,12 +1402,15 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_build_router_order(self):
         router = ba.build_router(ba.Settings())
-        self.assertEqual(router.names, ["opus", "fable", "sonnet", "haiku", "qwen"])
+        self.assertEqual(router.names, ["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"])
         self.assertEqual([b.model_id for b in router.brains[:4]],
                          ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"])
-        self.assertIsInstance(router.brains[4], ba.QwenEngine)
+        self.assertIsInstance(router.brains[4], ba.QwenRemoteEngine)
+        self.assertIsInstance(router.brains[5], ba.QwenEngine)
         local = ba.Settings.model_validate({"anthropic": {"enabled": False}})
-        self.assertEqual(ba.build_router(local).names, ["qwen"])
+        self.assertEqual(ba.build_router(local).names, ["qwen_remote", "qwen"])
+        only_ollama = ba.Settings.model_validate({"anthropic": {"enabled": False}, "qwen_remote": {"enabled": False}})
+        self.assertEqual(ba.build_router(only_ollama).names, ["qwen"])
         reverse = ba.Settings.model_validate({"engine": {"brain_order": ["qwen", "opus"]}})
         self.assertEqual(ba.build_router(reverse).names, ["qwen", "opus"])
         self.assertEqual(ba.build_router(ba.Settings(engine=ba.EngineSettings(mode="qwen"))).names, ["qwen"])
@@ -1471,10 +1647,10 @@ class QwenServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_mode_without_api_key_falls_back_to_qwen(self):
         response = await self.decide(mode="auto")
         self.assertEqual(response.meta.brain, "qwen", response.error)
-        self.assertEqual(sorted(response.meta.fallbacks), ["fable", "haiku", "opus", "sonnet"])
+        self.assertEqual(sorted(response.meta.fallbacks), ["fable", "haiku", "opus", "qwen_remote", "sonnet"])
         self.assertEqual(self.service.engine.status, {"opus": "BRAIN_NO_ACCESS", "fable": "BRAIN_NO_ACCESS",
                                                       "sonnet": "BRAIN_NO_ACCESS", "haiku": "BRAIN_NO_ACCESS",
-                                                      "qwen": "available"})
+                                                      "qwen_remote": "BRAIN_NO_ACCESS", "qwen": "available"})
 
     async def test_no_brain_when_ollama_is_down_and_no_api_key(self):
         self.settings.qwen = ba.QwenSettings(base_url="http://127.0.0.1:9", startup_timeout=2)
@@ -3319,6 +3495,19 @@ class QwenLiveServiceTests(_LiveDemoService):
             self.skipTest("ANTHROPIC_API_KEY is set, so Opus would answer")
         response = await self.decide(mode="auto", brain_order=["opus", "qwen"])
         self.assertEqual((response.meta.brain, response.meta.fallbacks), ("qwen", ["opus"]), response.error)
+
+
+@unittest.skipUnless(REMOTE_KEY, "QWEN_REMOTE_API_KEY is not set: no remote Qwen test")
+class QwenRemoteLiveTests(unittest.IsolatedAsyncioTestCase):
+    """The configured remote Qwen server answers one typed question (only with QWEN_REMOTE_API_KEY set)."""
+    async def test_remote_server_answers(self):
+        self.enterContext(mock.patch.dict(os.environ, {"QWEN_REMOTE_API_KEY": REMOTE_KEY}))
+        engine = ba.QwenRemoteEngine(ba.QwenRemoteSettings())
+        await engine.start()
+        raw = await engine.predict('{"issue":"double charge on the invoice"}', PROFILE.brain_questions())
+        print("\nRemote Qwen:", engine.model_id, "format", engine.format_mode, raw["usage"])
+        self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"] in ("billing", "tech", "other"), True)
+        await engine.close()
 
 
 @unittest.skipIf(QWEN_SKIP or not HAVE_FASTMCP, QWEN_SKIP or "fastmcp not installed")

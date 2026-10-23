@@ -35,14 +35,15 @@ rem  into the tools folder next to this file, from the official release pages, w
 rem  The pipeline then uses only the tools listed in tools\toolchain.json; it has no fallbacks.
 rem
 rem  Brains: the Claude models ANTHROPIC_API_KEY can access (Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5,
-rem  in the order of ut_config.json), else Qwen3 8B through Ollama. "check" shows which are available.
+rem  in the order of ut_config.json), else Qwen3 8B on the remote server (set QWEN_REMOTE_API_KEY),
+rem  else Qwen3 8B through Ollama. "check" shows which are available.
 rem
 rem  Live viewer: every run opens it in the browser or prints its address; add --no-view to switch it
 rem  off. Settings: "viewer" in ut_config.json.
 rem
 rem  Python: the BaseAgent environment ..\BaseAgent\.venv (created with Python 3.12 if missing),
-rem  or set BASEAGENT_PYTHON. ANTHROPIC_API_KEY stays an environment variable; it is never written
-rem  to a file.
+rem  or set BASEAGENT_PYTHON. ANTHROPIC_API_KEY and QWEN_REMOTE_API_KEY stay environment variables;
+rem  they are never written to a file.
 rem ===========================================================================
 setlocal EnableExtensions
 rem  A relative repository folder is meant from where the command was started [TP-23].

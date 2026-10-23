@@ -66,12 +66,14 @@ PILOTS = HERE / "pilots"
 # A test that needs a brain patches in the scripted stand-in (brain(...)).
 NO_BRAIN_URL = "http://127.0.0.1:9"
 os.environ.pop("ANTHROPIC_API_KEY", None)
+os.environ.pop("QWEN_REMOTE_API_KEY", None)                # the remote Qwen server is never reached either
 _REAL_BUILD_ROUTER = ba.build_router
 
 
 def _hermetic_router(settings, *, injected=None):
     qwen = settings.qwen.model_copy(update={"base_url": NO_BRAIN_URL})
-    return _REAL_BUILD_ROUTER(settings.model_copy(update={"qwen": qwen}), injected=injected)
+    remote = settings.qwen_remote.model_copy(update={"base_url": NO_BRAIN_URL + "/v1"})
+    return _REAL_BUILD_ROUTER(settings.model_copy(update={"qwen": qwen, "qwen_remote": remote}), injected=injected)
 
 
 ba.build_router = _hermetic_router
@@ -3486,7 +3488,7 @@ class RequirementsTests(unittest.TestCase):
         """ARCH-1a, ARCH-1b: every Claude model first, Qwen3 8B as the fallback, the same for every agent."""
         settings = ba.Settings.model_validate(json.loads((SRC / "ut_config.json").read_text())["brain"])
         router = ba.build_router(settings)
-        self.assertEqual(router.names, ["opus", "fable", "sonnet", "haiku", "qwen"])
+        self.assertEqual(router.names, ["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"])
         self.assertEqual([b.model_id for b in router.brains[:4]],
                          ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"])
         for role, (name, script) in up.AGENTS.items():

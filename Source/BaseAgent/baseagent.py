@@ -212,8 +212,10 @@ class Question(StrictModel):
 # are tried, and in which order, is configuration (engine.brain_order, anthropic.models).
 CLAUDE_BRAINS = {"opus": "claude-opus-5-5", "fable": "claude-fable-5-1", "sonnet": "claude-sonnet-5-5",
                  "haiku": "claude-haiku-5-5"}
-BRAIN_NAMES = (*CLAUDE_BRAINS, "qwen")
-BrainName = Literal["opus", "fable", "sonnet", "haiku", "qwen"]
+# qwen_remote: Qwen on a server with an OpenAI-compatible API (qwen_remote.base_url); qwen: Qwen through
+# Ollama on this computer. The remote one is tried first; the local one only when it is not available.
+BRAIN_NAMES = (*CLAUDE_BRAINS, "qwen_remote", "qwen")
+BrainName = Literal["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"]
 # Brains removed on 2026-10-08; their configured places go to Qwen.
 LEGACY_BRAINS = {"nimble": "qwen", "laya": "qwen"}
 
@@ -356,7 +358,7 @@ class ResponseMeta(StrictModel):
     use_case: str = ""
     policy_version: str = ""
     model_id: str = ""
-    brain: str = ""                                   # opus | fable | sonnet | haiku | qwen | demo | injected
+    brain: str = ""                       # opus | fable | sonnet | haiku | qwen_remote | qwen | demo | injected
     fallbacks: list[str] = Field(default_factory=list)  # brains skipped as unavailable
     model_invoked: bool = False
     simulation: bool = False
@@ -1040,10 +1042,42 @@ class QwenSettings(StrictModel):
         return self
 
 
+class QwenRemoteSettings(QwenSettings):
+    """Qwen on a server with an OpenAI-compatible API (``POST {base_url}/chat/completions``), tried before
+    the local Ollama. The key is read from the environment variable named in ``api_key_env`` at every
+    request; it is never written to a file, a log or a result. Without the variable the brain is skipped.
+
+    The checks, re-asks and budgets are those of the local Qwen. What differs: one context window (the
+    server's context length, ``windows``), no model download or preload, the system proxy is used, and
+    thinking is switched off in the request (``chat_template_kwargs`` and, with ``no_think_tag``, /no_think).
+    """
+    enabled: bool = True
+    base_url: str = "https://llm.openroute-ai.com/v1"
+    model: str = Field(default="qwen3-8b", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+    api_key_env: str = Field(default="QWEN_REMOTE_API_KEY", pattern=r"^[A-Z_][A-Z0-9_]{0,63}$")
+    no_think_tag: bool = True
+    # JSON-schema output (response_format json_schema); a server without it gets json_object, then none.
+    json_schema: bool = True
+    preload: bool = False
+    startup_timeout: float = Field(default=20.0, gt=0.0, le=120.0)
+    windows: list[int] = Field(default_factory=lambda: [16_384], min_length=1, max_length=8)
+
+    @field_validator("base_url")
+    @classmethod
+    def loopback_only(cls, value):            # replaces the local Ollama's loopback rule
+        parsed = urllib.parse.urlsplit(value)
+        local = parsed.hostname in LOOPBACK_HOSTS
+        if parsed.scheme not in ("https", "http") or not parsed.hostname or (parsed.scheme == "http" and not local) \
+                or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("qwen_remote.base_url must be an https URL such as https://host/v1 "
+                             "(http only on this computer), without credentials.")
+        return value.rstrip("/")
+
+
 class EngineSettings(StrictModel):
     # "auto": try brain_order, skipping brains without access and falling back when a brain is
     # unavailable. A brain name: exactly that brain. "demo": explicit simulation (no model).
-    mode: Literal["auto", "opus", "fable", "sonnet", "haiku", "qwen", "demo"] = "auto"
+    mode: Literal["auto", "opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen", "demo"] = "auto"
     brain_order: list[BrainName] = Field(default_factory=lambda: list(BRAIN_NAMES), min_length=1,
                                          max_length=len(BRAIN_NAMES))
     brain_cooldown: float = Field(default=30.0, ge=0.0, le=600.0)
@@ -1087,6 +1121,7 @@ class Settings(StrictModel):
     profiles_file: str = "./profiles.json"
     engine: EngineSettings = Field(default_factory=EngineSettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
+    qwen_remote: QwenRemoteSettings = Field(default_factory=QwenRemoteSettings)
     qwen: QwenSettings = Field(default_factory=QwenSettings)
     semantic_retrieval: bool = False
     embedding_model_path: str = ""
@@ -1816,14 +1851,17 @@ class OllamaHTTP:
     """Minimal JSON client for the LOCAL Ollama server: loopback only, never via a proxy."""
     MAX_REQUEST_BYTES = 256 * 1024
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024       # thinking text and /api/show can be large
+    LABEL = "Local Ollama server"
 
     def __init__(self, base_url: str, opener: Any = None):
         self.base_url = base_url
         self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    def headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/json", "Accept": "application/json"}
+
     def _http(self, method: str, path: str, data: bytes | None, timeout: float) -> tuple[int, bytes]:
-        request = urllib.request.Request(self.base_url + path, data=data, method=method,
-                                         headers={"Content-Type": "application/json", "Accept": "application/json"})
+        request = urllib.request.Request(self.base_url + path, data=data, method=method, headers=self.headers())
         try:
             with self.opener.open(request, timeout=timeout) as reply:
                 return reply.status, reply.read(self.MAX_RESPONSE_BYTES + 1)
@@ -1834,12 +1872,12 @@ class OllamaHTTP:
             # urllib wraps every failure while connecting/sending in URLError, including a
             # connect timeout (a firewall silently dropping the SYN, as on WSL2 mirrored
             # networking). No connection was made, so this is "unreachable", not "slow".
-            raise AgentFault("MODEL_UNAVAILABLE", "Local Ollama server is unreachable.", True) from exc
+            raise AgentFault("MODEL_UNAVAILABLE", f"{self.LABEL} is unreachable.", True) from exc
         except TimeoutError as exc:
             # Raised unwrapped only after the request was sent: Ollama is up but too slow.
-            raise AgentFault("MODEL_TIMEOUT", "Local Ollama request exceeded its deadline.", True) from exc
+            raise AgentFault("MODEL_TIMEOUT", f"{self.LABEL}: the request exceeded its deadline.", True) from exc
         except OSError as exc:
-            raise AgentFault("MODEL_UNAVAILABLE", "Local Ollama server is unreachable.", True) from exc
+            raise AgentFault("MODEL_UNAVAILABLE", f"{self.LABEL} is unreachable.", True) from exc
 
     async def call(self, method: str, path: str, body: Any, timeout: float) -> tuple[int, Any]:
         """Returns (status, parsed JSON) for 200, else (status, {"error": short text})."""
@@ -1853,7 +1891,7 @@ class OllamaHTTP:
             status, raw = await asyncio.wait_for(
                 asyncio.to_thread(self._http, method, path, data, timeout), timeout + 1.0)
         except TimeoutError as exc:
-            raise AgentFault("MODEL_TIMEOUT", "Local Ollama request exceeded its deadline.", True) from exc
+            raise AgentFault("MODEL_TIMEOUT", f"{self.LABEL}: the request exceeded its deadline.", True) from exc
         if len(raw) > self.MAX_RESPONSE_BYTES:
             raise AgentFault("MODEL_OUTPUT_INVALID", "Ollama response exceeded the size limit.")
         if status == 200:
@@ -1868,6 +1906,9 @@ class OllamaHTTP:
             parsed = json_loads(raw[:8192])
             if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
                 text = parsed["error"]
+            elif isinstance(parsed, dict) and isinstance(parsed.get("error"), dict) and \
+                    isinstance(parsed["error"].get("message"), str):             # OpenAI-compatible servers
+                text = parsed["error"]["message"]
         return status, {"error": " ".join(text.split())[:300]}
 
 
@@ -2219,8 +2260,163 @@ class QwenEngine:
         self.started = False
 
 
+class RemoteHTTP(OllamaHTTP):
+    """JSON client for an OpenAI-compatible server: the system proxy settings apply, the key comes from the
+    environment at every request and goes only into the Authorization header."""
+    LABEL = "The remote Qwen server"
+
+    def __init__(self, base_url: str, api_key_env: str, opener: Any = None):
+        super().__init__(base_url, opener or urllib.request.build_opener())
+        self.api_key_env = api_key_env
+
+    def key(self) -> str:
+        key = os.environ.get(self.api_key_env, "").strip()
+        if not key:
+            raise AgentFault("BRAIN_NO_ACCESS", f"{self.api_key_env} is not set: the remote Qwen is skipped.", False)
+        return key
+
+    def headers(self) -> dict[str, str]:
+        return {**super().headers(), "Authorization": "Bearer " + self.key()}
+
+
+REMOTE_FORMATS = ("json_schema", "json_object", "none")
+
+
+class QwenRemoteEngine(QwenEngine):
+    """Qwen on a server with an OpenAI-compatible API, tried before the local Ollama (ARCH-1a).
+
+    Everything above the transport is the local Qwen's: prompts, the ``_analysis`` lead, re-asks,
+    repetition handling, budgets. The request goes to ``/chat/completions`` and the reply is mapped
+    to the shape the local engine reads. Unreachable, overloaded (429, 5xx) or slow: MODEL_UNAVAILABLE
+    or MODEL_TIMEOUT, so the router uses the next brain for the cooldown. No key, or the key refused
+    (401, 403): BRAIN_NO_ACCESS, skipped for the run."""
+    brain_name = "qwen_remote"
+
+    def __init__(self, settings: QwenRemoteSettings, *, opener: Any = None):
+        super().__init__(settings, opener=opener)
+        self.model_id = "openai:" + settings.model
+        self.http = RemoteHTTP(settings.base_url, settings.api_key_env, opener)
+        self.format_mode = "json_schema" if settings.json_schema else "json_object"
+
+    @staticmethod
+    def _log_reply(status: int, reply: Any) -> None:
+        detail = reply.get("error") if isinstance(reply, dict) else None
+        LOG.warning("The remote Qwen server answered HTTP %s: %s", status, detail or "no detail")
+
+    def _refused(self, status: int, reply: Any) -> None:
+        if status in (401, 403):
+            raise AgentFault("BRAIN_NO_ACCESS", f"The remote Qwen server refused the key in {self.settings.api_key_env} "
+                             f"(HTTP {status}).", False)
+        if status == 404:
+            raise AgentFault("MODEL_NOT_FOUND", f"The remote Qwen server does not serve {self.settings.model} "
+                             "(or qwen_remote.base_url does not end in /v1).", True)
+        if status == 429 or status >= 500:
+            self._log_reply(status, reply)
+            raise AgentFault("MODEL_UNAVAILABLE", f"The remote Qwen server is not available (HTTP {status}).", True)
+
+    async def start(self) -> None:
+        """The server answers with the key and serves the model; nothing is downloaded or loaded."""
+        if self.started:
+            return
+        settings = self.settings
+        status, body = await self.http.call("GET", "/models", None, settings.startup_timeout)
+        self._refused(status, body)
+        if status != 200 or not isinstance(body, dict):
+            self._log_reply(status, body)
+            raise AgentFault("MODEL_STARTUP_FAILED", f"The remote Qwen server answered HTTP {status} to /models.", True)
+        models = [m for m in body.get("data", []) if isinstance(m, dict)] if isinstance(body.get("data"), list) else []
+        ids = {str(m.get("id", "")) for m in models}
+        if ids and settings.model not in ids:
+            raise AgentFault("MODEL_NOT_FOUND", f"The remote Qwen server does not serve {settings.model} "
+                             f"(it serves {', '.join(sorted(ids)[:5])}).", True)
+        entry = next((m for m in models if m.get("id") == settings.model), {})
+        length = entry.get("max_model_len") or entry.get("context_length")
+        if type(length) is int and length >= 2048:
+            self.server_window = length
+        self.started = True
+        LOG.info("Remote Qwen brain ready: %s at %s", settings.model, urllib.parse.urlsplit(settings.base_url).hostname)
+
+    server_window = 0
+
+    def call_limits(self, kind: str, need: int | None) -> tuple[list[int], int]:
+        windows, out = super().call_limits(kind, need)
+        if self.server_window:                                   # what the server reports wins
+            windows = [self.server_window]
+        return [max(windows)], min(out, max(windows) // 2)
+
+    def _check_budget(self, messages: list[dict[str, str]], num_ctx: int | None = None,
+                      num_predict: int | None = None) -> None:
+        window = self.server_window or max(self.settings.windows)
+        super()._check_budget(messages, min(num_ctx or window, window), num_predict)
+
+    def _messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.settings.think or not self.settings.no_think_tag or not messages:
+            return messages
+        out = [dict(m) for m in messages]
+        last = next((m for m in reversed(out) if m.get("role") == "user"), None)
+        if last is not None and "/no_think" not in last["content"]:
+            last["content"] = last["content"].rstrip() + "\n/no_think"
+        return out
+
+    async def _post_chat(self, messages: list[dict[str, str]], fmt: dict[str, Any], num_ctx: int,
+                         num_predict: int, timeout: float, vary: bool = False) -> dict[str, Any]:
+        settings = self.settings
+        for _ in REMOTE_FORMATS:
+            body: dict[str, Any] = {"model": settings.model, "messages": self._messages(messages), "stream": False,
+                                    "temperature": settings.temperature, "seed": settings.seed,
+                                    "max_tokens": num_predict,
+                                    "chat_template_kwargs": {"enable_thinking": settings.think}}
+            if vary:          # after a repetition loop: other sampling, still a fixed seed [ARCH-19]
+                body.update(temperature=max(settings.temperature, 0.4), seed=settings.seed + 1, frequency_penalty=0.3)
+            if self.format_mode == "json_schema":
+                body["response_format"] = {"type": "json_schema",
+                                           "json_schema": {"name": "answer", "schema": fmt, "strict": True}}
+            elif self.format_mode == "json_object":
+                body["response_format"] = {"type": "json_object"}
+            status, reply = await self.http.call("POST", "/chat/completions", body, timeout)
+            detail = str(reply.get("error", "")) if isinstance(reply, dict) else ""
+            if status == 400 and self.format_mode != "none" and re.search(
+                    r"response_format|json_schema|json_object|grammar|schema", detail, re.I):
+                self.format_mode = REMOTE_FORMATS[REMOTE_FORMATS.index(self.format_mode) + 1]
+                LOG.warning("The remote Qwen server does not take this output format; using %s.", self.format_mode)
+                continue
+            break
+        if status == 413 or (status == 400 and re.search(r"context|too long|maximum.*tokens", detail, re.I)):
+            raise AgentFault("CONTEXT_BUDGET_EXCEEDED", "The remote Qwen server refused the request size.")
+        if status >= 500 and re.search(r"repeat", detail, re.I):
+            fault = AgentFault("MODEL_OUTPUT_INVALID", "Qwen repeated itself until the server stopped the answer.")
+            fault.degenerate = True
+            raise fault
+        self._refused(status, reply)
+        if status == 400:
+            self._log_reply(status, reply)
+            raise AgentFault("BRAIN_REQUEST_REJECTED", "The remote Qwen server rejected the request; see the local log.")
+        if status != 200:
+            self._log_reply(status, reply)
+            raise AgentFault("MODEL_EXECUTION_FAILED", f"The remote Qwen server answered HTTP {status}.")
+        choices = reply.get("choices") if isinstance(reply, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict) \
+                or not isinstance(choices[0].get("message"), dict):
+            raise AgentFault("MODEL_OUTPUT_INVALID", "The remote Qwen server returned no message.")
+        choice = choices[0]
+        content = choice["message"].get("content")
+        usage = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+        mapped = {"message": {"content": content if isinstance(content, str) else ""},
+                  "done_reason": "length" if choice.get("finish_reason") == "length" else "stop",
+                  "prompt_eval_count": usage.get("prompt_tokens", 0), "eval_count": usage.get("completion_tokens", 0)}
+        if mapped["done_reason"] == "length":
+            fault = AgentFault("MODEL_OUTPUT_INVALID",
+                               "Qwen hit the answer limit before finishing its answer; raise qwen_remote.max_num_predict.")
+            fault.truncated = True
+            fault.partial = mapped["message"]["content"]                 # its complete items may be used [ARCH-19]
+            raise fault
+        if _token_count(mapped, "prompt_eval_count") + _token_count(mapped, "eval_count") >= num_ctx:
+            raise AgentFault("CONTEXT_BUDGET_EXCEEDED", "The remote model's context window was exhausted.")
+        return mapped
+
+
 class BrainRouter:
-    """Ordered brains with fallback. Default order: opus -> fable -> sonnet -> haiku -> qwen.
+    """Ordered brains with fallback. Default order: opus -> fable -> sonnet -> haiku -> qwen_remote -> qwen.
 
     A brain without access (BRAIN_NO_ACCESS: no API key, or a model the key may not use) is
     skipped for the whole run. A brain that raises another availability fault is skipped for
@@ -2403,6 +2599,8 @@ def build_router(settings: Settings, *, injected: dict[str, Any] | None = None) 
             brains.append(DemoEngine())
         elif name in CLAUDE_BRAINS and (settings.anthropic.enabled or settings.engine.mode == name):
             brains.append(ClaudeEngine(settings.anthropic, name))
+        elif name == "qwen_remote" and (settings.qwen_remote.enabled or settings.engine.mode == "qwen_remote"):
+            brains.append(QwenRemoteEngine(settings.qwen_remote))
         elif name == "qwen" and (settings.qwen.enabled or settings.engine.mode == "qwen"):
             brains.append(QwenEngine(settings.qwen))
     return BrainRouter(brains, settings.engine.brain_cooldown)

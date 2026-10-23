@@ -200,7 +200,7 @@ flowchart LR
     need -- no --> act
     need -- yes --> packs["knowledge packs<br/>for this step (KP-3)"]
     packs --> budget["token budget per call<br/>window and answer limit (ARCH-11)"]
-    budget --> brain["brain router<br/>accessible Claude model,<br/>else Qwen3 8B"]
+    budget --> brain["brain router<br/>accessible Claude model,<br/>else remote Qwen3 8B,<br/>else Qwen3 8B in Ollama"]
     brain --> check["validate against<br/>the contract schema"]
     check -- invalid --> brain
     check -- valid --> act["act and build<br/>the response contract"]
@@ -242,8 +242,9 @@ The result and the report list every case under "Rules that needed the brain".
 
 Every brain call goes to the first available brain in `brain.engine.brain_order` of `ut_config.json` [ARCH-1a].
 When the agents start, BaseAgent checks which Claude models the API key in `ANTHROPIC_API_KEY` can access (no
-tokens are spent). Models without access are skipped for the whole run, and Qwen3 8B through Ollama answers only
-when no Claude model is available. The same code, tasks, checks and token budgets are used for every brain
+tokens are spent). Models without access are skipped for the whole run. When no Claude model is available, Qwen3 8B
+on the remote server answers (`brain.qwen_remote`, key in the environment variable `QWEN_REMOTE_API_KEY`), and
+Qwen3 8B through Ollama on this PC only when the remote server is not available either. The same code, tasks, checks and token budgets are used for every brain
 [ARCH-1b]; `unittest_generator.bat check` shows which brains are in use.
 
 ```mermaid
@@ -256,9 +257,11 @@ flowchart LR
     s -- yes --> ans
     s -- no --> h{"Haiku 5.5?"}
     h -- yes --> ans
-    h -- no --> q{"Qwen3 8B<br/>in Ollama?"}
+    h -- no --> r{"Qwen3 8B on the<br/>remote server?"}
+    r -- yes --> ans
+    r -- no --> q{"Qwen3 8B<br/>in Ollama?"}
     q -- yes --> ans
-    q -- no --> rules(["agent's rules<br/>(no LLM)"])
+    q -- no --> stop(["no brain: the run stops<br/>or does not start (ARCH-24)"])
 ```
 
 The order, the model ids and which brains are enabled are configuration only. A brain that is only unreachable

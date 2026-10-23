@@ -32,8 +32,8 @@ Agents are reached as configured in ut_config.json ("pipeline.agents"):
   http      - FastMCP HTTP servers with bearer tokens, e.g. on a build server [ARCH-8]
 
 Brains [ARCH-1a]: the Claude models the API key in ANTHROPIC_API_KEY can access, in the order of
-"brain.engine.brain_order" (default Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5), else Qwen3 8B
-through Ollama. 'check' shows which are available.
+"brain.engine.brain_order" (default Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5), else Qwen3 8B on the
+remote server (key in QWEN_REMOTE_API_KEY), else Qwen3 8B through Ollama. 'check' shows which are available.
   inprocess - servers created in this process (tests and debugging)
 
 Command line:

@@ -25,8 +25,9 @@
 #  official release pages with SHA-256 checks; C library headers come from the distribution's
 #  package manager (without a password prompt, otherwise the command to run is shown).
 #  Brains: the Claude models ANTHROPIC_API_KEY can access (Opus 5.5, Fable 5.1, Sonnet 5.5, Haiku 5.5,
-#  in the order of ut_config.json), else Qwen3 8B through Ollama. "check" shows which are available.
-#  ANTHROPIC_API_KEY stays an environment variable; it is never written to a file.
+#  in the order of ut_config.json), else Qwen3 8B on the remote server (QWEN_REMOTE_API_KEY), else
+#  Qwen3 8B through Ollama. "check" shows which are available.
+#  ANTHROPIC_API_KEY and QWEN_REMOTE_API_KEY stay environment variables; never written to a file.
 #  Live viewer: every run opens it in the browser (on a desktop) or prints its address; --no-view
 #  after the command switches it off. Settings: "viewer" in ut_config.json.
 # ===========================================================================
