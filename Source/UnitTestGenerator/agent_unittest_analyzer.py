@@ -3277,6 +3277,7 @@ class AnalyzerAgent(ba.AgentCore):
         known = self._known_names(layout, stubs)
         evidence = list(evidence)
         accepted: list[uc.Scenario] = []
+        pending_trials: list[uc.Scenario] = []           # refused only by predictions [NC-7]
         extra, calls, brain = "", 0, ""
         dropped: list[str] = []
         failures: list[str] = []
@@ -3368,11 +3369,16 @@ class AnalyzerAgent(ba.AgentCore):
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k, reasons=reasons)
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): " + "; ".join(reasons))
                     continue
-                if scenario.trial:                         # refused only by predictions: the tool decides [NC-7]
-                    self.log_answer("A1.plan", "trial", function=fn.name, scenario=k, reasons=scenario.trial)
-                    plan_notes["planning"].append(f"{fn.name}: scenario {k} refused only by predictions "
-                                                  f"({'; '.join(scenario.trial)[:200]}); built in a trial [NC-6, NC-7]")
-                    reasons = []
+                if scenario.trial:          # refused only by predictions: the brain may correct it in the re-ask;
+                    self.log_answer("A1.plan", "refused", function=fn.name, scenario=k,   # otherwise the tool decides
+                                    reasons=scenario.trial, then="trial if the re-ask does not cover its items")
+                    problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): "
+                                    + "; ".join(scenario.trial))
+                    sig = uc.scenario_signature(scenario)
+                    if sig not in tried_before and all(sig != uc.scenario_signature(x) for x in pending_trials):
+                        scenario.made_by = brain
+                        pending_trials.append(scenario)                                         # NC-7
+                    continue
                 kinds = [req.item_kinds.get(g, "") for g in scenario.gap_ids]
                 wider = [k2 for k2 in uc.KIND_LADDER if k2 in kinds and k2 in ("setup", "stub", "test", "suite_part")]
                 scenario.kind = wider[-1] if wider else ("call_sequence" if scenario.calls_before else "scenario")
@@ -3422,6 +3428,11 @@ class AnalyzerAgent(ba.AgentCore):
                      + ("\nNew evidence from the look-up:\n" + "\n".join(
                          f"- {e.evidence_id} {e.evidence_class} (linked by look-up) {e.source}:{e.line}: {e.text[:300]}"
                          for e in found) if found else ""))
+        for scenario in pending_trials:          # NC-7: no checked scenario took its items - the tool decides
+            if set(scenario.gap_ids) - {g for s in accepted for g in s.gap_ids}:
+                accepted.append(scenario)
+                plan_notes["planning"].append(f"{fn.name}: a scenario refused only by predictions "
+                                              f"({'; '.join(scenario.trial)[:200]}) is built in a trial [NC-6, NC-7]")
         for index, scenario in enumerate(accepted, 1):
             scenario.scenario_id = f"S-brain-{fn.name.replace('::', '_')}-{req.iteration}-{index}"
         if not accepted and all(g.startswith("EVIDENCE:") for g in open_ids):

@@ -2444,14 +2444,11 @@ def next_kind(current: str, cause: str, allowed: list[str] | tuple[str, ...]) ->
 # NC-6: every check that refuses an answer before the tool declares its kind here. A guard protects the trust of the
 # result and is never overruled; a prediction only predicts what the tool would reject, and never removes an item by
 # itself: an item refused only by predictions is built alone, and the tool decides (NC-7). A refusal text that
-# matches no prediction is a guard - an unknown check never lets an item through.
+# matches no prediction is a guard - an unknown check never lets an item through. A stub, stub variable or return
+# sequence the dependency plan does not have is a guard of the plan: no test can be assembled with it.
 PREDICTION_CHECKS = {
     "calls functions that do not exist here": "unknown name",              # A2-20, A1-PL4 grounding
     "unbalanced": "unbalanced braces or parentheses",
-    "is not a stubbed function of the dependency plan": "unknown stub",   # A1-PL4 d
-    "is not a stubbed variable": "unknown variable",
-    "is const: a test cannot set it": "const variable",
-    "returns nothing that a test can set": "stub without a return value",
     "is set twice in a row": "value set twice",                           # A2-21t
     "is not an integer value": "value form",                              # A1-PL4 e
     "is not a floating-point value": "value form",
@@ -2459,7 +2456,6 @@ PREDICTION_CHECKS = {
     "unknown names in": "unknown name",
     "is not a variable of the setup or a stub control": "unknown name",
     "is not a value": "value form",
-    "a sequence of return values needs a scalar return type": "value form",
     "earlier call is not a call of the SUT": "call sequence form",       # BP-2 call_sequence
 }
 

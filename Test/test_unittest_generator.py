@@ -935,12 +935,14 @@ class GeneratorTests(unittest.TestCase):
         agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
         with brain(b):
             bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
-        self.assertNotIn("invented_api", uc.suite_of(bundle))                    # A2-20, A2-21
-        self.assertTrue(any("no LLM tests" in n for n in bundle.notes))
+        # A2-20, A2-21: an unknown name is a prediction of the compiler's verdict - the test is not used as it is,
+        # it is built alone in a trial and the tool decides [NC-6, NC-7]
+        self.assertEqual(list(bundle.trial), ["test_select_mode_bad"])
+        self.assertIn("invented_api", bundle.trial["test_select_mode_bad"])
 
     def test_one_faulty_test_does_not_cost_the_others(self):
         """[A2-21t, A2-21q] the answer is checked test by test: a long or duplicate name is repaired, a test
-        with an invented call is dropped and noted, the others are used - without asking the brain again."""
+        with an invented call goes to a trial build (NC-7), the others are used - without asking the brain again."""
         long_name = "test_select_mode_returns_eco_when_nobody_is_home_and_the_window_is_open_and_it_is_night"
         body = "UT_EXPECT_EQ_INT(select_mode(0, 0, 0), MODE_ECO);"
         b = UTBrain(tests={"select_mode": [
@@ -954,15 +956,15 @@ class GeneratorTests(unittest.TestCase):
         with brain(b):
             bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
         suite = uc.suite_of(bundle)
-        self.assertNotIn("invented_api", suite)
+        self.assertEqual(list(bundle.trial), ["test_select_mode_invents"])          # the tool decides [NC-7]
         names = re.findall(r"UT_TEST\((\w+)\)", suite)
         self.assertTrue(all(len(n) <= a2.NAME_LIMIT for n in names), names)
         self.assertIn("test_select_mode_returns_eco_when_nobody_is_home_and_the_window", names)
         self.assertIn("test_select_mode_nobody_home", names)
         self.assertIn("test_select_mode_nobody_home_2", names)
         self.assertIn("test_select_mode_away", names)
-        self.assertTrue(any("dropped test_select_mode_invents" in n and "A2-21t" in n for n in bundle.notes),
-                        bundle.notes)
+        self.assertTrue(any("test_select_mode_invents refused only by predictions" in n and "NC-7" in n
+                            for n in bundle.notes), bundle.notes)
         self.assertEqual(sum("select_mode" in t for t in b.generate_calls), 1)      # no second ask
 
     def test_tests_asked_at_the_same_time_give_the_same_suite(self):

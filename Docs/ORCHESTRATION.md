@@ -475,8 +475,9 @@ often is proposed for the application's reviewed library (`recipes/`).
 
 **Checks that guard and checks that predict (NC-6 .. NC-9).** A guard (expected values from evidence, no way out, no
 SUT change, no weaker test, no repeat) is never overruled. A prediction (an unknown name, unbalanced braces, a value's
-form) never removes an item by itself: the item is built and run alone in a trial (Agent3 observe), and kept when it
-compiles, passes and reaches what it targets - recorded as a false refusal of that check.
+form) never removes an item by itself: the brain sees the refusal in its re-ask and may correct it; otherwise the item
+is built and run alone in a trial (Agent3 observe), and kept when it compiles, passes and reaches what it targets -
+recorded as a false refusal of that check. A stub or stub variable the dependency plan does not have is a guard.
 
 **Platform facts (NC-10 .. NC-13).** Measured by the setup, read through `ut_contracts.py` (`same_file`,
 `program_outcome`); an end the facts do not describe is an unknown outcome: run again alone, then classified by the
