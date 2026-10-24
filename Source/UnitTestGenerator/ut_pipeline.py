@@ -879,6 +879,14 @@ class Orchestrator:
         suggestions (COV-12, COV-13) and the action needed (COV-11)."""
         if last.verified and last.decision == "complete":
             return s.finish("verified_measured", VERIFIED_REASON, last)
+        best = s.best_result
+        if best is not None and best.verified and best.decision == "complete":
+            # every target was met and measured; a later round (documented behaviour, ORC-32) did not end well - what
+            # Agent3 verified is delivered, never lost [ORC-32, ORC-33]
+            return s.finish("verified_measured", f"{VERIFIED_REASON}; a later round was then stopped ({reason}) and "
+                            "left out [ORC-32, ORC-33]", best)
+        if best is not None and (last.coverage is None or not last.link_ok):
+            last = best                     # the last measured result, not a build that did not link [ORC-33]
         self._metrics(s, last, final=True)
         self._stage("Stopped below target: collecting the evidence for the developer")
         s.not_reached = s.evidence(last)
@@ -1825,6 +1833,7 @@ class Journal:
         new = False
         attempted = self.attempts_of(plan, iteration)
         written = [sc for sc in plan.scenarios if not sc.inputs and sc not in attempted and sc.scenario_id in by_scenario]
+        explained: set[str] = set()                       # failing tests whose cause a scenario entry already gives
         for sc in attempted + written:                    # a test the test writer wrote is an attempt too [LA-5]
             tests = by_scenario.get(sc.scenario_id, [])
             missed = any(n in quarantined for n in tests) or not tests or any(
@@ -1855,9 +1864,17 @@ class Journal:
                 bad = [t for t in ran if t.status in ("failed", "crashed", "timeout")]
                 if bad:
                     t = bad[0]
-                    cause = "wrong_expectation" if t.status == "failed" else "wrong_inputs"
+                    explained.update(x.name for x in bad)
+                    # LA-3: the items are still open, so the test did not reach them - its values miss the path
+                    # conditions, whatever its assertion says; only a check of stated behaviour (EVIDENCE:) that
+                    # fails is a wrong expectation
+                    unreached = any(not g.startswith("EVIDENCE:") for g in items)
+                    cause = "wrong_inputs" if t.status != "failed" or unreached else "wrong_expectation"
                     message = (f"{t.name} failed: expected {t.expected}, actual {t.actual}" if t.status == "failed"
                                else f"{t.name} {t.status}: {t.message}")
+                    if t.status == "failed" and unreached:
+                        message += (" - and it did not reach " + ", ".join(items[:4]) + ": its inputs do not meet the "
+                                    "PATH CONDITIONS (see the code of the real dependencies it calls)")
                     new |= self._entry(sc.function, items, cause, message,
                                        tried=self._short(t.name, sources.get(t.name, "")), **common)
                     continue
@@ -1875,7 +1892,7 @@ class Journal:
         failing = {t.name: t for t in result.tests if t.status in ("failed", "crashed", "timeout")}
         recorded = {i for e in self.entries if e.iteration == iteration for i in e.items}
         for name, t in failing.items():                   # every failing test gets a root cause [LA-3]
-            if f"test:{name}" in recorded:
+            if f"test:{name}" in recorded or name in explained:
                 continue
             source = sources.get(name, "")
             fn = next((f for f in layout.functions if re.search(

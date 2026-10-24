@@ -213,10 +213,18 @@ def _close_paren(text: str) -> int:
     return len(text) - 1
 
 
+OPERATOR_NAME = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*operator\s*(?:\(\s*\)|\[\s*\]|(?:new|delete)(?:\s*\[\s*\])?|"
+                           r"[^\w\s(]+|[A-Za-z_][\w:<>*&\s]*?))\s*\(")
+
+
 def function_name(header: str) -> str:
     header = re.sub(r"\s+", " ", header).strip()
     if not header or "(" not in header or header.startswith(("=", "return")):
         return ""
+    op = OPERATOR_NAME.search(header)                     # an operator is a function too [NC-4]
+    if op and not re.match(r"^\s*(?:return|if|while)\b", header):
+        name = re.sub(r"\s*(::)\s*", r"\1", op.group(1).strip())
+        return re.sub(r"operator\s+(?=[^\w\s])", "operator", re.sub(r"\s+", " ", name))
     head = header[: header.index("(")].strip()
     m = re.search(r"((?:[A-Za-z_]\w*\s*::\s*)*~?[A-Za-z_]\w*)$", head)
     if not m:
@@ -2863,8 +2871,14 @@ class AnalyzerAgent(ba.AgentCore):
             ev = evidence.get(q.evidence_id)
             if ev is None or not norm_text(q.text) or norm_text(q.text) not in norm_text(ev.text):
                 reasons.append(f"the quote of {q.evidence_id} does not occur word for word in that evidence")
-        local = setup_locals(planned.setup)
         recipe = uc.object_recipe(fn, layout)                         # the object of a member function [A2-21ae]
+        if recipe is not None:               # the object exists already: a second declaration is form, not content
+            declared = set().union(*(uc.declared_names(x) for x in recipe[0]))
+            planned.setup, gone = uc.without_redeclarations(planned.setup, declared)
+            if gone:
+                self.last_fixes.append(f"setup: {'; '.join(gone)[:160]!r} declared the object again - dropped, the "
+                                       "test declares it once [ARCH-20, A2-21ae]")
+        local = setup_locals(planned.setup)
         if recipe is not None:
             local |= setup_locals(recipe[0]) | {"ut_obj"} | {f"ut_dep{i}" for i in range(8)}
         if len(planned.setup) > 15:
@@ -3166,7 +3180,11 @@ class AnalyzerAgent(ba.AgentCore):
             facts.append(f"CALL SEQUENCE: the gaps {', '.join(sorted(sequence)[:6])} need state that only earlier calls "
                          "build up (see JOURNAL). For them give calls_before: the earlier calls, in order, each one "
                          "statement" + (" on the same object ut_obj" if fn.member else "") + "; then the call of args.")
+        dep_code = uc.dependency_code(fn, layout)                               # what the real code computes
         return [uc.part("facts", "\n\n".join(facts)),
+                *([uc.part("real dependency code", "CODE OF THE REAL DEPENDENCIES IT CALLS (they run in the test; "
+                           "choose inputs and globals so that their results meet the PATH CONDITIONS):\n" + dep_code,
+                           uc.P_EVIDENCE, min_chars=600)] if dep_code else []),
                 *([uc.part("journal", "JOURNAL (why earlier attempts missed; plan so that the cause is removed) "
                            "[LA-4]:\n" + journal)] if journal else []),
                 *([uc.part("lessons", "LESSONS (verified fixes of the same causes) [LA-8]:\n"
@@ -3434,7 +3452,8 @@ class AnalyzerAgent(ba.AgentCore):
                 plan_notes["planning"].append(f"{fn.name}: a scenario refused only by predictions "
                                               f"({'; '.join(scenario.trial)[:200]}) is built in a trial [NC-6, NC-7]")
         for index, scenario in enumerate(accepted, 1):
-            scenario.scenario_id = f"S-brain-{fn.name.replace('::', '_')}-{req.iteration}-{index}"
+            scenario.scenario_id = f"S-brain-{uc.function_stem(fn, layout)}-{req.iteration}-{index}"
+            scenario.function_line = fn.line_start                                               # overloads [NC-4]
         if not accepted and all(g.startswith("EVIDENCE:") for g in open_ids):
             # only a documented-behaviour check was asked: it stays in the plan for Agent2's brain [A1-PL1, A2-21n]
             plan_notes["planning"].append(f"{fn.name}: the documented behaviour is left to the test writer: no "
@@ -3683,6 +3702,8 @@ class AnalyzerAgent(ba.AgentCore):
                 f.name for f in layout.functions if f.qualified_name in through and through[f.qualified_name] is fn}
             fn_gaps = [g for g in gaps if g.function in own and g.gap_id not in by_fuzz and g.gap_id not in final
                        and "infeasible" not in g.detail and "unreachable_code" not in g.detail]
+            if len(uc.overloads(fn, layout)) > 1:            # an overload: only the items inside its own lines [NC-4]
+                fn_gaps = [g for g in fn_gaps if not g.line or fn.line_start <= g.line <= fn.line_end]
             if not fn_gaps:
                 continue
             evidence = [e for e in self.collect_evidence(layout, fn.name).evidence if uc.evidence_key(e) not in disputed]
@@ -3700,7 +3721,7 @@ class AnalyzerAgent(ba.AgentCore):
                 for name in [n for n in real if re.search(r"\b" + re.escape(n) + r"\s*\(", text)]:
                     if g.attempts >= self.cfg.max_attempts_per_gap:
                         open_items.append(f"{g.gap_id}: needs control of the real dependency {name} [A1-DA12]")
-            active_by_fn[fn.name] = active
+            active_by_fn[uc.function_stem(fn, layout)] = active
             for group in self._group(active, sut_text)[: self.cfg.max_scenarios_per_function]:     # LA-10
                 lead = group[0]
                 reach = enclosing_conditions(sut_text, fn, lead.line)
@@ -3715,7 +3736,8 @@ class AnalyzerAgent(ba.AgentCore):
                 if retry:
                     description += " Earlier attempts did not reach it: change the stub return values or inputs."
                 scenarios.append(uc.Scenario(
-                    scenario_id=f"S-{fn.name.replace('::', '_')}-{lead.line}-{lead.metric}", function=fn.name,
+                    scenario_id=f"S-{uc.function_stem(fn, layout)}-{lead.line}-{lead.metric}", function=fn.name,
+                    function_line=fn.line_start,
                     gap_ids=[g.gap_id for g in group], description=description,
                     required_conditions=reach + required, stub_hints=hints,
                     expected="derive from the evidence when it states the result, otherwise observe it",
@@ -3741,7 +3763,8 @@ class AnalyzerAgent(ba.AgentCore):
             if fn is None:
                 continue
             out.append(uc.Scenario(
-                scenario_id=f"S-fuzz-{fn.name.replace('::', '_')}-{req.iteration}-{k + 1}", function=fn.name,
+                scenario_id=f"S-fuzz-{uc.function_stem(fn, layout)}-{req.iteration}-{k + 1}", function=fn.name,
+                function_line=fn.line_start,
                 gap_ids=inp.covers, description=f"Inputs found by coverage-guided search reach {', '.join(inp.covers[:4])}",
                 inputs=[inp], expected="observe it", characterization=True))
         return out
@@ -3767,13 +3790,17 @@ class AnalyzerAgent(ba.AgentCore):
         sut_text = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         out = list(scenarios)
         work = []
-        for name in list(dict.fromkeys(s.function for s in scenarios if not s.inputs)):
-            fn = next((f for f in layout.functions if f.name == name), None)
-            if fn is None:
+        def mine(s: uc.Scenario, fn: uc.FunctionInfo) -> bool:            # the function, not another overload [NC-4]
+            return s.function == fn.name and (s.function_line in (0, fn.line_start) or len(uc.overloads(fn, layout)) < 2)
+        for name, line in list(dict.fromkeys((s.function, s.function_line) for s in scenarios if not s.inputs)):
+            fn = uc.function_of(name, layout, line)
+            if fn is None or fn.name != name:
+                fn = next((f for f in layout.functions if f.name == name), None)
+            if fn is None or any(w[1] is fn for w in work):
                 continue
-            gaps = active_by_fn.get(name, [])
+            gaps = active_by_fn.get(uc.function_stem(fn, layout), [])
             open_ids = {g.gap_id for g in gaps}
-            if any(s.function == name and s.scenario_id.startswith("S-evidence-") for s in scenarios):
+            if any(mine(s, fn) and s.scenario_id.startswith("S-evidence-") for s in scenarios):
                 open_ids.add(f"EVIDENCE:{name}")
             if not open_ids:
                 continue
@@ -3792,11 +3819,11 @@ class AnalyzerAgent(ba.AgentCore):
                 return found, own, before
             return run
         results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
-        for (name, *_), result in zip(work, results):
+        for (name, fn, *_), result in zip(work, results):
             if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
                 # A1-PL8: this function gets no scenario in this plan - never a rule plan; the other functions go on
                 notes["planning"].append(f"{name}: no scenario this time - {result.message[:400]}")
-                out = [s for s in out if s.function != name or s.inputs]
+                out = [s for s in out if not mine(s, fn) or s.inputs]
                 continue
             if isinstance(result, BaseException):
                 raise result
@@ -3806,7 +3833,7 @@ class AnalyzerAgent(ba.AgentCore):
             # The brain's plan replaces the rule scenarios of the function [A1-PL1]; a documented-behaviour check the
             # brain did not plan stays, and Agent2's brain writes its test (A1-25y, A2-21n).
             behaviour = any(f"EVIDENCE:{name}" in s.gap_ids and not s.characterization for s in brain)
-            out = [s for s in out if s.function != name or s.inputs
+            out = [s for s in out if not mine(s, fn) or s.inputs
                    or (s.scenario_id.startswith("S-evidence-") and not behaviour)] + brain
         return out
 
@@ -3842,7 +3869,8 @@ class AnalyzerAgent(ba.AgentCore):
             if not evidence:
                 continue
             out.append(uc.Scenario(
-                scenario_id=f"S-evidence-{fn.name.replace('::', '_')}", function=fn.name, gap_ids=[key],
+                scenario_id=f"S-evidence-{uc.function_stem(fn, layout)}", function=fn.name, gap_ids=[key],
+                function_line=fn.line_start,
                 description=f"Check the behaviour of {fn.qualified_name} that the evidence states (results, error "
                             "values, limits); assert the stated values, do not observe them.",
                 expected="exactly as stated by the evidence", evidence=all_evidence,

@@ -1179,7 +1179,7 @@ def text_auto_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tuple
             stub_dims.append(values)
         combos = pairwise(dims + stub_dims, cap)
         for index, combo in enumerate(combos, 1):
-            name = f"test_{fn.name}_auto_{index}"
+            name = f"test_{uc.function_stem(fn, plan.layout)}_auto_{index}"
             if name in existing:
                 continue
             args = ", ".join(_c_literal(v) for v in combo[: len(dims)])
@@ -1384,7 +1384,7 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str],
         neutral = [[" ".join(o[k][0]) + " " + o[k][1] for k in range(len(o))] for o in options] + dims[len(options):]
         n_stub = len(options) + len(controlled)
         for index, combo in enumerate(combine(dims, cap, neutral), 1):
-            name = f"test_{fn.name.replace('::', '_')}_auto_{index}"
+            name = f"test_{uc.function_stem(fn, layout)}_auto_{index}"              # overloads apart [NC-4]
             if name in existing:
                 continue
             setup, args, after = [], [], []
@@ -1455,7 +1455,7 @@ def _is_member(fn: uc.FunctionInfo, layout: uc.LayoutProfile) -> bool:
 
 
 def _ident(name: str) -> str:
-    return re.sub(r"\W", "_", name.replace("(anonymous namespace)::", ""))
+    return uc.safe_name(name)                                   # operators in words [NC-4]
 
 
 # A test name has at most 63 characters: the length of an internal identifier that C99 and later
@@ -1665,7 +1665,7 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
     when it needs code the scenario does not contain (an object, a missing argument). ``block``: the object's
     building block from a recipe or the brain, in place of the rule's (NC-1, NC-2)."""
     layout = plan.layout
-    fn = next((f for f in layout.functions if sc.function in (f.name, f.qualified_name)), None)
+    fn = uc.function_of(sc.function, layout, sc.function_line)                          # overloads [NC-4]
     if fn is None or (fn.is_static and not fn.from_frontend):
         return None
     recipe = block or (uc.object_recipe(fn, layout) if fn.member else None)             # A2-21ae, NC-1
@@ -1695,7 +1695,10 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
             lines += [f"{controls['returns']}[{i}] = {v};" for i, v in enumerate(sv.returns)]
             lines += [f"{controls['returns_len']} = {len(sv.returns)};", f"{controls['return']} = {sv.returns[-1]};"]
     lines += [f"{v.name} = {v.value};" for v in sc.variables]
-    lines += [s.strip() if s.strip().endswith((";", "}")) else s.strip() + ";" for s in sc.setup if s.strip()]
+    setup = [s.strip() if s.strip().endswith((";", "}")) else s.strip() + ";" for s in sc.setup if s.strip()]
+    if recipe:                                   # the object is declared once, by its building block [A2-21ae]
+        setup, _ = uc.without_redeclarations(setup, set().union(*(uc.declared_names(x) for x in recipe[0])))
+    lines += setup
     sut = Path(layout.repo_root) / layout.sut_file
     body = "\n".join(sut.read_text(encoding="utf-8", errors="replace").splitlines()[fn.line_start - 1: fn.line_end]) \
         if sut.is_file() else ""
@@ -1755,7 +1758,8 @@ def _has_auto(function: str, auto_names: list[str], layout: uc.LayoutProfile) ->
     fn = next((f for f in layout.functions if function in (f.name, f.qualified_name)), None)
     if fn is None:
         return False
-    prefixes = [f"test_{fn.name.replace('::', '_')}_auto_", f"test_{_ident(fn.name)}_auto_"]
+    prefixes = [f"test_{uc.function_stem(f, layout)}_auto_" for f in uc.overloads(fn, layout)] + \
+        [f"test_{fn.name.replace('::', '_')}_auto_", f"test_{_ident(fn.name)}_auto_"]
     if "::" in fn.qualified_name:
         cls, method = fn.qualified_name.rsplit("::", 1)
         prefixes.append(f"test_{cls.split('::')[-1]}_{method}_auto_")
@@ -1768,13 +1772,13 @@ def fuzz_tests(plan: uc.UTPlan, existing: set[str]) -> list[tuple[str, str, str]
     out = []
     for scenario in plan.scenarios:
         for inp in scenario.inputs:
-            fn = next((f for f in layout.functions if inp.function in (f.name, f.qualified_name)), None)
+            fn = uc.function_of(inp.function, layout, scenario.function_line)
             if fn is None:
                 continue
             k = 1
-            while f"test_{fn.name.replace('::', '_')}_fuzz_{k}" in existing:
+            while f"test_{uc.function_stem(fn, layout)}_fuzz_{k}" in existing:
                 k += 1
-            name = f"test_{fn.name.replace('::', '_')}_fuzz_{k}"
+            name = f"test_{uc.function_stem(fn, layout)}_fuzz_{k}"
             existing.add(name)
             observe = _observer(fn.return_type, layout)
             call = f"{callee_of(fn)}({', '.join(inp.args)})"
@@ -1984,7 +1988,8 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
             dims = [_option_tokens(o) for o in ctor_opts + opts] + at_ctor + at_calls + [[0, 1] for _ in polls] + \
                 ([[0, 1]] if asm else []) + ([[0, 1]] if others else [])
             n_ctor, n_opts = len(ctor_opts), len(opts)
-            method = fn.qualified_name.split("::")[-1]
+            method = uc.function_stem(fn, layout).split(_ident(uc.class_of(fn)) + "_", 1)[-1] \
+                if "::" in fn.qualified_name else uc.safe_name(fn.qualified_name.split("::")[-1])
             for index, combo in enumerate(combine(dims, cap), 1):
                 name = f"test_{short}_{method}_auto_{index}"
                 if name in existing:
@@ -2169,7 +2174,7 @@ class GeneratorAgent(ba.AgentCore):
                         llm_scenarios.append(sc)
                         continue
                     name = self._test_name(sc, names)
-                    fn = next((f for f in layout.functions if sc.function in (f.name, f.qualified_name)), None)
+                    fn = uc.function_of(sc.function, layout, sc.function_line)
                     block, block_by, pending = None, "", []
                     if fn is not None and fn.member and not uc.static_member(fn, layout) and \
                             not uc.internal_member(fn, layout):                                     # NC-1
@@ -2442,27 +2447,32 @@ class GeneratorAgent(ba.AgentCore):
         headers = self._headers_text(layout)
         _, _, stub_header = render_stubs(plan)
         out, notes, linked = [], [], set()
-        by_function: dict[str, list[uc.Scenario]] = {}
+        by_function: dict[tuple[str, int], list[uc.Scenario]] = {}
         for s in scenarios:
-            by_function.setdefault(s.function, []).append(s)
+            fn_of = uc.function_of(s.function, layout, s.function_line)
+            by_function.setdefault((s.function, fn_of.line_start if fn_of else 0), []).append(s)
         rewrites_of: dict[str, list[str]] = {}
         for name in rewrite:                                       # the function a failing test calls [A2-21p]
             fn = next((f for f in layout.functions if re.search(
                 r"\b" + re.escape(callee_of(f).split("::")[-1]) + r"\s*\(", existing[name]["source"])), None)
             if fn is not None:
                 rewrites_of.setdefault(fn.name, []).append(name)
-                by_function.setdefault(fn.name, [])
+                if not any(key[0] == fn.name for key in by_function):
+                    by_function.setdefault((fn.name, fn.line_start), [])
         # ARCH-18: the functions' tests are asked for at the same time; every call sees the same names
         # and evidence it would see alone, and the answers are combined below in the order of the
         # functions, with names made unique there (A2-21q).
-        def job(fn_name: str, fn_scenarios: list[uc.Scenario]):
+        def job(key: tuple[str, int], fn_scenarios: list[uc.Scenario]):
+            fn_name = key[0]
+
             async def run():
-                fn = next((f for f in layout.functions if fn_name in (f.name, f.qualified_name)), None)
+                fn = uc.function_of(fn_name, layout, key[1])
                 if fn is None or (fn.is_static and not fn.from_frontend):
                     return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, [], {}, "", ""
                 if uc.internal_member(fn, layout):                                                # A2-21ae
                     return [], [f"{fn_name}: {uc.call_form(fn, layout)}"], fn, [], {}, "", ""
-                to_rewrite = rewrites_of.get(fn.name, [])
+                first = min((k2[1] for k2 in by_function if k2[0] == fn.name), default=fn.line_start)
+                to_rewrite = rewrites_of.get(fn.name, []) if fn.line_start == first else []   # once per name
                 call_as = f"Call it as {wrapper_name(fn)}(...): it is static [A2-21k]. " if fn.is_static else ""
                 member = (uc.call_form(fn, layout) or "It is a class member: construct an object in the test (see "
                           "HEADERS) and call it on the object.") + " " if fn.member else ""                 # A2-21ae
@@ -2518,6 +2528,9 @@ class GeneratorAgent(ba.AgentCore):
                     *([uc.part("lessons", "LESSONS (verified fixes of the same causes) [LA-8]:\n" + "\n".join(
                         f"- {k.snippet[:400]}" for k in req.guidance.lessons[:4]), uc.P_EXAMPLES)]
                       if req.guidance.lessons else []),
+                    *([uc.part("real dependency code", "CODE OF THE REAL DEPENDENCIES IT CALLS (they run in the "
+                               "test):\n" + uc.dependency_code(fn, layout), uc.P_EVIDENCE, min_chars=600)]
+                      if uc.dependency_code(fn, layout) else []),
                     uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
                     uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
                                        "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),

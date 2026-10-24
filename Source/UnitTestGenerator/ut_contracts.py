@@ -790,6 +790,7 @@ class Scenario(Contract):
     calls_before: list[str] = Field(default_factory=list)   # earlier calls that build up the state [BP-2 call_sequence]
     kind: str = "scenario"             # the answer kind it was asked for [BP-2, BP-3]
     trial: list[str] = Field(default_factory=list)          # refused only by predictions: the tool decides [NC-7]
+    function_line: int = 0             # first line of the function: tells overloads apart (0 = the first) [NC-4]
 
 
 class RepairItem(Contract):
@@ -2692,3 +2693,131 @@ def record_findings(path: Path, findings: list["PipelineFinding"]) -> list[str]:
     for f in findings:
         f.count = counts.get(f.signature, 1)
     return [f"{n}x {shown[s]}" for s, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+# ============================================================================ names of functions [NC-4]
+OPERATOR_WORDS = {"+": "plus", "-": "minus", "*": "times", "/": "div", "%": "mod", "==": "eq", "!=": "ne", "<": "lt",
+                  ">": "gt", "<=": "le", ">=": "ge", "<=>": "cmp", "=": "assign", "+=": "plus_assign",
+                  "-=": "minus_assign", "*=": "times_assign", "/=": "div_assign", "%=": "mod_assign", "&=": "and_assign",
+                  "|=": "or_assign", "^=": "xor_assign", "<<=": "shl_assign", ">>=": "shr_assign", "[]": "index",
+                  "()": "call", "<<": "shl", ">>": "shr", "&&": "and", "||": "or", "!": "not", "&": "bitand",
+                  "|": "bitor", "^": "xor", "~": "compl", "++": "inc", "--": "dec", "->": "arrow", "->*": "arrow_star",
+                  ",": "comma"}
+
+
+def safe_name(name: str) -> str:
+    """A function name as part of an identifier (test names, scenario ids): namespaces joined with _, an operator
+    named in words (operator+ -> operator_plus), every other character that is not allowed replaced by _."""
+    name = name.replace("(anonymous namespace)::", "")
+
+    def word(m: "re.Match[str]") -> str:
+        symbol = re.sub(r"\s+", "", m.group(1))
+        return "operator_" + OPERATOR_WORDS.get(symbol, re.sub(r"\W+", "_", symbol).strip("_") or "op")
+    name = re.sub(r"\boperator\s*(\(\s*\)|\[\s*\]|[^\w\s:]+|\s+[A-Za-z_][\w:<>*&\s]*)", word, name)
+    return re.sub(r"\W", "_", name.replace("::", "_"))
+
+
+def overloads(fn: "FunctionInfo", layout: "LayoutProfile") -> list["FunctionInfo"]:
+    """Every function of the SUT with the same name, in the order of the file (one for a function that has none)."""
+    key = fn.qualified_name or fn.name
+    return sorted((f for f in layout.functions if (f.qualified_name or f.name) == key), key=lambda f: f.line_start)
+
+
+def function_stem(fn: "FunctionInfo", layout: "LayoutProfile") -> str:
+    """The function's part of a test name or scenario id: unique also for overloads (scale, scale_2)."""
+    same = overloads(fn, layout)
+    stem = safe_name(fn.name)
+    index = next((k for k, f in enumerate(same) if f.line_start == fn.line_start), 0)
+    return stem if len(same) < 2 or index == 0 else f"{stem}_{index + 1}"
+
+
+def function_of(name: str, layout: "LayoutProfile", line: int = 0) -> "FunctionInfo | None":
+    """The function a scenario, gap or input names; for overloads the one that starts at, or contains, ``line``."""
+    same = [f for f in layout.functions if name in (f.name, f.qualified_name)]
+    if line and len(same) > 1:
+        return next((f for f in same if f.line_start == line), None) or \
+            next((f for f in same if f.line_start <= line <= f.line_end), same[0])
+    return same[0] if same else None
+
+
+def dependency_code(fn: "FunctionInfo", layout: "LayoutProfile", max_functions: int = 4, max_lines: int = 30) -> str:
+    """A1-PL2, NC-1: the code of the real dependencies the function calls, from their files in the repository, so a
+    brain can choose inputs that pass through them (for example hw_read(x) returning STATUS_REG + x). Short functions
+    only, whole; nothing from system headers."""
+    plan = layout.dependencies
+    root = Path(layout.repo_root)
+    out: list[str] = []
+    for d in (plan.entries if plan else []):
+        if len(out) >= max_functions:
+            break
+        if d.decision != "real" or d.system or d.kind not in ("function", "method") or not d.definition:
+            continue
+        if d.name not in fn.calls and (d.qualified_name or "") not in fn.calls:
+            continue
+        path = root / d.definition
+        if not path.is_file():
+            continue
+        text = read_source(path)
+        short = re.escape(d.name.split("::")[-1])
+        m = re.search(r"^[^;{}\n]*\b" + short + r"\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{", text, re.M)
+        if m is None:
+            continue
+        depth, k = 0, m.end() - 1
+        while k < len(text):
+            depth += {"{": 1, "}": -1}.get(text[k], 0)
+            if depth == 0:
+                break
+            k += 1
+        body = text[m.start(): k + 1]
+        if body.count("\n") + 1 > max_lines:
+            continue
+        out.append(f"// {d.definition}\n{body}")
+    return "\n\n".join(out)
+
+
+DECLARATION = re.compile(r"^\s*(?:(?:const|static|volatile|constexpr|struct|class|enum)\s+)*"
+                         r"([A-Za-z_][\w:]*(?:\s*<[^;(){}]*>)?)[\s*&]+([A-Za-z_]\w*)\s*(?:[;,({=\[]|$)")
+NOT_TYPES = {"return", "else", "case", "goto", "throw", "new", "delete", "sizeof", "typedef", "using", "do", "if",
+             "while", "for", "switch"}
+
+
+def declared_names(statement: str) -> set[str]:
+    """The variables or objects a statement declares ("TorqueMap ut_obj;", "int a = 1, *b;" gives a and b)."""
+    out = set()
+    for part in re.split(r";", statement):
+        m = DECLARATION.match(part)
+        if not m or m.group(1).split("<")[0].strip() in NOT_TYPES:
+            continue
+        out.add(m.group(2))
+        depth, start, rest = 0, 0, part[m.end(2):]
+        pieces = []
+        for i, ch in enumerate(rest):
+            depth += ch in "([{<"
+            depth -= ch in ")]}>"
+            if ch == "," and depth == 0:
+                pieces.append(rest[start:i])
+                start = i + 1
+        pieces.append(rest[start:])
+        for piece in pieces[1:]:
+            more = re.match(r"\s*[*&\s]*([A-Za-z_]\w*)\s*(?:[=({\[]|$)", piece)
+            if more:
+                out.add(more.group(1))
+    return out
+
+
+def without_redeclarations(statements: list[str], declared: set[str]) -> tuple[list[str], list[str]]:
+    """ARCH-20 (form is forgiven), A2-21ae: the statements of a set-up without those that declare again an object the
+    building block already declares (a brain often writes "TorqueMap ut_obj;" although the object exists). Returns the
+    statements kept and those dropped. A line with several statements keeps its other statements."""
+    kept, dropped = [], []
+    for stmt in statements:
+        parts = [x for x in stmt.split(";")]
+        keep = [x for x in parts if not (declared_names(x + ";") & declared)]
+        if len(keep) != len(parts):
+            dropped.append(stmt.strip())
+            rest = ";".join(keep).strip()
+            if rest.strip(" ;"):
+                kept.append(rest if rest.endswith((";", "}")) else rest + ";")
+        else:
+            kept.append(stmt)
+    return kept, dropped

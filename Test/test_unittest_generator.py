@@ -4181,6 +4181,68 @@ class NewCodeTests(unittest.TestCase):
         self.assertEqual(again.count, 2)
         self.assertTrue(lines[0].startswith("2x pipeline_limitation"))
 
+    def test_operators_and_overloads_get_their_own_names(self):                        # NC-4
+        self.assertEqual(a1.function_name("Money operator+(const Money& a, const Money& b)"), "operator+")
+        self.assertEqual(a1.function_name("Money& Money::operator += (const Money& o)"), "Money::operator+=")
+        self.assertEqual(a1.function_name("int F::operator()(int x) const"), "F::operator()")
+        self.assertEqual(a1.function_name("double scale(double x, double k)"), "scale")
+        functions = [a1.find_functions("int scale(int x, int k) {\n  return x * k;\n}\n"
+                                       "double scale(double x, double k) {\n  return x * k;\n}\n"
+                                       "bool operator==(const M& a, const M& b) {\n  return a.c == b.c;\n}\n",
+                                       "src/s.cpp")][0]
+        self.assertEqual([f.name for f in functions], ["scale", "scale", "operator=="])
+        layout = uc.LayoutProfile(repo_root="/r", sut_file="src/s.cpp", language="cpp", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/x.cpp", sut_sha256="a" * 64,
+                                  functions=functions)
+        self.assertEqual([uc.function_stem(f, layout) for f in functions], ["scale", "scale_2", "operator_eq"])
+        self.assertIs(uc.function_of("scale", layout, functions[1].line_start), functions[1])
+        self.assertIs(uc.function_of("scale", layout, functions[1].line_start + 1), functions[1])   # a line inside
+        self.assertIs(uc.function_of("scale", layout), functions[0])
+
+    def test_the_object_is_declared_once(self):                                         # A2-21ae, ARCH-20
+        kept, dropped = uc.without_redeclarations(["TorqueMap ut_obj; ut_obj.reset();", "int x = 3;",
+                                                   "ut_fake_IEncoder ut_dep0;"], {"ut_obj", "ut_dep0"})
+        self.assertEqual(kept, ["ut_obj.reset();", "int x = 3;"])
+        self.assertEqual(len(dropped), 2)
+        self.assertEqual(uc.declared_names("std::vector<int> v{1, 2};"), {"v"})
+        self.assertEqual(uc.declared_names("return x;") | uc.declared_names("x = 5;"), set())
+
+    def test_a_failing_test_that_did_not_reach_its_items_has_wrong_inputs(self):       # LA-3
+        with tmpdir() as d:
+            layout = uc.LayoutProfile(repo_root=d, sut_file="c.c", language="c", component_root=".",
+                                      writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/x.c",
+                                      sut_sha256="a" * 64, functions=[uc.FunctionInfo(
+                                          name="control", qualified_name="control", signature="int control(int x)",
+                                          file="c.c", line_start=12, line_end=17)])
+            journal = up.Journal("c.c", Path(d))
+            sc = uc.Scenario(scenario_id="S-brain-control-2-1", function="control", description="",
+                             gap_ids=["BC:control:14:30:T"], made_by="brain:qwen/q", checked=True)
+            plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="", scenarios=[sc])
+            suite = "UT_TEST(test_control_hw)\n{\n    /* S-brain-control-2-1: x */\n    UT_EXPECT_EQ_INT(control(10), 7);\n}\n"
+            gap = uc.GapItem(gap_id="BC:control:14:30:T", function="control", metric="BC", line=14)
+            result = uc.VerificationResult(
+                run_id="r", stage="verify", sut_sha256="a", suite_sha256="b", decision="failures", link_ok=True,
+                tests=[uc.TestResult(name="test_control_hw", status="failed", expected="7", actual="10")],
+                coverage=uc.CoverageReport(toolchain="t", definitions="d", functions=[uc.FunctionCoverage(
+                    name="control", gaps=[gap])]))
+            journal.record(2, plan, suite, {}, result, {"BC:control:14:30:T": 1}, layout, [], set())
+        entry = journal.entries[-1]
+        self.assertEqual(entry.cause, "wrong_inputs")                  # not a wrong expectation: it never got there
+        self.assertIn("did not reach BC:control:14:30:T", entry.result)
+        self.assertEqual([e.cause for e in journal.entries], ["wrong_inputs"])   # one cause per failing test
+
+    def test_a_verified_result_is_never_lost_by_a_later_round(self):                   # ORC-32, ORC-33
+        orch = object.__new__(up.Orchestrator)
+        orch.cfg = up.PipelineConfig()
+        done = uc.VerificationResult(run_id="r6", stage="verify", sut_sha256="a", suite_sha256="b", decision="complete",
+                                     link_ok=True, build_ok=True, verified=True, total=14, passed=14)
+        broken = uc.VerificationResult(run_id="r7", stage="verify", sut_sha256="a", suite_sha256="c",
+                                       decision="failures", reason="the build did not link")
+        s = types.SimpleNamespace(best_result=done, finish=lambda state, reason, last: (state, reason, last.run_id))
+        state, reason, run_id = run(orch._stop(s, "safety ceiling of the file reached: 10 min [LA-7]", broken))
+        self.assertEqual((state, run_id), ("verified_measured", "r6"))
+        self.assertIn("a later round was then stopped", reason)
+
     def test_every_corpus_case_is_complete(self):                                       # NC-4
         cases = up.corpus_cases()
         self.assertGreaterEqual(len(cases), 25)
@@ -4265,6 +4327,14 @@ class CorpusRunTests(unittest.TestCase):
                 raw["kb"] = {"db_path": str(Path(d) / "kb.sqlite3"), "resolutions_path": str(Path(d) / "r.sqlite3")}
                 cfg.write_text(json.dumps(raw), encoding="utf-8")
                 result = run(up.Orchestrator(cfg).run(uc.PipelineRequest(repo_root=str(repo), sut_file=spec["sut"])))
+                keep = SRC / "ut_output" / "corpus" / name       # the report and journal of every case, to read later
+                shutil.rmtree(keep, ignore_errors=True)
+                keep.mkdir(parents=True, exist_ok=True)
+                out = Path(result.output_dir) if result.output_dir else None
+                for f in ([out / "report.md", out / "result.json"] + sorted((out / "journal").glob("*.md"))
+                          if out and out.is_dir() else []):
+                    if f.is_file():
+                        shutil.copy2(f, keep / f.name)
             outcomes.append(f"{name}: {result.final_state} - {result.reason[:120]}")
             if result.final_state == "incomplete" and result.item_status:
                 for st in result.item_status:

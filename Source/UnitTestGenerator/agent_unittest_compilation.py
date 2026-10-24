@@ -2880,7 +2880,12 @@ class CompilationAgent(ba.AgentCore):
         self._prune_runs()
         repo = self._stage(layout, req, run_dir)
         base.update(host_notes=self._host_notes(layout, repo))                       # A3-HW2..HW4
-        sut_sha = uc.file_sha256(repo / layout.sut_file)
+        # ORC-10: the version of the SUT this run tested - as given (or as Agent4's patch gives it), never the host
+        # adaptation of its staged copy (target keywords and assembly replaced, A3-HW2, A3-HW3)
+        override = (getattr(req, "source_overrides", {}) or {}).get(layout.sut_file)
+        original = Path(layout.repo_root) / layout.sut_file
+        sut_sha = uc.sha256_bytes(uc.encode_like(original, override)) if override is not None else \
+            uc.file_sha256(original) if original.is_file() else uc.file_sha256(repo / layout.sut_file)
         suite_files = [a.path for a in (req.bundle.actions if req.bundle else [])] + list(layout.executable_tests)
         base.update(sut_sha256=sut_sha, suite_sha256=uc.files_signature(repo, suite_files),
                     compiler=chain.cc if layout.language == "c" else chain.cxx, compiler_version=chain.version)

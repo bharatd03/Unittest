@@ -421,7 +421,9 @@ A repeated attempt with the same information gives the same answer, so every att
 2. **Root cause (LA-3).** Rules decide from the tools' results:
    - a compiler message means *test did not compile* or *test setup*;
    - a test that passed but did not reach the item means *wrong inputs*, *needs several calls* or *needs control of a dependency*;
-   - a failing assertion means *wrong expectation*;
+   - a failing assertion means *wrong expectation* - unless the test did not reach the item it targets: then its
+     inputs miss the path conditions, which is *wrong inputs*, and the next attempt gets the code of the real
+     dependencies the function calls (A1-PL2);
    - a proof means *unreachable*.
 3. **The next attempt (LA-4).** Agent1's plan request and Agent2's test request carry a short excerpt of the open entries of the function. A scenario or rewrite that repeats an earlier one unchanged is refused.
 4. **Attempts (LA-5).**
@@ -429,7 +431,7 @@ A repeated attempt with the same information gives the same answer, so every att
    - Items blocked by one cause share their attempts.
    - A third attempt only by a brain of another model.
 5. **Final status (LA-6).** Every item not covered at the stop is one of: covered, proven unreachable, needs a requirement, needs a source change, pipeline limitation, or undetermined. Each has a reason and an owner.
-6. **Stop (LA-7).** The loop continues while an iteration covers something or finds a new root cause. It stops when every item has a final status, at the safety ceiling that grows with the file, or after two iterations with nothing new.
+6. **Stop (LA-7).** The loop continues while an iteration covers something or finds a new root cause. It stops when every item has a final status, at the safety ceiling that grows with the file, or after two iterations with nothing new. A verified, complete result is never lost by a later round: if a later round breaks the build or covers less, the best result is delivered and the later round is reported as left out (ORC-33).
 7. **Lessons (LA-8).** A cause that a verified test removed is stored in the knowledge base with the construct it occurred in. It goes to the next attempts, files and runs; a recurring one is proposed as a rule.
 8. **Decision point (LA-9).** Only in an interactive run (from the menu, or `--interactive`). When items need a source change or a requirement, the user keeps the suggestions, gives requirement documents (the file is run again with them), or leaves the items open.
 
@@ -482,6 +484,11 @@ recorded as a false refusal of that check. A stub or stub variable the dependenc
 **Platform facts (NC-10 .. NC-13).** Measured by the setup, read through `ut_contracts.py` (`same_file`,
 `program_outcome`); an end the facts do not describe is an unknown outcome: run again alone, then classified by the
 brain, never a pass.
+
+**Operators and overloads (NC-14).** An operator (`operator+`, `operator()`, `operator bool`) is a function like any
+other; its tests get a safe name (`Money_operator_plus_assign`), and every overload of a name gets its own scenarios and
+test names (the second one `_2`), found by its line. A set-up never declares the object of the building block again
+(A2-21ae), and the SUT signature is that of the file as given, not of the copy adapted for the host (ORC-10).
 
 **Findings across runs (NC-5).** Pipeline limitations, false refusals and unknown outcomes go to
 `ut_output/pipeline_findings.jsonl`, counted by signature; the report lists them first.
