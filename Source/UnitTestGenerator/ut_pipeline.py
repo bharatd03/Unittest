@@ -128,7 +128,7 @@ class PipelineConfig(BaseModel):
     # the documented-behaviour round after every target is met; 0 = no limit [ORC-32, ORC-7]
     after_target_seconds: float = Field(default=600.0, ge=0)
     repo_cache: str = "ut_cache"             # one clone per repository and PC [ORC-20]
-    max_parallel_suts: int = Field(default=1, ge=1, le=16)          # ORC-23, ORC-7
+    max_parallel_suts: int = Field(default=2, ge=1, le=16)          # ORC-23, ORC-7
     git_token_env: str = ""                  # name of an environment variable holding a token [ORC-21]
     git_token_user: str = "x-access-token"   # user name sent with that token over HTTPS
     git_author: str = "ut-pipeline <ut-pipeline@localhost>"
@@ -309,9 +309,15 @@ class Orchestrator:
         if self.config_path.is_file():
             args += ["--config", str(self.config_path)]
         log_dir.mkdir(parents=True, exist_ok=True)
-        # The full environment: Agent3 needs the compiler's (e.g. Visual Studio's INCLUDE/LIB/PATH).
-        return StdioTransport(command=sys.executable, args=args, env=dict(os.environ), cwd=str(HERE),
+        # The full environment: Agent3 needs the compiler's (e.g. Visual Studio's INCLUDE/LIB/PATH); the settings of
+        # this run (its answer log) go to its own agents only, never through the process environment [ORC-23 (c)]
+        env = {**os.environ, **getattr(self, "run_env", {})}
+        return StdioTransport(command=sys.executable, args=args, env=env, cwd=str(HERE),
                               keep_alive=False, log_file=log_dir / f"{name}.log"), None
+
+    def in_process(self) -> bool:
+        """An agent runs inside this process: it reads the process environment, so files run one at a time [ORC-23]."""
+        return any(self.cfg.agents.get(role, Endpoint()).transport == "inprocess" for role in AGENTS)
 
     async def connect(self, stack: contextlib.AsyncExitStack, log_dir: Path) -> None:
         for role in AGENTS:
@@ -419,8 +425,12 @@ class Orchestrator:
         if state.origin.get("commit"):                                    # ORC-19: bound to the tested commit
             self.ledger.append(agent="ut_pipeline", tool="tested_commit", repository=state.origin.get("repository", ""),
                                branch=state.origin.get("branch", ""), commit=state.origin["commit"])
+        self.run_env = {"BASEAGENT_ANSWER_LOG": str(out / "brain_answers.jsonl")}  # every brain answer [ARCH-20]
+        # an agent in this process reads the process environment: only then is it set there [ORC-23 (c)]
+        in_process = self.in_process()
         answer_log = os.environ.get("BASEAGENT_ANSWER_LOG")
-        os.environ["BASEAGENT_ANSWER_LOG"] = str(out / "brain_answers.jsonl")    # every brain answer [ARCH-20]
+        if in_process:
+            os.environ["BASEAGENT_ANSWER_LOG"] = self.run_env["BASEAGENT_ANSWER_LOG"]
         try:
             async with contextlib.AsyncExitStack() as stack:
                 await self.connect(stack, out / "logs")
@@ -453,7 +463,9 @@ class Orchestrator:
             else:
                 LOG.exception("pipeline run failed")
                 result = state.stopped(f"ended by an error ({type(exc).__name__}: {exc})"[:400])
-        if answer_log is None:
+        if not in_process:
+            pass
+        elif answer_log is None:
             os.environ.pop("BASEAGENT_ANSWER_LOG", None)
         else:
             os.environ["BASEAGENT_ANSWER_LOG"] = answer_log
@@ -2910,7 +2922,8 @@ class RepositoryRun:
         runs = [SutRun(sut, out / f"{i + 1:02d}-{slug(sut)}", out / "worktrees" / f"{i + 1:02d}")
                 for i, sut in enumerate(req.sut_files)]
         self.progress = Progress(len(runs))                                                   # VIEW-11
-        semaphore = asyncio.Semaphore(self.cfg.max_parallel_suts)                         # ORC-23
+        semaphore = asyncio.Semaphore(1 if self.cfg.interactive or self.orchestrator.in_process()       # ORC-23, LA-9
+                                      else self.cfg.max_parallel_suts)
         key = hashlib.sha256(f"{req.repository}|{commit}|{req.build_command}|{req.compile_commands}".encode()).hexdigest()[:20]
 
         async def one(r: SutRun) -> None:
@@ -2956,7 +2969,9 @@ class RepositoryRun:
         return result
 
     async def _folder(self, req: uc.RepositoryRequest, out: Path) -> uc.RepositoryResult:
-        """A local folder (pilots, development) [ORC-17]: each SUT file as before, one after another."""
+        """A local folder (pilots, development) [ORC-17]: every SUT file works on its own copy of the folder, in
+        parallel up to max_parallel_suts (one after another in an interactive run, LA-9); its tests are written into
+        the folder when it finishes, under names of its own (A2-21af) [ORC-23]."""
         result = uc.RepositoryResult(repository=str(Path(req.repository).resolve()), output_dir=str(out))
         if not req.sut_files:                                                                 # ORC-35
             result.selection = await self.orchestrator.select_files(Path(req.repository).resolve(), out / "select",
@@ -2967,20 +2982,33 @@ class RepositoryRun:
                 self._summary(result, out)
                 return result
         self.progress = Progress(len(req.sut_files))                                          # VIEW-11
-        for sut in req.sut_files:
-            r = await self._orchestrator().run(uc.PipelineRequest(
-                repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
-                stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands,
-                requirements=req.requirements))
-            again = [d.split(": ", 1)[1].split(" - ", 1)[0] for d in r.decisions
-                     if d.startswith("requirement documents given: ")]
-            if again:                                                   # LA-9: once more with the documents
-                r = await self._orchestrator().run(uc.PipelineRequest(
-                    repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
-                    stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands,
-                    requirements=list(req.requirements) + again))
-            self.progress.done += 1
-            r.delivery = "written to the folder (local folder input)"
+        parallel = 1 if self.orchestrator.cfg.interactive or self.orchestrator.in_process() else self.cfg.max_parallel_suts
+        semaphore = asyncio.Semaphore(parallel)
+        results: dict[str, uc.PipelineResult] = {}
+
+        def request(sut: str, requirements: list[str]) -> uc.PipelineRequest:
+            return uc.PipelineRequest(repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
+                                      stub_dir=req.stub_dir, build_command=req.build_command,
+                                      compile_commands=req.compile_commands, requirements=requirements)
+
+        async def one(sut: str) -> None:
+            async with semaphore:
+                try:
+                    r = await self._orchestrator().run(request(sut, list(req.requirements)))
+                    again = [d.split(": ", 1)[1].split(" - ", 1)[0] for d in r.decisions
+                             if d.startswith("requirement documents given: ")]
+                    if again:                                           # LA-9: once more with the documents
+                        r = await self._orchestrator().run(request(sut, list(req.requirements) + again))
+                    r.delivery = "written to the folder (local folder input)"
+                except (ba.AgentFault, OSError) as exc:                  # this SUT file only; the others go on
+                    message = exc.message if isinstance(exc, ba.AgentFault) else str(exc)
+                    r = uc.PipelineResult(final_state="incomplete", reason=f"not run: {message}"[:500], sut_file=sut)
+                self.progress.done += 1
+                results[sut] = r
+
+        await asyncio.gather(*(one(sut) for sut in req.sut_files))
+        for sut in req.sut_files:                                       # the summary in the order the files were named
+            r = results[sut]
             result.results.append(r)
             result.deliveries.append(uc.DeliveryRecord(kind="written_to_folder", sut_files=[sut], reason=r.output_dir))
         result.reason = "; ".join(f"{r.sut_file}: {r.final_state}" for r in result.results)

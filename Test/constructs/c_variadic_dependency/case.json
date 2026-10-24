@@ -1,0 +1,10 @@
+{
+  "construct": "C call of a variadic dependency that only a header declares",
+  "sut": "src/check.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

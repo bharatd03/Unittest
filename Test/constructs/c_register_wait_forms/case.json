@@ -1,0 +1,10 @@
+{
+  "construct": "C register waits in other spellings (0u == (SR & BIT), READ_BIT macro) at a non-Cortex address",
+  "sut": "src/uart.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

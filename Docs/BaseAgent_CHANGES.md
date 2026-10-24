@@ -1,5 +1,18 @@
 # BaseAgent changes
 
+## 2026-10-24 (late night): answers of any brain are read the same way
+
+**Why.** A brain without JSON-schema enforcement may write "Here is the JSON:" before a fenced block, use another
+reasoning tag than `<think>` (`<thinking>`, `<reasoning>`), or add a sentence after the JSON. These answers were
+refused as `MODEL_OUTPUT_INVALID` and counted as a brain failure, although they carried a valid answer.
+
+* **`parse_generated`** removes any leading reasoning blocks (`strip_reasoning`, tags think, thinking, reasoning,
+  reflection, analysis, scratchpad) and a code fence; when the text is still not JSON, the first complete JSON object
+  or array in it is the answer (`first_json`, strings with braces handled). The schema and every agent check still
+  decide whether the answer is used.
+* **`salvage_json`** (an answer cut at its token limit) does the same before it closes the last complete list item.
+* **Tests.** `test_parse_generated` covers the new forms.
+
 ## 2026-10-24 (night): brains per step - what a brain may answer, and a step's own brain order
 
 For the unit-test generator's brain profiles (BP-1 .. BP-10). BaseAgent stays application-agnostic: it does not know

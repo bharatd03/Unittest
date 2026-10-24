@@ -60,7 +60,8 @@ class KnowledgeBaseAgent(ba.AgentCore):
         self.backend = "sqlite"
         try:
             Path(self.cfg.db_path).parent.mkdir(parents=True, exist_ok=True)
-            self.db = sqlite3.connect(self.cfg.db_path, check_same_thread=False)
+            # ORC-23 (d): several runs share the KB; a writer waits for the other instead of failing
+            self.db = sqlite3.connect(self.cfg.db_path, check_same_thread=False, timeout=30)
             self._init_schema()
         except (sqlite3.Error, OSError, ValueError) as exc:   # KB-21: local fallback
             LOG.warning("KB database unavailable (%s); using an in-memory store.", type(exc).__name__)

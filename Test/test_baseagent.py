@@ -1949,6 +1949,12 @@ class GenerateTests(unittest.IsolatedAsyncioTestCase):
 
     def test_parse_generated(self):
         self.assertEqual(ba.parse_generated('<think>x</think>```json\n{"a": 1}\n```'), {"a": 1})
+        # any brain: other reasoning tags, prose around the JSON, a fence after a sentence
+        self.assertEqual(ba.parse_generated('<thinking>t</thinking><reasoning>r</reasoning>[1, 2]'), [1, 2])
+        self.assertEqual(ba.parse_generated('Here is the JSON:\n```json\n{"a": [1, {"b": "}"}]}\n```\nDone.'),
+                         {"a": [1, {"b": "}"}]})
+        self.assertEqual(ba.parse_generated('{"a": 1} - as asked'), {"a": 1})
+        self.assertEqual(ba.salvage_json('Sure: {"tests": [{"a": 1}, {"b": 2}, {"c'), {"tests": [{"a": 1}, {"b": 2}]})
         with self.assertRaises(ba.AgentFault) as ctx:
             ba.parse_generated("not json")
         self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")

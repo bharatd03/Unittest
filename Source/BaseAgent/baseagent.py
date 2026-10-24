@@ -1383,8 +1383,10 @@ def salvage_json(text: Any) -> Any:
     caller still runs the full schema and agent checks on the result."""
     if not isinstance(text, str):
         return None
-    text = re.sub(r"^\s*<think>.*?</think>", "", text, flags=re.S).strip()
+    text = strip_reasoning(text)
     text = re.sub(r"^```(?:json)?\s*", "", text)
+    if not text.startswith(("{", "[")) and "{" in text:            # prose before the JSON
+        text = text[text.index("{"):]
     stack, quote, escape, cuts = [], False, False, []
     for i, c in enumerate(text):
         if quote:
@@ -1415,16 +1417,65 @@ def salvage_json(text: Any) -> Any:
     return None
 
 
+REASONING_BLOCK = re.compile(r"^\s*<(think|thinking|reasoning|reflection|analysis|scratchpad)\b[^>]*>.*?</\1\s*>",
+                             flags=re.S | re.I)
+
+
+def strip_reasoning(text: str) -> str:
+    """A leading reasoning block of any brain (<think>, <thinking>, <reasoning> ...), however many."""
+    while True:
+        stripped = REASONING_BLOCK.sub("", text, count=1)
+        if stripped == text:
+            return text.strip()
+        text = stripped
+
+
+def first_json(text: str) -> str | None:
+    """The first complete JSON object or array in a text (prose or a code fence around it is left out)."""
+    for start, c in enumerate(text):
+        if c not in "{[":
+            continue
+        stack, quote, escape = [], False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if quote:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    quote = False
+                continue
+            if ch == '"':
+                quote = True
+            elif ch in "{[":
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]":
+                if not stack or stack.pop() != ch:
+                    break
+                if not stack:
+                    return text[start: i + 1]
+        return None
+    return None
+
+
 def parse_generated(text: Any) -> Any:
-    """JSON from a brain's text: tolerates a leading think block or a code fence."""
+    """JSON from a brain's text, whichever brain wrote it: a leading reasoning block, a code fence or prose before
+    and after the JSON are tolerated; the first complete JSON value is the answer."""
     if not isinstance(text, str):
         raise AgentFault("MODEL_OUTPUT_INVALID", "The brain returned no text.")
-    text = re.sub(r"^\s*<think>.*?</think>", "", text, flags=re.S).strip()
+    text = strip_reasoning(text)
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.S)
     text = fenced.group(1) if fenced else text
     try:
         return json_loads(text, max_bytes=GENERATE_MAX_BYTES)
     except AgentFault as exc:
+        inner = first_json(text)
+        if inner is not None and inner != text:
+            try:
+                return json_loads(inner, max_bytes=GENERATE_MAX_BYTES)
+            except AgentFault:
+                pass
         raise AgentFault("MODEL_OUTPUT_INVALID", "The brain did not return valid JSON.") from exc
 
 

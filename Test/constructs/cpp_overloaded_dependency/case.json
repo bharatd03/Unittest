@@ -1,0 +1,10 @@
+{
+  "construct": "C++ dependency with two overloads of one name, both stubbed",
+  "sut": "src/codec.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

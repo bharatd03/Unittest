@@ -55,7 +55,7 @@
     "interactive": false,
     "interactive_wait_seconds": 600,
     "repo_cache": "ut_cache",
-    "max_parallel_suts": 1,
+    "max_parallel_suts": 2,
     "git_token_env": "",
     "git_token_user": "x-access-token",
     "git_author": "ut-pipeline <ut-pipeline@localhost>",

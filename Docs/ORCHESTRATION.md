@@ -313,7 +313,7 @@ flowchart TD
     named -- no --> select["Agent1 select_files in a worktree<br/>of the tested commit: production files,<br/>no tests, third-party, generated code (ORC-35)"]
     select --> wt
     named -- yes --> wt["one git worktree per SUT file<br/>at the tested commit"]
-    wt --> pipe["the whole pipeline per SUT file<br/>(one after another, or in parallel, ORC-23)"]
+    wt --> pipe["the whole pipeline per SUT file<br/>(in parallel up to max_parallel_suts, ORC-23)"]
     pipe --> kind{"per SUT file"}
     kind -- "verified, tests only" --> moved{"branch still at<br/>the tested commit?"}
     moved -- yes --> push["one commit to the branch:<br/>tests, stubs, harness,<br/>ut_reports/&lt;SUT&gt;/ (ORC-24, ORC-27)"]
@@ -325,6 +325,16 @@ flowchart TD
     kind -- "production source changed,<br/>or not verified" --> pr["review branch ut-review/&lt;SUT&gt;-&lt;commit&gt;:<br/>fixed source + tests + reports;<br/>pull request (ORC-25, ORC-28)"]
     pr --> human(["a person reviews; merging is the approval (ORC-26)"])
 ```
+
+**Several files in parallel (ORC-23).** `pipeline.max_parallel_suts` (default 2) files run at the same time - for a
+repository link and for a local folder alike; an interactive run (LA-9) runs them one after another. Each file works
+in its own copy (a worktree, or a copy of the folder taken when it starts), with its own output folder and agent
+processes; the answer log of a run goes to its own agents only. Each file's generated files carry its unit name
+(`test_<unit>.c`, `ut_stubs_<unit>.c/.h`, `ut_sut_access_<unit>.c`, A2-21af), so two files of one component never
+replace each other's stubs. What the files share is written safely: the knowledge base and the resolution memory wait
+for each other's writes, one build capture per cache key runs at a time and the others reuse it, Agent3 never
+removes a run folder younger than two hours, and findings are appended as whole lines. A lesson (LA-8) learned by one
+file reaches another only if it was stored before that file asked.
 
 Git uses the login already configured on the PC (Git Credential Manager, SSH key) or a token in the environment
 variable named in `ut_config.json`; it is never written anywhere [ORC-21]. The pipeline never force-pushes,
@@ -489,6 +499,17 @@ brain, never a pass.
 other; its tests get a safe name (`Money_operator_plus_assign`), and every overload of a name gets its own scenarios and
 test names (the second one `_2`), found by its line. A set-up never declares the object of the building block again
 (A2-21ae), and the SUT signature is that of the file as given, not of the copy adapted for the host (ORC-10).
+
+**Generic by construction (NC-15, A2-21ag).** No rule, check, prompt or default is written for one file, project,
+target or brain; the pilots and the corpus only test the rules. Functions are found in any common form (return type
+on the line before, attributes, AUTOSAR-style FUNC(...) macros, #if/#else); a dependency is identified by name and
+parameter types, so overloads get their own stubs, and variadic, unnamed and function-pointer parameters are kept;
+a definition is never a static function of another file; headers come from "..." and project <...> includes, the
+nearest file first; macros from -D flags and every included header; a register wait is recognised in any form of
+its condition, its polarity found by evaluating it; register windows follow the SUT's own addresses; templates of a
+header SUT (class and function) are instantiated with arguments the repository uses; C++ tests compile with
+-fno-exceptions and -fno-rtti; brain tasks show forms, never pilot names; and the answer of any brain is read the
+same way (any reasoning tag, fences and prose around the JSON).
 
 **Findings across runs (NC-5).** Pipeline limitations, false refusals and unknown outcomes go to
 `ut_output/pipeline_findings.jsonl`, counted by signature; the report lists them first.

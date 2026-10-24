@@ -169,11 +169,23 @@ def find_functions(source: str, rel: str) -> list[uc.FunctionInfo]:
             header_start = i + 1
         elif ch == ":" and i + 1 < len(code) and code[i + 1] == ":":
             i += 1
-        elif ch in "#" and (i == 0 or code[i - 1] == "\n"):
+        elif ch in "#" and (i == 0 or code[i - 1] == "\n" or not code[code.rfind("\n", 0, i) + 1: i].strip()):
             j = code.find("\n", i)
             while j > 0 and code[j - 1] == "\\":
                 j = code.find("\n", j + 1)
-            i = len(code) if j < 0 else j
+            j = len(code) if j < 0 else j
+            if re.match(r"#\s*(?:else|elif|elifdef|elifndef)\b", code[i:j]):
+                # only the first branch of #if ... #else counts: both branches opening "{" would unbalance the
+                # braces and lose every later function [A1-1]
+                depth, k = 1, j
+                for d in re.finditer(r"(?m)^[ \t]*#[ \t]*(if|ifdef|ifndef|endif)\b", code[j:]):
+                    depth += 1 if d.group(1) != "endif" else -1
+                    if depth == 0:
+                        k = j + d.start()
+                        break
+                j = code.find("\n", k) if depth == 0 else len(code)
+                j = len(code) if j < 0 else j
+            i = j
             header_start = i
             continue
         i += 1
@@ -217,8 +229,43 @@ OPERATOR_NAME = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*operator\s*(?:\(\s*\)|\[\
                            r"[^\w\s(]+|[A-Za-z_][\w:<>*&\s]*?))\s*\(")
 
 
+def _strip_balanced(text: str, start: int) -> int:
+    """The index after the parenthesis group that starts at ``start`` (text[start] == "(")."""
+    depth, k = 0, start
+    while k < len(text):
+        depth += {"(": 1, ")": -1}.get(text[k], 0)
+        k += 1
+        if depth == 0:
+            break
+    return k
+
+
+def declaration_head(header: str) -> str:
+    """A function header without what does not name it: attributes (__attribute__((...)), __declspec(...),
+    [[...]], alignas(...)) and leading macro calls that stand for the return type or storage class
+    (AUTOSAR FUNC(void, COM_CODE), a project's API_EXPORT(int)), so that "<return type> name(" remains [A1-1]."""
+    out = re.sub(r"\[\[.*?\]\]", " ", header)
+    for word in ("__attribute__", "__declspec", "alignas", "_Alignas", "__pragma", "_Pragma"):
+        while True:
+            m = re.search(r"\b" + word + r"\s*\(", out)
+            if not m:
+                break
+            out = out[: m.start()] + " " + out[_strip_balanced(out, m.end() - 1):]
+    while True:                                   # MACRO(...) before the name: the macro is the return type
+        m = re.match(r"\s*((?:[A-Za-z_]\w*\s+)*?)([A-Z_][A-Z0-9_]*)\s*\(", out)
+        if not m:
+            break
+        end = _strip_balanced(out, m.end() - 1)
+        if not re.match(r"\s*[A-Za-z_~][\w:~]*\s*\(", out[end:]):
+            break
+        out = (m.group(1) or "") + " ut_macro_type " + out[end:]
+    return re.sub(r"\s+", " ", out).strip()
+
+
 def function_name(header: str) -> str:
-    header = re.sub(r"\s+", " ", header).strip()
+    header = declaration_head(re.sub(r"\s+", " ", header).strip())
+    if header.startswith("typedef "):
+        return ""
     if not header or "(" not in header or header.startswith(("=", "return")):
         return ""
     op = OPERATOR_NAME.search(header)                     # an operator is a function too [NC-4]
@@ -246,8 +293,11 @@ def find_declarations(text: str) -> dict[str, str]:
 def _declarations(text: str) -> tuple[tuple[str, str], ...]:
     code = strip_comments(text)
     decls = {}
-    for m in re.finditer(r"(?:^|[;}\n])\s*((?:extern\s+)?[A-Za-z_][\w\s\*&:<>,]*?\b([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*(?:const\s*)?);",
-                         code):
+    # A1-DA4: one level of parentheses inside the parameters (function pointers) and trailing attributes or
+    # noexcept are part of a declaration
+    for m in re.finditer(r"(?:^|[;}\n])\s*((?:extern\s+)?[A-Za-z_][\w\s\*&:<>,]*?\b([A-Za-z_]\w*)\s*"
+                         r"\(((?:[^;{}()]|\([^;{}()]*\))*)\)\s*(?:const\s*)?"
+                         r"(?:(?:noexcept|__attribute__\s*\(\((?:[^;{}()]|\([^;{}()]*\))*\)\))\s*)*);", code):
         decl, name = re.sub(r"\s+", " ", m.group(1)).strip(), m.group(2)
         if name in KEYWORDS or decl.startswith(("return", "typedef", "#")) or "=" in decl.split("(")[0]:
             continue
@@ -255,19 +305,36 @@ def _declarations(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(decls.items())
 
 
+TYPE_WORDS = {"int", "char", "long", "short", "float", "double", "unsigned", "signed", "bool", "_Bool", "void",
+              "size_t", "wchar_t", "char16_t", "char32_t", "auto"}
+TYPE_QUALIFIERS = {"const", "volatile", "struct", "union", "enum", "class", "register", "restrict", "__restrict",
+                   "typename"}
+
+
 def parse_declaration(decl: str) -> tuple[str, list[list[str]]]:
     decl = re.sub(r"^extern\s+", "", decl.strip().rstrip(";"))
+    decl = re.sub(r"\s*(?:noexcept|__attribute__\s*\(\(.*\)\))\s*$", "", decl)           # trailing attributes
     head, params = decl[: decl.index("(")], decl[decl.index("(") + 1: decl.rindex(")")]
     name = re.search(r"([A-Za-z_]\w*)\s*$", head).group(1)
     return_type = head[: head.rindex(name)].strip()
     out = []
     if params.strip() not in ("", "void"):
         for index, p in enumerate(_split_top(params)):
-            p = p.strip()
+            p = re.sub(r"\s*=\s*[^=].*$", "", p.strip())                  # a C++ default argument
+            if p == "...":                                                       # variadic [A2-21g]
+                out.append(["...", ""])
+                continue
+            fp = re.match(r"^(.*?)\(\s*\*\s*([A-Za-z_]\w*)?\s*\)\s*(\(.*\))$", p)
+            if fp:                                                               # int (*cb)(int)
+                out.append([f"{fp.group(1).strip()} (*){fp.group(3)}", fp.group(2) or f"arg{index}"])
+                continue
             m = re.search(r"([A-Za-z_]\w*)\s*(\[[^\]]*\])?$", p)
-            if m and m.group(1) not in ("int", "char", "long", "short", "float", "double", "unsigned", "signed",
-                                         "bool", "void", "size_t") and p != m.group(1):
-                ptype = (p[: m.start(1)] + (m.group(2) and "*" or "")).strip()
+            before = p[: m.start(1)] if m else ""
+            # a name follows a complete type: a type word that is not only a qualifier, or * or &
+            named = m is not None and m.group(1) not in TYPE_WORDS and (
+                re.search(r"[*&]", before) or set(re.findall(r"[A-Za-z_]\w*", before)) - TYPE_QUALIFIERS)
+            if named:
+                ptype = (before + (m.group(2) and "*" or "")).strip()
                 out.append([ptype, m.group(1)])
             else:
                 out.append([p, f"arg{index}"])
@@ -1438,7 +1505,7 @@ def select_production_files(root: Path, compile_commands: str = "", limit: int =
                 elif not reason and re.search(r"auto-?generated|generated (by|from|with)", head) and \
                         re.search(r"do not (edit|modify)|don't (edit|modify)", head):
                     reason = "generated code"
-                elif not reason and not DEFINITION.search(strip_comments(text)):
+                elif not reason and not DEFINITION.search(strip_comments(text)) and not find_functions(text, rel):
                     reason = "no function definition"
             if reason:
                 left_out.append(f"{rel}: {reason}")
@@ -1580,7 +1647,7 @@ def stub_spec(dep: uc.Dependency) -> uc.StubSpec | None:
     return_type = re.sub(r"\b(static|virtual|inline|extern|explicit)\b", "", return_type).strip()
     return uc.StubSpec(function=dep.name, declaration=dep.declaration, return_type=return_type, params=params,
                        header=header, kind=dep.kind, qualified_name=dep.qualified_name, method_suffix=dep.method_suffix,
-                       namespace=dep.namespace)
+                       namespace=dep.namespace, overload=dep.overload)
 
 
 # ============================================================================ brain planning [A1-PL1 .. A1-PL14]
@@ -1663,8 +1730,8 @@ PLAN_TASK = (
     "- Use the PATH CONDITIONS to choose values that reach each gap. For a gap listed under TRIED, choose "
     "different inputs, state or stub values than the ones tried.\n"
     "- classification: confirmed_gap only when an EVIDENCE item (not E8) states the expected result; then give "
-    "expected_return / expected_after, its evidence_ids (the ids as written in EVIDENCE, for example "
-    "EV-clamp_percent-1; never the classes E1-E8) and quotes copied word for word from it. "
+    "expected_return / expected_after, its evidence_ids (the ids as written in EVIDENCE, in the form "
+    "EV-<function>-<n>; never the classes E1-E8) and quotes copied word for word from it. "
     "characterization_gap when no evidence states the result: leave expected_return empty, the result is observed. "
     "conflicting_evidence when evidence items contradict each other (say which in conflict). "
     "insufficient_evidence when you need more evidence (say what in information_sought).\n"
@@ -1997,16 +2064,28 @@ class AnalyzerAgent(ba.AgentCore):
         files = [p for p in root.rglob("*") if p.is_file() and ".git" not in p.parts and "ut_work" not in p.parts]
         rel = lambda p: str(p.relative_to(root)).replace("\\", "/")
         headers_all = [p for p in files if p.suffix.lower() in HEADER_EXT]
-        included = re.findall(r'#\s*include\s*"([^"]+)"', source)
+        # "..." and <...> includes that resolve inside the repository (a <...> one found nowhere there is a system
+        # header); of several files with that name, the one the compiler would most likely find: next to the SUT,
+        # then inside its component, then the nearest to the SUT [A1-7]
+        included = [inc for quote, inc in re.findall(r'#\s*include\s*([<"])([^>"]+)[>"]', source)
+                    if quote == '"' or ("." in inc and inc not in uc.STANDARD_HEADERS)]
         include_dirs, headers = [], []
+
+        def nearness(h: Path, inc: str) -> tuple[int, int, int, str]:
+            beside = (sut.parent / inc).resolve() == h.resolve()
+            inside = h.resolve().is_relative_to(component.resolve())
+            shared = len(Path(os.path.commonpath([str(h.parent.resolve()), str(sut.parent.resolve())])).parts)
+            return (0 if beside else 1, 0 if inside else 1, -shared, rel(h))
         for inc in included:
-            for h in headers_all:
-                if rel(h) == inc or rel(h).endswith("/" + inc):        # "ctrl.h" is not "brake_ctrl.h"
-                    directory = rel(h)[: -len(inc)].rstrip("/") or "."
-                    if directory not in include_dirs:
-                        include_dirs.append(directory)
-                    headers.append(rel(h))
-                    break
+            inc = inc.replace("\\", "/")
+            matches = [h for h in headers_all if rel(h) == inc or rel(h).endswith("/" + inc)]   # "ctrl.h" is not "brake_ctrl.h"
+            if not matches:
+                continue
+            h = min(matches, key=lambda h: nearness(h, inc))
+            directory = rel(h)[: -len(inc)].rstrip("/") or "."
+            if directory not in include_dirs:
+                include_dirs.append(directory)
+            headers.append(rel(h))
         for candidate in ("include", "inc"):
             if (component / candidate).is_dir() and rel(component / candidate) not in include_dirs:
                 include_dirs.append(rel(component / candidate))
@@ -2046,7 +2125,8 @@ class AnalyzerAgent(ba.AgentCore):
                                             else "tests")
         default_stub_dir = req.stub_dir or next((d for d in stub_dirs if d not in read_only),
                                                 default_test_dir.rstrip("/") + "/stubs")
-        suite = f"{default_test_dir.rstrip('/')}/test_{sut.stem}.{'cpp' if language == 'cpp' else 'c'}"
+        unit = uc.unit_name_of(sut_rel, [rel(p) for p in files if p.suffix.lower() in uc.SOURCE_SUFFIXES])  # A2-21af
+        suite = f"{default_test_dir.rstrip('/')}/test_{unit}.{'cpp' if language == 'cpp' else 'c'}"
         build = self._build_system(root, component)
         requirement_files = self._requirement_files(root, files)
         given, requirement_notes = self._given_requirements(req.requirement_documents, root, requirement_files)
@@ -2134,12 +2214,24 @@ class AnalyzerAgent(ba.AgentCore):
 
     @staticmethod
     def _component_root(root: Path, sut: Path) -> Path:
+        """A1-3: the nearest folder with a build file of any common build system; without one, the folder above a
+        source folder (src, source, lib ...) or else the SUT's own folder."""
+        markers = ("CMakeLists.txt", "Makefile", "makefile", "GNUmakefile", "meson.build", "SConstruct", "SConscript",
+                   "BUILD", "BUILD.bazel", "configure.ac", "library.json", "platformio.ini", "Kbuild", "build.ninja",
+                   "premake5.lua", "xmake.lua", "conanfile.py")
+        patterns = ("*.vcxproj", "*.ewp", "*.uvprojx", ".cproject", "*.mk")
         for parent in sut.parents:
-            if any((parent / marker).exists() for marker in ("CMakeLists.txt", "Makefile", "meson.build")):
+            if any((parent / marker).exists() for marker in markers) or \
+                    any(next(parent.glob(pattern), None) is not None for pattern in patterns):
                 return parent
             if parent == root:
                 break
-        return sut.parent.parent if sut.parent != root else root
+        if sut.parent == root:
+            return root
+        if sut.parent.name.lower() in ("src", "source", "sources", "lib", "libs", "core", "impl", "private", "c", "cpp",
+                                       "include", "inc", "includes", "headers", "public", "api"):
+            return sut.parent.parent
+        return sut.parent
 
     # ---------------------------------------------------------------- evidence [A1-25a..25j]
     def collect_evidence(self, layout: uc.LayoutProfile, function: str) -> uc.EvidenceResult:
@@ -2394,9 +2486,9 @@ class AnalyzerAgent(ba.AgentCore):
             ref, depth, via = queue.pop(0)
             dep = self._describe_dependency(sut if depth == 0 else units.get(via) or sut, ref, repo, sut_text, depth)
             if dep is None or dep.qualified_name in sut_names or dep.name in sut_names or \
-                    (dep.qualified_name or dep.name) in decided:
+                    uc.dependency_key(dep) in decided:
                 continue
-            key = dep.qualified_name or dep.name
+            key = uc.dependency_key(dep)                                        # overloads apart [A1-DA4]
             old = previous.get(dep.name)
             dep.attempts = old.attempts if old else 0
             if not dep.system and not dep.definition.lower().endswith(HEADER_EXT):
@@ -2424,6 +2516,7 @@ class AnalyzerAgent(ba.AgentCore):
                 dep.decision, dep.decided_by = "real", "rule"
                 dep.reason = f"defined in {dep.definition}, which is linked for {real_units[dep.definition]} [A1-DA10]"
         plan.entries = sorted(decided.values(), key=lambda d: (d.depth, d.name))
+        uc.number_overloads(plan.entries)                                                    # A1-DA4
         plan.real_sources = sorted({d.definition for d in plan.entries if d.decision == "real" and d.definition
                                     and not d.definition.lower().endswith(HEADER_EXT)})            # A1-DA16
         # declarations proposed earlier for symbols without one stay in the plan [A1-PL14]
@@ -2508,6 +2601,8 @@ class AnalyzerAgent(ba.AgentCore):
                     " noexcept" if m and "noexcept" in m.group(1) else ""        # a noexcept function [A2-21ad]
                 dep.params = [[(p.get("type") or {}).get("qualType", ""), p.get("name") or f"arg{i}"]
                               for i, p in enumerate(c for c in node.get("inner", []) if c.get("kind") == "ParmVarDecl")]
+                if node.get("variadic") or re.search(r"(?:,\s*|\()\.\.\.\)", qt):              # f(fmt, ...) [A2-21g]
+                    dep.params.append(["...", ""])
         # A1-DA16: a definition in a header (inline function, member defined in its class, constexpr or inline
         # variable, template) is part of every translation unit that includes it: never a dependency to stub.
         if node and rel and rel.lower().endswith(HEADER_EXT) and (
@@ -2553,7 +2648,14 @@ class AnalyzerAgent(ba.AgentCore):
                                                             language="cpp" if path.suffix.lower() in CPP_EXT else "c"))
         word = re.compile(r"\b" + re.escape(dep.name) + r"\b")
         checked = 0
-        for rel, entry in sorted(entries.items()):
+        header = Path(dep.header).stem if dep.header else ""
+
+        def likely(item: tuple[str, Any]) -> tuple[int, int, str]:
+            """The file named like the declaring header first (hw.h -> hw.c), then the nearest to the header."""
+            rel = item[0]
+            near = len(os.path.commonprefix([rel, dep.header or layout.sut_file]))
+            return (0 if header and Path(rel).stem == header else 1, -near, rel)
+        for rel, entry in sorted(entries.items(), key=likely):
             path = root / rel
             try:
                 if not word.search(path.read_text(encoding="utf-8", errors="replace")):
@@ -2572,8 +2674,17 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             for node, qualified in unit.definitions():
                 if qualified == (dep.qualified_name or dep.name) or (not dep.qualified_name and node.get("name") == dep.name):
-                    if (dep.kind == "variable") == (node.get("kind") == "VarDecl"):
-                        return rel
+                    if (dep.kind == "variable") != (node.get("kind") == "VarDecl"):
+                        continue
+                    # internal linkage defines another symbol of the same name, never this one [A1-DA5]
+                    if node.get("storageClass") == "static" or "(anonymous" in (qualified or ""):
+                        continue
+                    if dep.kind != "variable" and dep.params is not None:          # the same overload [A1-DA4]
+                        params = [c for c in node.get("inner", []) or [] if c.get("kind") == "ParmVarDecl"]
+                        wanted = [p for p in dep.params if p[0] != "..."]
+                        if dep.params and len(params) != len(wanted):
+                            continue
+                    return rel
         return ""
 
     async def _decide(self, dep: uc.Dependency, layout: uc.LayoutProfile, units: dict[str, Any],

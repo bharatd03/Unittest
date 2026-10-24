@@ -27,7 +27,7 @@ if _BASEAGENT_HOME not in sys.path:
 import baseagent as ba  # noqa: E402  (path set above)
 
 CONTRACTS_VERSION = "1.0"
-HARNESS_VERSION = "ut_harness 1.2"
+HARNESS_VERSION = "ut_harness 1.3"
 METRICS = ("LC", "SC", "BC", "DC", "MCDC")
 FAILURE_CATEGORIES = ("test_generation_defect", "stub_defect", "test_framework_defect",
                       "build_configuration_defect", "source_compilation_defect", "source_behavior_defect",
@@ -195,6 +195,7 @@ class Dependency(Contract):
     params: list[list[str]] = Field(default_factory=list)   # [[type, name], ...]
     method_suffix: str = ""              # C++: " const" etc.
     namespace: str = ""                  # C++: the namespace that declares it, e.g. "QP" [A2-21ad]
+    overload: int = 0                    # C++: 0 the first declaration of its name, 1.. the other overloads [A1-DA4]
 
 
 class DependencyPlan(Contract):
@@ -728,6 +729,7 @@ class StubSpec(Contract):
     is_const: bool = False
     initializer: str = ""            # const variable: its value for the whole test program [A2-21j]
     namespace: str = ""              # C++: the declaring namespace; its types resolve there [A2-21ad]
+    overload: int = 0                # C++: the other overloads of a name get their own controls [A1-DA4]
 
 
 class FuzzInput(Contract):
@@ -2080,7 +2082,8 @@ for _model in (FieldInfo, ParamInfo, FunctionInfo, FuzzRequest, FuzzResult, Layo
 
 def stub_base(spec: "StubSpec") -> str:
     """Name stem of a stub's control variables: ut_stub_<stem>_return / _calls / _<param> [A2-21g]."""
-    return (spec.qualified_name or spec.function).replace("::", "_").replace("~", "dtor_")
+    base = (spec.qualified_name or spec.function).replace("::", "_").replace("~", "dtor_")
+    return f"{base}_{spec.overload + 1}" if getattr(spec, "overload", 0) else base          # A1-DA4: overloads apart
 
 
 def gap_item(g: "GapItem") -> str:
@@ -2677,9 +2680,9 @@ def record_findings(path: Path, findings: list["PipelineFinding"]) -> list[str]:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if findings:
-            with open(path, "a", encoding="utf-8") as handle:
-                for f in findings:
-                    handle.write(_json.dumps(f.model_dump(mode="json"), ensure_ascii=False) + "\n")
+            text = "".join(_json.dumps(f.model_dump(mode="json"), ensure_ascii=False) + "\n" for f in findings)
+            with open(path, "a", encoding="utf-8") as handle:               # one write: whole lines [ORC-23 (d)]
+                handle.write(text)
         for line in path.read_text(encoding="utf-8").splitlines() if path.is_file() else []:
             try:
                 raw = _json.loads(line)
@@ -2740,6 +2743,26 @@ def function_of(name: str, layout: "LayoutProfile", line: int = 0) -> "FunctionI
     return same[0] if same else None
 
 
+CONTROL_WORDS = r"(?:if|while|for|switch|return|else|do|case|sizeof|throw|new|delete)"
+
+
+def definition_match(text: str, name: str) -> "re.Match[str] | None":
+    """The definition of the function ``name`` in a source text, never a call: before the name only a declaration's
+    words (type, storage class, attributes, qualifiers, Class::), never "(" of a call or a control statement; the
+    return type may stand on the line before (BSD style). Its match ends at the opening brace."""
+    short = re.escape(name.split("::")[-1])
+    owner = r"(?:[A-Za-z_]\w*(?:<[^<>;(){}]*>)?::)*"
+    pattern = (r"^(?!\s*" + CONTROL_WORDS + r"\b)[\w \t*&:<>,~\[\]]*?(?:\n[\w \t*&]*?)?" + owner + r"~?\b" + short +
+               r"\s*\((?:[^;{}()]|\([^;{}()]*\))*\)\s*(?:const\b\s*)?(?:noexcept\b\s*)?(?:override\b\s*)?"
+               r"(?:->\s*[\w:<>*& ]+)?(?::[^;{]*)?\{")
+    for m in re.finditer(pattern, text, re.M):
+        head = text[m.start(): m.end()]
+        if re.search(r"(?:^|[^\w])" + CONTROL_WORDS + r"\s*\(", head.split(name.split("::")[-1])[0]):
+            continue
+        return m
+    return None
+
+
 def dependency_code(fn: "FunctionInfo", layout: "LayoutProfile", max_functions: int = 4, max_lines: int = 30) -> str:
     """A1-PL2, NC-1: the code of the real dependencies the function calls, from their files in the repository, so a
     brain can choose inputs that pass through them (for example hw_read(x) returning STATUS_REG + x). Short functions
@@ -2758,8 +2781,7 @@ def dependency_code(fn: "FunctionInfo", layout: "LayoutProfile", max_functions: 
         if not path.is_file():
             continue
         text = read_source(path)
-        short = re.escape(d.name.split("::")[-1])
-        m = re.search(r"^[^;{}\n]*\b" + short + r"\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{", text, re.M)
+        m = definition_match(text, d.name)
         if m is None:
             continue
         depth, k = 0, m.end() - 1
@@ -2821,3 +2843,192 @@ def without_redeclarations(statements: list[str], declared: set[str]) -> tuple[l
         else:
             kept.append(stmt)
     return kept, dropped
+
+
+# ============================================================================ generated files per SUT file [A2-21af]
+STUB_HEADER = re.compile(r"(?:^|[/\\])ut_stubs(?:_\w+)?\.h$")
+SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".c++")
+
+
+def unit_name(layout: "LayoutProfile") -> str:
+    """A2-21af: the unit name of the SUT file, read from its suite file (test_<unit>.c)."""
+    stem = Path(layout.suite_file or layout.sut_file).stem
+    return safe_name(stem[5:] if stem.startswith("test_") and len(stem) > 5 else stem) or "sut"
+
+
+def unit_name_of(sut_file: str, repository_files: list[str]) -> str:
+    """A2-21af: the SUT file's name without its extension, or its path when another source file of the repository
+    has the same name (src/uart.c, hal/uart.c -> src_uart, hal_uart)."""
+    sut = Path(sut_file.replace("\\", "/"))
+    same = [f for f in repository_files if Path(f.replace("\\", "/")).stem == sut.stem
+            and Path(f.replace("\\", "/")).suffix.lower() in SOURCE_SUFFIXES
+            and f.replace("\\", "/") != sut.as_posix()]
+    if not same:
+        return re.sub(r"\W", "_", sut.stem) or "sut"
+    return re.sub(r"\W", "_", sut.with_suffix("").as_posix()).strip("_") or "sut"
+
+
+def stub_names(layout: "LayoutProfile") -> tuple[str, str]:
+    """A2-21af: (stub source path, stub header file name) of the SUT file."""
+    ext = "cpp" if layout.language == "cpp" else "c"
+    unit = unit_name(layout)
+    return f"{layout.writable_stub_dir.rstrip('/')}/ut_stubs_{unit}.{ext}", f"ut_stubs_{unit}.h"
+
+
+# ============================================================================ shared files across parallel runs
+class LockBusy(Exception):
+    """file_lock: another run held the lock longer than the caller wanted to wait."""
+
+
+class file_lock:
+    """ORC-23 (d): one holder at a time across processes (several SUT files run in parallel, each with its own agent
+    processes). The lock is a file created exclusively; its holder refreshes it, so the lock of a run that ended
+    without releasing it is taken over after ``stale_s``. Raises LockBusy after ``wait_s``."""
+
+    def __init__(self, path: str | Path, wait_s: float = 3600.0, stale_s: float = 120.0, poll_s: float = 0.5):
+        self.path, self.wait_s, self.stale_s, self.poll_s = Path(path), wait_s, stale_s, poll_s
+        self._stop = None
+        self._beat = None
+
+    def __enter__(self) -> "file_lock":
+        import threading
+        import time as _time
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = _time.monotonic() + self.wait_s
+        while True:
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()} {_time.time():.0f}\n".encode())
+                os.close(fd)
+                break
+            except FileExistsError:
+                try:
+                    if _time.time() - self.path.stat().st_mtime > self.stale_s:
+                        self.path.unlink()
+                        continue
+                except OSError:
+                    continue
+                if _time.monotonic() > deadline:
+                    raise LockBusy(f"{self.path.name} is held by another run") from None
+                _time.sleep(self.poll_s)
+        self._stop = threading.Event()
+
+        def beat() -> None:
+            while not self._stop.wait(max(1.0, self.stale_s / 4)):
+                try:
+                    os.utime(self.path)
+                except OSError:
+                    pass
+        self._beat = threading.Thread(target=beat, daemon=True)
+        self._beat.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        if self._stop is not None:
+            self._stop.set()
+            self._beat.join(timeout=5)
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def dependency_key(dep: "Dependency") -> str:
+    """A1-DA4: a dependency's identity - its qualified name, and for a function its parameter types, so that the
+    overloads of a name (hw::write(uint8_t), hw::write(uint16_t)) are each decided and stubbed."""
+    name = dep.qualified_name or dep.name
+    if dep.kind == "variable":
+        return name
+    types = ",".join(" ".join(p[0].split()) for p in dep.params)
+    return f"{name}({types})"
+
+
+def number_overloads(entries: list["Dependency"]) -> None:
+    """A1-DA4: the overloads of one name get 0, 1, 2 ... in the order of their declarations."""
+    groups: dict[str, list["Dependency"]] = {}
+    for d in entries:
+        if d.kind != "variable":
+            groups.setdefault(d.qualified_name or d.name, []).append(d)
+    for group in groups.values():
+        for i, d in enumerate(sorted(group, key=lambda d: (d.header, d.line, dependency_key(d)))):
+            d.overload = i if len(group) > 1 else 0
+
+
+# ============================================================================ standard headers [A1-7]
+STANDARD_HEADERS = {f"{n}.h" for n in (
+    "assert complex ctype errno fenv float inttypes iso646 limits locale math setjmp signal stdalign stdarg stdatomic "
+    "stdbit stdbool stdckdint stddef stdint stdio stdlib stdnoreturn string tgmath threads time uchar wchar wctype "
+    "unistd fcntl pthread sys/types sys/stat sys/time sys/mman windows intrin malloc memory strings").split()}
+
+
+# ============================================================================ target register windows [A3-HW1]
+def _macro_int(expr: str, macros: dict[str, str], depth: int = 0) -> int | None:
+    """An integer constant expression of literals and macros (0x40000000UL + 0x1000, (1u << 4) | BASE)."""
+    if depth > 8:
+        return None
+    expr = re.sub(r"\(\s*(?:const\s+)?(?:volatile\s+)?(?:unsigned\s+)?[A-Za-z_]\w*\s*\)", " ", expr)   # (uint32_t)
+    def name(m: "re.Match[str]") -> str:
+        value = _macro_int(macros[m.group(0)], macros, depth + 1) if m.group(0) in macros else None
+        return str(value) if value is not None else m.group(0)
+    expr = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", expr)
+    expr = re.sub(r"\b[A-Za-z_]\w*\b", name, expr)
+    if not re.fullmatch(r"[\s0-9a-fA-FxX()+\-*|&<>~^]+", expr) or re.search(r"[a-wyzA-WYZ]", re.sub(r"0[xX][0-9a-fA-F]+", "", expr)):
+        return None
+    try:
+        value = eval(expr, {"__builtins__": {}}, {})                                          # noqa: S307
+    except Exception:                                                                        # noqa: BLE001
+        return None
+    return value if isinstance(value, int) else None
+
+
+def register_windows(layout: "LayoutProfile", defaults: list[list[int]], files: list[Path] | None = None,
+                     span: int = 0x100000, limit: int = 16) -> tuple[list[list[int]], list[str]]:
+    """A3-HW1: the host memory windows the harness maps for target registers: the configured ones and a window
+    around every constant address the SUT and its headers turn into a pointer ((volatile uint32_t *)0xF0001000,
+    #define PERIPH_BASE 0x40000000UL used in such a cast). Addresses the host cannot map (below 64 KiB) are
+    returned as notes. Returns (windows, notes)."""
+    root = Path(layout.repo_root)
+    paths = files if files is not None else [root / layout.sut_file, *[root / h for h in layout.headers],
+                                             *[root / h for h in (layout.dependencies.headers if layout.dependencies else [])]]
+    texts = []
+    for p in dict.fromkeys(paths):
+        try:
+            text = Path(p).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        text = re.sub(r"\\[ \t]*\r?\n", " ", re.sub(r"/\*.*?\*/", " ", text, flags=re.S))
+        texts.append(re.sub(r"//[^\n]*", "", text))
+    macros: dict[str, str] = {}
+    for text in texts:
+        for m in re.finditer(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(.+)$", text):
+            macros.setdefault(m.group(1), m.group(2).strip())
+    cast = re.compile(r"\(\s*(?:const\s+)?(?:volatile\s+)?[A-Za-z_][\w\s]*?(?:volatile\s*)?\*\s*(?:volatile\s*)?\)\s*"
+                      r"(\([^;()\n]*(?:\([^;()\n]*\)[^;()\n]*)*\)|[A-Za-z_]\w*|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*)")
+    addresses = set()
+    for text in texts:
+        for m in cast.finditer(text):
+            value = _macro_int(m.group(1), macros)
+            if value is not None and value > 0:
+                addresses.add(value)
+    for name, body in macros.items():                       # a base address the casts reach through macros
+        if re.search(r"(?:BASE|ADDR|ADDRESS)\b", name.upper()):
+            value = _macro_int(body, macros)
+            if value is not None and value >= 0x10000:
+                addresses.add(value)
+    windows = [list(w[:2]) for w in defaults]
+    notes = []
+    for a in sorted(addresses):
+        if a < 0x10000:
+            notes.append(f"register address 0x{a:X} is below 64 KiB: the host cannot map it [A3-HW1]")
+            continue
+        if any(lo <= a < hi for lo, hi in windows):
+            continue
+        lo = a & ~(span - 1)
+        windows.append([lo, lo + span])
+    merged: list[list[int]] = []
+    for lo, hi in sorted(windows):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged[:max(limit, len(defaults))], notes[:8]

@@ -537,7 +537,7 @@ class RuleValueTests(unittest.TestCase):
                                   sut_sha256="0" * 64, sut_state=[uc.StateVar(name="g_faults", type="int")])
         plan = uc.UTPlan(plan_id="p1", layout=layout, stage="coverage")
         path, access = a2.render_sut_access(plan)
-        self.assertEqual(path, "tests/ut_sut_access.c")
+        self.assertEqual(path, "tests/ut_sut_access_a.c")                                   # A2-21af
         self.assertIn("void ut_sut_reset(void)", access)
         self.assertIn("memcpy((void *)&g_faults, ut_state_0, sizeof ut_state_0);", access)
         _, stubs, header = a2.render_stubs(plan)
@@ -875,7 +875,7 @@ class GeneratorTests(unittest.TestCase):
 
     def test_stubs_are_deterministic(self):
         path, source, header = a2.render_stubs(self.plan)
-        self.assertEqual(path, "tests/stubs/ut_stubs.c")
+        self.assertEqual(path, "tests/stubs/ut_stubs_thermostat.c")                         # A2-21af
         self.assertIn("int read_sensor(int channel)", source)
         self.assertIn("extern int ut_stub_read_sensor_return;", header)
         self.assertIn("void ut_before_each(void)", source)                       # reset before each test
@@ -1795,7 +1795,7 @@ class EmbeddedRuleTests(unittest.TestCase):
         out = a2.finalize_bundle(bundle, observed).actions[0].content
         self.assertIn("UT_EXPECT_THROW(ut_obj.step(-100001), std::invalid_argument);", out)
         self.assertIn("UT_EXPECT_EQ_INT(ut_obj.step(5), 7);", out)
-        self.assertIn("try { ut_obj.push(1); } catch (...) { ut_thrown = true; } UT_EXPECT_TRUE(ut_thrown);", out)
+        self.assertIn("UT_EXPECT_ANY_THROW(ut_obj.push(1));", out)                     # A2-21ag: no try in a test
         self.assertNotIn("UT_OBSERVE", out)
         self.assertEqual(observed["t_r2"], "7")                                  # the caller's observations unchanged
 
@@ -2187,12 +2187,12 @@ class CaptureAndDependencyTests(unittest.TestCase):
         stub_path, stub_src, stub_h = a2.render_stubs(plan)
         access = a2.render_sut_access(plan)
         self.assertIn('#include "../src/ctrl.c"', access[1])
-        suite = ('#include "ut_harness.h"\n#include "ut_stubs.h"\nint ut_static_scale(int v);\n'
+        suite = ('#include "ut_harness.h"\n#include "ut_stubs_ctrl.h"\nint ut_static_scale(int v);\n'
                  'UT_TEST(test_scale) { UT_OBSERVE_INT("s", ut_static_scale(3)); }\n'
                  'UT_SUITE_BEGIN\nUT_CASE(test_scale)\nUT_SUITE_END\n')
         bundle = uc.FileActionBundle(bundle_id="b", actions=[
             uc.FileAction(path=stub_path, action="create", role="stub", content=stub_src),
-            uc.FileAction(path=stub_path.replace("ut_stubs.c", "ut_stubs.h"), action="create", role="helper",
+            uc.FileAction(path=stub_path[:-2] + ".h", action="create", role="helper",
                           content=stub_h),
             uc.FileAction(path=access[0], action="create", role="sut_access", content=access[1]),
             uc.FileAction(path=layout.suite_file, action="create", role="testsuite", content=suite)])
@@ -2210,7 +2210,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
         stub_path, stub_src, stub_h = a2.render_stubs(plan)
         bundle = uc.FileActionBundle(bundle_id="b", actions=[
             uc.FileAction(path=stub_path, action="create", role="stub", content=stub_src),
-            uc.FileAction(path=stub_path.replace("ut_stubs.c", "ut_stubs.h"), action="create", role="helper",
+            uc.FileAction(path=stub_path[:-2] + ".h", action="create", role="helper",
                           content=stub_h)])
         gap = uc.GapItem(gap_id="BC:control:13:9:T", function="control", metric="BC", line=13, column=9)
         return self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=["control"], gaps=[gap],
@@ -2562,7 +2562,7 @@ class PipelineTests(unittest.TestCase):
             result = self.run_pipeline(repo, "src/echo_sensor.c")
         self.assertEqual(result.final_state, "verified_measured", up.report(result))
         self.assertEqual(result.unfinished_tests, [])
-        header = (repo / "tests/stubs/ut_stubs.h").read_text()
+        header = (repo / "tests/stubs/ut_stubs_echo_sensor.h").read_text()
         self.assertNotRegex(header, r'#include "[^"]+\.c"')
         self.assertIn("ut_stub_hal_micros_step", header)
 
@@ -2614,7 +2614,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result.language, "cpp")
                 suite = (repo / "tests" / f"test_{Path(sut).stem}.cpp").read_text()
                 if check == "motor":
-                    self.assertIn("class ut_fake_IEncoder : public IEncoder", (repo / "tests/stubs/ut_stubs.h").read_text())
+                    self.assertIn("class ut_fake_IEncoder : public IEncoder",
+                                  (repo / f"tests/stubs/ut_stubs_{Path(sut).stem}.h").read_text())
                     self.assertIn("std::invalid_argument);", suite)
                     self.assertIn("UT_REG_SET_LATER(hw::tim2()->SR, hw::SR_UIF, 20);", suite)
                 elif check == "template":
@@ -2643,7 +2644,8 @@ class PipelineTests(unittest.TestCase):
                     result = run(up.Orchestrator(pipeline_config(d)).run(uc.PipelineRequest(repo_root=str(repo),
                                                                                             sut_file=sut)))
                 self.assertEqual(result.final_state, "verified_measured", up.report(result))
-                stubs = (repo / "tests/stubs/ut_stubs.h").read_text() if (repo / "tests/stubs/ut_stubs.h").exists() else ""
+                header = repo / f"tests/stubs/ut_stubs_{Path(sut).stem}.h"
+                stubs = header.read_text() if header.exists() else ""
                 suite = next((repo / "tests").glob(f"test_{Path(sut).stem}.c*")).read_text()
                 if check == "order":                                   # the SUT's own order, kernel.h first
                     self.assertLess(suite.index('#include "kernel.h"'), suite.index('#include "klist.h"'))
@@ -2742,7 +2744,7 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(result.build_estimated)
         self.assertTrue(any(line.startswith("clamp: stub") for line in result.dependencies))   # A1-DA11
         self.assertIn("scale", {f.name for f in result.function_coverage})                  # A3-63
-        delivered = repo / "tests" / "ut_sut_access.c"
+        delivered = repo / "tests" / "ut_sut_access_ctrl.c"
         self.assertTrue(delivered.is_file())                                                # A2-21k
 
     def new_pilot_reaches_every_target_without_a_brain(self, pilot: str, sut: str):
@@ -4571,6 +4573,214 @@ class MemberNameTests(unittest.TestCase):
         outside = {"id": "0x5", "kind": "CXXMethodDecl", "name": "put", "parentDeclContextId": "0x2"}
         index._index(outside, "", "")                                   # `void QP::QMPool::put() {}` at file scope
         self.assertEqual(index.qualified_name(outside), "QP::QMPool::put")
+
+
+class GenericFormTests(unittest.TestCase):
+    """NC-15, A2-21af, A2-21ag, ORC-23: rules that hold for any C/C++ file, project and brain, not only the pilots."""
+
+    def test_each_sut_file_has_its_own_generated_files(self):                               # A2-21af
+        self.assertEqual(uc.unit_name_of("src/ctrl.c", ["src/ctrl.c", "src/brake_ctrl.c", "include/ctrl.h"]), "ctrl")
+        self.assertEqual(uc.unit_name_of("src/uart.c", ["src/uart.c", "hal/uart.c"]), "src_uart")
+        self.assertEqual(uc.unit_name_of("include/ring.hpp", ["include/ring.hpp", "src/ring.cpp"]), "include_ring")
+        layout = uc.LayoutProfile(repo_root=".", sut_file="hal/uart.c", language="c", component_root=".",
+                                  writable_test_dir="tests", writable_stub_dir="tests/stubs",
+                                  suite_file="tests/test_hal_uart.c", sut_sha256="0" * 64)
+        self.assertEqual(uc.stub_names(layout), ("tests/stubs/ut_stubs_hal_uart.c", "ut_stubs_hal_uart.h"))
+        self.assertTrue(uc.STUB_HEADER.search("tests/stubs/ut_stubs_hal_uart.h"))
+        self.assertTrue(uc.STUB_HEADER.search("tests/stubs/ut_stubs.h"))
+
+    def test_two_files_of_one_component_keep_their_own_stubs(self):                          # A2-21af, ORC-23
+        with tmpdir() as d:
+            repo = copy_pilot("c_deps_pilot", Path(d))
+            analyzer = a1.AnalyzerAgent()
+            paths = set()
+            for sut in ("src/ctrl.c", "src/brake_ctrl.c"):
+                layout = analyzer.discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=sut))
+                plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="")
+                paths.add(a2.render_stubs(plan)[0])
+                paths.add(layout.suite_file)
+            self.assertEqual(len(paths), 4, paths)
+
+    def test_function_definitions_in_any_common_form(self):                                  # NC-15 (a)
+        cases = {
+            "static int\nfoo(int x)\n{\n  return x;\n}\n": ["foo"],
+            "FUNC(void, COM_CODE) Com_Init(P2CONST(Cfg, AUTOMATIC, X) cfg)\n{\n}\n": ["Com_Init"],
+            "__attribute__((weak)) void SysTick_Handler(void)\n{\n}\n": ["SysTick_Handler"],
+            "typedef struct __attribute__((packed)) {\n int a;\n} pk_t;\nint g(void) { return 1; }\n": ["g"],
+            "#if A\nint f(int a) {\n#else\nint f(int a, int b) {\n#endif\n return a;\n}\nint later(void) { return 2; }\n":
+                ["f", "later"],
+            "__declspec(dllexport) int api(void) { return 0; }\n[[nodiscard]] int nd(void) { return 0; }\n": ["api", "nd"],
+        }
+        for source, names in cases.items():
+            self.assertEqual([f.qualified_name for f in a1.find_functions(source, "x.c")], names, source)
+
+    def test_declarations_keep_variadic_unnamed_and_function_pointer_parameters(self):      # NC-15 (b)
+        self.assertEqual(a1.parse_declaration("int log_printf(const char *fmt, ...)")[1],
+                         [["const char *", "fmt"], ["...", ""]])
+        self.assertEqual(a1.parse_declaration("void f(const my_t, struct cfg)")[1],
+                         [["const my_t", "arg0"], ["struct cfg", "arg1"]])
+        self.assertEqual(a1.parse_declaration("void reg(void (*cb)(int), unsigned n)")[1],
+                         [["void (*)(int)", "cb"], ["unsigned", "n"]])
+        self.assertIn("pure_fn", a1.find_declarations("int pure_fn(int) __attribute__((pure));\n"))
+        spec = uc.StubSpec(function="log_printf", declaration="", return_type="int",
+                           params=[["const char *", "fmt"], ["...", ""]])
+        layout = uc.LayoutProfile(repo_root=".", sut_file="a.c", language="c", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/test_a.c",
+                                  sut_sha256="0" * 64)
+        _, source, _ = a2.render_stubs(uc.UTPlan(plan_id="p", layout=layout, stage="coverage", stubs=[spec]))
+        self.assertIn("int log_printf(const char * fmt, ...)", source)
+
+    def test_overloads_of_a_dependency_are_stubbed_apart(self):                              # NC-15 (b)
+        one = uc.Dependency(name="write", qualified_name="hw::write", params=[["uint8_t", "v"]], header="hw.h", line=3)
+        two = uc.Dependency(name="write", qualified_name="hw::write", params=[["uint16_t", "v"]], header="hw.h", line=4)
+        self.assertNotEqual(uc.dependency_key(one), uc.dependency_key(two))
+        uc.number_overloads([one, two])
+        names = {uc.stub_base(uc.StubSpec(function="write", declaration="", return_type="void",
+                                          qualified_name="hw::write", overload=d.overload)) for d in (one, two)}
+        self.assertEqual(names, {"hw_write", "hw_write_2"})
+
+    def test_dependency_code_is_the_definition_never_a_call(self):                           # NC-15 (d)
+        text = "int caller(int x)\n{\n    if (hw_read(x)) {\n        return 1;\n    }\n    return 0;\n}\n" \
+               "static int\nhw_read(int ch)\n{\n    return STATUS + ch;\n}\n"
+        m = uc.definition_match(text, "hw_read")
+        self.assertTrue(text[m.start():].startswith("static int\nhw_read(int ch)"))
+
+    def test_register_waits_in_any_form(self):                                              # NC-15 (f)
+        fn = uc.FunctionInfo(name="f", qualified_name="f", signature="void f(void)", file="x.c", line_start=1, line_end=3)
+        cases = {"while ((SR & RDY) == 0u) {}": ("SR", "RDY", True),
+                 "while (0u == (UART1_SR & UART_TXE)) { }": ("UART1_SR", "UART_TXE", True),
+                 "while ((SR & RDY) != RDY);": ("SR", "RDY", True),
+                 "while (UART_SR & BUSY) {}": ("UART_SR", "BUSY", False),
+                 "while (!(USART1->SR & USART_SR_TXE)) {}": ("USART1->SR", "USART_SR_TXE", True),
+                 "while ((REG & 0x20u) == 0x20u) {}": ("REG", "0x20u", False)}
+        for body, wait in cases.items():
+            self.assertEqual(a2.register_waits(fn, "{ " + body + " }"), [wait], body)
+        macros = {"READ_BIT": (["REG", "BIT"], "((REG) & (BIT))")}
+        cond = a2.expand_macros("!READ_BIT(USART1->SR, TXE)", macros)
+        self.assertEqual(a2.wait_polarity(cond, "TXE"), True)
+
+    def test_register_windows_follow_the_sut(self):                                          # NC-15 (g), A3-HW1
+        with tmpdir() as d:
+            Path(d, "r.h").write_text("#define PERIPH_BASE (0xF0000000UL)\n"
+                                      "#define TIM0 (*(volatile uint32_t *)(PERIPH_BASE + 0x2010u))\n"
+                                      "#define PORTB (*(volatile uint8_t *)0x25)\n")
+            Path(d, "s.c").write_text('#include "r.h"\nint f(void) { return TIM0; }\n')
+            layout = uc.LayoutProfile(repo_root=d, sut_file="s.c", language="c", component_root=".",
+                                      writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/test_s.c",
+                                      sut_sha256="0" * 64, headers=["r.h"])
+            windows, notes = uc.register_windows(layout, [[0x40000000, 0x60000000]])
+        self.assertIn([0xF0000000, 0xF0100000], windows)
+        self.assertIn([0x40000000, 0x60000000], windows)
+        self.assertTrue(any("0x25" in n for n in notes))
+
+    def test_macros_from_flags_included_headers_and_continuation_lines(self):              # NC-15 (e)
+        with tmpdir() as d:
+            Path(d, "inc").mkdir()
+            Path(d, "inc/hw.h").write_text('#include "deep.h"\n#define TIMEOUT_US \\\n   (5000u)\n')
+            Path(d, "inc/deep.h").write_text("#define DEEP 7 // seven\n")
+            Path(d, "s.c").write_text('#include "hw.h"\n')
+            layout = uc.LayoutProfile(repo_root=d, sut_file="s.c", language="c", component_root=".",
+                                      writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/test_s.c",
+                                      sut_sha256="0" * 64, include_dirs=["inc"], headers=["inc/hw.h"],
+                                      compile_flags=["-DMODE=2"])
+            self.assertEqual(a2.header_macros(layout), {"MODE": "2", "TIMEOUT_US": "(5000u)", "DEEP": "7"})
+
+    def test_function_templates_of_a_header_sut_are_instantiated(self):                    # NC-15 (h)
+        with tmpdir() as d:
+            Path(d, "m.hpp").write_text("#pragma once\nnamespace util {\ntemplate <typename T>\n"
+                                        "inline T maxv(T a, T b) { return a > b ? a : b; }\n"
+                                        "template <typename T> auto bad(T a) -> T { return a; }\n}\n")
+            Path(d, "use.cpp").write_text('#include "m.hpp"\nlong k = util::maxv<long>(1, 2);\n')
+            layout = uc.LayoutProfile(repo_root=d, sut_file="m.hpp", language="cpp", component_root=".",
+                                      writable_test_dir="t", writable_stub_dir="t/s", suite_file="t/test_m.cpp",
+                                      sut_sha256="0" * 64, header_sut=True)
+            rows = a2.function_templates(uc.UTPlan(plan_id="p", layout=layout, stage="coverage"))
+        self.assertEqual(rows, ["template long util::maxv<long>(long a, long b);"])
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_cpp_tests_compile_without_exceptions_and_rtti(self):                           # A2-21ag
+        tools = _tools()
+        with tmpdir() as d:
+            Path(d, "ut_harness.h").write_text(a3.HARNESS_H)
+            Path(d, "t.cpp").write_text('#include "ut_harness.h"\nint f(int x) { return x; }\n'
+                                        "void t(void) { UT_EXPECT_NO_THROW(f(1)); UT_CALL_ANY(f(2)); "
+                                        'UT_OBSERVE_THROW("o", f(3)); UT_EXPECT_ANY_THROW(f(4)); }\n')
+            for flags in ([], ["-fno-exceptions", "-fno-rtti"]):
+                proc = subprocess.run([tools.cxx, "-std=c++17", "-fsyntax-only", *flags, str(Path(d, "t.cpp"))],
+                                      capture_output=True, text=True, env={**os.environ, **tools.env()})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_answers_of_any_brain_are_read(self):                                           # NC-15 (k)
+        self.assertEqual(ba.parse_generated('Here is the JSON:\n```json\n{"a": 1}\n```\nDone.'), {"a": 1})
+        self.assertEqual(ba.parse_generated("<reasoning>r</reasoning>[1]"), [1])
+
+    def test_no_brain_task_names_a_pilot(self):                                             # NC-15 (j)
+        pilot_names = set()
+        for f in PILOTS.rglob("*"):
+            if f.suffix in (".c", ".cpp", ".h", ".hpp"):
+                for fn in a1.find_functions(f.read_text(encoding="utf-8", errors="replace"), f.name):
+                    pilot_names |= set(fn.qualified_name.split("::"))
+        # identifiers, not English words: with an underscore or a capital inside (clamp_percent, MotorCtrl)
+        pilot_names = {n for n in pilot_names if not n.startswith("__")                 # reserved: vendor intrinsics
+                       and ("_" in n.strip("_") or re.search(r"[a-z][A-Z]", n))}
+        for module in (a1, a2, a3):
+            text = Path(module.__file__).read_text(encoding="utf-8")
+            prompts = " ".join(re.findall(r'"([^"\n]{40,})"', text))              # long string literals: brain tasks
+            used = sorted(n for n in pilot_names if re.search(r"\b" + re.escape(n) + r"\b", prompts))
+            self.assertEqual(used, [], module.__name__)
+
+    def test_a_shared_lock_is_held_by_one_run_at_a_time(self):                              # ORC-23 (d)
+        with tmpdir() as d:
+            lock = Path(d) / "x.lock"
+            with uc.file_lock(lock, wait_s=5):
+                with self.assertRaises(uc.LockBusy):
+                    with uc.file_lock(lock, wait_s=0.3, poll_s=0.05):
+                        pass
+            self.assertFalse(lock.exists())
+            lock.write_text("1 0\n")
+            os.utime(lock, (time.time() - 600, time.time() - 600))                     # a run that ended without releasing
+            with uc.file_lock(lock, wait_s=1, stale_s=60):
+                pass
+
+    def test_files_of_a_folder_run_in_parallel_and_report_in_order(self):                  # ORC-23
+        with tmpdir() as d:
+            repo = copy_pilot("c_deps_pilot", Path(d))
+            runner = up.RepositoryRun(None)
+            runner.cfg = runner.cfg.model_copy(update={"max_parallel_suts": 2})
+            active, peak = [0], [0]
+
+            class Fake:
+                async def run(self, req):
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                    await asyncio.sleep(0.2 if req.sut_file.endswith("ctrl.c") and "brake" not in req.sut_file else 0.05)
+                    active[0] -= 1
+                    return uc.PipelineResult(final_state="verified_measured", reason="ok", sut_file=req.sut_file,
+                                             output_dir=str(Path(d) / req.sut_file.replace("/", "_")))
+            runner._orchestrator = lambda: Fake()
+            suts = ["src/ctrl.c", "src/brake_ctrl.c", "src/steer_assist.c"]
+            out = Path(d) / "out"
+            out.mkdir()
+            result = run(runner._folder(uc.RepositoryRequest(repository=str(repo), sut_files=suts), out))
+        self.assertEqual(peak[0], 2)                                       # two at a time, never more
+        self.assertEqual([r.sut_file for r in result.results], suts)       # reported in the order named
+        runner.orchestrator.cfg.interactive = True                          # LA-9: one after another
+        peak[0] = 0
+        with tmpdir() as d:
+            repo = copy_pilot("c_deps_pilot", Path(d))
+            out = Path(d) / "out"
+            out.mkdir()
+            run(runner._folder(uc.RepositoryRequest(repository=str(repo), sut_files=suts), out))
+        self.assertEqual(peak[0], 1)
+
+    @unittest.skipUnless(HAVE_FASTMCP, "fastmcp not installed")
+    def test_parallel_files_of_a_folder_do_not_share_the_answer_log(self):                 # ORC-23 (c)
+        orch = up.Orchestrator(None)
+        orch.run_env = {"BASEAGENT_ANSWER_LOG": "/tmp/one.jsonl"}
+        before = os.environ.get("BASEAGENT_ANSWER_LOG")
+        transport, _ = orch._transport("analyzer", Path(tempfile.gettempdir()))
+        self.assertEqual(transport.env["BASEAGENT_ANSWER_LOG"], "/tmp/one.jsonl")
+        self.assertEqual(os.environ.get("BASEAGENT_ANSWER_LOG"), before)
 
 
 class ReadOnceTests(unittest.TestCase):

@@ -151,16 +151,91 @@ def _int_value(token: str, macros: dict[str, str], depth: int = 0) -> int | None
     return None
 
 
-def header_macros(layout: uc.LayoutProfile) -> dict[str, str]:
-    """#define NAME value of the SUT's headers and of the SUT file itself."""
+def _macro_files(layout: uc.LayoutProfile) -> list[Path]:
+    """The SUT file, its headers and the headers they include (A2-21x, A2-21z, A2-21ab)."""
     root = Path(layout.repo_root)
+    files = [root / layout.sut_file, *[root / h for h in layout.headers]]
+    return list(dict.fromkeys([f for f in files if f.is_file()] + _sut_includes(layout)))
+
+
+def _define_lines(path: Path) -> list[str]:
+    """The #define lines of a file, continuation lines joined and comments removed."""
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return []
+    return list(_define_lines_of(str(path), stamp))
+
+
+@functools.lru_cache(maxsize=512)
+def _define_lines_of(path: str, _stamp: int) -> tuple[str, ...]:
+    text = re.sub(r"\\[ \t]*\r?\n", " ", Path(path).read_text(encoding="utf-8", errors="replace"))
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return tuple(re.sub(r"//.*$", "", line).strip() for line in text.splitlines() if re.match(r"\s*#\s*define\b", line))
+
+
+def header_macros(layout: uc.LayoutProfile) -> dict[str, str]:
+    """#define NAME value of the SUT file, its headers and the headers they include (continuation lines joined),
+    and -DNAME=value of its compile flags, which come first as the compiler sees them."""
     macros: dict[str, str] = {}
-    for h in [*layout.headers, layout.sut_file]:
-        if (root / h).is_file():
-            for m in re.finditer(r"#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+([^\n]+)",
-                                 (root / h).read_text(encoding="utf-8", errors="replace")):
+    for flag in layout.compile_flags:
+        m = re.match(r"-D([A-Za-z_]\w*)(?:=(.*))?$", flag)
+        if m:
+            macros.setdefault(m.group(1), m.group(2) if m.group(2) is not None else "1")
+    for path in _macro_files(layout):
+        for line in _define_lines(path):
+            m = re.match(r"#\s*define[ \t]+([A-Za-z_]\w*)[ \t]+(.+)$", line)
+            if m and m.group(2).strip():
                 macros.setdefault(m.group(1), m.group(2).strip())
     return macros
+
+
+def function_macros(layout: uc.LayoutProfile | None) -> dict[str, tuple[list[str], str]]:
+    """Function-like macros of the SUT file and its headers: NAME -> (parameters, body)."""
+    out: dict[str, tuple[list[str], str]] = {}
+    if layout is None:
+        return out
+    for path in _macro_files(layout):
+        for line in _define_lines(path):
+            m = re.match(r"#\s*define[ \t]+([A-Za-z_]\w*)\(([^)]*)\)[ \t]*(.+)$", line)
+            if m:
+                out.setdefault(m.group(1), ([p.strip() for p in m.group(2).split(",")], m.group(3).strip()))
+    return out
+
+
+def expand_macros(text: str, macros: dict[str, tuple[list[str], str]]) -> str:
+    """One level of function-like macro calls in an expression, as the preprocessor would expand them
+    (READ_BIT(USART1->SR, TXE) -> ((USART1->SR) & (TXE)))."""
+    if not macros:
+        return text
+    out, k = "", 0
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", text):
+        if m.start() < k or m.group(1) not in macros:
+            continue
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        args, depth, cur = [], 0, ""
+        for c in text[m.end(): j - 1]:                     # an expression's commas: "->" is not a bracket
+            depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(c, 0)
+            if c == "," and depth == 0:
+                args.append(cur.strip())
+                cur = ""
+            else:
+                cur += c
+        args.append(cur.strip())
+        params, body = macros[m.group(1)]
+        if len(args) != len([p for p in params if p]):
+            continue
+        for p, a in zip(params, args):
+            body = re.sub(r"\b" + re.escape(p) + r"\b", a.replace("\\", "\\\\"), body)
+        # a simple operand needs no parentheses of its own: ((REG) & (BIT)) reads as (REG & BIT)
+        body = re.sub(r"(?<![\w)\]])\(\s*([A-Za-z_][\w:]*(?:\s*(?:->|\.)\s*\w+|\s*\[\s*\w+\s*\])*|"
+                      r"0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*)\s*\)", r"\1", body)
+        out += text[k: m.start()] + "(" + body + ")"
+        k = j
+    return out + text[k:]
 
 
 def clock_steps(stubs: list[uc.StubSpec], sut_text: str, macros: dict[str, str],
@@ -301,6 +376,9 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
             reset.append(f"    {names['step']} = {step};")
         params, stores = [], []
         for index, (ptype, pname) in enumerate(spec.params):
+            if ptype.strip() == "...":                         # variadic: declared as it is, not captured [A2-21g]
+                params.append("...")
+                continue
             pname = pname or f"arg{index}"
             params.append(_declarator(ptype, pname))
             vt = _value_type(ptype)
@@ -335,7 +413,7 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
     if uc.reset_state(layout):               # A2-21s: the SUT's state as before the first test
         decl_lines.append(('extern "C" ' if cpp else "") + "void ut_sut_reset(void);")
         reset.insert(0, "    ut_sut_reset();")
-    guard = "UT_STUBS_H"
+    guard = f"UT_STUBS_{uc.unit_name(layout).upper()}_H"                                  # A2-21af
     fake_headers, fakes = render_fakes(layout)                                                 # A2-21aa
     if fakes:
         headers = sorted(set(headers) | set(fake_headers))
@@ -345,16 +423,17 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
     if prologue:
         reached = {include_name(h, layout) for h in (layout.dependencies.headers if layout.dependencies else [])}
         headers = [h for h in headers if h not in reached]
-    header = ["/* ut_stubs.h - generated by agent_unittest_generator. Control variables of the stubs. */",
+    stub_path, stub_h = uc.stub_names(layout)                                              # A2-21af
+    header = [f"/* {stub_h} - generated by agent_unittest_generator. Control variables of the stubs. */",
               f"#ifndef {guard}", f"#define {guard}", *prologue, *[f'#include "{h}"' for h in headers],
               *(["#include <limits.h>", '#include "ut_harness.h"'] if fakes else []),
               "#define UT_STUB_SEQUENCE 16", *decl_lines, *fakes,
               f"#endif /* {guard} */", ""]
-    source = ["/* ut_stubs - generated by agent_unittest_generator from the declarations [A2-21g]. */",
-              "#include <string.h>", "#include <limits.h>", '#include "ut_harness.h"', '#include "ut_stubs.h"', "",
+    source = [f"/* {Path(stub_path).name} - generated by agent_unittest_generator from the declarations [A2-21g]. */",
+              "#include <string.h>", "#include <limits.h>", '#include "ut_harness.h"', f'#include "{stub_h}"', "",
               *def_lines,
               ('extern "C" ' if cpp else "") + "void ut_before_each(void)", "{", *reset, "}", ""]
-    return f"{stub_dir}/ut_stubs.{ext}", "\n".join(source), "\n".join(header)
+    return stub_path, "\n".join(source), "\n".join(header)
 
 
 # ============================================================================ embedded targets
@@ -399,6 +478,9 @@ def render_fakes(layout: uc.LayoutProfile) -> tuple[list[str], list[str]]:
             rows.append(f"    mutable int {base}_calls = 0;")
             params, stores = [], []
             for k, (ptype, pname) in enumerate(m.params):
+                if ptype.strip() == "...":
+                    params.append("...")
+                    continue
                 pname = pname or f"arg{k}"
                 params.append(_declarator(ptype, pname))
                 vt = _value_type(ptype)
@@ -490,18 +572,20 @@ def _locals(body: str) -> set[str]:
 
 
 REG_TEST = re.compile(r"\(\s*([A-Za-z_][\w:]*(?:\s*\(\s*\))?(?:\s*(?:->|\.)\s*\w+|\s*\[\s*\w+\s*\])*)\s*&\s*"
-                      r"(\(?\s*[A-Za-z_][\w:]*\s*\)?|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*|"
+                      r"(\(\s*[A-Za-z_][\w:]*\s*\)|[A-Za-z_][\w:]*|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*|"
                       r"\(\s*1[uUlL]*\s*<<\s*\w+\s*\))\s*\)")
 
 
-def register_polls(fn: uc.FunctionInfo, body: str) -> list[tuple[str, str]]:
+def register_polls(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile | None = None) -> list[tuple[str, str]]:
     """A2-21ab: bits of a target register the function tests in a decision, as (register, mask): a
     register is a macro, a constant address dereferenced or a member reached through a pointer or a
     function call, never a parameter or a local variable of the function."""
     own = {p.name for p in fn.params} | _locals(body)
     out = []
+    macros = function_macros(layout)
     for cond in _conditions(body):
-        for m in REG_TEST.finditer("(" + cond + ")" if not cond.startswith("(") else cond):
+        cond = expand_macros(cond, macros)
+        for m in REG_TEST.finditer("(" + cond + ")"):
             reg, mask = re.sub(r"\s+", "", m.group(1)), m.group(2).strip()
             first = re.match(r"[A-Za-z_][\w:]*", reg).group(0)
             if first.split("::")[-1] in own or first in own:
@@ -513,7 +597,45 @@ def register_polls(fn: uc.FunctionInfo, body: str) -> list[tuple[str, str]]:
     return out
 
 
-def register_waits(fn: uc.FunctionInfo, body: str) -> list[tuple[str, str, bool]]:
+def wait_polarity(cond: str, mask: str) -> bool | None:
+    """A2-21ab: True when a loop with this condition waits while the masked bit is clear, False while it is set,
+    None when the condition does not decide it: the condition is evaluated with the bit set and with it clear
+    (0u == (SR & TXE), !(SR & RDY), (SR & RDY) != RDY, SR & BUSY ...)."""
+    expr = cond
+    hits = 0
+    for m in list(REG_TEST.finditer("(" + cond + ")"))[::-1]:
+        if re.sub(r"\s+", "", m.group(2)) != re.sub(r"\s+", "", mask):
+            continue
+        start, end = m.start() - 1, m.end() - 1            # positions in cond (the added "(" shifts them)
+        expr = expr[:max(start, 0)] + " __X__ " + expr[end:]
+        hits += 1
+    if not hits:
+        return None
+    value = 1
+    literal = re.fullmatch(r"\(?\s*(0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*\)?", mask.strip())
+    if literal:
+        value = int(literal.group(1), 0) or 1
+    expr = expr.replace(mask.strip(), " __M__ ")
+    expr = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", expr)
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    expr = re.sub(r"!(?!=)", " not ", expr)
+    words = set(re.findall(r"[A-Za-z_]\w*", expr)) - {"__X__", "__M__", "and", "or", "not"}
+    if words or not re.fullmatch(r"[\s\w()<>=!+\-*/%&|^~]+", expr):
+        return None
+    try:
+        when_set = bool(eval(expr, {"__builtins__": {}}, {"__X__": value, "__M__": value}))   # noqa: S307
+        when_clear = bool(eval(expr, {"__builtins__": {}}, {"__X__": 0, "__M__": value}))     # noqa: S307
+    except Exception:                                                                        # noqa: BLE001
+        return None
+    if when_clear and not when_set:
+        return True
+    if when_set and not when_clear:
+        return False
+    return None
+
+
+def register_waits(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile | None = None
+                   ) -> list[tuple[str, str, bool]]:
     """A2-21ab: register bits a loop waits for without any other way out (while ((REG & MASK) == 0) {} with no
     parameter, local variable, break, return or goto), as (register, mask, waits_while_clear). The test lets
     the "hardware" change the bit after a while (UT_REG_SET_LATER, UT_REG_CLEAR_LATER), so the call returns
@@ -525,7 +647,7 @@ def register_waits(fn: uc.FunctionInfo, body: str) -> list[tuple[str, str, bool]
         while k < len(body) and depth:
             depth += {"(": 1, ")": -1}.get(body[k], 0)
             k += 1
-        cond = body[m.end(): k - 1]
+        cond = expand_macros(body[m.end(): k - 1], function_macros(layout))
         rest = body[k:].lstrip()
         if rest.startswith("{"):
             depth, j = 0, 0
@@ -542,8 +664,10 @@ def register_waits(fn: uc.FunctionInfo, body: str) -> list[tuple[str, str, bool]
         if idents & own:
             continue
         polls = [p for p in register_polls(fn, "if (" + cond + ")") if p[0].split("->")[0] not in own]
-        clear = bool(re.search(r"==\s*0[uUlL]*\b|^\s*!", cond.strip()))
-        out += [(reg, mask, clear) for reg, mask in polls if (reg, mask, clear) not in out]
+        for reg, mask in polls:
+            clear = wait_polarity(cond, mask)              # decided by the condition itself [A2-21ab]
+            if clear is not None and (reg, mask, clear) not in out:
+                out.append((reg, mask, clear))
     return out
 
 
@@ -571,8 +695,11 @@ def _sut_includes(layout: uc.LayoutProfile) -> list[Path]:
         path, depth = todo.pop(0)
         if not path.is_file() or depth > 2:
             continue
-        for inc in re.findall(r'#\s*include\s*"([^"]+)"', path.read_text(encoding="utf-8", errors="replace")):
-            for d in [path.parent] + dirs:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for quote, inc in re.findall(r'#\s*include\s*([<"])([^>"]+)[>"]', text):
+            if quote == "<" and ("." not in inc or inc in uc.STANDARD_HEADERS):
+                continue                                   # a system header; <drivers/uart.h> of the project counts
+            for d in ([path.parent] if quote == '"' else []) + dirs:
                 c = d / inc
                 if c.is_file():
                     if c not in found:
@@ -627,7 +754,7 @@ def register_headers(plan: uc.UTPlan) -> list[str]:
     lines = sut.read_text(encoding="utf-8", errors="replace").splitlines()
     names = set()
     for fn in layout.functions:
-        for reg, mask in register_polls(fn, "\n".join(lines[fn.line_start - 1: fn.line_end])):
+        for reg, mask in register_polls(fn, "\n".join(lines[fn.line_start - 1: fn.line_end]), plan.layout):
             names.add(re.match(r"[A-Za-z_][\w:]*", reg).group(0).split("::")[-1])
     if not names:
         return []
@@ -746,14 +873,8 @@ def class_templates(plan: uc.UTPlan) -> dict[str, tuple[str, str]]:
     text = sut.read_text(encoding="utf-8", errors="replace")
     code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), text, flags=re.S)
     out: dict[str, tuple[str, str]] = {}
-    usage = ""
-    for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx") \
-                and path != sut and "ut_work" not in path.parts and ".git" not in path.parts:
-            try:
-                usage += path.read_text(encoding="utf-8", errors="replace") + "\n"
-            except OSError:
-                continue
+    usage = _repository_text(str(root), str(sut))
+    own_types = _declared_types(code)
     for m in re.finditer(r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*(?:class|struct)\s+(\w+)\s*(?:final\s*)?[:{]", code):
         params, name = m.group(1), m.group(2)
         defaults = []
@@ -770,12 +891,99 @@ def class_templates(plan: uc.UTPlan) -> dict[str, tuple[str, str]]:
         args = defaults
         for use in re.finditer(r"\b" + re.escape(name) + r"\s*<\s*([^<>;{}()]+?)\s*>", usage):
             found = [a.strip() for a in use.group(1).split(",")]
-            if len(found) == len(defaults) and all(SCALAR_ARG.match(a) for a in found):
+            if len(found) == len(defaults) and all(_usable_arg(a, own_types) for a in found):
                 args = found
                 break
         ns = _namespace_at(code, m.start())
         out[name] = (f"{ns}::{name}" if ns else name, ", ".join(args))
     return out
+
+
+@functools.lru_cache(maxsize=8)
+def _repository_text(root: str, sut: str) -> str:
+    """A1-DA19: the C/C++ text of the repository except the SUT, read once per repository and run."""
+    parts = []
+    for path in Path(root).rglob("*"):
+        if path.is_file() and path.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx") \
+                and str(path) != sut and "ut_work" not in path.parts and ".git" not in path.parts:
+            try:
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    return "\n".join(parts)
+
+
+def _declared_types(code: str) -> set[str]:
+    """Types the header SUT itself declares (class, struct, enum, typedef, using): a template argument the
+    access file can name, because it includes the SUT."""
+    names = set(re.findall(r"\b(?:class|struct|union|enum(?:\s+class)?)\s+([A-Za-z_]\w*)\s*[:{;]", code))
+    names |= set(re.findall(r"\btypedef\b[^;{}]*?\b([A-Za-z_]\w*)\s*;", code))
+    names |= set(re.findall(r"\busing\s+([A-Za-z_]\w*)\s*=", code))
+    return names
+
+
+def _usable_arg(arg: str, own_types: set[str]) -> bool:
+    """A template argument the access file can name: a scalar, a number or a type the SUT header declares."""
+    arg = re.sub(r"\s+", " ", arg.strip())
+    base = re.sub(r"^(?:const|volatile)\s+|\s*[*&]+$", "", arg).strip()
+    return bool(SCALAR_ARG.match(arg) or SCALAR_ARG.match(base) or base.split("::")[-1] in own_types)
+
+
+def function_templates(plan: uc.UTPlan) -> list[str]:
+    """A1-DA19: explicit instantiations of the function templates the header SUT defines at namespace scope, with
+    the arguments the repository uses (name<int>(...)) or int for a type and 4 for a value; only for a plain
+    signature (no auto, decltype, requires, enable_if or parameter pack), so the access file always compiles."""
+    layout = plan.layout
+    sut = Path(layout.repo_root) / layout.sut_file
+    if not layout.header_sut or layout.language != "cpp" or not sut.is_file():
+        return []
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), sut.read_text(encoding="utf-8",
+                  errors="replace"), flags=re.S)
+    usage = _repository_text(str(Path(layout.repo_root)), str(sut))
+    own_types = _declared_types(code)
+    rows = []
+    pattern = (r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*((?:(?:static|inline|constexpr)\s+)*)"
+               r"([A-Za-z_][\w:<>,\s*&]*?)\s+([A-Za-z_]\w*)\s*\(([^(){};]*)\)\s*(?:noexcept\s*)?\{")
+    for m in re.finditer(pattern, code):
+        params, storage, ret, name, args_text = m.groups()
+        if re.search(r"\b(?:auto|decltype|requires|enable_if\w*)\b|\.\.\.", m.group(0)) or "static" in storage:
+            continue
+        stack = []
+        for b in re.finditer(r"\bnamespace\s+[\w:]*\s*\{|\{|\}", code[: m.start()]):
+            if b.group(0) == "}":
+                if stack:
+                    stack.pop()
+            else:
+                stack.append(b.group(0).startswith("namespace"))
+        if not all(stack):
+            continue                                     # a member template: instantiated with its class
+        names, defaults = [], []
+        for prm in _top_level_commas(params):
+            prm = prm.strip()
+            if not prm:
+                continue
+            d = re.search(r"=\s*(.+)$", prm)
+            names.append(re.sub(r"=.*$", "", prm).strip().split()[-1])
+            if re.match(r"^(typename|class)\b", prm):
+                defaults.append(d.group(1).strip() if d else "int")
+            else:
+                defaults.append(d.group(1).strip() if d else "4")
+        chosen = defaults
+        for use in re.finditer(r"\b" + re.escape(name) + r"\s*<\s*([^<>;{}()]+?)\s*>\s*\(", usage):
+            found = [a.strip() for a in use.group(1).split(",")]
+            if len(found) == len(names) and all(_usable_arg(a, own_types) for a in found):
+                chosen = found
+                break
+
+        def put(text: str) -> str:
+            for n, a in zip(names, chosen):
+                text = re.sub(r"\b" + re.escape(n) + r"\b", a, text)
+            return text
+        plist = ", ".join(re.sub(r"\s*=\s*[^,]+$", "", p.strip()) for p in _top_level_commas(args_text) if p.strip())
+        ns = _namespace_at(code, m.start())
+        qualified = f"{ns}::{name}" if ns else name
+        rows.append(f"template {put(ret.strip())} {qualified}<{', '.join(chosen)}>({put(plist)});")
+    return rows
 
 
 def _top_level_commas(text: str) -> list[str]:
@@ -796,7 +1004,8 @@ def _top_level_commas(text: str) -> list[str]:
 def template_instances(plan: uc.UTPlan) -> list[str]:
     """A1-DA19: explicit instantiations in the sut_access file, so the template's code is compiled and measured."""
     rows = [f"template class {q}<{args}>;" for q, args in class_templates(plan).values()]
-    return (["/* A1-DA19: the class templates of the header SUT, instantiated for the tests. */", "#include <cstdint>",
+    rows += function_templates(plan)
+    return (["/* A1-DA19: the templates of the header SUT, instantiated for the tests. */", "#include <cstdint>",
              "#include <cstddef>", *rows, ""] if rows else [])
 
 
@@ -856,7 +1065,8 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
     ext = "cpp" if layout.language == "cpp" else "c"
     test_dir = layout.writable_test_dir.rstrip("/")
     rel = os.path.relpath(layout.sut_file, test_dir).replace("\\", "/")
-    rows = [f"/* ut_sut_access.{ext} - generated by agent_unittest_generator. It includes the SUT so that its static",
+    access_name = f"ut_sut_access_{uc.unit_name(layout)}.{ext}"                             # A2-21af
+    rows = [f"/* {access_name} - generated by agent_unittest_generator. It includes the SUT so that its static",
             "   functions can be tested; build it instead of the SUT itself, never together with it [A2-21k]. */",
             f'#include "{rel}"', ""]
     for fn in statics:
@@ -871,7 +1081,7 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
                  *[setter_source(v) for v in setters], ""]
     if layout.header_sut:                                                                    # A1-DA19
         rows += template_instances(plan)
-    return f"{test_dir}/ut_sut_access.{ext}", "\n".join(rows)
+    return f"{test_dir}/{access_name}", "\n".join(rows)
 
 
 SUITE_TEST = re.compile(r"(?:/\*\s*evidence:\s*(E\d)(\s+linked)?\s*\*/\s*\n)?UT_TEST\(\s*(\w+)\s*\)\s*\{", re.M)
@@ -928,15 +1138,17 @@ def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_head
     root_text = uc.read_source(Path(layout.repo_root) / layout.sut_file) if (Path(layout.repo_root) / layout.sut_file).is_file() else ""
     lines += uc.sut_prologue(root_text, layout.functions, layout.header_sut)                    # A2-21ad
     if stub_header:
-        lines.append('#include "ut_stubs.h"')
+        lines.append(f'#include "{uc.stub_names(layout)[1]}"')                              # A2-21af
     if layout.header_sut and include_name(layout.sut_file, layout) not in sut_headers:          # A1-DA19
         sut_headers.append(include_name(layout.sut_file, layout))
     if uc.sut_prologue(root_text, layout.functions, layout.header_sut):
         sut_headers = [h for h in sut_headers if layout.header_sut and h == include_name(layout.sut_file, layout)]
-    lines += [f'#include "{h}"' for h in sut_headers if h != "ut_stubs.h"]
+    lines += [f'#include "{h}"' for h in sut_headers if not uc.STUB_HEADER.search(h)]
     instances = class_templates(plan)
-    if instances:      # the tests use the instrumented instantiation of the sut_access file [A1-DA19]
+    functions = function_templates(plan)
+    if instances or functions:      # the tests use the instrumented instantiation of the sut_access file [A1-DA19]
         lines += ["#include <cstdint>"] + [f"extern template class {q}<{a}>;" for q, a in instances.values()]
+        lines += ["extern " + row for row in functions]
     if render_sut_access(plan) is not None:                     # A2-21k
         prototypes += [wrapper_signature(f) + ";" for f in static_functions(layout) if not uses_private_type(f, layout)]
         prototypes += [f"void {state_setter(v)}(long long v);" for v in setter_vars(plan)]    # A2-21z
@@ -1366,8 +1578,8 @@ def auto_tests(plan: uc.UTPlan, cap: int, existing: set[str],
         endless = endless_loop(body)                                                       # A2-21y
         if any(o is None for o in options) or (observe is None and not endless):
             continue
-        polls = register_polls(fn, body + "\n" + helpers)                                   # A2-21ab
-        waits = register_waits(fn, body)
+        polls = register_polls(fn, body + "\n" + helpers, plan.layout)                      # A2-21ab
+        waits = register_waits(fn, body, plan.layout)
         state = decision_state(fn, body, layout, header_macros(layout))                    # A2-21z
         repeats = 1 if endless or waits else repeat_count(fn, body, layout, header_macros(layout))
         can_throw = throws(body + "\n" + helpers, layout)                                  # A3-45e
@@ -1702,7 +1914,7 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
     sut = Path(layout.repo_root) / layout.sut_file
     body = "\n".join(sut.read_text(encoding="utf-8", errors="replace").splitlines()[fn.line_start - 1: fn.line_end]) \
         if sut.is_file() else ""
-    waits = register_waits(fn, body)                         # the brain's test ends a register wait too [A2-21ab]
+    waits = register_waits(fn, body, plan.layout)            # the brain's test ends a register wait too [A2-21ab]
     if waits:
         given_setup = " ".join(sc.setup)
         preset = {(reg, mask) for reg, mask, _ in waits
@@ -1954,8 +2166,8 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
                 re.sub(r"^const\s+", "", st.return_type.strip()), layout) else []) for st in controlled]
             built = [st for st in controlled if ctor and st.function in ctor.calls]
             at_ctor = [values for _ in built]
-            polls = register_polls(fn, body)                                                   # A2-21ab
-            waits = register_waits(fn, body)
+            polls = register_polls(fn, body, plan.layout)                                      # A2-21ab
+            waits = register_waits(fn, body, plan.layout)
             repeats = 1 if endless else max(4, repeat_count(fn, body, layout, macros))
             sizes = [int(v) for k, v in mapping.items() if re.fullmatch(r"\d+", v) and re.search(r"\b" + k + r"\b", body)]
             sizes += _class_sizes(cls, headers)       # and the sizes of the class's members [A2-21z]
@@ -1972,7 +2184,7 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
                                           g.qualified_name.split("::")[-1].startswith("~") and
                                           not re.search(r"\)\s*const\s*$", g.signature)):
                     o_body = "\n".join(sut_lines[other.line_start - 1: other.line_end])
-                    if endless_loop(o_body) or register_waits(other, o_body):
+                    if endless_loop(o_body) or register_waits(other, o_body, plan.layout):
                         continue
                     # only a method that changes what this one decides on, by a computed value (not a reset)
                     changed = {m.group(1) for m in re.finditer(
@@ -2036,8 +2248,7 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
                             pick = min(o, key=_gentle)          # a small value: 1, then 0 (loop counts, sizes)
                             o_setup += pick[0]
                             o_args.append(pick[1])
-                        lines += o_setup + [f"try {{ ut_obj.{other.qualified_name.split('::')[-1]}({', '.join(o_args)}); }} "
-                                            "catch (...) {}"]
+                        lines += o_setup + [f"UT_CALL_ANY(ut_obj.{other.qualified_name.split('::')[-1]}({', '.join(o_args)}));"]
                 lines += wait_setup(waits, preset)                         # A2-21ab
                 if endless:                                                # A2-21y
                     lines.append(f"UT_EXPECT_NO_RETURN({call});")
@@ -2137,7 +2348,7 @@ class GeneratorAgent(ba.AgentCore):
         stub_path, stub_source, stub_header = render_stubs(plan)
         actions = [uc.FileAction(path=stub_path, action="replace" if (root / stub_path).exists() else "create",
                                  role="stub", content=stub_source),
-                   uc.FileAction(path=str(Path(stub_path).with_name("ut_stubs.h")).replace("\\", "/"),
+                   uc.FileAction(path=str(Path(stub_path).with_name(uc.stub_names(layout)[1])).replace("\\", "/"),
                                  action="create", role="helper", content=stub_header)]
         access = render_sut_access(plan)
         if access is not None:
@@ -2559,11 +2770,11 @@ class GeneratorAgent(ba.AgentCore):
                     "memory), ut_state_set_<variable>(value) where listed, ut_asm_value = v (the result of replaced target "
                     "assembly) and, in C++, UT_EXPECT_THROW(statement, type) and UT_OBSERVE_THROW(\"id\", statement). "
                     "When the EVIDENCE states the expected result, assert it, put the "
-                    "EVIDENCE ids (as written there, for example EV-clamp_percent-1; never the classes E1-E8) into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
+                    "EVIDENCE ids (as written there, in the form EV-<function>-<n>; never the classes E1-E8) into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
                     "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
                     "and set evidence_class to E8. Never guess an expected value. Every test contains at least one "
                     "UT_EXPECT_... or UT_OBSERVE_...; in C++ it uses only public members of a class (never a private "
-                    "member such as count_), and an object is declared once: MotorCtrl ctrl(enc);")
+                    "member), and an object is declared once - never again one the set-up already declares.")
                 part = any(s.kind == "suite_part" for s in fn_scenarios)                           # BP-2, BP-3
                 part_brains = await uc.brains_for(self, "suite_part", "A2.tests") if part else []
                 if part and part_brains:
@@ -2905,8 +3116,7 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
                     lines.append(line[: t.start()] + f"UT_EXPECT_THROW({call}, {kind});")
                     continue
                 else:                                   # a type the test cannot name: any exception
-                    lines.append(line[: t.start()] + "{ bool ut_thrown = false; try { " + call + "; } catch (...) "
-                                 "{ ut_thrown = true; } UT_EXPECT_TRUE(ut_thrown); }  /* observed: " +
+                    lines.append(line[: t.start()] + "UT_EXPECT_ANY_THROW(" + call + ");  /* observed: " +
                                  kind.replace("*/", "") + " */")
                     continue
             m = pattern.search(line)
