@@ -10,6 +10,18 @@
                   "effort": "high", "max_tokens": 16000, "adaptive": true, "thinking_reserve": 8000,
                   "parallel_calls": 4, "rate_limit_wait": 300}
   },
+  "profiles": {
+    "_comment": "BP-1, BP-2, BP-6, BP-8: what each brain may write. Answer kinds: values, scenario, call_sequence, setup, stub, test, suite_part, repair, decision. A brain without an entry gets minimum.",
+    "brains": {"opus": "full", "fable": "full", "sonnet": "full", "haiku": "full", "qwen_remote": "minimum", "qwen": "minimum"},
+    "definitions": {
+      "minimum": {"kinds": ["values", "scenario", "test", "repair", "decision"], "journal_tokens": 1500,
+                  "long_function_lines": 150, "window_tokens": 16384, "scenarios_per_call": 4},
+      "full": {"kinds": ["values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision"],
+               "journal_tokens": 8000, "long_function_lines": 0, "window_tokens": 1000000, "scenarios_per_call": 4}
+    },
+    "steps": {},
+    "calibration_share": 0.9
+  },
   "coverage": {
     "default_level": "D",
     "files": {},
@@ -20,7 +32,7 @@
       "C":  {"LC": "100", "SC": "100", "BC": "100", "DC": "100", "MCDC": "100"},
       "D":  {"LC": "100", "SC": "100", "BC": "100", "DC": "100", "MCDC": "100"}
     },
-    "iterations": {"QM": 5, "A": 5, "B": 5, "C": 5, "D": 5}
+    "iterations": {"QM": 10, "A": 10, "B": 10, "C": 10, "D": 10}
   },
   "viewer": {"enabled": true, "open_browser": true, "host": "127.0.0.1", "port": 0, "replay": true,
              "token_env": "", "metrics": []},
@@ -33,6 +45,15 @@
     "fuzz_after_stagnation": true,
     "fuzz_budget_seconds": 300,
     "after_target_seconds": 600,
+    "attempts_per_item": 2,
+    "minutes_per_function": 2,
+    "min_minutes_per_file": 10,
+    "journal_tokens": 1500,
+    "lesson_rule_count": 3,
+    "trials_per_iteration": 10,
+    "recipe_candidate_uses": 3,
+    "interactive": false,
+    "interactive_wait_seconds": 600,
     "repo_cache": "ut_cache",
     "max_parallel_suts": 1,
     "git_token_env": "",
@@ -48,7 +69,7 @@
       "kb": {"transport": "stdio"}
     }
   },
-  "analyzer": {"max_attempts_per_gap": 2, "max_scenarios_per_function": 12, "real_dependency_depth": 2,
+  "analyzer": {"max_attempts_per_gap": 2, "long_function_lines": 150, "max_scenarios_per_function": 12, "real_dependency_depth": 2,
                "requirement_files": [], "max_brain_calls_per_function": 2,
                "max_lookups_per_function": 6, "link_requirements": true, "propose_declarations": true,
                "rule_attempts": 2},

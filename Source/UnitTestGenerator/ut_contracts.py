@@ -528,7 +528,7 @@ ASIL_LEVELS = ("QM", "A", "B", "C", "D")
 # The lowest targets the requirements allow (COV-1); a configuration may only be stricter.
 MIN_TARGETS = {level: {"LC": "100", "SC": "100", "BC": "100", "DC": "100",
                        "MCDC": "100" if level in ("C", "D") else ">95"} for level in ASIL_LEVELS}
-DEFAULT_ITERATIONS = 5
+DEFAULT_ITERATIONS = 10                 # the safety ceiling of LA-7 (ORC-7)
 
 
 def parse_target(text: str | float | int) -> tuple[float, bool]:
@@ -695,6 +695,7 @@ class VerificationResult(Contract):
     register_pages: list[str] = Field(default_factory=list)   # target register pages in host memory [A3-HW1]
     host_notes: list[str] = Field(default_factory=list)       # target keywords, target asm, data model [A3-HW2..HW4]
     repaired_files: dict[str, str] = Field(default_factory=dict)   # generated files repaired by the brain [A3-CL14]
+    unknown_outcomes: list[str] = Field(default_factory=list)      # ends the platform facts do not describe [NC-12]
 
 
 # ============================================================================ planning (Agent1)
@@ -786,6 +787,9 @@ class Scenario(Contract):
     expected_after: list[ExpectedCheck] = Field(default_factory=list)
     quotes: list[Quote] = Field(default_factory=list)
     linked: bool = False               # rests on evidence linked by the brain [A1-PL13]
+    calls_before: list[str] = Field(default_factory=list)   # earlier calls that build up the state [BP-2 call_sequence]
+    kind: str = "scenario"             # the answer kind it was asked for [BP-2, BP-3]
+    trial: list[str] = Field(default_factory=list)          # refused only by predictions: the tool decides [NC-7]
 
 
 class RepairItem(Contract):
@@ -822,6 +826,7 @@ class UTPlan(Contract):
     lookups: list[str] = Field(default_factory=list)        # retrieval-loop steps [A1-25s, A1-PL6]
     disputed_evidence: list[str] = Field(default_factory=list)   # evidence keys not to plan again [A1-PL13]
     proposed_dependencies: list[Dependency] = Field(default_factory=list)   # declarations proposed [A1-PL14]
+    kinds_available: list[str] = Field(default_factory=list)   # answer kinds an available brain may give [BP-3, BP-9]
 
 
 class FuzzResult(Contract):
@@ -832,6 +837,64 @@ class FuzzResult(Contract):
     crashes: list[str] = Field(default_factory=list)        # inputs that crashed the SUT (reported, never asserted)
     reason: str = ""
     engine: str = ""                                        # "libFuzzer" or "ut_search" [A3-FZ11]
+
+
+# ============================================================================ learning between attempts [LA-1 .. LA-10]
+RootCause = Literal["test_did_not_compile", "test_setup", "wrong_inputs", "needs_call_sequence",
+                    "needs_dependency_control", "wrong_expectation", "unreachable", "needs_requirement",
+                    "needs_source_change", "pipeline_limitation", "undetermined"]
+FinalStatus = Literal["covered", "proven_unreachable", "needs_requirement", "needs_source_change",
+                      "pipeline_limitation", "undetermined"]
+CAUSE_TEXT = {
+    "test_did_not_compile": "the test did not compile",
+    "test_setup": "the test could not build what the call needs (an object, an argument, a stub or variable that "
+                  "does not exist)",
+    "wrong_inputs": "the test ran, but its values do not meet the path conditions of the item",
+    "needs_call_sequence": "the item needs state that only several calls in a row build up",
+    "needs_dependency_control": "the item needs control of a real dependency's result",
+    "wrong_expectation": "the test contradicts its own scenario or evidence",
+    "unreachable": "a deterministic proof shows that no test can reach it",
+    "needs_requirement": "the expected behaviour is not stated",
+    "needs_source_change": "the source prevents the item",
+    "pipeline_limitation": "the pipeline cannot yet build the test the item needs",
+    "undetermined": "no cause could be decided from the facts"}
+FIX_FORM = {                                                       # LA-4: the form a fix takes
+    "test_did_not_compile": "write a test that compiles: use only the names in HEADERS, STUB CONTROL and SETTERS",
+    "test_setup": "build the object or argument as shown under OBJECT, and use only controls that exist",
+    "wrong_inputs": "choose other values that meet the PATH CONDITIONS of the item",
+    "needs_call_sequence": "call the function several times in a row (the earlier calls in setup) to build up its state",
+    "needs_dependency_control": "set what the real dependency reads (a global or register), or ask for a stub",
+    "wrong_expectation": "assert only what the evidence states for exactly these inputs, or observe the result"}
+OWNER = {"covered": "", "proven_unreachable": "developer: the source", "needs_requirement": "developer: requirement "
+         "documents", "needs_source_change": "developer: a source change through review", "pipeline_limitation":
+         "the pipeline's developers", "undetermined": "developer: with the evidence"}
+
+
+class JournalEntry(Contract):
+    """LA-2: one deviation of one attempt - what was tried, what the tools said and why it missed."""
+    entry_id: str
+    function: str
+    items: list[str] = Field(default_factory=list)
+    iteration: int = 0
+    attempt: int = 0
+    strategy: str = ""                 # brain scenario, brain test, rule test, rewrite
+    brain: str = ""                    # name/model
+    tried: str = ""                    # the test (name and body) or scenario, in short
+    result: str = ""                   # the tool's message: compiler, assertion, crash, items reached
+    cause: RootCause = "undetermined"
+    decided_by: Literal["rule", "brain"] = "rule"
+    next_action: str = ""
+    status: Literal["open", "closed"] = "open"
+    final_status: FinalStatus | Literal[""] = ""
+
+
+class ItemStatus(Contract):
+    """LA-6: the final status of an item not covered, with its reason and owner."""
+    item_id: str
+    function: str = ""
+    status: FinalStatus
+    reason: str = ""
+    owner: str = ""
 
 
 class PlanRequest(Contract):
@@ -848,6 +911,12 @@ class PlanRequest(Contract):
     refused: dict[str, list[str]] = Field(default_factory=dict)  # function -> scenarios refused earlier [A1-PL8]
     crashed_calls: list[str] = Field(default_factory=list)       # rule-based test inputs that crashed [A2-21f]
     inputs_only: bool = False          # only the search's inputs as scenarios, no brain [ORC-5a, A1-18c]
+    journal: dict[str, str] = Field(default_factory=dict)        # function -> journal excerpt [LA-4]
+    tried_scenarios: list[str] = Field(default_factory=list)     # signatures of earlier scenarios [A1-PL4 g, LA-4]
+    other_model_items: list[str] = Field(default_factory=list)   # items whose third attempt needs another model [LA-5]
+    final_items: list[str] = Field(default_factory=list)         # items with a final status: not planned [LA-6]
+    lessons: list[str] = Field(default_factory=list)             # verified lessons of the knowledge base [LA-8]
+    item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
 
 
 class DependencyRequest(Contract):
@@ -941,28 +1010,38 @@ class FileActionBundle(Contract):
     new_tests: list[str] = Field(default_factory=list)       # added by this bundle (minimization candidates)
     notes: list[str] = Field(default_factory=list)
     crashed_calls: list[str] = Field(default_factory=list)   # rule-based inputs that crashed or hung [A2-21f]
+    # tests refused only by predictions: name -> the refusal; the tool decides in a trial [NC-6, NC-7]
+    trial: dict[str, str] = Field(default_factory=dict)
+    trial_targets: dict[str, list[str]] = Field(default_factory=dict)   # name -> the items it targets
+    made: dict[str, str] = Field(default_factory=dict)        # test -> "brain/model kind" that wrote it [BP-7]
+    recipes: dict[str, str] = Field(default_factory=dict)     # test -> building block (Recipe JSON) to store [NC-2]
+    needs_kind: dict[str, str] = Field(default_factory=dict)  # item -> answer kind no available brain may give [BP-9]
 
 
 class KBExample(Contract):
     example_id: str
-    kind: Literal["positive", "gap_closure", "negative"]
+    kind: Literal["positive", "gap_closure", "negative", "lesson"]
     language: str
     framework: str
     category: str
     snippet: str
     reason: str = ""
     uses: int = 1
+    pattern: str = ""                  # LA-8: the construct a lesson applies to
 
 
 class KBGuidance(Contract):
     positive: list[KBExample] = Field(default_factory=list)
     negative: list[KBExample] = Field(default_factory=list)
+    lessons: list[KBExample] = Field(default_factory=list)      # verified lessons [LA-8, KB-22]
 
 
 class GenerationRequest(Contract):
     plan: UTPlan
     guidance: KBGuidance = Field(default_factory=KBGuidance)
     existing_suite: str = ""
+    journal: dict[str, str] = Field(default_factory=dict)        # function -> journal excerpt [LA-4]
+    item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
 
 
 class FinalizeRequest(Contract):
@@ -975,6 +1054,7 @@ class FinalizeRequest(Contract):
 class VerifyRequest(Contract):
     layout: LayoutProfile
     stage: Literal["probe", "build_check", "verify", "observe"]
+    measure_tests: list[str] | None = None    # observe: the tests to measure alone; None = all [A3-OBS5, LA-10]
     targets: dict[str, str] = Field(default_factory=dict)     # COV-1 per metric ("100", ">95"); empty = 100
     bundle: FileActionBundle | None = None
     previous: VerificationResult | None = None
@@ -1149,15 +1229,17 @@ class GuidanceRequest(Contract):
     framework: str
     categories: list[str] = Field(default_factory=list)
     k: int = Field(default=4, ge=1, le=12)
+    patterns: list[str] = Field(default_factory=list)           # constructs of the SUT, for lessons [LA-8]
 
 
 class LearningEvent(Contract):
-    kind: Literal["positive", "gap_closure", "negative"]
+    kind: Literal["positive", "gap_closure", "negative", "lesson"]
     language: str
     framework: str
     category: str
     snippet: str
     reason: str = ""
+    pattern: str = ""                                           # LA-8
     verification: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1260,6 +1342,21 @@ class SuggestionSet(Contract):
     notes: list[str] = Field(default_factory=list)
 
 
+class PipelineFinding(Contract):
+    """NC-5: what the pipeline itself could not do - a limitation, a false refusal of a check or an unknown outcome -
+    with what is needed to fix it once for every project."""
+    kind: Literal["pipeline_limitation", "false_refusal", "unknown_outcome"]
+    signature: str                      # the normalized construct, check or message (counted across runs)
+    subject: str = ""                   # the construct signature, the check or the outcome
+    item: str = ""                      # the item or test concerned
+    kinds_tried: list[str] = Field(default_factory=list)   # answer kinds tried [BP-2]
+    brains: list[str] = Field(default_factory=list)
+    message: str = ""                   # the tool's last message
+    platform: str = ""
+    sut_file: str = ""
+    count: int = 1                      # occurrences across runs (filled from the findings file)
+
+
 class PipelineResult(Contract):
     final_state: Literal["verified_measured", "incomplete"]
     reason: str
@@ -1312,6 +1409,16 @@ class PipelineResult(Contract):
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
     escalations: list[str] = Field(default_factory=list)       # rules that needed the brain, with outcome [ARCH-22]
+    item_status: list[ItemStatus] = Field(default_factory=list)    # final status per item not covered [LA-6]
+    journal: str = ""                                              # the failure journal of the file [LA-2]
+    lessons: list[str] = Field(default_factory=list)               # lessons applied or learned [LA-8, KB-22]
+    decisions: list[str] = Field(default_factory=list)             # questions of the decision point [LA-9]
+    profiles: list[str] = Field(default_factory=list)              # "brain: profile sha256 kinds" [BP-7]
+    kinds_used: dict[str, int] = Field(default_factory=dict)       # answer kind -> accepted pieces [BP-7]
+    recipes: list[str] = Field(default_factory=list)               # recipes used, stored and proposed [NC-2, NC-3]
+    findings: list["PipelineFinding"] = Field(default_factory=list)   # this run's pipeline findings [NC-5]
+    findings_overall: list[str] = Field(default_factory=list)      # "count x signature" across runs [NC-5]
+    trials: list[str] = Field(default_factory=list)                # what the trials of NC-7 decided
 
 
 class DeliveryRecord(Contract):
@@ -1565,7 +1672,8 @@ def manifest_path(config_path: str | Path | None, section: dict[str, Any] | None
 # The brain steps of this application (KP-2); a knowledge pack names the steps it is for.
 KNOWLEDGE_STEPS = ["A1.dependency", "A1.plan", "A1.links", "A1.declaration", "A2.tests", "A3.root_cause",
                    "A3.flags", "A4.candidates", "A4.review", "A4.suggest",
-                   "A1.header", "A2.value", "A3.repair", "A3.host"]     # rule failures [ARCH-21]
+                   "A1.header", "A2.value", "A3.repair", "A3.host",     # rule failures [ARCH-21]
+                   "A2.setup", "A2.stub", "A2.sequence", "A3.outcome"]  # building blocks, unknown outcomes [NC-1, NC-12]
 # Priorities of the context parts of a brain call (ARCH-17): 0 is never shortened; the highest
 # number is shortened or left out first when a call does not fit the brain's window.
 P_FACTS, P_EVIDENCE, P_PACKS, P_TRIED, P_EXAMPLES = 0, 1, 2, 3, 4
@@ -1983,3 +2091,608 @@ def gap_item(g: "GapItem") -> str:
     if g.metric == "BC":
         return f"BC:{g.line}:{g.column}:{g.gap_id.rsplit(':', 1)[-1]}"
     return f"MCDC:{g.line}:{g.column}:{(g.condition_index or 0) + 1}"
+
+
+# ============================================================================ learning between attempts [LA-1 .. LA-10]
+_QUOTE_NOISE = re.compile(r"(?:^|\s)@\w+|[/*]+|^\s*[-#>]+")
+
+
+def norm_quote(text: str) -> str:
+    """A1-PL4 b), COV-12: a quote and its evidence compared without white space, comment markers (//, ///, /*, *)
+    and a leading @tag, in either; the words themselves must stay the same."""
+    return re.sub(r"\s+", " ", _QUOTE_NOISE.sub(" ", text or "")).strip().lower()
+
+
+def scenario_signature(sc: Any) -> str:
+    """A1-PL4 g), LA-4: what makes two scenarios the same attempt - the function, its targets, the inputs and the
+    set-up, with white space normalised."""
+    norm = lambda v: re.sub(r"\s+", " ", str(v)).strip()
+    parts = [sc.function, ",".join(sorted(sc.gap_ids)),
+             ";".join(sorted(f"{a.name}={norm(a.value)}" for a in sc.args)),
+             ";".join(norm(x) for x in sc.setup),
+             ";".join(f"{v.stub}:{','.join(norm(r) for r in v.returns)}" for v in getattr(sc, "stub_values", [])),
+             ";".join(sorted(f"{v.name}={norm(v.value)}" for v in sc.variables))]
+    before = getattr(sc, "calls_before", [])
+    if before:                                       # a call sequence is another attempt [BP-2]
+        parts.append(";".join(norm(x) for x in before))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def normalized_body(text: str) -> str:
+    """A2-21p: a test body without comments and white space differences, to recognise an unchanged rewrite."""
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", " ", text or "", flags=re.S)
+    return re.sub(r"\s+", "", text)
+
+
+_HEADER_CACHE: dict[tuple, str] = {}
+
+
+def headers_text(layout: "LayoutProfile") -> str:
+    """The text of the SUT's headers (and of the SUT when it is a header) [A2-21ae]."""
+    root = Path(layout.repo_root)
+    rels = list(dict.fromkeys(layout.headers + ([layout.sut_file] if layout.header_sut else [])))
+    key = (layout.repo_root, tuple(rels), layout.sut_sha256)
+    if key not in _HEADER_CACHE:
+        texts = []
+        for rel in rels:
+            path = root / rel
+            if path.is_file():
+                texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        _HEADER_CACHE[key] = "\n".join(texts)
+    return _HEADER_CACHE[key]
+
+
+def class_of(fn: "FunctionInfo") -> str:
+    """The class of a member function, qualified ("" for a free function)."""
+    q = fn.qualified_name.replace("(anonymous namespace)::", "")
+    return q.rsplit("::", 1)[0] if fn.member and "::" in q else ""
+
+
+def internal_member(fn: "FunctionInfo", layout: "LayoutProfile") -> bool:
+    """A2-21ae: a member of a class that no header declares (an unnamed namespace, a class of the SUT file itself):
+    a test cannot name it."""
+    cls = class_of(fn)
+    if not cls:
+        return False
+    short = cls.split("::")[-1]
+    return "(anonymous namespace)" in fn.qualified_name or not re.search(
+        r"\b(?:class|struct)\s+(?:\w+\s+)*" + re.escape(short) + r"\b", headers_text(layout))
+
+
+def static_member(fn: "FunctionInfo", layout: "LayoutProfile") -> bool:
+    """A member function declared static in its class (called through the class, not an object)."""
+    if not fn.member:
+        return False
+    short = fn.qualified_name.split("::")[-1]
+    return bool(re.match(r"^\s*static\b", fn.signature)) or bool(re.search(
+        r"\bstatic\b[^;{}()]*\b" + re.escape(short) + r"\s*\(", headers_text(layout)))
+
+
+def callers_of(fn: "FunctionInfo", layout: "LayoutProfile") -> list["FunctionInfo"]:
+    """The SUT's functions that call this one (by name), callable ones first."""
+    short = fn.qualified_name.split("::")[-1]
+    out = [f for f in layout.functions if f is not fn and f.qualified_name != fn.qualified_name and any(
+        c == fn.name or c == fn.qualified_name or c.split("::")[-1] == short for c in f.calls)]
+    return sorted(out, key=lambda f: internal_member(f, layout))
+
+
+def keeps_state(fn: "FunctionInfo", layout: "LayoutProfile") -> str:
+    """A1-PL2: why a behaviour of this function may need several calls in a row ("" when it keeps no state)."""
+    statics = [v.name.split("::")[-1] for v in layout.local_statics
+               if v.name.startswith((fn.qualified_name + "::", fn.name + "::"))]
+    if statics:
+        return "keeps state between calls in its static variable(s) " + ", ".join(statics[:4])
+    if fn.member and not static_member(fn, layout):
+        return "a member function: the object keeps state between calls"
+    return ""
+
+
+def fake_name_of(interface: str) -> str:
+    return "ut_fake_" + re.sub(r"\W", "_", interface.split("::")[-1])
+
+
+def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str], str] | None:
+    """A2-21ae: how a test builds the object a member function is called on - every argument a named object
+    declared before (never a temporary bound to a reference) - and the expression to call it with. None for a
+    free function, a static member or a member no test can name."""
+    if not fn.member or static_member(fn, layout) or internal_member(fn, layout):
+        return None
+    cls = class_of(fn)
+    short = cls.split("::")[-1]
+    if fn.qualified_name.split("::")[-1] in (short, "~" + short):
+        return None
+    ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
+             .endswith(f"{short}::{short}")]
+    ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
+    lines, args = [], []
+    for i, p in enumerate(ctor.params if ctor else []):
+        base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
+        iface = next((f for f in layout.interfaces if f.name.split("::")[-1] == base.split("::")[-1]), None)
+        if iface is not None or p.kind == "interface":
+            lines.append(f"{fake_name_of(iface.name if iface else base)} ut_dep{i};")
+            args.append(f"ut_dep{i}" if p.by_ref or "&" in p.type else f"&ut_dep{i}")
+        elif p.by_ref or "&" in p.type:
+            lines.append(f"{base or 'int'} ut_dep{i}{{}};")
+            args.append(f"ut_dep{i}")
+        elif "*" in p.type:
+            lines.append(f"{base or 'int'} ut_dep{i}{{}};")
+            args.append(f"&ut_dep{i}")
+        else:
+            args.append("{}")
+    lines.append(f"{cls} ut_obj{('(' + ', '.join(args) + ')') if args else ''};")
+    return lines, f"ut_obj.{fn.qualified_name.split('::')[-1]}"
+
+
+def call_form(fn: "FunctionInfo", layout: "LayoutProfile") -> str:
+    """A2-21ae: one line for the brain on how a test calls this function."""
+    if internal_member(fn, layout):
+        callers = [f.qualified_name for f in callers_of(fn, layout) if not internal_member(f, layout)]
+        return (f"{fn.qualified_name} cannot be named by a test (its class is declared in no header): reach it through "
+                f"{', '.join(callers[:3]) or 'the functions that call it'}.")
+    if static_member(fn, layout):
+        return f"a static member function: call it as {class_of(fn)}::{fn.qualified_name.split('::')[-1]}(...)."
+    recipe = object_recipe(fn, layout)
+    if recipe is not None:
+        lines, call = recipe
+        return ("a member function: declare the object and every constructor argument as a named variable first "
+                f"(never a temporary), exactly: {' '.join(lines)} then call {call}(...). Set a fake's controls "
+                "(<method>_return) on ut_depN before the call.")
+    return ""
+
+
+def reset_state(layout: "LayoutProfile") -> list["StateVar"]:
+    """A2-21s: the state every test starts from - the SUT's own state and the mutable global variables of real
+    dependencies linked into the test program (a test that sets STATUS_REG must not change the next test)."""
+    state = list(layout.sut_state)
+    names = {v.name for v in state}
+    plan = layout.dependencies
+    for d in (plan.entries if plan else []):
+        name = d.qualified_name or d.name
+        if d.kind == "variable" and d.decision == "real" and not d.is_const and not d.system and d.definition \
+                and d.definition in plan.real_sources and name not in names:
+            state.append(StateVar(name=name, type=d.type))
+            names.add(name)
+    return state
+
+
+def patterns_of(fn: "FunctionInfo", layout: "LayoutProfile") -> list[str]:
+    """LA-8: the constructs of a function a lesson can apply to, decided from the facts (no LLM)."""
+    out = [f"language {layout.language}"]
+    if fn.member:
+        out.append("static member function" if static_member(fn, layout) else "member function")
+        recipe = object_recipe(fn, layout)
+        if recipe and any("ut_fake_" in line for line in recipe[0]):
+            out.append("constructor takes an injected interface")
+        if recipe and any(re.search(r"\but_dep\d+\{\};", line) and "ut_fake_" not in line for line in recipe[0]):
+            out.append("constructor takes a reference or pointer")
+    if internal_member(fn, layout):
+        out.append("class no header declares")
+    if keeps_state(fn, layout) and not fn.member:
+        out.append("function keeps state between calls")
+    if fn.is_static:
+        out.append("static function")
+    plan = layout.dependencies
+    real = {d.name for d in (plan.entries if plan else []) if d.decision == "real"}
+    if real & set(fn.calls):
+        out.append("calls a real dependency")
+    if any(p.kind == "callback" for p in fn.params):
+        out.append("callback parameter")
+    if any(p.kind in ("ptr_struct", "struct") for p in fn.params):
+        out.append("structure parameter")
+    return out
+
+
+# ============================================================================ brain profiles [BP-1 .. BP-10]
+# BP-2: the kinds of answer a brain may give, from narrow to wide (repair and decision are not on the ladder)
+ANSWER_KINDS = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision")
+KIND_LADDER = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part")
+MINIMUM_KINDS = ("values", "scenario", "test", "repair", "decision")      # what Qwen3 8B was given before BP
+# BP-3: a cause on the test-building side, and the narrowest kind that contains the missing piece
+CAUSE_KIND = {"needs_call_sequence": "call_sequence", "test_setup": "setup", "needs_dependency_control": "stub",
+              "pipeline_limitation": "test"}
+KIND_STEP = {"values": "A2.value", "scenario": "A1.plan", "call_sequence": "A1.plan", "setup": "A2.setup",
+             "stub": "A2.stub", "test": "A2.tests", "suite_part": "A2.tests", "repair": "A3.repair",
+             "decision": ""}
+
+
+class BrainProfile(Contract):
+    """BP-1: what one brain may write and how much context it is given. The engine settings of ARCH-11 to ARCH-14
+    (window, answer limit, characters per token, effort) stay in the brain's section of ut_config.json and belong to
+    the profile; ``window_tokens`` here only overrides them for the limits of BP-5."""
+    name: str
+    kinds: list[str] = Field(default_factory=lambda: list(MINIMUM_KINDS))
+    journal_tokens: int = 1500             # journal excerpt per function [LA-4, BP-5]
+    long_function_lines: int = 150         # above it only the paths to the open items; 0: only when it does not fit
+    window_tokens: int = 16384             # the window the limits of BP-5 are computed for
+    scenarios_per_call: int = 4            # ARCH-11a
+    cost_input_per_mtok: float = 0.0       # for the report only
+    cost_output_per_mtok: float = 0.0
+
+    def allows(self, kind: str) -> bool:
+        return kind in self.kinds
+
+    def digest(self) -> str:
+        return sha256_bytes(self.model_dump_json().encode())[:16]
+
+    def fits_whole(self, function_chars: int, facts_chars: int = 0) -> bool:
+        """BP-5: does the whole function with its facts fit this profile's window (cautiously, 3 chars per token,
+        half the window for the facts)?"""
+        return (function_chars + facts_chars) / 3.0 <= self.window_tokens / 2
+
+    def short_function(self, lines: int, function_chars: int, facts_chars: int = 0) -> bool:
+        """LA-10, BP-5: is the function sent whole? The line limit applies only to a profile that sets one; a profile
+        without one (0) sends it whole whenever it fits the window."""
+        if self.long_function_lines > 0:
+            return lines <= self.long_function_lines
+        return self.fits_whole(function_chars, facts_chars)
+
+
+DEFAULT_PROFILES: dict[str, BrainProfile] = {
+    "minimum": BrainProfile(name="minimum"),
+    "full": BrainProfile(name="full", kinds=list(ANSWER_KINDS), journal_tokens=8000, long_function_lines=0,
+                         window_tokens=1_000_000, scenarios_per_call=4)}
+DEFAULT_BRAIN_PROFILES = {"opus": "full", "fable": "full", "sonnet": "full", "haiku": "full",
+                          "qwen_remote": "minimum", "qwen": "minimum"}
+
+
+class ProfileBook(Contract):
+    """BP-1, BP-6: the profiles, which brain has which, and a brain order per step. Configuration only."""
+    profiles: dict[str, BrainProfile] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
+    brains: dict[str, str] = Field(default_factory=lambda: dict(DEFAULT_BRAIN_PROFILES))
+    steps: dict[str, list[str]] = Field(default_factory=dict)
+    calibration_share: float = 0.9          # BP-8
+
+    def of(self, brain: str) -> BrainProfile:
+        """The profile of a brain; a brain without one gets "minimum" (BP-1)."""
+        name = self.brains.get(brain, "minimum")
+        return self.profiles.get(name) or self.profiles.get("minimum") or DEFAULT_PROFILES["minimum"]
+
+    def allows(self, brain: str, kind: str) -> bool:
+        return self.of(brain).allows(kind)
+
+    def order(self, names: list[str], step: str = "") -> list[str]:
+        """BP-6: the brains of a step's own order first, then the others in their usual order."""
+        own = [n for n in self.steps.get(step, []) if n in names]
+        return own + [n for n in names if n not in own]
+
+    def record(self, brains: list[str]) -> list[str]:
+        """BP-7: "brain: profile (sha256) kinds" for the result and the ledger."""
+        out = []
+        for b in brains:
+            p = self.of(b)
+            out.append(f"{b}: {p.name} ({p.digest()}) - {', '.join(p.kinds)}")
+        return out
+
+
+def brain_profiles(config_path: str | Path | None) -> ProfileBook:
+    """BP-1: the "profiles" section of ut_config.json:
+    {"brains": {"sonnet": "full", ...}, "definitions": {"minimum": {...}, "full": {...}}, "steps": {"A2.value": [...]},
+     "calibration_share": 0.9}. Missing parts keep their defaults; an unknown answer kind in a profile is ignored."""
+    section: dict[str, Any] = {}
+    if config_path and Path(config_path).is_file():
+        import json as _json
+        section = _json.loads(Path(config_path).read_text(encoding="utf-8")).get("profiles", {}) or {}
+    profiles = dict(DEFAULT_PROFILES)
+    for name, raw in (section.get("definitions") or {}).items():
+        data = {**(profiles[name].model_dump() if name in profiles else {}), **dict(raw or {}), "name": name}
+        data["kinds"] = [k for k in data.get("kinds", MINIMUM_KINDS) if k in ANSWER_KINDS]
+        profiles[name] = BrainProfile(**data)
+    brains = {**DEFAULT_BRAIN_PROFILES, **(section.get("brains") or {})}
+    return ProfileBook(profiles=profiles, brains=brains, steps=dict(section.get("steps") or {}),
+                       calibration_share=float(section.get("calibration_share", 0.9)))
+
+
+async def brains_for(agent: ba.AgentCore, kind: str, step: str = "", avoid: set[str] | frozenset = frozenset()
+                     ) -> list[str]:
+    """BP-3, BP-6: the available brains, in the step's order, whose profile allows ``kind``. Empty: no brain may give
+    this kind now (BP-9) - the caller does not ask any brain for it."""
+    book: ProfileBook = getattr(agent, "profiles", None) or ProfileBook()
+    try:
+        router = await agent._brains()
+    except ba.AgentFault:
+        return []
+    names = [n for n in router.available if n in agent.allowed_brains or n in ("injected", "demo")]
+    return [n for n in book.order(names, step) if n not in avoid and book.allows(n, kind)]
+
+
+async def answering_profile(agent: ba.AgentCore, step: str = "") -> BrainProfile:
+    """BP-5: the profile of the brain that would answer next (the first available brain of the step's order)."""
+    book: ProfileBook = getattr(agent, "profiles", None) or ProfileBook()
+    try:
+        router = await agent._brains()
+    except ba.AgentFault:
+        return book.profiles.get("minimum") or DEFAULT_PROFILES["minimum"]
+    names = [n for n in router.available if n in agent.allowed_brains or n in ("injected", "demo")]
+    first = next(iter(book.order(names, step)), "")
+    return book.of(first)
+
+
+# BP-3: the brain steps that give one of the answer kinds; the other steps are not restricted by a profile
+STEP_KIND = {"A1.plan": "scenario", "A2.value": "values", "A2.sequence": "call_sequence", "A2.setup": "setup",
+             "A2.stub": "stub", "A2.tests": "test", "A3.repair": "repair", "A3.host": "repair",
+             "A1.dependency": "decision", "A3.root_cause": "decision", "A4.review": "decision",
+             "A3.outcome": "decision"}
+
+
+def apply_profiles(agent: ba.AgentCore, config_path: str | Path | None) -> None:
+    """BP-1, BP-3, BP-6: the agent asks a brain for a step only when the brain's profile allows the step's answer
+    kind, and in the step's own brain order when the configuration gives one."""
+    book = brain_profiles(config_path)
+    agent.profiles = book
+
+    def gate(step: str, names: list[str]) -> list[str] | None:
+        kind = STEP_KIND.get(step)
+        if not kind:
+            return None
+        return [n for n in book.order(list(names), step) if book.allows(n, kind)]
+    agent.brains_for_step = gate
+    agent.step_order = lambda step: book.steps.get(step) or None
+
+
+def next_kind(current: str, cause: str, allowed: list[str] | tuple[str, ...]) -> str:
+    """BP-3: the kind of the next attempt. A cause on the test-building side climbs the ladder to the next wider kind
+    that contains the missing piece and is allowed; any other cause keeps the kind. "" when the piece needs a kind
+    no available brain may give (BP-9)."""
+    if cause not in CAUSE_KIND:
+        return current if current in allowed else next((k for k in KIND_LADDER if k in allowed), "")
+    wanted = CAUSE_KIND[cause]
+    start = max(KIND_LADDER.index(wanted), KIND_LADDER.index(current) + 1 if current in KIND_LADDER else 0)
+    return next((k for k in KIND_LADDER[start:] if k in allowed), "")
+
+
+# ============================================================================ checks: guard or prediction [NC-6]
+# NC-6: every check that refuses an answer before the tool declares its kind here. A guard protects the trust of the
+# result and is never overruled; a prediction only predicts what the tool would reject, and never removes an item by
+# itself: an item refused only by predictions is built alone, and the tool decides (NC-7). A refusal text that
+# matches no prediction is a guard - an unknown check never lets an item through.
+PREDICTION_CHECKS = {
+    "calls functions that do not exist here": "unknown name",              # A2-20, A1-PL4 grounding
+    "unbalanced": "unbalanced braces or parentheses",
+    "is not a stubbed function of the dependency plan": "unknown stub",   # A1-PL4 d
+    "is not a stubbed variable": "unknown variable",
+    "is const: a test cannot set it": "const variable",
+    "returns nothing that a test can set": "stub without a return value",
+    "is set twice in a row": "value set twice",                           # A2-21t
+    "is not an integer value": "value form",                              # A1-PL4 e
+    "is not a floating-point value": "value form",
+    "pass a variable declared in setup": "value form",
+    "unknown names in": "unknown name",
+    "is not a variable of the setup or a stub control": "unknown name",
+    "is not a value": "value form",
+    "a sequence of return values needs a scalar return type": "value form",
+    "earlier call is not a call of the SUT": "call sequence form",       # BP-2 call_sequence
+}
+
+
+def check_kind(reason: str) -> Literal["guard", "prediction"]:
+    """NC-6: the kind of the check that gave this refusal."""
+    return "prediction" if any(text in reason for text in PREDICTION_CHECKS) else "guard"
+
+
+def prediction_name(reason: str) -> str:
+    return next((name for text, name in PREDICTION_CHECKS.items() if text in reason), "guard")
+
+
+def only_predictions(reasons: list[str]) -> bool:
+    """NC-7: refused, and only by predictions - the item goes to a trial instead of being dropped."""
+    return bool(reasons) and all(check_kind(r) == "prediction" for r in reasons)
+
+
+# ============================================================================ recipes [NC-1 .. NC-3]
+RECIPE_RULES = {"setup": "NC-2 setup", "stub": "NC-2 stub", "call_sequence": "NC-2 call_sequence"}
+
+
+class Recipe(Contract):
+    """NC-2: a building block the tool accepted, as a template. Parameters are written @@name@@ in the lines (braces
+    are C code, so they are not used for parameters): the class, the method and the constructor's parameter types."""
+    kind: Literal["setup", "stub", "call_sequence"]
+    signature: str                      # the construct, from the front end
+    lines: list[str] = Field(default_factory=list)
+    call: str = ""                      # the call target, e.g. "ut_obj.@@method@@"
+    made_by: str = ""                   # brain/model, or "library" for the application's recipes
+    uses: int = 0
+
+    def instantiate(self, params: dict[str, str]) -> tuple[list[str], str]:
+        def fill(text: str) -> str:
+            return re.sub(r"@@(\w+)@@", lambda m: params.get(m.group(1), m.group(0)), text)
+        return [fill(line) for line in self.lines], fill(self.call)
+
+    def complete(self, params: dict[str, str]) -> bool:
+        """Every parameter of the template is known for this construct."""
+        used = set(re.findall(r"@@(\w+)@@", "\n".join(self.lines) + self.call))
+        return used <= set(params)
+
+
+def templated(lines: list[str], call: str, params: dict[str, str]) -> tuple[list[str], str]:
+    """NC-2: a block written for one class turned into a template: every parameter value (longest first, whole words
+    only) becomes @@name@@, so the block applies to another class of the same construct."""
+    order = sorted(((k, v) for k, v in params.items() if v), key=lambda kv: -len(kv[1]))
+
+    def tpl(text: str) -> str:
+        for k, v in order:
+            text = re.sub(r"(?<![\w:])" + re.escape(v) + r"(?![\w])", f"@@{k}@@", text)
+        return text
+    return [tpl(line) for line in lines], tpl(call)
+
+
+def construct_of(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[str, dict[str, str]]:
+    """NC-2: the construct signature of the object a member function is called on, from the front end's facts, and
+    the parameters of a recipe for it. Free functions have no object construct ("", {})."""
+    if not fn.member or static_member(fn, layout):
+        return "", {}
+    cls = class_of(fn)
+    short = cls.split("::")[-1]
+    ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
+             .endswith(f"{short}::{short}")]
+    ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
+    params = {"cls": cls, "method": fn.qualified_name.split("::")[-1]}
+    shapes = []
+    for i, p in enumerate(ctor.params if ctor else []):
+        base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
+        iface = next((f for f in layout.interfaces if f.name.split("::")[-1] == base.split("::")[-1]), None)
+        how = "ref" if p.by_ref or "&" in p.type else "ptr" if "*" in p.type else "value"
+        what = "interface" if iface is not None or p.kind == "interface" else p.kind or "other"
+        shapes.append(f"{how} {what}")
+        if base:
+            params[f"t{i}"] = base
+            if iface is not None:
+                params[f"fake{i}"] = fake_name_of(iface.name)
+    traits = [f"ctor({', '.join(shapes)})" if ctor else "no constructor declared"]
+    if internal_member(fn, layout):
+        traits.append("internal linkage")
+    if "<" in cls or any(t.name.split("::")[-1] == short for t in getattr(layout, "templates", []) or []):
+        traits.append("template")
+    return "object: " + "; ".join(traits), params
+
+
+def application_recipes(folder: Path | None = None) -> list[Recipe]:
+    """NC-3: the application's recipe library (recipes/*.json next to the agents): reviewed data, never written by a
+    run. A file that is not a valid recipe is skipped."""
+    import json as _json
+    folder = folder or APP_DIR / "recipes"
+    out: list[Recipe] = []
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+            for item in raw if isinstance(raw, list) else [raw]:
+                out.append(Recipe(**{**item, "made_by": item.get("made_by") or "library"}))
+        except (OSError, ValueError, TypeError):
+            continue
+    return out
+
+
+# ============================================================================ platform facts [NC-10, NC-11]
+class PlatformFacts(Contract):
+    """NC-10: how the platform and the toolchain behave, measured by the setup with small probe programs and written
+    to the platform section of the tool manifest. ``measured`` is empty when only the host defaults are known."""
+    os: str = ""                                   # windows | linux | darwin
+    case_sensitive: bool = True                    # does the file system tell A.c from a.c
+    page_bytes: int = 4096                         # register pages in host memory [A3-HW1]
+    exe_suffix: str = ""
+    line_ending: str = "\n"
+    path_separator: str = "/"                      # how the compiler prints a path given with forward slashes
+    paths_absolute: bool = False                   # does llvm-cov print absolute source paths
+    outcomes: dict[str, list[int]] = Field(default_factory=dict)   # normal, crash, abort, exception, stack_overflow
+    watchdog_marker: str = "UT_WATCHDOG"           # the harness's own marker of a watchdog end [A3-45d]
+    watchdog_exit: int | None = 4
+    measured: str = ""                             # date of the measurement
+
+    def outcome_of(self, code: int) -> str:
+        """The measured kind of an end with this exit status, or ""."""
+        return next((kind for kind, codes in self.outcomes.items() if code in codes), "")
+
+
+def host_facts() -> PlatformFacts:
+    """The facts a host shows without a measurement (used until the setup has measured them)."""
+    import mmap as _mmap
+    windows = os.name == "nt"
+    return PlatformFacts(os="windows" if windows else ("darwin" if sys.platform == "darwin" else "linux"),
+                         case_sensitive=not windows and sys.platform != "darwin",
+                         page_bytes=int(getattr(_mmap, "ALLOCATIONGRANULARITY", 4096) or 4096),
+                         exe_suffix=".exe" if windows else "", line_ending="\r\n" if windows else "\n",
+                         path_separator="\\" if windows else "/")
+
+
+def platform_facts(manifest: "Tools | dict[str, Any] | None") -> PlatformFacts:
+    """NC-11: the platform facts of the manifest; the host defaults when the manifest has none."""
+    data = manifest.data if isinstance(manifest, Tools) else (manifest or {})
+    raw = data.get("platform") if isinstance(data, dict) else None
+    if not raw:
+        return host_facts()
+    try:
+        return PlatformFacts(**raw)
+    except (TypeError, ValueError):
+        return host_facts()
+
+
+def path_key(path: str, facts: PlatformFacts | None = None, fold: bool | None = None) -> str:
+    """NC-11: a path as an identity: separators unified, '.' parts removed, a drive letter in one case, and letter case
+    folded where the file system does not distinguish it (``fold`` overrides the facts)."""
+    facts = facts or host_facts()
+    text = str(path).strip().strip('"').replace("\\", "/")
+    while "//" in text[1:]:
+        text = text[0] + text[1:].replace("//", "/")
+    text = "/".join(p for p in text.split("/") if p != ".")
+    if re.match(r"^[A-Za-z]:/", text):
+        text = text[0].lower() + text[1:]
+    return text.lower() if (fold if fold is not None else not facts.case_sensitive) else text
+
+
+def windows_path(path: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:[\\/]", path)) or "\\" in path
+
+
+def same_file(a: str, b: str, facts: PlatformFacts | None = None) -> bool:
+    """NC-11, A3-CL14: do two paths name the same file - whatever form a tool printed them in (absolute or relative,
+    either separator, any letter case where the file system ignores it)? A relative path matches an absolute one that
+    ends with it at a folder boundary. Letter case is folded when the measured file system ignores it, when a path is
+    a Windows path, and when nothing was measured: the paths compared are the few files of one bundle."""
+    fold = facts is None or not facts.case_sensitive or windows_path(a) or windows_path(b)
+    ka, kb = path_key(a, facts, fold), path_key(b, facts, fold)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    shorter, longer = sorted((ka, kb), key=len)
+    return not re.match(r"^([a-z]:)?/", shorter) and longer.endswith("/" + shorter)
+
+
+def program_outcome(code: int, text: str, facts: PlatformFacts | None = None) -> str:
+    """NC-11, NC-12: how a test program ended, from its exit status and output and the measured facts: normal,
+    watchdog, timeout, crash, abort, exception, stack_overflow - or unknown when the facts do not describe it."""
+    facts = facts or host_facts()
+    if facts.watchdog_marker and facts.watchdog_marker + "|" in text:
+        return "watchdog"
+    if code == -9 and "UT_TIMEOUT" in text:
+        return "timeout"
+    if code == 0:
+        return "normal"
+    measured = facts.outcome_of(code)
+    if measured:
+        return measured
+    if code < 0:                                   # a signal on Linux and macOS
+        return {-11: "crash", -6: "abort", -7: "crash", -8: "crash", -4: "crash", -5: "crash"}.get(code, "unknown")
+    if code > 0xFFFF:                              # Windows NTSTATUS
+        return {0xC0000005: "crash", 0xC00000FD: "stack_overflow", 0xC0000094: "crash", 0xC0000409: "abort",
+                0xC000001D: "crash", 0xE06D7363: "exception"}.get(code, "unknown")
+    return "unknown"
+
+
+# ============================================================================ pipeline findings [NC-5]
+def finding_signature(kind: str, subject: str, message: str = "") -> str:
+    """NC-5: the same finding in another run or file - normalized as in ARCH-23."""
+    return ba.RuleFailure(rule=kind, failure="", subject=subject, message=message).signature()
+
+
+def findings_path(config_path: str | Path | None, output_dir: str = "ut_output") -> Path:
+    """NC-5: the application's findings file, ut_output/pipeline_findings.jsonl next to ut_config.json."""
+    base = Path(config_path).resolve().parent if config_path and Path(config_path).is_file() else APP_DIR
+    out = Path(output_dir)
+    return (out if out.is_absolute() else base / out) / "pipeline_findings.jsonl"
+
+
+def record_findings(path: Path, findings: list["PipelineFinding"]) -> list[str]:
+    """NC-5: appends this run's findings (never credentials) and returns every signature with its count across runs,
+    most frequent first: "3x pipeline_limitation: <subject> - <message>"."""
+    import json as _json
+    counts: dict[str, int] = {}
+    shown: dict[str, str] = {}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if findings:
+            with open(path, "a", encoding="utf-8") as handle:
+                for f in findings:
+                    handle.write(_json.dumps(f.model_dump(mode="json"), ensure_ascii=False) + "\n")
+        for line in path.read_text(encoding="utf-8").splitlines() if path.is_file() else []:
+            try:
+                raw = _json.loads(line)
+            except ValueError:
+                continue
+            sig = raw.get("signature", "")
+            counts[sig] = counts.get(sig, 0) + 1
+            shown[sig] = f"{raw.get('kind', '')}: {raw.get('subject', '')} - {raw.get('message', '')}"[:300]
+    except OSError:
+        return []
+    for f in findings:
+        f.count = counts.get(f.signature, 1)
+    return [f"{n}x {shown[s]}" for s, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]

@@ -1,0 +1,30 @@
+{
+  "construct": "C++ class whose constructor takes a reference to an abstract interface",
+  "sut": "src/heater.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "setup": [
+      {
+        "lines": [
+          "ut_fake_ISensor ut_dep0;",
+          "Heater ut_obj(ut_dep0);"
+        ],
+        "call": "ut_obj.demand"
+      }
+    ],
+    "tests": [
+      {
+        "name": "test_heater_demand_below_set_point",
+        "scenario_ids": [],
+        "purpose": "reach the item",
+        "evidence_ids": [],
+        "body": "ut_fake_ISensor s;\ns.read_return = 10;\nHeater h(s);\nUT_OBSERVE_INT(\"test_heater_demand_below_set_point_1\", h.demand(20));",
+        "evidence_class": "E8"
+      }
+    ]
+  }
+}

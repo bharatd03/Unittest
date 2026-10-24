@@ -40,12 +40,14 @@ flowchart LR
     dl --> sha{"SHA-256<br/>matches?"}
     sha -- no --> refuse(["delete, stop<br/>TP-4"])
     sha -- yes --> unpack["unpack into tools/&lt;tool&gt;"]
-    unpack --> check["functional check<br/>C, C++, MC/DC, libFuzzer, analyzer"]
+    unpack --> check["functional check<br/>C, C++, MC/DC, libFuzzer, analyzer;<br/>platform probes (NC-10)"]
     check -- blocked by Windows --> blocked(["stop and report<br/>TP-9"])
     use --> manifest["tools/toolchain.json"]
     check -- ok --> manifest
     manifest --> pipe(["pipeline: tools only<br/>from the manifest, TP-10"])
 ```
+
+The functional check also runs small probe programs and writes the platform facts into the manifest: how a crash, an abort, an uncaught exception, a stack overflow and the watchdog's end appear, the register page unit, whether file names keep their letter case and how the compiler prints paths [NC-10]. The agents read platform behaviour only from these facts [NC-11].
 
 The application never searches for tools and has no fallback compiler. Windows uses llvm-mingw (self-contained, no administrator rights) unless a working Visual Studio/LLVM installation exists; Linux uses an installed Clang 18+ or the official LLVM release. Per repository, Make, Meson and Bazel are added when its build files need them [TP-5].
 
@@ -76,7 +78,8 @@ flowchart TD
         covPlan --> kb["KB guidance<br/>fetched by the orchestrator"]
         kb --> gen["Agent2 generate<br/>suites, test cases, stubs"]
         gen --> verify["Agent3 verify<br/>build, run all tests, measure"]
-        verify --> route{"Agent3 routing<br/>A3-177"}
+        verify --> journal["Failure journal (LA-2): root cause of every miss<br/>by rules from the tools' results (LA-3);<br/>covered fixes become lessons in the KB (LA-8)"]
+        journal --> route{"Agent3 routing<br/>A3-177"}
         route -- "test or stub defect" --> covPlan
         route -- "gaps remain" --> covPlan
         route -- "gaps remain,<br/>no new tests reach them" --> fuzz["Agent3 fuzz<br/>libFuzzer or ut_search, inputs that reach the gaps;<br/>runs while the brain plans the next iteration,<br/>one time budget per run (ORC-5a)"]
@@ -90,7 +93,7 @@ flowchart TD
     end
 
     route -- "every ASIL target reached,<br/>measured, behaviour checked" --> done(["verified_measured<br/>(COV-1, COV-3)"])
-    route -- "iteration limit of the ASIL level,<br/>or stagnation after every strategy" --> handover["hand-over: evidence per item,<br/>Agent4 suggestions checked on<br/>a trial copy, action needed<br/>(COV-9 .. COV-13)"]
+    route -- "every open item has a final status (LA-6),<br/>no new coverage and no new root cause twice,<br/>or the safety ceiling scaled with the file (LA-7)" --> handover["hand-over: evidence per item,<br/>Agent4 suggestions checked on<br/>a trial copy, action needed<br/>(COV-9 .. COV-13)"]
     handover --> stop(["incomplete,<br/>with reason"])
     route -- "environment" --> stop
     builds -- "budget exhausted" --> stop
@@ -142,14 +145,18 @@ sequenceDiagram
     participant A4 as Agent4
     participant L as Ledger
 
-    O->>A1: plan(PlanRequest: layout, last VerificationResult, attempts, fuzz inputs, per-test items)
+    O->>A1: plan(PlanRequest: layout, last VerificationResult, attempts, fuzz inputs, per-test items, kind per item)
     Note over A1: facts first; from the 2nd plan the brain suggests<br/>scenarios per function, Agent1 checks each (A1-PL4)
     A1-->>O: UTPlan (scenarios with who made them, repair items, conflicts, look-ups)
     O->>KB: guidance(GuidanceRequest)
     KB-->>O: KBGuidance (advisory examples)
     O->>A2: generate(GenerationRequest: UTPlan + KBGuidance + current suite)
     Note over A2: checked scenarios assembled directly; the LLM writes<br/>requirement tests, hard set-ups and rewrites (A2-21m..p)
-    A2-->>O: FileActionBundle (stubs, suite, tests, probes for E8 values)
+    A2-->>O: FileActionBundle (stubs, suite, tests, probes for E8 values; tests refused only by predictions)
+    opt tests refused only by predictions (NC-7)
+        O->>A3: observe(VerifyRequest: only those tests, each measured alone)
+        A3-->>O: compiled? passed? items reached - kept, or out with the tool's message for the journal
+    end
     opt the bundle observes values (A2-21f)
         O->>A3: observe(VerifyRequest: bundle)
         A3-->>O: observed values + per-test coverage (A3-OBS5)
@@ -233,6 +240,7 @@ flowchart LR
 |---|---|---|---|
 | Agent1 | a header the front end does not find (A1-DA20); after a search by name with one candidate | candidates with that name, the folders with headers | the front end parses again: the header is found and errors do not grow |
 | Agent2 | a parameter whose value no rule can build (A2-21ac) | the function, the type's declarations, the SUT's functions | declared symbols only, no assertion; then Agent3's build; stored only once tests using it are in the verified suite |
+| Agent2 | the object a member function is called on, or a fake of an interface the rules cannot fake (NC-1) | the constructors, the fakes, the headers, the journal's compiler message | the guards of BP-4, then Agent3's build; stored as a recipe with parameters once its test is in the measured suite (NC-2) |
 | Agent3 | the test program does not build in generated files (A3-CL14) | compiler errors, the generated files, the SUT's include lines | the compiler: fewer errors; assertions, test names and calls unchanged |
 | Agent3 | the SUT does not compile on the host after the keyword and assembly tables (A3-BD16) | compiler errors, the SUT, the flags | the compiler: fewer SUT errors; no SUT function defined, no user file changed |
 | Agent4, Agent1 planning | already brain steps (A4-23g, COV-12, A1-PL1) | as before | Agent3's verify |
@@ -260,8 +268,9 @@ Every brain call goes to the first available brain in `brain.engine.brain_order`
 When the agents start, BaseAgent checks which Claude models the API key in `ANTHROPIC_API_KEY` can access (no
 tokens are spent). Models without access are skipped for the whole run. When no Claude model is available, Qwen3 8B
 on the remote server answers (`brain.qwen_remote`, key in the environment variable `QWEN_REMOTE_API_KEY`), and
-Qwen3 8B through Ollama on this PC only when the remote server is not available either. The same code, tasks, checks and token budgets are used for every brain
-[ARCH-1b]; `unittest_generator.bat check` shows which brains are in use.
+Qwen3 8B through Ollama on this PC only when the remote server is not available either. The same code, contracts and
+checks are used for every brain; what a brain may write and how much context it gets is its profile (section 7a2)
+[ARCH-1b, BP-1]; `unittest_generator.bat check` shows which brains are in use.
 
 ```mermaid
 flowchart LR
@@ -404,6 +413,83 @@ flowchart LR
 The run does not wait: a later run with requirement documents, or on a new commit after the developer changed the
 source, continues from the stored build capture and the verified tests.
 
+## 7a1. Learning between attempts [LA]
+
+A repeated attempt with the same information gives the same answer, so every attempt after the first carries the reason the earlier one missed:
+
+1. **Journal (LA-2).** After every iteration the orchestrator writes `journal/<file>.jsonl` and `journal/<file>.md` in the run folder. Only deviations are recorded: the test or scenario tried, the tool's message, the root cause and the next step.
+2. **Root cause (LA-3).** Rules decide from the tools' results:
+   - a compiler message means *test did not compile* or *test setup*;
+   - a test that passed but did not reach the item means *wrong inputs*, *needs several calls* or *needs control of a dependency*;
+   - a failing assertion means *wrong expectation*;
+   - a proof means *unreachable*.
+3. **The next attempt (LA-4).** Agent1's plan request and Agent2's test request carry a short excerpt of the open entries of the function. A scenario or rewrite that repeats an earlier one unchanged is refused.
+4. **Attempts (LA-5).**
+   - At most 2 per item, counted only for tests that were built and measured.
+   - Items blocked by one cause share their attempts.
+   - A third attempt only by a brain of another model.
+5. **Final status (LA-6).** Every item not covered at the stop is one of: covered, proven unreachable, needs a requirement, needs a source change, pipeline limitation, or undetermined. Each has a reason and an owner.
+6. **Stop (LA-7).** The loop continues while an iteration covers something or finds a new root cause. It stops when every item has a final status, at the safety ceiling that grows with the file, or after two iterations with nothing new.
+7. **Lessons (LA-8).** A cause that a verified test removed is stored in the knowledge base with the construct it occurred in. It goes to the next attempts, files and runs; a recurring one is proposed as a rule.
+8. **Decision point (LA-9).** Only in an interactive run (from the menu, or `--interactive`). When items need a source change or a requirement, the user keeps the suggestions, gives requirement documents (the file is run again with them), or leaves the items open.
+
+## 7a2. Brain profiles and new code without pipeline changes [BP, NC]
+
+The pipeline uses what the answering brain can do. Qwen3 8B is the floor every requirement works with, not the size the
+pipeline is built around; a stronger brain is allowed to write more, and everything any brain writes passes the same
+checks (BP-4) and Agent3's measurement.
+
+**Profiles (BP-1, BP-2).** `ut_config.json` → `profiles`: each brain has a profile with the answer kinds it may give and
+its context limits. Default: the Claude models "full", Qwen3 8B "minimum" (exactly what it was given before).
+
+| Kind | What the brain writes | minimum | full |
+| --- | --- | --- | --- |
+| values | inputs, argument values (A2-21ac) | yes | yes |
+| scenario | a coverage scenario (A1-PL1) | yes | yes |
+| call_sequence | earlier calls that build up the state | - | yes |
+| setup | the object and constructor arguments (NC-1) | - | yes |
+| stub | a fake the rules cannot write (NC-1) | - | yes |
+| test | a whole test function (A2-21n) | yes | yes |
+| suite_part | the tests of a function with shared set-up | - | yes |
+| repair, decision | repairs of generated files, typed choices | yes | yes |
+
+**The ladder of kinds (BP-3).**
+
+```mermaid
+flowchart LR
+    a1["attempt: narrowest kind<br/>(scenario; the rules build the rest)"] --> m{"measured:<br/>covered?"}
+    m -- yes --> done(["covered"])
+    m -- "no: test_setup, needs_call_sequence,<br/>needs_dependency_control, pipeline_limitation" --> next{"a wider kind that<br/>holds the missing piece<br/>and an available brain<br/>allows?"}
+    next -- yes --> a2["next attempt with that kind<br/>(call_sequence, setup, stub, test, suite_part)"]
+    a2 --> m
+    next -- no --> lim(["pipeline limitation:<br/>needs answer kind X (BP-9)"])
+```
+
+A step whose kind no available brain may give is never sent to a brain (BaseAgent's per-step gate). The attempts of
+LA-5 count over the ladder; the third goes to another model with the widest profile.
+
+**Building blocks (NC-1 .. NC-3).** Agent2 builds the object of a member function and the fakes from a stored recipe
+first, then its rules, then the brain within its profile; Agent3's build decides. A block the compiler accepted is
+stored as a recipe of its construct (class, method and constructor types as parameters) per repository; a recipe used
+often is proposed for the application's reviewed library (`recipes/`).
+
+**Checks that guard and checks that predict (NC-6 .. NC-9).** A guard (expected values from evidence, no way out, no
+SUT change, no weaker test, no repeat) is never overruled. A prediction (an unknown name, unbalanced braces, a value's
+form) never removes an item by itself: the item is built and run alone in a trial (Agent3 observe), and kept when it
+compiles, passes and reaches what it targets - recorded as a false refusal of that check.
+
+**Platform facts (NC-10 .. NC-13).** Measured by the setup, read through `ut_contracts.py` (`same_file`,
+`program_outcome`); an end the facts do not describe is an unknown outcome: run again alone, then classified by the
+brain, never a pass.
+
+**Findings across runs (NC-5).** Pipeline limitations, false refusals and unknown outcomes go to
+`ut_output/pipeline_findings.jsonl`, counted by signature; the report lists them first.
+
+**Construct corpus and calibration (NC-4, BP-8).** `Test/constructs` holds one small example per construct with known
+correct answers; `test` checks the answers against the checks, `test-full` runs the pipeline on every case, and
+`unittest_generator.bat calibrate BRAIN` runs the corpus with one real brain and proposes its profile (never applied by
+itself).
+
 ## 7b. The live viewer [VIEW]
 
 Every run writes `events.jsonl` into its output folder and serves a page on 127.0.0.1 (a free port, printed at the
@@ -440,6 +526,7 @@ flowchart LR
     outdir --> r5["logs/<br/>one per agent"]
     outdir --> r6["events.jsonl and viewer.html<br/>(VIEW-4)"]
     outdir --> r7["coverage_suggestions/<br/>checked patches, never applied,<br/>with their fault-check records"]
+    run --> r8["ut_output/pipeline_findings.jsonl<br/>limitations, false refusals,<br/>unknown outcomes across runs (NC-5)"]
     run --> repo["your repository"]
     repo --> fix{"verified<br/>source fix?"}
     fix -- no --> t1["tests, stubs and harness<br/>in the test folders"]

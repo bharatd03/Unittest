@@ -1,0 +1,19 @@
+{
+  "construct": "C++ nested class",
+  "sut": "src/parser.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "setup": [
+      {
+        "lines": [
+          "Parser::Token ut_obj('7');"
+        ],
+        "call": "ut_obj.kind"
+      }
+    ]
+  }
+}

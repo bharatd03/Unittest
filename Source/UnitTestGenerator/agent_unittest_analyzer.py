@@ -73,6 +73,7 @@ class AnalyzerConfig(BaseModel):
     max_brain_calls_per_function: int = 2    # re-ask included [A1-PL9, ORC-7]
     max_brain_scenarios: int = 4             # per call: shorter answers, faster on a small brain [ORC-7]
     rules_first: bool = True                 # no test measured yet: cheap tests first, then the brain [A1-PL1]
+    long_function_lines: int = 150           # above: only the paths to the open items go to the brain [LA-10]
     max_lookups_per_function: int = 6        # A1-PL6, ORC-7
     # Expected answer per brain scenario, in tokens: sets the answer limit and window [ARCH-11]
     tokens_per_scenario: int = 320
@@ -1611,6 +1612,9 @@ class PlannedScenario(BaseModel):
     classification: Literal["confirmed_gap", "characterization_gap", "conflicting_evidence", "insufficient_evidence"]
     conflict: str = Field(description="conflicting_evidence only: which evidence ids contradict each other, how")
     information_sought: str = Field(description="insufficient_evidence only: what to look up, a few words")
+    calls_before: list[str] = Field(default_factory=list, description=(
+        "only when the task asks for a CALL SEQUENCE: the earlier calls of the function (or of other functions of "
+        "the SUT), in order, each one C statement such as f(1); - they build up the state before the call"))
 
 
 class PlannedScenarios(BaseModel):
@@ -1690,15 +1694,33 @@ NULLS = {"NULL", "nullptr", "0", "(void*)0", "(void *)0", "((void*)0)", "((void 
 PLAN_FORBIDDEN = re.compile(r"#\s*include|\bmain\s*\(|\bsystem\s*\(|\bpopen\s*\(|\bexec\w*\s*\(|\bfopen\s*\(|"
                             r"\bremove\s*\(|\bunlink\s*\(|\bwhile\b|\bfor\s*\(|\bgoto\b|__asm|\basm\b|\breturn\b")
 PLAN_SAFE_CALLS = {"sizeof", "strlen", "strcmp", "memset", "memcpy", "strcpy", "strncpy", "snprintf", "static_cast",
-                   "reinterpret_cast", "const_cast"}
+                   "reinterpret_cast", "const_cast",
+                   "UT_REG32", "UT_REG_SET_LATER", "UT_REG_CLEAR_LATER"}      # harness macros [A3-HW1, A2-21ab, A1-PL4 d]
 # A declaration: type words, then a separator (blank, *, &), then the name - the separator keeps a name such as
 # "list" in "List_t list;" from being split into a second type word "lis" and a name "t".
 LOCAL_DECL = re.compile(r"^\s*(?:(?:const|static|struct|enum|union|unsigned|signed|volatile)\s+)*[A-Za-z_][\w:<>]*"
                         r"(?:\s+[A-Za-z_]\w*)?(?:\s*[*&]+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*\s*(?:=|;|\{|\()")
 
 
+def block_end(lines: list[str], line: int) -> int:
+    """The last line of the block a decision at ``line`` (1-based) opens; the line itself when it opens none."""
+    depth, opened = 0, False
+    for n in range(line - 1, min(len(lines), line + 400)):
+        code = re.sub(r"/\*.*?\*/|//.*$|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", "", lines[n])
+        for ch in code:
+            if ch == "{":
+                depth, opened = depth + 1, True
+            elif ch == "}":
+                depth -= 1
+                if opened and depth <= 0:
+                    return n + 1
+        if not opened and n > line and code.strip().endswith(";"):
+            return n + 1                                     # a single statement without braces
+    return line
+
+
 def norm_text(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[/*]+", " ", text)).strip().lower()
+    return uc.norm_quote(text)                             # white space, comment markers and @tags [A1-PL4 b]
 
 
 # ARCH-20, A1-PL4: form is forgiven, content is not. Harmless format noise of a brain answer is removed before the
@@ -1885,7 +1907,9 @@ class AnalyzerAgent(ba.AgentCore):
                 raise ba.ContractRejected("SUT changed since discovery; run discover again [ORC-10]")
 
         async def plan(payload, request, scratch):
-            return await self.plan(payload)
+            out = await self.plan(payload)
+            out.kinds_available = [k for k in uc.ANSWER_KINDS if await uc.brains_for(self, k)]   # BP-3, BP-9
+            return out
 
         def evidence_pre(payload: uc.EvidenceRequest, request):
             uc.check_signature(payload.layout, request)
@@ -2710,6 +2734,7 @@ class AnalyzerAgent(ba.AgentCore):
                     names.add(f"ut_cb_{re.sub(r'[^A-Za-z0-9_]', '_', f.name.replace('(anonymous namespace)::', ''))}_{i}")
         for e in layout.enums:
             names |= {k.split("::")[-1] for k in e.values} | {e.name.split("::")[-1]}
+        names |= {"ut_state_set_" + re.sub(r"\W", "_", v.name) for v in layout.sut_state}          # A2-21z
         return names
 
     @staticmethod
@@ -2770,9 +2795,25 @@ class AnalyzerAgent(ba.AgentCore):
 
     @staticmethod
     def _normalize_planned(planned: "PlannedScenario", fn: uc.FunctionInfo, open_ids: set[str],
-                           evidence: dict[str, uc.EvidenceRef]) -> list[str]:
+                           evidence: dict[str, uc.EvidenceRef], layout: uc.LayoutProfile | None = None) -> list[str]:
         """ARCH-20, A1-PL4: format noise removed from values and gap ids; returns "field: 'before' -> 'after'"."""
         fixes: list[str] = []
+        if layout is not None:                       # a setter for a visible variable, an assignment of a hidden one
+            state = {re.sub(r"\W", "_", v.name): v.name for v in layout.sut_state}
+            visible = uc.headers_text(layout)
+            setup = []
+            for stmt in planned.setup:
+                new = stmt
+                m = re.fullmatch(r"\s*ut_state_set_(\w+)\s*\((.*)\)\s*;?\s*", stmt, re.S)
+                if m and m.group(1) not in state and re.search(r"\b" + re.escape(m.group(1)) + r"\b", visible):
+                    new = f"{m.group(1)} = {m.group(2).strip()};"
+                m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*=(?!=)\s*([^;]+);?\s*", stmt)
+                if m and m.group(1) in state and not re.search(r"\b" + re.escape(m.group(1)) + r"\b", visible):
+                    new = f"ut_state_set_{m.group(1)}({m.group(2).strip()});"
+                if new != stmt:
+                    fixes.append(f"setup: {stmt.strip()[:60]!r} -> {new[:60]!r}")
+                setup.append(new)
+            planned.setup = setup
         strings = {p.name for p in text_params(fn) if p.kind == "cstring"}
 
         def fixed(field: str, value: str, name: str = "", keep: bool = False) -> str:
@@ -2807,7 +2848,7 @@ class AnalyzerAgent(ba.AgentCore):
                        known: set[str], layout: uc.LayoutProfile) -> tuple[uc.Scenario | None, list[str]]:
         """A1-PL4: every check, deterministically, before Agent2 receives the scenario. The format fixes of ARCH-20
         are applied first and recorded in ``self.last_fixes``."""
-        self.last_fixes = self._normalize_planned(planned, fn, open_ids, evidence)
+        self.last_fixes = self._normalize_planned(planned, fn, open_ids, evidence, layout)
         reasons: list[str] = []
         claim = WAY_OUT.search(" ".join([planned.name, planned.purpose, planned.information_sought, planned.conflict]))
         if claim:                                                                          # COV-5
@@ -2823,8 +2864,23 @@ class AnalyzerAgent(ba.AgentCore):
             if ev is None or not norm_text(q.text) or norm_text(q.text) not in norm_text(ev.text):
                 reasons.append(f"the quote of {q.evidence_id} does not occur word for word in that evidence")
         local = setup_locals(planned.setup)
+        recipe = uc.object_recipe(fn, layout)                         # the object of a member function [A2-21ae]
+        if recipe is not None:
+            local |= setup_locals(recipe[0]) | {"ut_obj"} | {f"ut_dep{i}" for i in range(8)}
         if len(planned.setup) > 15:
             reasons.append("setup has more than 15 statements")
+        sut_names = {f.name.split("::")[-1] for f in layout.functions}
+        for stmt in planned.calls_before[:12]:                                     # BP-2 call_sequence
+            if PLAN_FORBIDDEN.search(stmt):
+                reasons.append(f"setup statement not allowed: {stmt[:60]}")
+            elif not any(re.search(r"\b" + re.escape(n) + r"\s*\(", stmt) for n in sut_names):
+                reasons.append(f"an earlier call is not a call of the SUT: {stmt[:60]} [BP-2]")
+            else:
+                missing = self._calls_known(stmt, known | local)
+                if missing:
+                    reasons.append(f"setup calls functions that do not exist here: {', '.join(missing[:4])}")
+        if len(planned.calls_before) > 12:
+            reasons.append("more than 12 earlier calls")
         for stmt in planned.setup:                                                         # grounding
             if PLAN_FORBIDDEN.search(stmt):
                 reasons.append(f"setup statement not allowed: {stmt[:60]}")
@@ -2885,8 +2941,9 @@ class AnalyzerAgent(ba.AgentCore):
             reasons.append("targets gaps proven infeasible [A1-37]: " + ", ".join(proven[:3]))
         if not re.fullmatch(r"test_[A-Za-z0-9]+(?:_[A-Za-z0-9]+){1,}", planned.name or ""):
             planned.name = ""                                     # Agent2 names it [A2-21q]
-        if reasons:
+        if reasons and not uc.only_predictions(reasons):         # a guard refused it [NC-6]
             return None, reasons
+        trial = list(reasons)                                     # only predictions: the tool decides [NC-7]
         cited = [evidence[e] for e in planned.evidence_ids if e in evidence]
         strong = [e for e in cited if e.evidence_class != "E8"]
         normative = planned.classification == "confirmed_gap" and bool(strong) and \
@@ -2930,7 +2987,10 @@ class AnalyzerAgent(ba.AgentCore):
             if normative else "E8", characterization=not normative, checked=True,
             classification="confirmed_gap" if normative else (
                 planned.classification if planned.classification != "confirmed_gap" else "characterization_gap"),
-            expected="as stated by the evidence" if normative else "observe it", linked=linked and normative)
+            expected="as stated by the evidence" if normative else "observe it", linked=linked and normative,
+            calls_before=[s.strip() if s.strip().endswith((";", "}")) else s.strip() + ";"
+                          for s in planned.calls_before if s.strip()],                         # BP-2
+            trial=trial)                                                                       # NC-7
         return scenario, notes
 
     @staticmethod
@@ -2998,11 +3058,14 @@ class AnalyzerAgent(ba.AgentCore):
         return out
 
     def _facts(self, fn: uc.FunctionInfo, gaps: list[uc.GapItem], open_ids: set[str], layout: uc.LayoutProfile,
-               req: uc.PlanRequest, sut_text: str, stubs: list[uc.StubSpec], evidence: list[uc.EvidenceRef]) -> list[ba.ContextPart]:
-        """A1-PL2 (facts first) and A1-PL12 (what was tried)."""
+               req: uc.PlanRequest, sut_text: str, stubs: list[uc.StubSpec], evidence: list[uc.EvidenceRef],
+               profile: uc.BrainProfile | None = None, sequence: set[str] | frozenset = frozenset()
+               ) -> list[ba.ContextPart]:
+        """A1-PL2 (facts first) and A1-PL12 (what was tried). ``profile``: the answering brain's limits (BP-5);
+        ``sequence``: gaps whose next attempt is a call sequence (BP-2, BP-3)."""
         lines = sut_text.splitlines()
         root = Path(layout.repo_root)
-        source = "\n".join(f"{n:4d}| {lines[n - 1]}" for n in range(fn.line_start, min(fn.line_end, len(lines)) + 1))
+        source = self._source_for_brain(fn, lines, [g.line for g in gaps], profile)              # LA-10, BP-5
         params = []
         suggested = self._suggested_values(fn, sut_text, stubs, self._constants_for_values(layout))   # A1-PL2
         for p in text_params(fn):
@@ -3039,6 +3102,15 @@ class AnalyzerAgent(ba.AgentCore):
                         if s.function + "()" in suggested else "") for s in called]
         var_rows = [f"- {s.function}: {s.var_type}" for s in stubs if s.kind == "variable" and not s.is_const]
         real = [d.name for d in (layout.dependencies.entries if layout.dependencies else []) if d.decision != "stub"]
+        # A1-PL2: what a test can set besides the stubs - globals the headers declare, the SUT's state setters
+        stubbed_vars = {s.function for s in stubs if s.kind == "variable"}
+        globals_ = sorted({m.group(2) for m in re.finditer(
+            r"^\s*extern\s+(?!.*\bconst\b)([^;()]*?)\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;",
+            "\n".join(self._dependency_headers_text(layout)), re.M)} - stubbed_vars)
+        setters = [f"ut_state_set_{re.sub(chr(92) + 'W', '_', v.name)}(value) sets {v.name} ({v.type})"
+                   for v in layout.sut_state][:12]
+        outside = sorted({g.line for g in gaps if g.line and not fn.line_start <= g.line <= fn.line_end})
+        callees = [f for f in layout.functions if f is not fn and any(f.line_start <= n <= f.line_end for n in outside)]
         ev_rows = [f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
                    f"{e.source}:{e.line}: {e.text[:400]}" for e in evidence]
         # A1-PL7/A1-PL12: the earlier tests of this function and what each reached
@@ -3069,16 +3141,36 @@ class AnalyzerAgent(ba.AgentCore):
             f"LANGUAGE: {'C++' if layout.language == 'cpp' else 'C'}",
             f"FUNCTION {fn.qualified_name} ({layout.sut_file}){' - static, called through a wrapper' if fn.is_static else ''}"
             f"{' - class member' if fn.member else ''}:\n{source}",
+            *([f"OBJECT: {uc.call_form(fn, layout)}"] if uc.call_form(fn, layout) else []),            # A2-21ae
+            *([f"STATE: {fn.qualified_name} {uc.keeps_state(fn, layout)}: a behaviour may need several calls in a row "
+               "- put the earlier calls in setup"] if uc.keeps_state(fn, layout) else []),      # A1-PL2, A1-PL3
+            *[f"REACHED THROUGH THIS FUNCTION: {c.qualified_name} (no test can call it) holds open gaps; reach them "
+              f"by calling {fn.qualified_name}:\n{self._source_for_brain(c, lines, outside, profile)}"
+              for c in callees[:2]],
             "PARAMETERS:\n" + ("\n".join(params) or "- none"),
             f"RETURNS: {return_type_of(fn) or 'void'}",
             "OPEN GAPS:\n" + "\n".join(gap_rows),
             "STUBS (controllable return values):\n" + ("\n".join(stub_rows) or "- none"),
             "STUB VARIABLES:\n" + ("\n".join(var_rows) or "- none"),
-            "REAL OR SYSTEM DEPENDENCIES (not controllable): " + (", ".join(real[:20]) or "none"),
+            "REAL OR SYSTEM DEPENDENCIES (their real code runs; they have no ut_stub_ control - control them through "
+            "what they read, such as the GLOBALS below): " + (", ".join(real[:20]) or "none"),
+            "GLOBALS a test can set directly: " + (", ".join(globals_[:20]) or "none"),
+            "SUT STATE SETTERS:\n" + ("\n".join(f"- {x}" for x in setters) or "- none"),
         ]
         # ARCH-17: facts stay whole; evidence, earlier tests and the style give way in that order
         # (reverse) when the call does not fit the brain's window.
+        journal = req.journal.get(fn.qualified_name) or req.journal.get(fn.name, "")
+        if profile is not None and journal:
+            journal = journal[: profile.journal_tokens * 3]                                    # BP-5, LA-4
+        if sequence:                                                                         # BP-2, BP-3
+            facts.append(f"CALL SEQUENCE: the gaps {', '.join(sorted(sequence)[:6])} need state that only earlier calls "
+                         "build up (see JOURNAL). For them give calls_before: the earlier calls, in order, each one "
+                         "statement" + (" on the same object ut_obj" if fn.member else "") + "; then the call of args.")
         return [uc.part("facts", "\n\n".join(facts)),
+                *([uc.part("journal", "JOURNAL (why earlier attempts missed; plan so that the cause is removed) "
+                           "[LA-4]:\n" + journal)] if journal else []),
+                *([uc.part("lessons", "LESSONS (verified fixes of the same causes) [LA-8]:\n"
+                           + "\n".join(f"- {x}" for x in req.lessons[:4]), uc.P_EXAMPLES)] if req.lessons else []),
                 uc.part("evidence", "EVIDENCE:\n" + ("\n".join(ev_rows) or
                                                      "- none: every scenario is characterization_gap"), uc.P_EVIDENCE),
                 uc.part("tried", "TRIED (earlier tests of this function and the items each reached):\n"
@@ -3089,6 +3181,43 @@ class AnalyzerAgent(ba.AgentCore):
                         uc.P_TRIED),
                 uc.part("style", "EXISTING TEST STYLE:\n" + ("\n---\n".join(style) or f"- {layout.framework}"),
                         uc.P_EXAMPLES)]
+
+    def _source_for_brain(self, fn: uc.FunctionInfo, lines: list[str], focus: list[int],
+                          profile: uc.BrainProfile | None = None) -> str:
+        """The function's source with line numbers; for a long function only the lines around its open items,
+        with the function's first lines (LA-10). What is long follows the answering brain's profile: a line limit,
+        or - in a profile without one - only a function that does not fit its window (BP-5)."""
+        end = min(fn.line_end, len(lines))
+        rows = range(fn.line_start, end + 1)
+        count = end - fn.line_start + 1
+        if profile is None:
+            long = count > self.cfg.long_function_lines
+        else:
+            long = not profile.short_function(count, sum(len(lines[n - 1]) + 7 for n in rows))
+        if long and focus:
+            keep = set(range(fn.line_start, fn.line_start + 3))
+            for n in focus:
+                keep |= set(range(max(fn.line_start, n - 6), min(end, n + 3) + 1))
+                for k in range(n - 1, fn.line_start, -1):          # the decisions that enclose the item
+                    if re.search(r"\b(if|else|for|while|switch|case)\b", lines[k - 1]) and block_end(lines, k) >= n:
+                        keep.add(k)
+            out, last = [], 0
+            for n in sorted(k for k in keep if fn.line_start <= k <= end):
+                if last and n > last + 1:
+                    out.append("   ...")
+                out.append(f"{n:4d}| {lines[n - 1]}")
+                last = n
+            return "\n".join(out)
+        return "\n".join(f"{n:4d}| {lines[n - 1]}" for n in rows)
+
+    def _dependency_headers_text(self, layout: uc.LayoutProfile) -> list[str]:
+        root = Path(layout.repo_root)
+        out = []
+        for rel in list(dict.fromkeys(layout.headers + (layout.dependencies.headers if layout.dependencies else []))):
+            path = root / rel
+            if path.is_file():
+                out.append(strip_comments(path.read_text(encoding="utf-8", errors="replace")))
+        return out
 
     def _lookup(self, fn: uc.FunctionInfo, layout: uc.LayoutProfile, sought: list[str],
                 evidence: list[uc.EvidenceRef], lookups: list[str], budget: int) -> list[uc.EvidenceRef]:
@@ -3156,24 +3285,47 @@ class AnalyzerAgent(ba.AgentCore):
             return []                                                        # nothing to plan [ARCH-16]
         limit = self.cfg.max_brain_calls_per_function
         available, family = await self._available_brains()
+        third = open_ids & set(req.other_model_items)          # LA-5: a third attempt only by another model
+        if third:
+            used = {family.get(b, b) for b in req.avoid_brains}
+            others = [b for b in available if family.get(b, b) not in used]
+            if not others or third != open_ids:
+                open_ids = open_ids - third
+                gaps = [g for g in gaps if g.gap_id not in third]
+                if not open_ids:
+                    plan_notes["planning"].append(f"{fn.name}: no brain of another model for a third attempt at "
+                                                  f"{', '.join(sorted(third)[:4])} [LA-5]")
+                    return []
+        tried_before = set(req.tried_scenarios)                # A1-PL4 g, LA-4
+        profile = await uc.answering_profile(self, "A1.plan")                                  # BP-5
+        book: uc.ProfileBook = getattr(self, "profiles", None) or uc.ProfileBook()
+        sequence = {g for g in open_ids if req.item_kinds.get(g) == "call_sequence"}           # BP-2, BP-3
+        seq_brains = await uc.brains_for(self, "call_sequence", "A1.plan") if sequence else []
+        if sequence and not seq_brains:
+            plan_notes["planning"].append(f"{fn.name}: {', '.join(sorted(sequence)[:4])} need a call sequence, which no "
+                                          "available brain's profile allows; planned as a scenario [BP-3, BP-9]")
+            sequence = set()
 
         def next_brains() -> list[str] | None:
             """COV-6: the next available brain of another model in the brain order; none left - the same brains
             again with the facts of what was tried. A1-PL8: a model whose scenarios all failed the check is not
             asked again - neither on another server (the remote Qwen and the one in Ollama are one model) [ARCH-19]."""
-            if not (req.avoid_brains or tried):
+            if not (req.avoid_brains or tried or third):
                 return None
             failed = {family.get(b, b) for b in tried}
             avoid = {family.get(b, b) for b in req.avoid_brains}
             pool = [b for b in available if family.get(b, b) not in failed]
+            if third and third == open_ids:                       # LA-5: never the same model a third time
+                return [b for b in pool if family.get(b, b) not in avoid]
             return [b for b in pool if family.get(b, b) not in avoid] or pool
         while calls < limit:
             calls += 1
-            context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence)
+            context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence, profile, sequence)
             if extra:
                 context.insert(1, uc.part("re-ask", extra.strip()))
             covered = {g for s in accepted for g in s.gap_ids}
-            need = ba.OutputNeed(items=min(self.cfg.max_brain_scenarios, max(len(open_ids - covered), 1)),
+            need = ba.OutputNeed(items=min(self.cfg.max_brain_scenarios, max(profile.scenarios_per_call, 1),
+                                           max(len(open_ids - covered), 1)),                 # ARCH-11a, BP-5
                                  tokens_per_item=self.cfg.tokens_per_scenario, overhead=100)
             # as many scenarios as the answer limit was planned for, not the configured maximum [ARCH-11a]
             task = PLAN_TASK.format(fn=fn.qualified_name, limit=need.items)
@@ -3181,6 +3333,8 @@ class AnalyzerAgent(ba.AgentCore):
                 allowed = next_brains()                                            # COV-6, A1-PL8: the next brain
                 if allowed is not None and not allowed:
                     raise ba.AgentFault("NO_BRAIN_AVAILABLE", "every allowed brain was tried")
+                if sequence:                                   # BP-3: only a brain whose profile allows it [BP-2]
+                    allowed = [b for b in (allowed if allowed is not None else seq_brains) if b in seq_brains] or allowed
                 answer = await self.generate(task, context, PlannedScenarios, need=need, step="A1.plan",
                                              project=layout.repo_root, allowed=allowed, vary=calls > 1)  # ARCH-20
             except ba.AgentFault as exc:
@@ -3194,6 +3348,9 @@ class AnalyzerAgent(ba.AgentCore):
             used = self.brain_of_call()                             # this call's brain, not another's [ARCH-18]
             brain = f"brain:{used.get('brain', '')}/{used.get('model_id', '')}"
             ev_map = {e.evidence_id: e for e in evidence}
+            if not book.allows(used.get("brain", ""), "call_sequence"):      # BP-3: never taken from a brain whose
+                for planned in answer.scenarios:                            # profile does not allow the kind
+                    planned.calls_before = []
             problems, sought = [], []
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
                 if planned.name in req.failed_tests:                         # A1-PL8: not again unchanged
@@ -3210,6 +3367,21 @@ class AnalyzerAgent(ba.AgentCore):
                 if scenario is None:
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k, reasons=reasons)
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): " + "; ".join(reasons))
+                    continue
+                if scenario.trial:                         # refused only by predictions: the tool decides [NC-7]
+                    self.log_answer("A1.plan", "trial", function=fn.name, scenario=k, reasons=scenario.trial)
+                    plan_notes["planning"].append(f"{fn.name}: scenario {k} refused only by predictions "
+                                                  f"({'; '.join(scenario.trial)[:200]}); built in a trial [NC-6, NC-7]")
+                    reasons = []
+                kinds = [req.item_kinds.get(g, "") for g in scenario.gap_ids]
+                wider = [k2 for k2 in uc.KIND_LADDER if k2 in kinds and k2 in ("setup", "stub", "test", "suite_part")]
+                scenario.kind = wider[-1] if wider else ("call_sequence" if scenario.calls_before else "scenario")
+                if uc.scenario_signature(scenario) in tried_before:           # A1-PL4 g, LA-4
+                    self.log_answer("A1.plan", "refused", function=fn.name, scenario=k,
+                                    reasons=["the same scenario was tried in an earlier iteration"])
+                    problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): the same inputs and "
+                                    "set-up were tried in an earlier iteration and did not reach the items (see "
+                                    "JOURNAL): plan different values, set-up or a sequence of calls")
                     continue
                 scenario.made_by = brain
                 scenario.required_conditions = [c for g in gaps if g.gap_id in scenario.gap_ids
@@ -3487,26 +3659,38 @@ class AnalyzerAgent(ba.AgentCore):
         real = {d.name: d for d in (layout.dependencies.entries if layout.dependencies else []) if d.decision == "real"}
         lines = sut_text.splitlines()
         active_by_fn: dict[str, list[uc.GapItem]] = {}
+        final = set(req.final_items)
+        through = {}                          # A2-21ae: a member no test can name is planned through its caller
         for fn in layout.functions:
-            fn_gaps = [g for g in gaps if g.function in (fn.name, fn.qualified_name) and g.gap_id not in by_fuzz
+            if uc.internal_member(fn, layout):
+                caller = next((c for c in uc.callers_of(fn, layout) if not uc.internal_member(c, layout)), None)
+                if caller is not None:
+                    through[fn.qualified_name] = caller
+        planned_fns = [f for f in layout.functions if f.qualified_name not in through]
+        for fn in planned_fns:
+            own = {fn.name, fn.qualified_name} | {q for q, c in through.items() if c is fn} | {
+                f.name for f in layout.functions if f.qualified_name in through and through[f.qualified_name] is fn}
+            fn_gaps = [g for g in gaps if g.function in own and g.gap_id not in by_fuzz and g.gap_id not in final
                        and "infeasible" not in g.detail and "unreachable_code" not in g.detail]
             if not fn_gaps:
                 continue
             evidence = [e for e in self.collect_evidence(layout, fn.name).evidence if uc.evidence_key(e) not in disputed]
             strongest = min((r.evidence_class for r in evidence), default="E8")
             active, given_up = [], []
+            third = set(req.other_model_items)                  # LA-5: a third attempt only by another model
             for g in fn_gaps:
                 g.attempts = req.attempts.get(g.gap_id, 0)
-                (given_up if g.attempts >= 2 * self.cfg.max_attempts_per_gap else active).append(g)
+                limit = self.cfg.max_attempts_per_gap + (1 if g.gap_id in third else 0)
+                (given_up if g.attempts >= limit else active).append(g)
             for g in given_up:
-                open_items.append(f"{g.gap_id}: still uncovered after {g.attempts} attempts [A1-36]")
+                open_items.append(f"{g.gap_id}: still uncovered after {g.attempts} attempts [A1-36, LA-5]")
             for g in fn_gaps:
                 text = lines[g.line - 1] if 0 < g.line <= len(lines) else ""
                 for name in [n for n in real if re.search(r"\b" + re.escape(n) + r"\s*\(", text)]:
                     if g.attempts >= self.cfg.max_attempts_per_gap:
                         open_items.append(f"{g.gap_id}: needs control of the real dependency {name} [A1-DA12]")
             active_by_fn[fn.name] = active
-            for group in self._group(active)[: self.cfg.max_scenarios_per_function]:
+            for group in self._group(active, sut_text)[: self.cfg.max_scenarios_per_function]:     # LA-10
                 lead = group[0]
                 reach = enclosing_conditions(sut_text, fn, lead.line)
                 hints = [f"set ut_stub_{uc.stub_base(s)}_return to control {s.qualified_name or s.function}()"
@@ -3890,13 +4074,20 @@ class AnalyzerAgent(ba.AgentCore):
         return gaps
 
     @staticmethod
-    def _group(gaps: list[uc.GapItem]) -> list[list[uc.GapItem]]:
-        """One scenario per decision/line, outer (earlier) lines first [plan section 3.3]."""
+    def _group(gaps: list[uc.GapItem], sut_text: str = "") -> list[list[uc.GapItem]]:
+        """One scenario per decision/line; the groups whose decision guards the most other open items first, then
+        outer (earlier) lines [LA-10, plan section 3.3]."""
         groups: dict[tuple[int, str], list[uc.GapItem]] = {}
         for g in sorted(gaps, key=lambda g: (g.line, g.metric)):
             key = (g.line, "LC" if g.metric in ("LC", "SC") else "DEC")
             groups.setdefault(key, []).append(g)
-        return list(groups.values())
+        lines = sut_text.splitlines()
+        open_lines = sorted({g.line for g in gaps})
+
+        def guarded(line: int) -> int:
+            end = block_end(lines, line)
+            return sum(1 for n in open_lines if line < n <= end)
+        return sorted(groups.values(), key=lambda grp: (-guarded(grp[0].line), grp[0].line))
 
     @staticmethod
     def _describe(fn: uc.FunctionInfo, group: list[uc.GapItem], sut_text: str) -> str:
@@ -3916,6 +4107,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Analyz
     agent = AnalyzerAgent(settings, config=AnalyzerConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
     agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
+    uc.apply_profiles(agent, config_path)                         # BP-1, BP-3, BP-6
     return agent
 
 

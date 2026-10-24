@@ -1,0 +1,44 @@
+{
+  "construct": "C++ header-only SUT",
+  "sut": "include/clamp.hpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:clamp_to:4"
+        ],
+        "name": "test_clamp_to_below",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "v",
+            "value": "-5"
+          },
+          {
+            "name": "lo",
+            "value": "0"
+          },
+          {
+            "name": "hi",
+            "value": "10"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

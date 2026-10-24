@@ -12,7 +12,8 @@ UnitTest/
 │   ├── BaseAgent/              baseagent.py, baseagent.bat – the base framework
 │   └── UnitTestGenerator/      the derived agents, orchestrator, setup, ut_config.json,
 │                               knowledge packs, unittest_generator.bat / .sh
-├── Test/                       test_unittest_generator.py, test_baseagent.py, pilots/
+├── Test/                       test_unittest_generator.py, test_baseagent.py, pilots/,
+│                               constructs/ (one small example per C/C++ construct)
 ├── Docs/                       requirements, ORCHESTRATION.md, BaseAgent_CHANGES.md
 ├── .github/                    skills (ut-agent-builder, agent-live-viewer), Copilot instructions
 └── Patents/                    kept on your computer only – not in Git
@@ -74,7 +75,9 @@ Run without a command, the `.bat` shows a menu.
 | `pilot-embedded`, `pilot-embedded-cpp` | the full pipeline on the embedded pilots: registers, register polling, a superloop, interrupt flags, target keywords and assembly; an injected interface, exceptions, a static object in a function and a header-only template |
 | `pilot-realrepo` | the full pipeline on patterns found in real repositories: a header that needs its configuration header first, `T * const` parameters, a header next to the source only, `_Atomic` and callback fields, a handle whose `Instance` points to registers, C++ namespaces |
 | `pilot-all` | every pilot folder, every production file Agent1 selects (23 files, the header-only template of the embedded C++ pilot included), each pilot on a fresh copy; one summary at the end (`ut_output/pilots/pilot_all_summary.txt`) |
+| `--interactive` (with `run` or a `pilot-...`) | ask at a decision point when items need a source change or a requirement; the menu always does, other runs never ask and put the question into the report [LA-9] |
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
+| `calibrate BRAIN` | runs the construct corpus (`Test/constructs`) with one real brain, e.g. `sonnet` or `qwen_remote`, and writes which answer kinds it passes and a profile proposal to `ut_output/calibration/BRAIN.md` (BP-8); your configuration is never changed |
 | `run REPO [SUT\|all] [--branch NAME] [--requirements FILE_OR_FOLDER]` | a git repository link or a folder, and the source file to test; without a file (or `all`) every production file of the commit is selected and tested (ORC-35); `--requirements` adds the project's requirement documents - ReqIF, Markdown, text or CSV - for the run (A1-RQ1) |
 | `view RUN_FOLDER` | replay an earlier run in the viewer |
 | `baseagent-test` | the BaseAgent tests (Windows and Linux); results in `test_results_baseagent.txt` |
@@ -86,6 +89,14 @@ BaseAgent on its own: `Source\BaseAgent\baseagent.bat test`, `start` or `check`;
 Results of a run go to `Source/UnitTestGenerator/ut_output/`.
 
 Embedded code runs on the host: target registers are mapped in host memory, target compiler keywords get host definitions and target assembly is replaced in the run's copy of the source (never in your files); the report lists all of it under "Target code on the host". When the target is 32-bit and the build was not captured from its cross-compiler, set `compilation.target_data_model` to `ILP32` in `ut_config.json`, so the report names the functions whose `long` arithmetic differs on the host.
+
+What each brain may write is its profile, in the `profiles` section of `ut_config.json`: the Claude models get the
+profile `full` (they may also write call sequences, objects, fakes and tests with shared set-up), Qwen3 8B gets
+`minimum` (scenarios, values, tests, repairs and decisions, as before). A model of your own without an entry gets
+`minimum`; `calibrate` measures what it can do. Whatever a brain writes passes the same checks and Agent3's
+measurement. Items the pipeline itself could not handle - with every answer kind the available brains may give - are
+listed first in the report and collected across runs in `ut_output/pipeline_findings.jsonl`; send that file with a
+report when a new kind of code ends incomplete.
 
 With a Claude model, the brain is asked about several functions at the same time (`brain.anthropic.parallel_calls` in `ut_config.json`, default 4; match it to your API quota); with Qwen one at a time. The results are combined in a fixed order, so the same input gives the same tests.
 

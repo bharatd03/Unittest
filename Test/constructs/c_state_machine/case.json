@@ -1,0 +1,39 @@
+{
+  "construct": "C state machine: an item needs several calls in a row",
+  "sut": "src/door.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:door_step:9"
+        ],
+        "name": "test_door_step_close_after_open",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "event",
+            "value": "1"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": "",
+        "calls_before": [
+          "door_step(0);"
+        ]
+      }
+    ]
+  }
+}

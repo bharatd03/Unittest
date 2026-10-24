@@ -1,0 +1,33 @@
+{
+  "construct": "C function calling a real dependency that reads a global variable",
+  "sut": "src/fan.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:fan_needed:5"
+        ],
+        "name": "test_fan_needed_hot",
+        "purpose": "reach the item",
+        "args": [],
+        "setup": [
+          "g_temp_raw = 500;"
+        ],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "construct": "C variadic function",
+  "sut": "src/sum.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "tests": [
+      {
+        "name": "test_sum_n_limits_large_sums",
+        "scenario_ids": [],
+        "purpose": "reach the item",
+        "evidence_ids": [],
+        "body": "UT_OBSERVE_INT(\"test_sum_n_limits_large_sums_1\", sum_n(2, 900, 500));",
+        "evidence_class": "E8"
+      }
+    ]
+  }
+}

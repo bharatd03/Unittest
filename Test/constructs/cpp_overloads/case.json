@@ -1,0 +1,10 @@
+{
+  "construct": "C++ overloaded functions",
+  "sut": "src/scale.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

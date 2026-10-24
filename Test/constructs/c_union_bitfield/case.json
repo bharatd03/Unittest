@@ -1,0 +1,10 @@
+{
+  "construct": "C union and bit-fields",
+  "sut": "src/status.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

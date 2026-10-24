@@ -303,6 +303,84 @@ def check_toolchain(tc: dict, work: Path) -> dict:
     return features
 
 
+# ============================================================================ platform facts [NC-10]
+PROBE_HEAD = r"""#include <stdio.h>
+#include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#define UT_QUIET() (SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX), \
+                    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT))
+#else
+#define UT_QUIET() ((void)0)
+#endif
+"""
+PROBES_C = {
+    "normal": "int main(void) { UT_QUIET(); puts(\"UT_PROBE normal\"); return 0; }",
+    "crash": "int main(void) { volatile int *p = 0; UT_QUIET(); *p = 1; return 0; }",
+    "abort": "int main(void) { UT_QUIET(); abort(); }",
+    "stack_overflow": "static int deep(volatile int n) { volatile char b[4096]; b[0] = (char)n; "
+                      "return deep(n + 1) + b[0]; }\nint main(void) { UT_QUIET(); return deep(0); }",
+    # the harness's own end by its watchdog: the marker, then exit(4) [A3-45d]
+    "watchdog": "int main(void) { UT_QUIET(); printf(\"UT_WATCHDOG|probe\\n\"); fflush(stdout); exit(4); }",
+}
+PROBE_CPP = "int main() { UT_QUIET(); throw 1; }"
+
+
+def measure_platform(tc: dict, work: Path) -> dict:
+    """NC-10: how this platform and toolchain behave, measured with small probe programs: the exit status of a normal
+    end, a crash, an abort, an uncaught C++ exception, a stack overflow and the watchdog's end; the register page unit;
+    whether the file system tells upper from lower case; how the compiler prints a path; the program suffix and the
+    line endings. Never fails the setup: what cannot be measured keeps the host's value."""
+    import mmap
+    env = tc.get("env") or {}
+    if tc.get("path"):
+        env = {**env, "PATH": os.pathsep.join(tc["path"] + [env.get("PATH", os.environ.get("PATH", ""))])}
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)       # no crash dialog for the probes
+        except (AttributeError, OSError):
+            pass
+    work.mkdir(parents=True, exist_ok=True)
+    facts: dict = {"os": OS_KEY if sys.platform != "darwin" else "darwin", "exe_suffix": EXE,
+                   "line_ending": "\r\n" if IS_WINDOWS else "\n", "outcomes": {},
+                   "page_bytes": int(getattr(mmap, "ALLOCATIONGRANULARITY", 4096) or 4096),
+                   "watchdog_marker": "UT_WATCHDOG", "watchdog_exit": 4}
+    for kind, body in [*PROBES_C.items(), ("exception", PROBE_CPP)]:
+        cpp = kind == "exception"
+        src = work / f"probe_{kind}.{'cpp' if cpp else 'c'}"
+        src.write_text(PROBE_HEAD + body + "\n", encoding="utf-8")
+        exe = work / f"probe_{kind}{EXE}"
+        compiler = tc["cxx"] if cpp else tc["cc"]
+        flags = [*tc.get("cxx_flags", [])] if cpp else []
+        link = [*tc.get("link_flags", []), *(tc.get("cxx_link_flags", []) if cpp else [])]
+        code, out = run([compiler, *flags, "-O0", src.name, "-o", exe.name, *link], work, env, 120)
+        if code != 0:
+            continue
+        code, out = run([str(exe)], work, env, 20)
+        if code == -9:
+            continue
+        if kind == "watchdog":
+            facts["watchdog_exit"] = code
+            if "UT_WATCHDOG|probe" not in out:
+                facts["watchdog_marker"] = ""
+            continue
+        facts["outcomes"].setdefault(kind, [])
+        if code not in facts["outcomes"][kind]:
+            facts["outcomes"][kind].append(code)
+    probe = work / "CaseProbe.txt"
+    probe.write_text("x", encoding="utf-8")
+    facts["case_sensitive"] = not (work / "caseprobe.txt").exists()
+    (work / "sub").mkdir(exist_ok=True)
+    (work / "sub" / "err.c").write_text("int f(void) { return undeclared_name; }\n", encoding="utf-8")
+    code, out = run([tc["cc"], "-fsyntax-only", "sub/err.c"], work, env, 60)
+    printed = re.search(r"^(.*?err\.c):\d+", out, re.M)
+    facts["path_separator"] = "\\" if printed and "\\" in printed.group(1) else "/"
+    facts["paths_absolute"] = bool(printed and re.match(r"^([A-Za-z]:)?[\\/]", printed.group(1)))
+    facts["measured"] = _dt.date.today().isoformat()
+    return facts
+
+
 def missing_headers(message: str) -> list[str]:
     return re.findall(r"'([\w./+-]+)' file not found", message)
 
@@ -380,6 +458,7 @@ class Setup:
             self.manifest["toolchain"] = old
             log(f"Compiler    : {old['kind']} {old['version']} ({old['origin']}), checked "
                 f"{old.get('checked', '')[:10]}")
+            self.platform(old, self.old.get("platform"))
             return
         candidates = self._installed_toolchains() + (self._existing_toolchains() if self.prefer_existing else [])
         problems: list[str] = []
@@ -396,6 +475,21 @@ class Setup:
         tc = self._install_toolchain()
         if not self._try(tc, problems):
             raise SetupFailed("the installed toolchain failed its check: " + problems[-1][:800])
+
+    def platform(self, tc: dict, old: dict | None) -> None:
+        """NC-10: the platform facts, measured again whenever the toolchain is checked again (TP-11)."""
+        if old and old.get("measured"):
+            self.manifest["platform"] = old
+            return
+        with tempfile.TemporaryDirectory(prefix="ut_probe_", ignore_cleanup_errors=True) as tmp:
+            try:
+                facts = measure_platform(tc, Path(tmp))
+            except (Blocked, OSError, KeyError) as exc:
+                self.manifest["notes"].append(f"platform facts not measured: {exc}"[:200])
+                return
+        self.manifest["platform"] = facts
+        log(f"Platform    : {facts['os']}, file names {'with' if facts['case_sensitive'] else 'without'} letter case, "
+            f"register page {facts['page_bytes']} bytes, crash exit {facts['outcomes'].get('crash', ['?'])}")
 
     def _fingerprint(self, tc: dict) -> str:
         return file_fingerprint([tc.get("cc", ""), tc.get("cxx", ""), tc.get("profdata", ""), tc.get("cov", "")])
@@ -422,6 +516,7 @@ class Setup:
         tc.update(version=version, target=target.strip(), checked=_dt.date.today().isoformat(), **features)
         tc["fingerprint"] = self._fingerprint(tc)
         self.manifest["toolchain"] = tc
+        self.platform(tc, None)                                                             # NC-10
         extras = ", ".join(k for k in ("fuzzer", "analyzer") if features.get(k)) or "no fuzzer/analyzer"
         log(f"Compiler    : {tc['kind']} {version} ({tc['origin']}) - C, C++, MC/DC, {extras}")
         for k in ("fuzzer", "analyzer"):

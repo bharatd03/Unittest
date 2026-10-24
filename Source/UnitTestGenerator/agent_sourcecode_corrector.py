@@ -376,8 +376,8 @@ class CorrectorAgent(ba.AgentCore):
                         "original_fragment")
             for q in s.quotes:
                 ev = known.get(q.evidence_id)
-                if ev is None or not q.text.strip() or " ".join(q.text.split()) not in " ".join(ev.text.split()):
-                    return f"the quote of {q.evidence_id} does not occur word for word"
+                if ev is None or not uc.norm_quote(q.text) or uc.norm_quote(q.text) not in uc.norm_quote(ev.text):
+                    return f"the quote of {q.evidence_id} does not occur word for word"           # COV-12
             return ""
 
         need = ba.OutputNeed(items=limit, tokens_per_item=self.cfg.tokens_per_candidate + 200, overhead=100)
@@ -548,6 +548,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Correc
         section = json.loads(Path(config_path).read_text(encoding="utf-8")).get("corrector", {})
     agent = CorrectorAgent(settings, config=CorrectorConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
+    uc.apply_profiles(agent, config_path)                         # BP-1, BP-3
     return agent
 
 

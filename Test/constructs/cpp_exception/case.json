@@ -1,0 +1,21 @@
+{
+  "construct": "C++ function that throws",
+  "sut": "src/checked.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "tests": [
+      {
+        "name": "test_checked_div_by_zero_throws",
+        "scenario_ids": [],
+        "purpose": "reach the item",
+        "evidence_ids": [],
+        "body": "UT_OBSERVE_THROW(\"test_checked_div_by_zero_throws_1\", checked_div(1, 0));",
+        "evidence_class": "E8"
+      }
+    ]
+  }
+}

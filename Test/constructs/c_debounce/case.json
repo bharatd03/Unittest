@@ -1,0 +1,40 @@
+{
+  "construct": "C debounce: a state change after three equal samples",
+  "sut": "src/button.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:button_sample:15"
+        ],
+        "name": "test_button_sample_third_press",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "input",
+            "value": "1"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": "",
+        "calls_before": [
+          "button_sample(1);",
+          "button_sample(1);"
+        ]
+      }
+    ]
+  }
+}

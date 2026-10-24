@@ -29,7 +29,7 @@ import ut_contracts as uc
 from ut_contracts import ba
 
 LOG = ba.logging.getLogger("ut.kb")
-KIND_RANK = {"positive": 2, "gap_closure": 1, "negative": 0}
+KIND_RANK = {"lesson": 3, "positive": 2, "gap_closure": 1, "negative": 0}
 
 
 class KBConfig(BaseModel):
@@ -74,6 +74,10 @@ class KnowledgeBaseAgent(ba.AgentCore):
             example_id TEXT PRIMARY KEY, kind TEXT NOT NULL, language TEXT NOT NULL, framework TEXT NOT NULL,
             category TEXT NOT NULL, snippet TEXT NOT NULL, reason TEXT NOT NULL, uses INTEGER NOT NULL,
             created REAL NOT NULL, verification TEXT NOT NULL)""")
+        try:                                                     # LA-8, KB-22: the construct a lesson applies to
+            self.db.execute("ALTER TABLE examples ADD COLUMN pattern TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass                                                 # the column exists already
         self.db.commit()
 
     async def close(self) -> None:
@@ -93,6 +97,13 @@ class KnowledgeBaseAgent(ba.AgentCore):
                 if not (v.get("gap_covered") is True and v.get("tests") == "passed" and v.get("regression") is False):
                     raise ba.ContractRejected("a gap-closure example needs gap_covered=true, tests=passed and "
                                               "regression=false from Agent3 [KB-5a]")
+            elif event.kind == "lesson":
+                # KB-22, LA-8: a lesson only after Agent3 verified the fix
+                if not (v.get("verified") is True and v.get("gap_covered") is True and v.get("tests") == "passed"):
+                    raise ba.ContractRejected("a lesson needs verified=true, gap_covered=true and tests=passed from "
+                                              "Agent3 [KB-22]")
+                if not event.reason.strip() or not event.pattern.strip():
+                    raise ba.ContractRejected("a lesson needs its root cause and its pattern [KB-22]")
             elif not event.reason.strip():
                 raise ba.ContractRejected("a negative example needs its failure reason [KB-7]")
             if not event.snippet.strip():
@@ -112,7 +123,8 @@ class KnowledgeBaseAgent(ba.AgentCore):
     # ---------------------------------------------------------------- learning
     def learn(self, event: uc.LearningEvent) -> uc.LearnAck:
         snippet = event.snippet[: self.cfg.max_snippet_chars]
-        key = "|".join([event.kind, event.language, event.framework, event.category, normalize(snippet)])
+        key = "|".join([event.kind, event.language, event.framework, event.category, normalize(snippet)]
+                       + ([event.pattern] if event.kind == "lesson" else []))
         example_id = "KB-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         try:
             with self._lock:
@@ -120,10 +132,13 @@ class KnowledgeBaseAgent(ba.AgentCore):
                 if row:                                                   # KB-9, KB-10
                     self.db.execute("UPDATE examples SET uses = uses + 1 WHERE example_id = ?", (example_id,))
                     self.db.commit()
-                    return uc.LearnAck(stored=True, example_id=example_id, duplicate=True)
-                self.db.execute("INSERT INTO examples VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    return uc.LearnAck(stored=True, example_id=example_id, duplicate=True,
+                                       reason=f"uses={row[0] + 1}")
+                self.db.execute("INSERT INTO examples (example_id, kind, language, framework, category, snippet, "
+                                "reason, uses, created, verification, pattern) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                                 (example_id, event.kind, event.language, event.framework, event.category, snippet,
-                                 event.reason, 1, time.time(), json.dumps(event.verification, sort_keys=True)))
+                                 event.reason, 1, time.time(), json.dumps(event.verification, sort_keys=True),
+                                 event.pattern))
                 self._evict(event.kind)
                 self.db.commit()
             return uc.LearnAck(stored=True, example_id=example_id)
@@ -135,6 +150,8 @@ class KnowledgeBaseAgent(ba.AgentCore):
         """Bounded working sets; the least valuable examples go first [KB-11, KB-12]."""
         if kind == "negative":
             kinds, limit = ("negative",), self.cfg.max_negative
+        elif kind == "lesson":
+            kinds, limit = ("lesson",), self.cfg.max_positive
         else:
             kinds, limit = ("positive", "gap_closure"), self.cfg.max_positive
         marks = ",".join("?" * len(kinds))
@@ -153,17 +170,25 @@ class KnowledgeBaseAgent(ba.AgentCore):
         category match, kind (verified complete first) and how often they were seen [KB-13, KB-14]."""
         with self._lock:
             rows = self.db.execute(
-                "SELECT example_id, kind, language, framework, category, snippet, reason, uses, created "
-                "FROM examples WHERE language = ? AND framework = ?", (req.language, req.framework)).fetchall()
+                "SELECT example_id, kind, language, framework, category, snippet, reason, uses, created, pattern "
+                "FROM examples WHERE language = ? AND (framework = ? OR kind = 'lesson')",
+                (req.language, req.framework)).fetchall()
         wanted = set(req.categories)
+        patterns = set(req.patterns)
 
         def score(row) -> tuple:
             return (row[4] in wanted, KIND_RANK[row[1]], row[7], row[8])
 
         examples = [uc.KBExample(example_id=r[0], kind=r[1], language=r[2], framework=r[3], category=r[4],
-                                 snippet=r[5], reason=r[6], uses=r[7]) for r in sorted(rows, key=score, reverse=True)]
-        return uc.KBGuidance(positive=[e for e in examples if e.kind != "negative"][: req.k],
-                             negative=[e for e in examples if e.kind == "negative"][: req.k])
+                                 snippet=r[5], reason=r[6], uses=r[7], pattern=r[9] or "")
+                    for r in sorted(rows, key=score, reverse=True)]
+        # LA-8, KB-22: lessons of the same pattern first - a lesson of another construct does not apply
+        lessons = sorted([e for e in examples if e.kind == "lesson" and set(e.pattern.split("; ")) & patterns],
+                         key=lambda e: (len(set(e.pattern.split("; ")) & patterns), e.category in wanted, e.uses),
+                         reverse=True)
+        return uc.KBGuidance(positive=[e for e in examples if e.kind in ("positive", "gap_closure")][: req.k],
+                             negative=[e for e in examples if e.kind == "negative"][: req.k],
+                             lessons=lessons[: req.k])
 
 
 def build_agent(settings: ba.Settings, config_path: str | None = None) -> KnowledgeBaseAgent:

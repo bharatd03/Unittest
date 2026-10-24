@@ -1,0 +1,36 @@
+{
+  "construct": "C++ enum class parameter in a switch",
+  "sut": "src/gear.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:gear_limit:8"
+        ],
+        "name": "test_gear_limit_reverse",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "g",
+            "value": "Gear::Reverse"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

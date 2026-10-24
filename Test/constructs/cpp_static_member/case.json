@@ -1,0 +1,21 @@
+{
+  "construct": "C++ static member function",
+  "sut": "src/math_util.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "tests": [
+      {
+        "name": "test_math_util_sat_add_limits",
+        "scenario_ids": [],
+        "purpose": "reach the item",
+        "evidence_ids": [],
+        "body": "UT_OBSERVE_INT(\"test_math_util_sat_add_limits_1\", MathUtil::sat_add(900, 200));",
+        "evidence_class": "E8"
+      }
+    ]
+  }
+}

@@ -14,8 +14,11 @@
 #    ./unittest_generator.sh benchmark [on|off|both]
 #                                              seeded-defect benchmark on the pilots, with the knowledge
 #                                              packs (on, default), without (off) or both to compare them
+#    ./unittest_generator.sh calibrate BRAIN   the construct corpus with one real brain (e.g. sonnet, qwen_remote):
+#                                              which answer kinds it passes, and a profile proposal [BP-8]
 #    ./unittest_generator.sh run REPO [SUT|all] [--branch NAME] [--sut FILE] [--requirements FILE_OR_FOLDER]
 #                                [--build-command "..."] [--compile-commands FILE]
+#                                [--interactive]  ask when a source change or a requirement is needed [LA-9]
 #                                              REPO = git repository link (https://... or git@...) or a folder
 #
 #  A repository link: the default branch is tested unless --branch names another one. Tests only and
@@ -45,7 +48,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-all|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-all|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -174,6 +177,9 @@ case "$ACTION" in
     done
     echo; echo "---- every pilot ----"; cat "$SUMMARY"; exit $ALL ;;
   benchmark) "$PY" ut_pipeline.py benchmark --config ut_config.json --knowledge "${1:-on}" ;;
+  calibrate)                                    # BP-8: one real brain on the construct corpus
+    if [ $# -lt 1 ]; then echo "Usage: $0 calibrate BRAIN, for example sonnet or qwen_remote [BP-8]"; exit 2; fi
+    "$PY" ut_pipeline.py calibrate "$1" --config ut_config.json ;;
   run)
     if [ $# -lt 1 ]; then echo "Usage: $0 run REPO [SUT|all] [options]"; exit 2; fi
     REPO="${1%/}"; shift

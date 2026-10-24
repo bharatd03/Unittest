@@ -2235,6 +2235,33 @@ class ParallelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, "BRAIN_RATE_LIMITED")                      # fails, no other brain
 
 
+class StepBrainTests(unittest.IsolatedAsyncioTestCase):
+    """The application narrows the brains per step (brains_for_step) and may give a step its own order (step_order)."""
+
+    async def test_a_step_no_brain_may_answer_is_never_asked(self):
+        sonnet, qwen = GenBrain("sonnet"), GenBrain("qwen")
+        agent = EchoAgent(router=ba.BrainRouter([qwen, sonnet], 0.0))
+        agent.brains_for_step = lambda step, names: [n for n in names if n == "sonnet"] if step == "wide" else None
+        await agent.generate("t", "c", GenPlan, step="wide")
+        self.assertEqual((agent.brain_of_call()["brain"], qwen.calls), ("sonnet", 0))     # qwen is first, not allowed
+        agent.brains_for_step = lambda step, names: [] if step == "wide" else None
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await agent.generate("t", "c", GenPlan, step="wide")
+        self.assertEqual(ctx.exception.code, "NO_BRAIN_FOR_STEP")
+        self.assertIn("NO_BRAIN_FOR_STEP", ba.NO_BRAIN_CODES)
+        self.assertEqual(sonnet.calls, 1)                                                 # nobody was asked
+        await agent.generate("t", "c", GenPlan, step="other")                             # not restricted
+        self.assertEqual(agent.brain_of_call()["brain"], "qwen")
+
+    async def test_a_step_has_its_own_brain_order(self):
+        agent = EchoAgent(router=ba.BrainRouter([GenBrain("sonnet"), GenBrain("qwen")], 0.0))
+        agent.step_order = lambda step: ["qwen"] if step == "cheap" else None
+        await agent.generate("t", "c", GenPlan, step="cheap")
+        self.assertEqual(agent.brain_of_call()["brain"], "qwen")
+        await agent.generate("t", "c", GenPlan, step="other")
+        self.assertEqual(agent.brain_of_call()["brain"], "sonnet")
+
+
 class EchoOut(_PydanticBase):
     doubled: int
     found: list[str] = []

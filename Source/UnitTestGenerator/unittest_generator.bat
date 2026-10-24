@@ -19,6 +19,8 @@ rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in 
 rem    unittest_generator.bat benchmark [on|off|both]
 rem                                             seeded-defect benchmark on the pilots, with the knowledge
 rem                                             packs (on, default), without (off) or both to compare them
+rem    unittest_generator.bat calibrate BRAIN   the construct corpus with one real brain (e.g. sonnet, qwen_remote):
+rem                                             which answer kinds it passes, and a profile proposal [BP-8]
 rem    unittest_generator.bat run REPO [SUT|all] [options]
 rem                                             REPO = git repository link (https://... or git@...) or a folder
 rem                                             SUT  = file relative to REPO, e.g. src/foo.c;
@@ -26,6 +28,8 @@ rem                                                    all (or none) = every pro
 rem                                             options: --branch NAME  --sut ANOTHER_FILE
 rem                                                      --build-command "..."  --compile-commands FILE
 rem                                                      --requirements FILE_OR_FOLDER (repeatable) [A1-RQ1]
+rem                                                      --interactive: ask when a source change or a requirement
+rem                                                      is needed (the menu always does) [LA-9]
 rem
 rem  A repository link: the default branch is tested unless --branch names another one. Tests only and
 rem  verified: one commit to that branch. Production source changed, or not verified: a review branch and a
@@ -114,8 +118,11 @@ if /i "%ACTION%"=="run" if not "%~3"=="" set "SUT=%~3"
 if /i "%ACTION%"=="run" if not "%~4"=="" set EXTRA=%4 %5 %6 %7 %8 %9
 set "KNOWLEDGE=on"
 if /i "%ACTION%"=="benchmark" if not "%~2"=="" set "KNOWLEDGE=%~2"
+if /i "%ACTION%"=="calibrate" set "CALBRAIN=%~2"
 if /i "%ACTION%"=="view" set "VIEWDIR=%~2"
 if /i "%ACTION:~0,6%"=="pilot-" if not "%~2"=="" set EXTRA=%2 %3
+rem  LA-9: a run started from the menu may ask at a decision point; a run from the command line asks only with --interactive.
+if defined INTERACTIVE set "EXTRA=%EXTRA% --interactive"
 rem  Without quotes and without a trailing backslash: "C:\repo\" would escape the closing quote.
 rem  Only when REPO is set: cmd turns a substitution on an unset variable into broken text.
 if not defined REPO goto repo_clean
@@ -205,8 +212,9 @@ if /i "%ACTION%"=="pilot-embedded-cpp" goto pilot_embedded_cpp
 if /i "%ACTION%"=="pilot-realrepo" goto pilot_realrepo
 if /i "%ACTION%"=="pilot-all" goto pilot_all
 if /i "%ACTION%"=="benchmark" goto benchmark
+if /i "%ACTION%"=="calibrate" goto calibrate
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-all, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-all, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -258,6 +266,17 @@ popd
 findstr /b /c:"FAIL:" /c:"ERROR:" "%BA_RESULTS%"
 findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%BA_RESULTS%"
 echo Full results: %BA_RESULTS%
+goto end
+
+:calibrate
+rem  BP-8: one real brain on the construct corpus; the configuration is never changed - the proposal is a file.
+if not defined CALBRAIN echo Usage: unittest_generator.bat calibrate BRAIN, for example sonnet or qwen_remote [BP-8]
+if not defined CALBRAIN set "UT_EXIT=2"
+if not defined CALBRAIN goto end
+echo.
+echo Calibrating %CALBRAIN% on the construct corpus - one pipeline run per case with that brain only [BP-8] ...
+"%PY%" ut_pipeline.py calibrate %CALBRAIN% --config ut_config.json
+set "UT_EXIT=%errorlevel%"
 goto end
 
 :benchmark

@@ -166,7 +166,8 @@ class UTBrain:
 
     def __init__(self, tests=None, patch=None, root_cause="source_behavior_defect", fail=None, dependency="real",
                  plans=None, links=None, declarations=None, flags=None, review="agree", candidates=None,
-                 name="qwen", suggestions=None, repairs=None, values=None, headers=None, host=None):
+                 name="qwen", suggestions=None, repairs=None, values=None, headers=None, host=None, setups=None,
+                 fakes=None):
         self.tests = CANNED_TESTS if tests is None else tests
         self.patch = patch or {"original_fragment": "return 99;", "corrected_fragment": "return 100;",
                                "rationale": "EV-clamp_percent-1 (E2): the value is limited to 0..100."}
@@ -175,7 +176,8 @@ class UTBrain:
         self.flags, self.review, self.candidates = flags or [], review, candidates
         self.brain_name, self.suggestions = name, suggestions
         # rule failures handed to the brain [ARCH-21]: a reply, a list of replies (one per call) or a function
-        self.rule_replies = {"repair": repairs, "value": values, "header": headers, "host": host}
+        self.rule_replies = {"repair": repairs, "value": values, "header": headers, "host": host,
+                             "setup": setups, "stub": fakes}                                # NC-1 building blocks
         self.generate_calls, self.decide_calls, self.questions = [], 0, []
 
     def _rule_reply(self, kind, task, context):
@@ -211,6 +213,10 @@ class UTBrain:
             reply = self._rule_reply("repair", task, context)
         elif task.startswith("A deterministic test generator must call"):            # A2-21ac
             reply = self._rule_reply("value", task, context)
+        elif task.startswith("Build the object for a unit test"):                   # NC-1 setup
+            reply = self._rule_reply("setup", task, context)
+        elif task.startswith("Write a fake of the C++ interface"):                  # NC-1 stub
+            reply = self._rule_reply("stub", task, context)
         elif task.startswith("The C/C++ front end cannot find a header"):           # A1-DA20
             reply = self._rule_reply("header", task, context)
         elif task.startswith("This C/C++ file is target code"):                     # A3-BD16
@@ -542,6 +548,227 @@ class RuleValueTests(unittest.TestCase):
         self.assertNotIn("&s", uc.sut_reset_source(cpp, True))                     # only plain C++ state
 
 
+class LearningBetweenAttemptsTests(unittest.TestCase):
+    """LA-1 .. LA-10, A2-21ae, A1-PL4, A2-21p, A3-CL14, KB-22, VIEW-11: the pieces, without a whole run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tmpdir()
+        repo = copy_pilot("cpp_embedded_pilot", Path(cls.tmp.name))
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/motor_ctrl.cpp"))
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(cls.tmp.name) / "w")))
+        cls.layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(          # with the C++ front end
+            layout=layout, build=agent.capture(uc.CaptureRequest(layout=layout)))))
+        cls.fn = {f.qualified_name.replace("(anonymous namespace)::", ""): f for f in cls.layout.functions}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_cpp_objects_are_built_as_named_variables(self):                          # A2-21ae
+        lines, call = uc.object_recipe(self.fn["MotorCtrl::wait_update"], self.layout)
+        self.assertEqual(lines, ["ut_fake_IEncoder ut_dep0;", "MotorCtrl ut_obj(ut_dep0);"])  # never a temporary
+        self.assertEqual(call, "ut_obj.wait_update")
+        self.assertTrue(uc.static_member(self.fn["MotorCtrl::sat_add"], self.layout))
+        self.assertIn("MotorCtrl::sat_add(...)", uc.call_form(self.fn["MotorCtrl::sat_add"], self.layout))
+        self.assertTrue(uc.internal_member(self.fn["Integrator::add"], self.layout))
+        self.assertIn("reach it through MotorCtrl::step", uc.call_form(self.fn["Integrator::add"], self.layout))
+        self.assertIn("integ", uc.keeps_state(self.fn["MotorCtrl::step"], self.layout))
+        self.assertIn("constructor takes an injected interface", uc.patterns_of(self.fn["MotorCtrl::step"], self.layout))
+
+    def test_a_member_scenario_is_assembled_on_a_named_object(self):                  # A2-21ae, A2-21m
+        plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason="")
+        sc = uc.Scenario(scenario_id="S-1", function="MotorCtrl::wait_update", description="", checked=True,
+                         characterization=True, args=[uc.NamedValue(name="max_loops", value="1")],
+                         setup=["ut_dep0.fault_return = false;"])
+        body = a2.assemble_scenario(sc, plan, "test_wait")
+        self.assertIsNotNone(body)
+        self.assertLess(body.index("ut_fake_IEncoder ut_dep0;"), body.index("MotorCtrl ut_obj(ut_dep0);"))
+        self.assertIn("ut_obj.wait_update(1)", body)
+
+    def test_the_facts_tell_the_brain_how_to_reach_a_member_no_test_can_name(self):    # A2-21ae, A1-PL2
+        agent = a1.AnalyzerAgent()
+        step, add = self.fn["MotorCtrl::step"], self.fn["Integrator::add"]
+        gaps = [uc.GapItem(gap_id=f"LC:Integrator::add:{add.line_start + 5}", function="Integrator::add", metric="LC",
+                           line=add.line_start + 5, detail="line never executed")]
+        sut = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
+        facts = "\n".join(p.text for p in agent._facts(step, gaps, {gaps[0].gap_id}, self.layout, uc.PlanRequest(
+            layout=self.layout, journal={"MotorCtrl::step": "- LC:x (attempt 1): tried t -> did not compile"}),
+            sut, [], []))
+        self.assertIn("REACHED THROUGH THIS FUNCTION: Integrator::add", facts)
+        self.assertIn("OBJECT: a member function: declare the object", facts)
+        self.assertIn("STATE: MotorCtrl::step keeps state", facts)
+        self.assertIn("JOURNAL (why earlier attempts missed", facts)
+
+    def test_a_scenario_refused_only_by_predictions_is_tried(self):                    # NC-6, NC-7, BP-2
+        agent = a1.AnalyzerAgent()
+        fn = self.fn["MotorCtrl::wait_update"]
+        known = agent._known_names(self.layout, [])
+
+        def check(**kw):
+            planned = a1.PlannedScenario(**{**dict(gap_ids=["LC:1"], name="test_wait_update_case", purpose="p",
+                                                   args=[], setup=[], stubs=[], variables=[], expected_return="",
+                                                   expected_after=[], evidence_ids=[], quotes=[],
+                                                   classification="characterization_gap", conflict="",
+                                                   information_sought=""), **kw})
+            return agent._check_planned(planned, fn, {"LC:1"}, set(), {}, [], {}, known, self.layout)
+        scenario, _ = check(setup=["mystery_init();"])                       # a prediction: the tool decides
+        self.assertIn("mystery_init", scenario.trial[0])
+        scenario, _ = check(calls_before=["ut_obj.step(1);", "ut_obj.step(2);"])     # a call sequence [BP-2]
+        self.assertEqual((scenario.calls_before, scenario.trial), (["ut_obj.step(1);", "ut_obj.step(2);"], []))
+        scenario, _ = check(calls_before=['puts("x");'])
+        self.assertIn("not a call of the SUT", scenario.trial[0])
+        scenario, reasons = check(purpose="this gap is unreachable", setup=["mystery_init();"])   # a guard [COV-5]
+        self.assertIsNone(scenario)
+        self.assertNotEqual(uc.scenario_signature(check(calls_before=["ut_obj.step(1);"])[0]),
+                            uc.scenario_signature(check()[0]))                  # another attempt [A1-PL4 g]
+
+    def test_a_wider_profile_writes_the_object_and_the_minimum_keeps_the_rule(self):  # NC-1, BP-3, BP-7, BP-10
+        sc = uc.Scenario(scenario_id="S-brain-MotorCtrl_wait_update-2-1", function="MotorCtrl::wait_update",
+                         description="", gap_ids=["LC:MotorCtrl::wait_update:62"], checked=True, kind="setup",
+                         characterization=True, made_by="brain:opus/scripted",
+                         args=[uc.NamedValue(name="max_loops", value="1")])
+        plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason="", scenarios=[sc])
+        block = {"lines": ["ut_fake_IEncoder ut_e;", "MotorCtrl ut_m(ut_e);"], "call": "ut_m.wait_update"}
+        for name in ("opus", "qwen"):
+            agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
+            uc.apply_profiles(agent, None)
+            b = UTBrain(name=name, setups=block)
+            agent.router = ba.BrainRouter([b], 0.0)
+            bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=plan)))
+            suite = uc.suite_of(bundle)
+            asked = [c for c in b.generate_calls if c.startswith("Build the object")]
+            if name == "opus":                                       # the brain's block, recorded and kept
+                self.assertEqual(len(asked), 1)
+                self.assertIn("MotorCtrl ut_m(ut_e);", suite)
+                self.assertIn("ut_m.wait_update(1)", suite)
+                self.assertIn("[NC-2]", suite)
+                self.assertTrue(any("setup" in m for m in bundle.made.values()))
+                self.assertEqual(len(bundle.recipes), 1)
+            else:                                                    # never asked; the rule's object [BP-3]
+                self.assertEqual(asked, [])
+                self.assertIn("MotorCtrl ut_obj(ut_dep0);", suite)
+                self.assertEqual(bundle.recipes, {})
+
+    def test_the_construct_of_an_object(self):                                        # NC-2
+        signature, params = uc.construct_of(self.fn["MotorCtrl::wait_update"], self.layout)
+        self.assertEqual(signature, "object: ctor(ref interface)")
+        self.assertEqual((params["cls"], params["method"], params["fake0"]), ("MotorCtrl", "wait_update",
+                                                                              "ut_fake_IEncoder"))
+        self.assertEqual(uc.construct_of(self.fn["MotorCtrl::sat_add"], self.layout), ("", {}))   # static member
+
+    def test_setup_form_fixes_and_harness_macros(self):                                 # A1-PL4 d, ARCH-20
+        layout = self.layout.model_copy(update={"sut_state": [uc.StateVar(name="g_hidden", type="int")]})
+        planned = a1.PlannedScenario(gap_ids=["LC:1"], name="t", purpose="p", args=[], setup=[
+            "g_hidden = 3;", "ut_state_set_hw_regs(1);", "UT_REG_SET_LATER(UT_REG32(0x40000010u), 1u, 20);"],
+            stubs=[], variables=[], expected_return="", expected_after=[], evidence_ids=[], quotes=[],
+            classification="characterization_gap", conflict="", information_sought="")
+        fixes = a1.AnalyzerAgent._normalize_planned(planned, self.fn["MotorCtrl::sync"], {"LC:1"}, {}, layout)
+        self.assertEqual(planned.setup[0], "ut_state_set_g_hidden(3);")              # a hidden variable: its setter
+        self.assertTrue(fixes)
+        self.assertIn("UT_REG_SET_LATER", a1.PLAN_SAFE_CALLS)
+        self.assertEqual(uc.norm_quote("/// @return true when the flag is set"), uc.norm_quote("true when the flag is  set"))
+
+    def test_an_unchanged_rewrite_and_a_repeated_scenario_are_refused(self):          # A2-21p, A1-PL4 g
+        old = "UT_TEST(test_a)\n{\n    /* S-1: x */\n    UT_EXPECT_EQ_INT(f(1), 1); /* EV-f-1 */\n}\n"
+        check = a2.GeneratorAgent._grounding({"f", "UT_EXPECT_EQ_INT"}, set(), {"test_a"}, "f", [], {"test_a": old})
+        answer = a2.GeneratedTests.model_validate({"tests": [{"name": "test_a", "scenario_ids": [],
+                                                              "body": "UT_EXPECT_EQ_INT(f(1),  1);", "evidence_class": "E2"}]})
+        with self.assertRaises(ba.AgentFault) as caught:
+            check(answer)
+        self.assertIn("the same as the failing test", caught.exception.message)
+        one = uc.Scenario(scenario_id="S-1", function="f", description="", gap_ids=["LC:f:3"],
+                          args=[uc.NamedValue(name="a", value="1")])
+        two = one.model_copy(update={"scenario_id": "S-9", "args": [uc.NamedValue(name="a", value=" 1 ")]})
+        self.assertEqual(uc.scenario_signature(one), uc.scenario_signature(two))
+
+    def test_repair_edits_name_a_generated_file_in_any_path_form(self):                # A3-CL14
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+            path="tests/test_motor_ctrl.cpp", action="create", role="testsuite", content="int a = 1;\n")])
+        repair = a3.BuildRepair(edits=[a3.FileEdit(path="C:\\Users\\x\\ut_work\\run\\repo\\tests\\Test_Motor_Ctrl.cpp",
+                                                   old="int a = 1;", new="int a = 2;")], reason="r")
+        changed, problem = a3.CompilationAgent._apply_edits(bundle, repair)
+        self.assertEqual(problem, "")
+        self.assertIn("int a = 2;", changed.actions[0].content)
+
+    def test_the_journal_records_the_cause_and_gives_the_next_attempt_the_reason(self):  # LA-2 .. LA-6
+        with tmpdir() as d:
+            journal = up.Journal("src/motor_ctrl.cpp", Path(d))
+            sc = uc.Scenario(scenario_id="S-brain-MotorCtrl_wait_update-2-1", function="MotorCtrl::wait_update",
+                             description="", gap_ids=["BC:MotorCtrl::wait_update:62:13:T"], made_by="brain:qwen/q",
+                             checked=True, args=[uc.NamedValue(name="max_loops", value="1")])
+            plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason="", scenarios=[sc])
+            source = ("UT_TEST(test_wait)\n{\n    /* S-brain-MotorCtrl_wait_update-2-1: x */\n"
+                      "    MotorCtrl ctrl(ut_fake_IEncoder()); UT_EXPECT_TRUE(ctrl.wait_update(1));\n}\n")
+            gap = uc.GapItem(gap_id="BC:MotorCtrl::wait_update:62:13:T", function="MotorCtrl::wait_update",
+                             metric="BC", line=62)
+            result = uc.VerificationResult(run_id="r", stage="verify", sut_sha256="x", suite_sha256="",
+                                           decision="gaps_remain", coverage=uc.CoverageReport(toolchain="t", definitions="d", functions=[
+                                               uc.FunctionCoverage(name="MotorCtrl::wait_update", gaps=[gap])]))
+            new = journal.record(2, plan, "", {"test_wait": ("no matching constructor for 'MotorCtrl'", source)},
+                                 result, {gap.gap_id: 1}, self.layout, [], set())
+            self.assertTrue(new)                                                   # a new cause is progress [LA-7]
+            entry = journal.entries[0]
+            self.assertEqual((entry.cause, entry.items), ("test_setup", [gap.gap_id]))
+            excerpt = journal.excerpt()["MotorCtrl::wait_update"]
+            self.assertIn("no matching constructor", excerpt)
+            self.assertIn("build the object or argument as shown under OBJECT", excerpt)
+            self.assertFalse(journal.record(2, plan, "", {"test_wait": ("no matching constructor for 'MotorCtrl'", source)},
+                                            result, {gap.gap_id: 1}, self.layout, [], set()))     # nothing new
+            status = journal.final_status(gap.gap_id, "MotorCtrl::wait_update", "", {})
+            self.assertEqual((status.status, status.owner), ("pipeline_limitation", "the pipeline's developers"))
+            covered = result.model_copy(update={"coverage": uc.CoverageReport(toolchain="t", definitions="d")})
+            journal.record(3, uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason=""), "", {}, covered, {},
+                           self.layout, [], set())
+            self.assertEqual([e.final_status for e in journal.just_closed], ["covered"])     # LA-2: closed
+            path = Path(journal.write())
+            self.assertTrue(path.is_file() and path.with_suffix(".md").is_file())
+
+    def test_attempts_then_another_model_then_a_final_status(self):                    # LA-5, LA-6
+        orch = object.__new__(up.Orchestrator)
+        orch.cfg = up.PipelineConfig()
+        s = types.SimpleNamespace(attempts={"LC:1": 2, "LC:2": 1}, final_items=set(), other_model_items=set(),
+                                  avoid_brains=set(), item_brains={"LC:1": {"qwen_remote"}})
+        plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason="")
+        orch._next_attempts(s, plan, set())
+        self.assertEqual((s.other_model_items, s.avoid_brains), ({"LC:1"}, {"qwen_remote"}))
+        orch._next_attempts(s, plan, {"LC:1"})                   # asked, but no other model planned it
+        self.assertEqual(s.final_items, {"LC:1"})
+
+    def test_lessons_only_when_verified_and_found_by_their_pattern(self):              # KB-22, LA-8
+        with tmpdir() as d:
+            store = kb.KnowledgeBaseAgent(config=kb.KBConfig(db_path=str(Path(d) / "kb.sqlite3")))
+            unverified = uc.LearningEvent(kind="lesson", language="cpp", framework="ut_harness", category="test_setup",
+                                          snippet="build the fake first", reason="x", pattern="member function")
+            resp = run(store.call_local("learn", unverified))
+            self.assertEqual(resp.status, "rejected")
+            verified = unverified.model_copy(update={"verification": {"verified": True, "gap_covered": True,
+                                                                      "tests": "passed"}})
+            self.assertTrue(store.learn(verified).stored)
+            self.assertEqual(store.learn(verified).reason, "uses=2")                       # recurrence counted
+            found = store.guidance(uc.GuidanceRequest(language="cpp", framework="googletest",
+                                                      patterns=["member function", "language cpp"]))
+            self.assertEqual([e.snippet for e in found.lessons], ["build the fake first"])
+            self.assertEqual(store.guidance(uc.GuidanceRequest(language="cpp", framework="ut_harness",
+                                                               patterns=["static function"])).lessons, [])
+
+    def test_progress_line_and_unattended_questions(self):                              # VIEW-11, LA-9
+        progress = up.Progress(4)
+        progress.done = 1
+        self.assertTrue(progress.line(0.5, 2).startswith("38 % - file 2 of 4 - iteration 2"))
+        with mock.patch.object(sys, "stdin", None):
+            self.assertEqual(up.ask_user("?", {"1": "a", "2": "b"}, 5, "1"), ("1", ""))
+
+    def test_globals_of_real_dependencies_are_reset_before_each_test(self):           # A2-21s
+        layout = self.layout.model_copy(update={"dependencies": uc.DependencyPlan(entries=[
+            uc.Dependency(name="STATUS_REG", kind="variable", decision="real", definition="lib/hw.c", type="unsigned"),
+            uc.Dependency(name="calib", kind="variable", decision="real", definition="lib/hw.c", is_const=True)],
+            real_sources=["lib/hw.c"])})
+        names = [v.name for v in uc.reset_state(layout)]
+        self.assertIn("STATUS_REG", names)
+        self.assertNotIn("calib", names)
+
+
 class BodyCheckTests(unittest.TestCase):
     def test_a_value_set_twice_in_a_row_is_refused(self):                                  # A2-21t
         allowed = {"thermostat_command", "UT_EXPECT_EQ_INT"}
@@ -603,10 +830,12 @@ class BodyCheckTests(unittest.TestCase):
             return {"generate": bundle, "observe": observed}.get(tool, uc.KBGuidance())
         orch = object.__new__(up.Orchestrator)
         orch.layout, orch.suite, orch.call, orch._stage = layout, "", call, lambda *a, **k: None
-        s = types.SimpleNamespace(notes=[], quarantined=[], test_items={})
+        orch.layout.functions = []
+        s = types.SimpleNamespace(notes=[], quarantined=[], test_items={}, quarantine={},
+                                  journal=up.Journal("a.cpp", Path(".")))
         loose = lambda **fields: fields                           # the requests are not the subject here
         with mock.patch.multiple(up.uc, GenerationRequest=loose, GuidanceRequest=loose, VerifyRequest=loose):
-            out = run(orch._generate(s, types.SimpleNamespace(repairs=[])))
+            out = run(orch._generate(s, types.SimpleNamespace(repairs=[], scenarios=[])))
         self.assertNotIn("finalize", calls)
         self.assertEqual(out.tests, ["test_a"])
         self.assertEqual(out.observations, [])
@@ -2232,6 +2461,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ut_stub_read_sensor_return = 10;", suite)                     # rewritten, delivered
         self.assertNotIn("ut_stub_read_sensor_return = 18;", suite)
         self.assertEqual(sum("agent_sourcecode_corrector.candidates" in item for item in result.open_items), 1)
+        journal = Path(result.journal)                                           # LA-2: the deviation is recorded
+        self.assertTrue(journal.is_file(), result.journal)
+        self.assertIn("the test contradicts its own scenario or evidence", journal.with_suffix(".md").read_text())
+        self.assertTrue(any(line.startswith("learned (") for line in result.lessons), result.lessons)   # LA-8
 
     def test_brain_plans_the_documented_behaviour(self):
         """A1-PL1, A1-25y, A2-21m: after the deterministic tests, the brain plans a check of the stated
@@ -2903,14 +3136,14 @@ class BrainPlanningTests(unittest.TestCase):
                  '    UT_EXPECT_EQ_INT(thermostat_command(1, 0), 0);\n}\n')
         req = uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps, tests=[
             uc.TestResult(name="test_thermostat_command_auto_1", status="passed")]), iteration=3,
-            attempts={"BC:thermostat_command:7:9:T": 2}, existing_suite=suite,
+            attempts={"BC:thermostat_command:7:9:T": 1}, existing_suite=suite,
             test_items={"test_thermostat_command_auto_1": ["LC:6", "LC:13", "BC:7:9:F"]})
         contexts = []
         with brain(UTBrain(plans={"thermostat_command": lambda ctx: contexts.append(ctx) or []})):
             plan = run(self.agent.plan(req))
         self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs])
         self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning))  # A1-PL8
-        self.assertIn("TRIED 2 time(s)", contexts[0])                                   # A1-PL12
+        self.assertIn("TRIED 1 time(s)", contexts[0])                    # A1-PL12; a second attempt [LA-5]
         self.assertIn("reached: LC:6, LC:13, BC:7:9:F", contexts[0])                    # A1-PL7
         self.assertIn("PATH CONDITIONS", contexts[0])
 
@@ -3019,8 +3252,8 @@ class BrainGenerationTests(unittest.TestCase):
         self.assertIn("ut_stub_read_sensor_returns[1] = 10;", suite)
         self.assertIn("ut_stub_read_sensor_returns_len = 2;", suite)
         self.assertIn("UT_EXPECT_EQ_INT(thermostat_command(20, 2), -1);", suite)
-        self.assertIn(f"/* S-brain-thermostat_command-2-1: the second reading heats [{self.e2.evidence_id}] */",
-                      suite)                                                                      # A2-21q, A2-21a
+        self.assertIn(f"/* S-brain-thermostat_command-2-1: the second reading heats [{self.e2.evidence_id}] - by "
+                      "qwen/scripted scenario [BP-7] */", suite)                       # A2-21q, A2-21a, BP-7
         self.assertNotIn("test_thermostat_command_heats_later", bundle.characterization_tests)
 
     def test_linked_scenario_is_marked(self):
@@ -3548,7 +3781,7 @@ class CoveragePolicyTests(unittest.TestCase):
         level, source, targets, iterations = uc.coverage_policy("src/a.c", None)
         self.assertEqual((level, source, iterations), ("D", "default", uc.DEFAULT_ITERATIONS))
         self.assertEqual(targets, {"LC": "100", "SC": "100", "BC": "100", "DC": "100", "MCDC": "100"})
-        self.assertEqual(uc.DEFAULT_ITERATIONS, 5)                                          # COV-9
+        self.assertEqual(uc.DEFAULT_ITERATIONS, 10)                            # the safety ceiling [COV-9, LA-7]
 
     def test_lower_levels_need_mcdc_above_95_and_everything_else_100(self):             # COV-1
         section = {"files": {"src/body/*.c": "B"}, "iterations": {"B": 3}}
@@ -3765,11 +3998,290 @@ class ViewerPipelineTests(unittest.TestCase):
             self.assertEqual(up.show_run(Path(d), open_browser=False), 2)
 
 
+# ============================================================================ 8b. brain profiles, new code [BP, NC]
+class BrainProfileTests(unittest.TestCase):
+    """BP-1 .. BP-10: what each brain may write, the ladder of kinds, the gate per step, the same checks for every
+    brain."""
+
+    def test_default_profiles_and_the_configuration(self):                             # BP-1, BP-2
+        book = uc.brain_profiles(None)
+        self.assertEqual(book.of("sonnet").name, "full")
+        self.assertEqual(book.of("qwen_remote").name, "minimum")
+        self.assertEqual(book.of("a_model_of_the_customer").name, "minimum")          # no profile: the floor
+        self.assertEqual(book.of("qwen").kinds, list(uc.MINIMUM_KINDS))                # Qwen runs unchanged
+        self.assertTrue(book.allows("opus", "setup") and not book.allows("qwen", "setup"))
+        with tmpdir() as d:
+            cfg = Path(d) / "ut_config.json"
+            cfg.write_text(json.dumps({"profiles": {"brains": {"mine": "mid"}, "definitions": {
+                "mid": {"kinds": ["scenario", "setup", "no_such_kind"], "journal_tokens": 3000}},
+                "steps": {"A2.value": ["haiku"]}}}))
+            book = uc.brain_profiles(cfg)
+        self.assertEqual(book.of("mine").kinds, ["scenario", "setup"])                # an unknown kind is ignored
+        self.assertEqual(book.order(["opus", "haiku", "qwen"], "A2.value"), ["haiku", "opus", "qwen"])   # BP-6
+        self.assertEqual(book.order(["opus", "haiku"], "A1.plan"), ["opus", "haiku"])
+        self.assertRegex(book.record(["mine"])[0], r"^mine: mid \([0-9a-f]{16}\) - scenario, setup$")      # BP-7
+
+    def test_the_ladder_of_kinds(self):                                                 # BP-3, BP-9
+        full, minimum = list(uc.ANSWER_KINDS), list(uc.MINIMUM_KINDS)
+        self.assertEqual(uc.next_kind("scenario", "test_setup", full), "setup")
+        self.assertEqual(uc.next_kind("setup", "test_setup", full), "stub")          # the next wider kind
+        self.assertEqual(uc.next_kind("scenario", "test_setup", minimum), "test")    # setup is not allowed
+        self.assertEqual(uc.next_kind("scenario", "needs_call_sequence", full), "call_sequence")
+        self.assertEqual(uc.next_kind("scenario", "wrong_inputs", full), "scenario")  # not a building cause
+        self.assertEqual(uc.next_kind("test", "pipeline_limitation", ["values", "scenario", "test"]), "")   # BP-9
+        self.assertEqual(uc.next_kind("suite_part", "test_setup", full), "")          # the top of the ladder
+
+    def test_a_kind_the_profile_does_not_allow_is_never_asked(self):                  # BP-3, BP-10
+        for name, allowed in (("qwen", False), ("opus", True)):
+            agent = a2.GeneratorAgent()
+            uc.apply_profiles(agent, None)
+            b = UTBrain(name=name, setups={"lines": ["Heater ut_obj(ut_dep0);"], "call": "ut_obj.demand"})
+            agent.router = ba.BrainRouter([b], 0.0)
+            if allowed:
+                out = run(agent.generate(a2.SETUP_TASK.format(method="demand", cls="Heater"), "facts", a2.SetupBlock,
+                                         step="A2.setup"))
+                self.assertEqual(out.call, "ut_obj.demand")
+            else:
+                with self.assertRaises(ba.AgentFault) as caught:
+                    run(agent.generate("Build the object for a unit test", "facts", a2.SetupBlock, step="A2.setup"))
+                self.assertEqual(caught.exception.code, "NO_BRAIN_FOR_STEP")
+                self.assertEqual(b.generate_calls, [])                                 # not even asked
+            gate = agent.brains_for_step
+            self.assertIsNone(gate("A1.links", ["qwen"]))                              # not a kind of BP-2: open
+            self.assertEqual(run(uc.brains_for(agent, "setup")), [name] if allowed else [])
+
+    def test_the_same_checks_for_the_same_kind(self):                                  # BP-4, BP-10
+        good = ["ut_fake_ISensor ut_dep0;", "Heater ut_obj(ut_dep0);"]
+        self.assertEqual(a2.GeneratorAgent._block_problem(good, "ut_obj.demand"), "")
+        self.assertIn("assert", a2.GeneratorAgent._block_problem(good + ["UT_EXPECT_TRUE(1);"], "ut_obj.demand"))
+        self.assertIn("forbidden", a2.GeneratorAgent._block_problem(["system(\"x\");"], "ut_obj.demand"))
+        self.assertEqual(a2.GeneratorAgent._block_problem(["class ut_fake_I : public I { int execute() override "
+                                                           "{ return 0; } };"], fake=True), "")   # any method name
+        self.assertIn("only helpers named ut_", a2.GeneratorAgent._shared_problem("static int helper(void) { return 1; }"))
+        self.assertEqual(a2.GeneratorAgent._shared_problem("static int ut_helper(void) { return 1; }"), "")
+
+    def test_profile_limits_of_the_context(self):                                      # BP-5, LA-10
+        minimum, full = uc.DEFAULT_PROFILES["minimum"], uc.DEFAULT_PROFILES["full"]
+        self.assertTrue(minimum.short_function(150, 6000) and not minimum.short_function(151, 6000))
+        self.assertTrue(full.short_function(3000, 120_000))                            # the whole function fits
+        self.assertFalse(full.model_copy(update={"window_tokens": 16384}).short_function(3000, 120_000))
+
+
+class NewCodeTests(unittest.TestCase):
+    """NC-1 .. NC-13 without a whole run: checks that guard or predict, recipes, platform facts, findings, corpus."""
+
+    def test_guards_and_predictions(self):                                              # NC-6
+        for reason in ("setup calls functions that do not exist here: mystery_init",
+                       "ut_stub_x_return is set twice in a row (1, then 2)", "unbalanced braces or parentheses",
+                       "x: 'abc' is not an integer value (literal, enumerator or macro)"):
+            self.assertEqual(uc.check_kind(reason), "prediction", reason)
+        for reason in ("claims the gap cannot or need not be covered ('unreachable'); ignored [COV-5]",
+                       "the quote of EV-1 does not occur word for word in that evidence",
+                       "checks nothing: no UT_EXPECT_... or UT_OBSERVE_...", "a reason no check declares"):
+            self.assertEqual(uc.check_kind(reason), "guard", reason)
+        self.assertTrue(uc.only_predictions(["unbalanced braces or parentheses"]))
+        self.assertFalse(uc.only_predictions(["unbalanced braces or parentheses", "checks nothing"]))
+        self.assertFalse(uc.only_predictions([]))
+
+    def test_a_test_refused_only_by_a_prediction_goes_to_a_trial(self):                # NC-7
+        trial: dict[str, str] = {}
+        check = a2.GeneratorAgent._grounding({"f", "UT_EXPECT_EQ_INT"}, set(), function="f", trial=trial)
+        answer = a2.GeneratedTests.model_validate({"tests": [
+            {"name": "test_f_with_helper_init", "scenario_ids": [], "body": "helper_init(); UT_EXPECT_EQ_INT(f(1), 0);",
+             "evidence_class": "E8"},
+            {"name": "test_f_nothing_checked", "scenario_ids": [], "body": "f(2);", "evidence_class": "E8"}]})
+        check(answer)
+        self.assertEqual([x.name for x in answer.tests], ["test_f_with_helper_init"])     # kept, for the tool
+        self.assertIn("helper_init", trial["test_f_with_helper_init"])
+        dropped: list[str] = []                                   # without a trial: refused as before [A2-20]
+        with self.assertRaises(ba.AgentFault):
+            a2.GeneratorAgent._grounding({"f", "UT_EXPECT_EQ_INT"}, set(), function="f", dropped=dropped)(
+                a2.GeneratedTests.model_validate({"tests": [answer.tests[0].model_dump()]}))
+
+    def test_the_trial_keeps_what_the_tool_accepts(self):                              # NC-7
+        suite = ("UT_TEST(test_a)\n{\n    UT_EXPECT_EQ_INT(f(1), 1);\n}\n\nUT_TEST(test_b)\n{\n    UT_EXPECT_EQ_INT(g(1), 1);\n}"
+                 "\n\nUT_SUITE_BEGIN\n    UT_CASE(test_a)\n    UT_CASE(test_b)\nUT_SUITE_END\n")
+        bundle = uc.FileActionBundle(bundle_id="b", tests=["test_a", "test_b"], actions=[uc.FileAction(
+            path="tests/t.c", action="create", role="testsuite", content=suite)],
+            trial={"test_a": "calls functions that do not exist here: f", "test_b": "calls functions that do not exist "
+                   "here: g"}, trial_targets={"test_a": ["LC:f:3"], "test_b": ["LC:g:9"]})
+        seen = []
+
+        async def call(role, tool, request, model):
+            seen.append(uc.test_sources(uc.suite_of(request.bundle)))
+            return uc.VerificationResult(run_id="r", stage="observe", sut_sha256="s", suite_sha256="t", link_ok=True,
+                                         decision="complete", tests=[uc.TestResult(name="test_a", status="passed"),
+                                                                     uc.TestResult(name="test_b", status="failed")],
+                                         test_items={"test_a": ["LC:f:3"], "test_b": []})
+        orch = object.__new__(up.Orchestrator)
+        orch.cfg, orch.layout, orch.call = up.PipelineConfig(), types.SimpleNamespace(sut_sha256="s", sut_file="a.c"), call
+        orch.check_result = lambda *a: None
+        s = types.SimpleNamespace(findings=[], trials=[], quarantine={}, failed_tests={}, test_items={}, open_now=set())
+        with mock.patch.object(up.uc, "VerifyRequest", lambda **kw: types.SimpleNamespace(**kw)):   # the layout is a stand-in
+            out = run(orch._trial(s, bundle))
+        self.assertEqual(sorted(seen[0]), ["test_a", "test_b"])                       # built alone: only the trials
+        self.assertEqual(out.tests, ["test_a"])                                        # the tool accepted test_a
+        self.assertEqual(out.trial, {})
+        self.assertEqual([f.kind for f in s.findings], ["false_refusal"])              # NC-5
+        self.assertIn("test_b", s.failed_tests)
+
+    def test_recipes_are_templates_of_a_construct(self):                               # NC-2, NC-3
+        lines, call = uc.templated(["ut_fake_ISensor ut_dep0;", "Heater ut_obj(ut_dep0);"], "ut_obj.demand",
+                                   {"cls": "Heater", "method": "demand", "t0": "ISensor", "fake0": "ut_fake_ISensor"})
+        recipe = uc.Recipe(kind="setup", signature="object: ctor(ref interface)", lines=lines, call=call)
+        self.assertEqual(recipe.lines, ["@@fake0@@ ut_dep0;", "@@cls@@ ut_obj(ut_dep0);"])
+        got = recipe.instantiate({"cls": "Cooler", "method": "need", "t0": "IThermo", "fake0": "ut_fake_IThermo"})
+        self.assertEqual(got, (["ut_fake_IThermo ut_dep0;", "Cooler ut_obj(ut_dep0);"], "ut_obj.need"))
+        self.assertFalse(recipe.complete({"cls": "X"}))
+        with tmpdir() as d:
+            (Path(d) / "object.json").write_text(json.dumps([recipe.model_dump()]))
+            (Path(d) / "broken.json").write_text("{")
+            library = uc.application_recipes(Path(d))
+        self.assertEqual([r.made_by for r in library], ["library"])                    # NC-3: reviewed data
+
+    def test_paths_and_outcomes_from_the_platform_facts(self):                          # NC-10, NC-11, NC-12
+        windows = uc.PlatformFacts(os="windows", case_sensitive=False, page_bytes=65536, measured="2026-10-24",
+                                   outcomes={"crash": [0xC0000005], "abort": [3]})
+        linux = uc.PlatformFacts(os="linux", case_sensitive=True, measured="2026-10-24", outcomes={"crash": [-11]})
+        self.assertTrue(uc.same_file("C:\\Users\\x\\repo\\Tests\\T.CPP", "tests/t.cpp", windows))
+        self.assertTrue(uc.same_file("/home/x/repo/tests/t.cpp", "tests/t.cpp", linux))
+        self.assertFalse(uc.same_file("/home/x/repo/tests/T.cpp", "tests/t.cpp", linux))   # Linux tells them apart
+        self.assertFalse(uc.same_file("/home/x/repo/mytests/t.cpp", "tests/t.cpp", linux))  # a folder boundary
+        self.assertEqual(uc.program_outcome(3, "", windows), "abort")
+        self.assertEqual(uc.program_outcome(-11, "", linux), "crash")
+        self.assertEqual(uc.program_outcome(4, "UT_WATCHDOG|t\n", windows), "watchdog")
+        self.assertEqual(uc.program_outcome(77, "", linux), "unknown")                 # never a pass [NC-12]
+        self.assertIn("unknown outcome", a3._exit_text(77, "", linux))
+        self.assertEqual(uc.platform_facts({"platform": windows.model_dump()}).page_bytes, 65536)
+        self.assertEqual(uc.platform_facts({}).measured, "")                           # the host until measured
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_the_setup_measures_the_platform(self):                                    # NC-10
+        with tmpdir() as d:
+            facts = us.measure_platform(_tools().tc, Path(d))
+        self.assertTrue(facts["measured"])
+        self.assertIn(0, facts["outcomes"]["normal"])
+        self.assertTrue(facts["outcomes"].get("crash"))
+        self.assertNotIn(0, facts["outcomes"]["crash"])
+        self.assertEqual(facts["watchdog_marker"], "UT_WATCHDOG")
+        self.assertEqual(facts["case_sensitive"], os.name != "nt" and sys.platform != "darwin")
+        uc.PlatformFacts(**facts)                                                       # the manifest's form
+
+    def test_findings_are_counted_across_runs(self):                                   # NC-5
+        with tmpdir() as d:
+            path = Path(d) / "pipeline_findings.jsonl"
+            f = uc.PipelineFinding(kind="pipeline_limitation", signature=uc.finding_signature(
+                "pipeline_limitation", "object: ctor(ref interface)", "error at line 12"), subject="object: ctor")
+            uc.record_findings(path, [f])
+            again = f.model_copy(update={"signature": uc.finding_signature(
+                "pipeline_limitation", "object: ctor(ref interface)", "error at line 97")})   # numbers removed
+            lines = uc.record_findings(path, [again])
+        self.assertEqual(again.count, 2)
+        self.assertTrue(lines[0].startswith("2x pipeline_limitation"))
+
+    def test_every_corpus_case_is_complete(self):                                       # NC-4
+        cases = up.corpus_cases()
+        self.assertGreaterEqual(len(cases), 25)
+        for name, folder, spec in cases:
+            self.assertTrue((folder / spec["sut"]).is_file(), name)
+            self.assertIn(spec["language"], ("c", "cpp"), name)
+            self.assertTrue(spec["construct"], name)
+            self.assertIn(spec["expect"]["final_state"], ("verified_measured", "incomplete", "any"), name)
+
+
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+class CorpusAnswerTests(unittest.TestCase):
+    """NC-9: known correct answers of the construct corpus pass every check."""
+
+    def _layout(self, folder: Path, spec: dict, d: str) -> uc.LayoutProfile:
+        repo = Path(d) / folder.name
+        shutil.copytree(folder, repo)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=spec["sut"]))
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(d) / "w")))
+        return run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(
+            layout=layout, build=agent.capture(uc.CaptureRequest(layout=layout)))))
+
+    def test_correct_answers_pass_every_check(self):
+        checked = 0
+        for name, folder, spec in up.corpus_cases():
+            answers = spec.get("answers") or {}
+            if not answers:
+                continue
+            with tmpdir() as d:
+                for block in answers.get("setup", []):
+                    self.assertEqual(a2.GeneratorAgent._block_problem(block["lines"], block["call"]), "", name)
+                    checked += 1
+                for fake in answers.get("fakes", []):
+                    self.assertEqual(a2.GeneratorAgent._block_problem([fake["code"]], fake=True), "", name)
+                    checked += 1
+                if not (answers.get("scenarios") or answers.get("tests")):
+                    continue
+                layout = self._layout(folder, spec, d)
+                agent = a1.AnalyzerAgent()
+                for planned in answers.get("scenarios", []):
+                    fn_name = planned["gap_ids"][0].split(":")[1]
+                    fn = next(f for f in layout.functions if fn_name in (f.name, f.qualified_name))
+                    scenario, reasons = agent._check_planned(
+                        a1.PlannedScenario(**planned), fn, set(planned["gap_ids"]), set(), {}, [],
+                        agent._constants_for_values(layout), agent._known_names(layout, []), layout)
+                    self.assertIsNotNone(scenario, f"{name}: {reasons}")
+                    self.assertEqual(scenario.trial, [], f"{name}: {scenario.trial}")
+                    checked += 1
+                plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="")
+                _, _, stub_header = a2.render_stubs(plan)
+                allowed = a2.GeneratorAgent._allowed_symbols(plan, a2.GeneratorAgent._headers_text(layout), stub_header)
+                for test in answers.get("tests", []):
+                    trial: dict[str, str] = {}
+                    parsed = a2.GeneratedTests.model_validate({"tests": [test]})
+                    a2.GeneratorAgent._grounding(allowed, set(), trial=trial)(parsed)
+                    self.assertEqual(([x.name for x in parsed.tests], trial), ([test["name"]], {}), name)
+                    checked += 1
+        self.assertGreaterEqual(checked, 12)
+
+
+@full_run
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+@unittest.skipUnless(HAVE_FASTMCP and HAVE_LANGGRAPH, "needs fastmcp and langgraph")
+class CorpusRunTests(unittest.TestCase):
+    """NC-4, NC-13: every construct with the scripted brain - the run ends, and every item it did not cover has a
+    final status with a reason; where the case states its expected result, the run reaches it."""
+
+    def test_every_construct(self):
+        outcomes = []
+        for name, folder, spec in up.corpus_cases():
+            with tmpdir() as d, brain(UTBrain()):
+                repo = Path(d) / name
+                shutil.copytree(folder, repo)
+                cfg = Path(d) / "ut_config.json"
+                raw = json.loads((SRC / "ut_config.json").read_text(encoding="utf-8"))
+                raw["viewer"]["enabled"] = False
+                raw["pipeline"].update(output_dir=str(Path(d) / "out"), deliver_tests_to_repo=False,
+                                       agents={r: {"transport": "inprocess"} for r in
+                                               ("analyzer", "generator", "compilation", "corrector", "kb")})
+                raw["compilation"].update(tools_manifest=str(uc.manifest_path(SRC / "ut_config.json")),
+                                          work_dir=str(Path(d) / "w"))
+                raw["kb"] = {"db_path": str(Path(d) / "kb.sqlite3"), "resolutions_path": str(Path(d) / "r.sqlite3")}
+                cfg.write_text(json.dumps(raw), encoding="utf-8")
+                result = run(up.Orchestrator(cfg).run(uc.PipelineRequest(repo_root=str(repo), sut_file=spec["sut"])))
+            outcomes.append(f"{name}: {result.final_state} - {result.reason[:120]}")
+            if result.final_state == "incomplete" and result.item_status:
+                for st in result.item_status:
+                    self.assertTrue(st.reason or st.status == "undetermined", f"{name}: {st}")
+            expected = spec["expect"]["final_state"]
+            if expected != "any":
+                self.assertEqual(result.final_state, expected, f"{name}: {result.reason}")
+            for item, status in spec["expect"].get("statuses", {}).items():
+                self.assertIn(status, [s.status for s in result.item_status if s.item_id.startswith(item)
+                                       or s.function == item], name)
+        print("\nConstruct corpus [NC-4]:\n" + "\n".join(outcomes))
+
+
 # ============================================================================ 9. requirements and skill
 class RequirementsTests(unittest.TestCase):
     REQ = DOCS / "unittest_generator_requirments.txt"
     ID = re.compile(r"\b(?:GEN-\d+|ORC-\d+[a-z]?|ARCH-\d+|TP-\d+|A1-(?:DA|PL|RQ)?\d+[a-z]?|KP-\d+|A2-\d+[a-z]?|"
-                    r"A3-(?:PR|OBS|CL|BD|FZ)?\d+[a-z]?|A4-\d+[a-z]?|KB-\d+[a-z]?|SC-\d+[a-z]?|COV-\d+|VIEW-\d+)\b")
+                    r"A3-(?:PR|OBS|CL|BD|FZ|HW)?\d+[a-z]?|A4-\d+[a-z]?|KB-\d+[a-z]?|SC-\d+[a-z]?|COV-\d+|VIEW-\d+|"
+                    r"LA-\d+|BP-\d+|NC-\d+)\b")
 
     def test_every_cited_requirement_exists(self):
         text = self.REQ.read_text(encoding="utf-8")

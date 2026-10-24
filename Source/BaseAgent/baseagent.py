@@ -2565,17 +2565,25 @@ class BrainRouter:
         """Brains that are not ruled out for this run, in order."""
         return [self.name_of(b) for b in self.brains if self.retry_after.get(self.name_of(b), 0.0) != math.inf]
 
+    def _preferred(self, candidates: list[Any], prefer: list[str] | None) -> list[Any]:
+        """A step's own brain order (prefer) first, the others in the configured order."""
+        if not prefer:
+            return candidates
+        rank = {name: k for k, name in enumerate(prefer)}
+        return sorted(candidates, key=lambda b: (rank.get(self.name_of(b), len(rank)), candidates.index(b)))
+
     async def decide(self, state: str, questions: dict[str, Any], allowed: list[str], *,
                      parts: list[ContextPart] | None = None, need: int | None = None, step: str = "",
-                     plans: list[TokenPlan] | None = None) -> tuple[dict[str, Any], Any, list[str]]:
+                     plans: list[TokenPlan] | None = None, prefer: list[str] | None = None
+                     ) -> tuple[dict[str, Any], Any, list[str]]:
         """Returns (raw answers, brain that answered, brains skipped).
 
         ``parts`` (optional) replaces ``state`` with prioritized parts; ``need`` is the expected
-        answer in tokens; every plan made is appended to ``plans``."""
+        answer in tokens; every plan made is appended to ``plans``; ``prefer`` is a step's own brain order."""
         # "demo" (explicit simulation) and "injected" (supplied in code, e.g. test fixtures)
         # are not configurable cloud/local brains, so per-use-case lists do not apply.
-        candidates = [b for b in self.brains if self.name_of(b) in ("demo", "injected")
-                      or self.name_of(b) in allowed]
+        candidates = self._preferred([b for b in self.brains if self.name_of(b) in ("demo", "injected")
+                                      or self.name_of(b) in allowed], prefer)
         if not candidates:
             raise AgentFault("FORBIDDEN", "No configured brain is allowed for this use case.")
         parts = parts if parts is not None else [ContextPart("state", state)]
@@ -2591,12 +2599,12 @@ class BrainRouter:
     async def generate(self, task: str, context: str | None, schema: dict[str, Any], validate: Callable[[Any], Any],
                        allowed: list[str] | None = None, *, parts: list[ContextPart] | None = None,
                        need: int | None = None, step: str = "", plans: list[TokenPlan] | None = None,
-                       vary: bool = False) -> tuple[dict[str, Any], Any, list[str]]:
+                       vary: bool = False, prefer: list[str] | None = None) -> tuple[dict[str, Any], Any, list[str]]:
         """Structured generation with the same fallback rules as ``decide``.
         Returns (result with "output", brain that answered, brains skipped)."""
         allowed = allowed or list(BRAIN_NAMES)
-        candidates = [b for b in self.brains if hasattr(b, "generate") and (
-            self.name_of(b) in ("demo", "injected") or self.name_of(b) in allowed)]
+        candidates = self._preferred([b for b in self.brains if hasattr(b, "generate") and (
+            self.name_of(b) in ("demo", "injected") or self.name_of(b) in allowed)], prefer)
         if not candidates:
             raise AgentFault("FORBIDDEN", "No configured brain can generate for this use case.")
         parts = parts if parts is not None else [ContextPart("context", context or "")]
@@ -3633,7 +3641,7 @@ class AgentGraphState(TypedDict, total=False):
 # cannot produce its result hands the case to the brain; the tool that rejected the rule's result
 # checks the brain's proposal; an accepted proposal is remembered per project.
 NO_BRAIN_CODES = frozenset({"NO_BRAIN_AVAILABLE", "BRAIN_NO_ACCESS", "MODEL_UNAVAILABLE", "BRAIN_RATE_LIMITED",
-                            "DEPENDENCY_MISSING"})
+                            "DEPENDENCY_MISSING", "NO_BRAIN_FOR_STEP"})
 
 
 @dataclass
@@ -3778,6 +3786,11 @@ class AgentCore:
         # Rule failures handed to the brain (ARCH-21 .. ARCH-23): the application sets the memory.
         self.resolutions: ResolutionMemory | None = None
         self.escalations: list[dict[str, Any]] = []
+        # The application may narrow the brains per step, for example by what each brain may write (its profile):
+        # brains_for_step(step, available brain names) -> the names allowed, or None for no restriction. A step no
+        # available brain may answer fails as NO_BRAIN_FOR_STEP before any brain is asked.
+        self.brains_for_step: Callable[[str, list[str]], list[str] | None] | None = None
+        self.step_order: Callable[[str], list[str] | None] | None = None      # a step's own brain order, or None
 
     # ---------------------------------------------------------------- subclass API
     def tools(self) -> list[ContractTool]:
@@ -3848,6 +3861,25 @@ class AgentCore:
                 return await job()
         return list(await asyncio.gather(*(one(job) for job in jobs), return_exceptions=True))
 
+    def _step_brains(self, router: BrainRouter, step: str, names: list[str]) -> list[str]:
+        """The brains of ``names`` that the application allows for ``step`` (brains_for_step)."""
+        if self.brains_for_step is None or not step:
+            return names
+        narrowed = self.brains_for_step(step, router.available)
+        if narrowed is None:
+            return names
+        if not narrowed:
+            raise AgentFault("NO_BRAIN_FOR_STEP", f"No available brain may answer the step {step}.")
+        kept = [n for n in names if n in narrowed]
+        if not kept and not any(n in ("injected", "demo") for n in narrowed):
+            raise AgentFault("NO_BRAIN_FOR_STEP", f"No allowed brain may answer the step {step}.")
+        return kept or [n for n in narrowed if n in ("injected", "demo")]
+
+    def _step_order(self, router: BrainRouter, step: str) -> list[str] | None:
+        """A step's own brain order, when the application gives one (step_order)."""
+        order = self.step_order(step) if self.step_order is not None and step else None
+        return [n for n in order if n in router.names] if order else None
+
     async def decide(self, state: str | list[ContextPart], questions: dict[str, Question], *, step: str = "",
                      project: str | Path | None = None, need: OutputNeed | None = None) -> dict[str, Any]:
         """Typed questions (choice/score/noul) answered with probabilities, as BaseAgent does.
@@ -3855,14 +3887,16 @@ class AgentCore:
         if need is not None and need.items <= 0:
             raise AgentFault("NO_WORK", "Nothing to ask a brain for in this step (ARCH-16).")
         router = await self._brains()
+        allowed = self._step_brains(router, step, list(self.allowed_brains))
+        prefer = self._step_order(router, step)
         profile = UseCase(domain=self.name, questions=questions)
         plans: list[TokenPlan] = []
         parts = self.context_parts(state, step, project)
         self.emit("brain_call", data={"step": step}, summary=f"{self.view_label} asks the brain ({step or 'decide'})")
         try:
-            raw, brain, skipped = await router.decide("", profile.brain_questions(), self.allowed_brains,
+            raw, brain, skipped = await router.decide("", profile.brain_questions(), allowed,
                                                       parts=parts, need=need.tokens if need else None,
-                                                      step=step, plans=plans)
+                                                      step=step, plans=plans, prefer=prefer)
         finally:
             self.token_plans.extend(plan.record() for plan in plans)
             self._brain_answer(step, plans)
@@ -3905,6 +3939,8 @@ class AgentCore:
         if need is not None and need.items <= 0:
             raise AgentFault("NO_WORK", "Nothing to ask a brain for in this step (ARCH-16).")
         router = await self._brains()
+        names = self._step_brains(router, step, [b for b in (allowed or self.allowed_brains) if b in self.allowed_brains]
+                                  or list(self.allowed_brains))
         schema = llm_schema(output_model.model_json_schema())
         validate = model_validator_for(output_model)
         if check is not None:
@@ -3916,10 +3952,9 @@ class AgentCore:
         self.emit("brain_call", data={"step": step}, summary=f"{self.view_label} asks the brain ({step or 'generate'})")
         try:
             result, brain, skipped = await router.generate(
-                task, None, schema, validate, [b for b in (allowed or self.allowed_brains) if b in self.allowed_brains]
-                or self.allowed_brains,
+                task, None, schema, validate, names,
                 parts=self.context_parts(context, step, project), need=need.tokens if need else None,
-                step=step, plans=plans, vary=vary)
+                step=step, plans=plans, vary=vary, prefer=self._step_order(router, step))
         except AgentFault as exc:                      # an answer no check let through is logged too [ARCH-20]
             self.log_answer(step, "refused", brain=plans[-1].brain if plans else "", task=task[:400],
                             varied=vary, code=exc.code, reason=exc.message[:1500])
@@ -4360,7 +4395,7 @@ class AgentClient:
 # the file named by BASEAGENT_EVENTS; the hub serves it to the page.
 VIEW_ENV = "BASEAGENT_EVENTS"
 VIEW_KINDS = ("run_start", "stage", "run_end", "tool_start", "tool_end", "handoff", "brain_call", "brain_answer",
-              "program", "metric", "escalation")
+              "program", "metric", "escalation", "progress")
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
 
 
@@ -4637,7 +4672,7 @@ body.present header h1{font-size:24px}body.present #canvas{min-height:600px}body
 @media (prefers-reduced-motion:reduce){.anim{display:none}}
 </style></head><body>
 <header><div><h1 id="title">__TITLE__</h1><div class="sub" id="subtitle"></div></div>
-<span class="pill" id="status">waiting</span><span class="grow"></span>
+<span class="pill" id="progress" style="display:none" title="share of the run's work done, and the time left"></span><span class="pill" id="status">waiting</span><span class="grow"></span>
 <span id="replay" style="display:none;gap:6px;align-items:center"><button id="play">Pause</button><button id="speed">Speed 1x</button><button id="end">Show end</button></span>
 <button id="present">Present</button></header>
 <section id="metrics"></section>
@@ -4794,6 +4829,7 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="metric"){setMetric(d.id,d);return}
  if(k==="escalation"){feed(ev,ev.summary||(labelOf(ev.agent)+": a rule needed the brain"),d.outcome==="resolved"?"purple":"gray");return}
  if(k==="stage"){feed(ev,ev.summary||d.stage||"stage","gray");return}
+ if(k==="progress"){var pg=document.getElementById("progress");if(pg){pg.style.display="";pg.textContent=d.text||((d.percent||0)+" %")}return}
  if(k==="run_end"){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
    if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)});
   if(S.orch){S.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"");paintOrch()}

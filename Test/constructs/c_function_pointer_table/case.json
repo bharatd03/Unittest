@@ -1,0 +1,40 @@
+{
+  "construct": "C table of function pointers",
+  "sut": "src/dispatch.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:dispatch:8"
+        ],
+        "name": "test_dispatch_unknown_command",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "cmd",
+            "value": "5"
+          },
+          {
+            "name": "x",
+            "value": "1"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

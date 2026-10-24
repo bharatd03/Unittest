@@ -1,0 +1,10 @@
+{
+  "construct": "C code in a .cpp file",
+  "sut": "src/crc.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {}
+}

@@ -1,0 +1,33 @@
+{
+  "construct": "C interrupt handler that sets a volatile flag the main code reads",
+  "sut": "src/uart.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:uart_poll:9"
+        ],
+        "name": "test_uart_poll_after_isr",
+        "purpose": "reach the item",
+        "args": [],
+        "setup": [
+          "uart_rx_isr();"
+        ],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "construct": "C memory-mapped register polling",
+  "sut": "src/timer.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:timer_done:5"
+        ],
+        "name": "test_timer_done_flag_set",
+        "purpose": "reach the item",
+        "args": [],
+        "setup": [
+          "UT_REG32(0x40000010u) = 1u;"
+        ],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

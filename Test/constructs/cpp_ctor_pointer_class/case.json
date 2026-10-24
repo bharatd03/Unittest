@@ -1,0 +1,20 @@
+{
+  "construct": "C++ class whose constructor takes a pointer to a concrete class",
+  "sut": "src/logger.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "setup": [
+      {
+        "lines": [
+          "Buffer ut_dep0{};",
+          "Logger ut_obj(&ut_dep0);"
+        ],
+        "call": "ut_obj.log"
+      }
+    ]
+  }
+}

@@ -77,6 +77,7 @@ from ut_contracts import ba
 
 HERE = Path(__file__).resolve().parent
 PILOTS = HERE.parent.parent / "Test" / "pilots"      # repository layout: Source/UnitTestGenerator, Test/pilots
+CONSTRUCTS = HERE.parent.parent / "Test" / "constructs"    # the construct corpus [NC-4]
 LOG = ba.logging.getLogger("ut.pipeline")
 # role -> (agent name, python file)
 AGENTS = {"analyzer": ("agent_unittest_analyzer", "agent_unittest_analyzer.py"),
@@ -135,6 +136,16 @@ class PipelineConfig(BaseModel):
     # link or host -> {"kind": github | gitlab | bitbucket, "api": ..., "project": ..., "token_env": ...}
     repositories: dict[str, dict[str, str]] = Field(default_factory=dict)
     keep_worktrees: bool = False
+    # learning between attempts [LA-5, LA-7, LA-4, LA-8, LA-9, ORC-7]
+    attempts_per_item: int = Field(default=2, ge=1, le=10)
+    minutes_per_function: float = Field(default=2.0, ge=0.1)       # safety ceiling: time per function with open items
+    min_minutes_per_file: float = Field(default=10.0, ge=1.0)
+    journal_tokens: int = Field(default=1500, ge=200, le=8000)      # journal excerpt per function
+    lesson_rule_count: int = Field(default=3, ge=2, le=50)          # a lesson this often is proposed as a rule
+    interactive: bool = False                                       # LA-9: ask at a decision point
+    interactive_wait_seconds: float = Field(default=600.0, ge=5.0)
+    trials_per_iteration: int = Field(default=10, ge=0, le=100)     # NC-7: items refused only by predictions
+    recipe_candidate_uses: int = Field(default=3, ge=2, le=50)      # NC-3
 
 
 class ViewerConfig(BaseModel):
@@ -164,6 +175,33 @@ DEFAULT_VIEW_METRICS = [
 
 ORCHESTRATOR_LABEL = "UT-Orchestrator"
 VIEW_OVERRIDE: bool | None = None          # --view / --no-view on the command line [VIEW-3]
+INTERACTIVE_OVERRIDE: bool | None = None   # --interactive on the command line [LA-9]
+
+
+def ask_user(question: str, choices: dict[str, str], wait: float, default: str) -> tuple[str, str]:
+    """LA-9: one question in the console; the answer, or the default after ``wait`` seconds (and at once when no
+    console is attached). Returns (choice, the text typed)."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return default, ""
+    import queue
+    import threading
+    answers: "queue.Queue[str]" = queue.Queue()
+
+    def read() -> None:
+        with contextlib.suppress(Exception):
+            answers.put(sys.stdin.readline())
+    print("\n" + question, flush=True)
+    for key, text in choices.items():
+        print(f"  [{key}] {text}", flush=True)
+    print(f"Your choice (the run continues with [{default}] after {wait / 60:.0f} min): ", end="", flush=True)
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        typed = answers.get(timeout=wait).strip()
+    except queue.Empty:
+        print(f"\nNo answer: continuing with [{default}] [LA-9].", flush=True)
+        return default, ""
+    key = typed.split(" ", 1)[0] if typed else default
+    return (key if key in choices else default), typed
 
 
 class Rejected(Exception):
@@ -236,12 +274,15 @@ class Orchestrator:
         self.viewer = ViewerConfig.model_validate(self.raw.get("viewer", {}))
         if VIEW_OVERRIDE is not None:
             self.viewer.enabled = VIEW_OVERRIDE
+        if INTERACTIVE_OVERRIDE is not None:                                                     # LA-9
+            self.cfg.interactive = INTERACTIVE_OVERRIDE
         self.hub: ba.ViewHub | None = None            # shared by the SUT runs of one repository run [VIEW-1]
         self.targets: dict[str, str] = {}             # COV-1 of the SUT file being processed
         self._last_agent = ""
         self._called: set[str] = set()                # VIEW-9
         self._labels: dict[str, str] = {}
         self.suggest_limit = int((self.raw.get("corrector") or {}).get("suggestions", 3))   # COV-12
+        self.book = uc.brain_profiles(self.config_path)                                   # BP-1
 
     # ---------------------------------------------------------------- connections
     def _transport(self, role: str, log_dir: Path):
@@ -418,6 +459,15 @@ class Orchestrator:
             os.environ["BASEAGENT_ANSWER_LOG"] = answer_log
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
+        brains = set()
+        for made in state.made.values():                                     # "brain/model kind; object: brain setup"
+            for part in made.split("; "):
+                part = part.removeprefix("object: ").strip()
+                if part and not part.startswith("recipe"):
+                    brains.add(part.split(" ")[0].split("/")[0])
+        result.profiles = self.book.record(sorted(b for b in brains if b))                             # BP-7
+        result.findings_overall = uc.record_findings(uc.findings_path(self.config_path, self.cfg.output_dir),
+                                                     result.findings)                                  # NC-5
         delivered = self._deliver(state, result)
         if self.hub is not None:
             self.hub.emit("run_end", summary=f"{req.sut_file}: {delivered.final_state}", data={
@@ -624,6 +674,11 @@ class Orchestrator:
                                 "issues remain: " + last.reason)
         # 3. Stage B: coverage loop [ORC-5], up to the iteration limit of the file's ASIL level [COV-9]
         last_good = last if not last.failures else None
+        s.started = time.monotonic()                                      # LA-7 c: the ceiling scales with the file
+        open_functions = {fc.name for fc in (last.coverage.functions if last.coverage else []) if fc.gaps} or \
+            {f.name for f in self.layout.functions}
+        s.deadline = s.started + 60.0 * max(self.cfg.min_minutes_per_file,
+                                            self.cfg.minutes_per_function * len(open_functions))
         stagnant = 0
         fuzz: uc.FuzzResult | None = None
         next_brain_asked = False
@@ -637,12 +692,23 @@ class Orchestrator:
                         " - targets met: checking the documented behaviour [A1-25y, ORC-32]" if s.targets_met_at else ""))
                     if self._needs_revision(last, s):                                  # A1-DA12
                         await self._dependencies(s, last)
+                    if s.deadline is not None and time.monotonic() > s.deadline:                  # LA-7 c
+                        return await self._stop(s, f"safety ceiling of the file reached: "
+                                                   f"{(s.deadline - s.started) / 60:.0f} min [LA-7]", last)
+                    s.quarantine = {}
+                    asked_third = set(s.other_model_items)
+                    s.open_now = {g.gap_id for fc in (last.coverage.functions if last.coverage else []) for g in fc.gaps}
+                    widest = max([self.cfg.journal_tokens] + [p.journal_tokens for p in self.book.profiles.values()])
+                    journal = s.journal.excerpt(widest * 3)              # each agent cuts it to its brain's [BP-5]
                     planning = self.call("analyzer", "plan", uc.PlanRequest(
                         layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
                         fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
                         avoid_brains=sorted(s.avoid_brains), failed_tests=dict(s.failed_tests),
                         refused={fn: lines[-6:] for fn, lines in s.rejected.items()},           # A1-PL2, A1-PL8
-                        crashed_calls=s.crashed_calls[-40:]), uc.UTPlan)
+                        crashed_calls=s.crashed_calls[-40:], journal=journal,                   # LA-4
+                        tried_scenarios=sorted(s.tried_scenarios), other_model_items=sorted(s.other_model_items),
+                        final_items=sorted(s.final_items), lessons=await self._lesson_texts(s),
+                        item_kinds=dict(s.item_kinds)), uc.UTPlan)
                     if pending is None:
                         plan = await planning
                     else:                       # the brain plans while the search runs on this computer [ORC-5a]
@@ -658,6 +724,13 @@ class Orchestrator:
                             plan = plan.model_copy(update={"scenarios": plan.scenarios + [
                                 sc for sc in extra.scenarios if sc.scenario_id not in known]})
                     s.take_plan(plan)
+                    if plan.kinds_available:                                           # BP-3, BP-9
+                        s.kinds_available = list(plan.kinds_available)
+                    for sc in plan.scenarios:
+                        for g in sc.gap_ids:
+                            tried = s.kinds_tried.setdefault(g, [])
+                            if not tried or tried[-1] != sc.kind:
+                                tried.append(sc.kind)
                     s.note_plan(plan, iteration)                                       # COV-6, COV-10
                     fuzz = None
                     s.revise = any("[A1-DA12]" in item for item in plan.open_items)
@@ -678,9 +751,32 @@ class Orchestrator:
                     if self._only_proven(plan, last):                                       # COV-4, COV-7
                         return await self._stop(s, "no test can reach the remaining items: each has a deterministic proof, "
                                                    "so only a change of the source can reach them [COV-4, COV-7]", last)
-                    for item in [g for sc in plan.scenarios for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
+                    attempted = Journal.attempts_of(plan, iteration)                          # LA-5
+                    if not plan.scenarios and not plan.repairs and self._settled(s, last):     # LA-7 b
+                        return await self._stop(s, "every open item has a final status: no further attempt can change "
+                                                   "it [LA-6, LA-7]", last)
+                    for item in [g for sc in attempted for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
                         s.attempts[item] = s.attempts.get(item, 0) + 1
-                    bundle = await self._generate(s, plan)
+                    for sc in attempted:
+                        if sc.made_by.startswith("brain:"):
+                            s.tried_scenarios.add(uc.scenario_signature(sc))                    # A1-PL4 g
+                            for g in sc.gap_ids:
+                                s.item_brains.setdefault(g, set()).add(sc.made_by.split(":", 1)[1].split("/")[0])
+                    self._next_attempts(s, plan, asked_third)                                  # LA-5, LA-6
+                    bundle = await self._generate(s, plan, journal=journal)
+                    generated_suite = uc.suite_of(bundle)                     # before tests are left out [LA-2]
+                    s.made.update(bundle.made)                                                    # BP-7
+                    for item, kind in bundle.needs_kind.items():                                 # BP-9
+                        s.needs_kind[item] = kind
+                        s.final_items.add(item)
+                    for n in bundle.notes:                                                       # NC-2, NC-3
+                        uses = re.search(r"used for (\d+) item\(s\) \[NC-2\]", n)
+                        if not uses:
+                            continue
+                        line = n if int(uses.group(1)) < self.cfg.recipe_candidate_uses else \
+                            n + " - a candidate for the application's recipe library [NC-3]"
+                        if line not in s.recipes:
+                            s.recipes.append(line)
                     s.crashed_calls = list(dict.fromkeys(s.crashed_calls + bundle.crashed_calls))   # A2-21f
                     result = await self.call("compilation", "verify", uc.VerifyRequest(
                         layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
@@ -698,6 +794,13 @@ class Orchestrator:
                     self._accept_bundle(s, bundle)
                     s.notes.extend(n for n in bundle.notes if n not in s.notes)
                     s.record(iteration, "verify", result, bundle)
+                    new_cause = s.journal.record(iteration, plan, generated_suite, s.quarantine, result, s.attempts,
+                                                 self.layout, bundle.notes + s.notes[-40:], s.open_items)    # LA-3
+                    self._climb(s, iteration)                                                    # BP-3
+                    for line in result.unknown_outcomes:                                         # NC-12, NC-5
+                        s.findings.append(self._finding("unknown_outcome", line.split(" -> ")[0].split(": ", 1)[-1][:80],
+                                                        line, item=line.split(":", 1)[0]))
+                    await self._lessons(s, generated_suite, result)                                        # LA-8
                     await self._learn(s, result, bundle)
                     if result.decision == "environment_error":
                         return s.finish("incomplete", "environment: " + result.reason, result)
@@ -714,7 +817,8 @@ class Orchestrator:
                             self._back_to_the_test(s, failure)
                     for failure in [f for f in result.failures if f.route == "stop"]:
                         return s.finish("incomplete", "environment: " + failure.diagnostic, result)
-                    progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures)
+                    progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures) \
+                        or new_cause                                    # a new root cause changes the next attempt [LA-7]
                     stagnant = 0 if progress else stagnant + 1
                     if progress:
                         next_brain_asked = False
@@ -722,6 +826,7 @@ class Orchestrator:
                         last_good = result
                     last = result
                     self._metrics(s, result)
+                    self._progress(s, result, iteration)                                         # VIEW-11
                     complete = result.verified and result.decision == "complete"
                     if complete and not self._open(result):
                         if not progress:              # one more round added nothing: the target and the checks are done
@@ -781,8 +886,228 @@ class Orchestrator:
             reason = (f"no test can reach the {len(s.not_reached)} remaining item(s): each has a deterministic proof, so "
                       "only a change of the source can reach them [COV-4, COV-7]; stopped after: " + reason)
         await self._suggest(s, last)
+        self._final_statuses(s, last)                                                          # LA-6
+        await self._decide(s)                                                                  # LA-9
         s.action_needed = s.actions(last)
         return s.finish("incomplete", reason, last)
+
+    async def _decide(self, s: "RunState") -> None:
+        """LA-9: in an interactive run the user decides what happens with items that need a source change or a
+        requirement; an unattended run never asks - the question is part of the hand-over (COV-11)."""
+        wanted = [st for st in s.item_status if st.status in ("needs_source_change", "needs_requirement")]
+        if not wanted:
+            return
+        items = ", ".join(st.item_id for st in wanted[:6]) + (" ..." if len(wanted) > 6 else "")
+        question = (f"{s.req.sut_file}: {len(wanted)} item(s) need a source change or a stated requirement "
+                    f"({items}). What should happen?")
+        if not self.cfg.interactive:
+            s.decisions.append(f"open question for the developer (unattended run): {question}")
+            return
+        choices = {"1": "keep Agent4's source-change suggestions for review (checked on a trial copy, never applied)",
+                   "2": "give requirement documents: type 2 and the path, e.g. 2 docs/requirements.md",
+                   "3": "leave the items open, without suggestions"}
+        choice, typed = await asyncio.to_thread(ask_user, question, choices, self.cfg.interactive_wait_seconds, "1")
+        if choice == "2":
+            path = typed.split(" ", 1)[1].strip().strip('"') if " " in typed else ""
+            s.decisions.append(f"requirement documents given: {path or '(none typed)'} - the file is run again with "
+                               "them [LA-9, A1-RQ1]" if path else "requirement documents asked for, none given [LA-9]")
+            if path:
+                s.rerun_requirements = [path]
+        elif choice == "3":
+            s.suggestions = []
+            s.decisions.append("the items stay open, without suggestions (the user's choice) [LA-9]")
+        else:
+            s.decisions.append("the source-change suggestions are kept for review [LA-9, COV-13]")
+
+    LESSON_CAUSES = ("test_setup", "test_did_not_compile", "needs_call_sequence", "needs_dependency_control",
+                     "wrong_inputs", "wrong_expectation")
+
+    async def _lessons(self, s: "RunState", suite: str, result: uc.VerificationResult) -> None:
+        """LA-8, KB-22: an entry closed because its items are now covered, by a test that passed in Agent3's verified
+        run, becomes a lesson: the cause, the pattern it occurred in and the test that removed it."""
+        passed = {t.name for t in result.tests if t.status == "passed"}
+        sources = uc.test_sources(suite)
+        functions = {f.name: f for f in self.layout.functions} | {f.qualified_name: f for f in self.layout.functions}
+        for e in s.journal.just_closed:
+            fn = functions.get(e.function)
+            if e.cause not in self.LESSON_CAUSES or fn is None or result.coverage is None:
+                continue
+            callers = [fn] + uc.callers_of(fn, self.layout) if uc.internal_member(fn, self.layout) else [fn]
+            reached = [n for n in passed if any(re.search(r"\b" + re.escape(f.qualified_name.split("::")[-1]) + r"\s*\(",
+                                                          sources.get(n, "")) for f in callers)]
+            reached.sort(key=lambda n: -len(set(SCENARIO_ID.findall(sources.get(n, "")))))
+            fixing = next((n for n in reached if n in sources), "")
+            if not fixing:
+                continue
+            body = Journal._short(fixing, sources[fixing]).split(": ", 1)[-1][:500]
+            pattern = "; ".join(uc.patterns_of(fn, self.layout))
+            lesson = (f"{uc.CAUSE_TEXT[e.cause]} - it failed with: {e.result[:200]} - fixed by a test like: {body}")
+            try:
+                ack = await self.call("kb", "learn", uc.LearningEvent(
+                    kind="lesson", language=self.layout.language, framework=self.layout.framework, category=e.cause,
+                    snippet=lesson, reason=uc.CAUSE_TEXT[e.cause], pattern=pattern,
+                    verification={"verified": True, "gap_covered": True, "tests": "passed", "items": e.items[:8]}),
+                    uc.LearnAck)
+            except (Rejected, ba.AgentFault) as exc:                     # KB-18: never blocks the run
+                LOG.info("lesson not stored: %s", exc)
+                continue
+            uses = int(ack.reason.split("=", 1)[1]) if ack.reason.startswith("uses=") else 1
+            line = f"learned ({pattern}): {lesson}"[:600]
+            if uses >= self.cfg.lesson_rule_count:
+                line = f"seen {uses} times - a candidate for a rule of Agent2 [LA-8]: " + line
+            if line not in s.lessons:
+                s.lessons.append(line)
+
+    async def _lesson_texts(self, s: "RunState") -> list[str]:
+        """LA-8: the verified lessons that match the constructs of the functions with open items."""
+        patterns = sorted({p for f in self.layout.functions for p in uc.patterns_of(f, self.layout)})
+        causes = sorted({e.cause for e in s.journal.entries if e.status == "open"})
+        try:
+            found = await self.call("kb", "guidance", uc.GuidanceRequest(
+                language=self.layout.language, framework=self.layout.framework, categories=causes,
+                patterns=patterns, k=6), uc.KBGuidance)
+        except (Rejected, ba.AgentFault):
+            return []
+        texts = [f"({e.pattern}) {e.snippet[:500]}" for e in found.lessons]
+        for t in texts:
+            line = f"applied: {t}"[:600]
+            if line not in s.lessons:
+                s.lessons.append(line)
+        return texts
+
+    def _settled(self, s: "RunState", last: uc.VerificationResult) -> bool:
+        """LA-7 b: every open item has a final status - its attempts are used, it was given its third attempt or no
+        other model could take it, or it is proven unreachable. A plan without scenarios for another reason (no brain
+        answered this time) is no such stop."""
+        open_items = [g.gap_id for fc in (last.coverage.functions if last.coverage else []) for g in fc.gaps]
+        n = self.cfg.attempts_per_item
+        return bool(open_items) and all(
+            i in s.final_items or i in s.proofs or s.attempts.get(i, 0) >= n + (1 if i in s.other_model_items else 0)
+            for i in open_items)
+
+    def _next_attempts(self, s: "RunState", plan: uc.UTPlan, asked_third: set[str]) -> None:
+        """LA-5, LA-6: an item with its attempts used goes once to a brain of another model; an item that got no
+        scenario although that was asked - no other model is available - or whose third attempt is used has a final
+        status and is not planned again."""
+        n = self.cfg.attempts_per_item
+        planned = {g for sc in plan.scenarios for g in sc.gap_ids}
+        for item in asked_third - planned:
+            s.final_items.add(item)
+        for item, count in s.attempts.items():
+            if item in s.final_items:
+                continue
+            if item in s.other_model_items and count > n:
+                s.final_items.add(item)
+            elif count >= n and item not in s.other_model_items:
+                s.other_model_items.add(item)
+                s.avoid_brains |= s.item_brains.get(item, set())
+
+    def _final_statuses(self, s: "RunState", last: uc.VerificationResult) -> None:
+        """LA-6: every item not covered at the stop gets a final status with its reason and owner. An item that needs
+        an answer kind no available brain may give is a pipeline limitation that a brain with a wider profile would
+        resolve (BP-9). Every pipeline limitation is a finding across runs (NC-5)."""
+        s.item_status = []
+        brains = ", ".join(f"{b} ({self.book.of(b).name})" for b in self.book.brains) or "none"
+        for fc in (last.coverage.functions if last.coverage else []):
+            for g in fc.gaps:
+                if g.gap_id in s.needs_kind and not s.proofs.get(g.gap_id):
+                    status = uc.ItemStatus(item_id=g.gap_id, function=fc.name, status="pipeline_limitation",
+                                           reason=f"needs answer kind {s.needs_kind[g.gap_id]}; brains configured: "
+                                                  f"{brains} [BP-9]", owner=uc.OWNER["pipeline_limitation"])
+                else:
+                    status = s.journal.final_status(g.gap_id, fc.name, s.proofs.get(g.gap_id, ""), s.suggested)
+                s.item_status.append(status)
+                if status.status == "pipeline_limitation":                                   # NC-5
+                    fn = next((f for f in self.layout.functions if fc.name in (f.name, f.qualified_name)), None) \
+                        if self.layout else None
+                    construct = (uc.construct_of(fn, self.layout)[0] or "; ".join(uc.patterns_of(fn, self.layout))) \
+                        if fn is not None else fc.name
+                    entry = s.journal.cause_of(g.gap_id)
+                    s.findings.append(self._finding(
+                        "pipeline_limitation", construct, entry.result if entry else status.reason, item=g.gap_id,
+                        kinds=s.kinds_tried.get(g.gap_id, []), brains=sorted(s.item_brains.get(g.gap_id, set()))))
+
+    def _finding(self, kind: str, subject: str, message: str, item: str = "", kinds: list[str] | None = None,
+                 brains: list[str] | None = None) -> uc.PipelineFinding:
+        """NC-5: one finding of this run; its signature counts it across runs and files."""
+        return uc.PipelineFinding(kind=kind, signature=uc.finding_signature(kind, subject, message), subject=subject[:300],
+                                  item=item, kinds_tried=list(kinds or []), brains=list(brains or []),
+                                  message=message[:600], platform=f"{sys.platform}",
+                                  sut_file=self.layout.sut_file if self.layout else "")
+
+    def _climb(self, s: "RunState", iteration: int) -> None:
+        """BP-3: an item whose attempt failed for a cause on the test-building side gets the next wider answer kind
+        that an available brain may give; none - a pipeline limitation a wider profile would resolve (BP-9)."""
+        for e in s.journal.entries:
+            if e.iteration != iteration or e.status != "open" or e.cause not in uc.CAUSE_KIND:
+                continue
+            for item in e.items:
+                if item.startswith("test:") or item in s.final_items:
+                    continue
+                current = s.item_kinds.get(item, "scenario")
+                kind = uc.next_kind(current, e.cause, s.kinds_available)
+                if not kind:
+                    s.needs_kind[item] = uc.CAUSE_KIND[e.cause]
+                    s.final_items.add(item)
+                elif kind != current:
+                    s.item_kinds[item] = kind
+                    s.note(item, f"iteration {iteration}: next attempt as {kind} ({uc.CAUSE_TEXT[e.cause]}) [BP-3]")
+
+    async def _trial(self, s: Any, bundle: uc.FileActionBundle) -> uc.FileActionBundle:
+        """NC-6, NC-7: tests refused only by predictions are built and run alone (the other tests left out); a test the
+        tool accepts - it compiles, passes and reaches an item it targets - stays, and the refusal is recorded as a false
+        refusal of that check; the others leave the bundle with the tool's message for the journal (LA-4)."""
+        names = [n for n in bundle.trial if n in bundle.tests]
+        budget = getattr(self.cfg, "trials_per_iteration", 10)
+        tried, over = names[:budget], names[budget:]
+        decided: dict[str, str] = {n: "over the trial budget of this iteration [NC-7]" for n in over}
+        accepted: list[str] = []
+        if tried:
+            only = uc.without_tests(bundle, [t for t in bundle.tests if t not in tried])
+            try:
+                obs = await self.call("compilation", "observe", uc.VerifyRequest(
+                    layout=self.layout, stage="observe", bundle=only, measure_tests=tried), uc.VerificationResult)
+                self.check_result(obs, self.layout.sut_sha256)
+            except (Rejected, ba.AgentFault) as exc:
+                obs = None
+                decided.update({n: f"no trial build: {exc}"[:300] for n in tried})
+            if obs is not None:
+                compiled = {f.affected_test: f.diagnostic for f in obs.quarantined if f.affected_test}
+                status = {t.name: t for t in obs.tests}
+                open_now = getattr(s, "open_now", set()) or set()
+                for name in tried:
+                    reached = set(obs.test_items.get(name, []))
+                    targets = set(bundle.trial_targets.get(name) or []) or open_now
+                    result = status.get(name)
+                    if name in compiled or not obs.link_ok:
+                        decided[name] = f"the compiler rejected it: {compiled.get(name) or obs.reason}"[:400]
+                    elif result is None or result.status != "passed":
+                        decided[name] = f"{result.status if result else 'not run'}: {result.message if result else ''}"
+                    elif targets and not reached & targets:
+                        decided[name] = "it ran, but reached none of the items it targets"
+                    else:
+                        accepted.append(name)
+                        if hasattr(s, "test_items"):
+                            s.test_items[name] = sorted(reached)
+        tests = uc.test_sources(uc.suite_of(bundle))
+        for name in accepted:
+            why = bundle.trial.get(name, "")
+            check = uc.prediction_name(why)
+            if hasattr(s, "findings"):
+                s.findings.append(self._finding("false_refusal", check, why, item=name))
+            if hasattr(s, "trials"):
+                s.trials.append(f"{name}: accepted by the tool although '{check}' refused it - a false refusal [NC-7]")
+        for name, why in decided.items():
+            if why.startswith("the compiler rejected it") and hasattr(s, "quarantine"):
+                s.quarantine[name] = (why, tests.get(name, ""))                       # the tool's message [LA-4]
+            elif hasattr(s, "failed_tests"):
+                s.failed_tests[name] = f"trial: {why}"[:160]                          # not planned again unchanged
+            if hasattr(s, "trials"):
+                s.trials.append(f"{name}: refusal stands - {why}"[:300])
+        out = uc.without_tests(bundle, list(decided), f"{len(decided)} test(s) refused by predictions did not pass "
+                               f"their trial; {len(accepted)} did [NC-7]" if decided or accepted else "")
+        out.trial = {}
+        return out
 
     async def _suggest(self, s: "RunState", last: uc.VerificationResult) -> None:
         """COV-12, COV-13: source-change suggestions from the requirements, each checked on a trial copy."""
@@ -853,6 +1178,8 @@ class Orchestrator:
                       "[COV-7, COV-13].\n")
             path = folder / f"{sug.suggestion_id}.patch"
             path.write_text(header + diff, encoding="utf-8", newline="")
+            for item in sug.item_ids:                                                         # LA-6
+                s.suggested.setdefault(item, sug.cause)
             s.suggestions.append(f"{sug.suggestion_id} ({sug.cause.replace('_', ' ')}, {sug.function or sug.file}): "
                                  f"{effect} on a trial copy; {fault.summary()}" + ("" if sug.with_requirements else
                                                                                    " - without requirements")
@@ -889,6 +1216,23 @@ class Orchestrator:
     def _stage(self, text: str) -> None:
         if self.hub is not None:
             self.hub.emit("stage", data={"stage": text}, summary=text)
+
+    def _progress(self, s: "RunState", result: uc.VerificationResult, iteration: int) -> None:
+        """VIEW-11: items covered or with a final status, out of all items of the file, in a corner of the viewer -
+        or one console line per iteration when the viewer is off."""
+        if result.coverage is None:
+            return
+        metrics = result.coverage.file_metrics
+        total = sum(getattr(metrics, n).total for n in METRIC_IDS)
+        covered = sum(getattr(metrics, n).covered for n in METRIC_IDS)
+        open_items = {g.gap_id for fc in result.coverage.functions for g in fc.gaps}
+        fraction = (covered + len(open_items & s.final_items)) / total if total else 0.0
+        progress = getattr(self, "progress", None) or Progress(1)
+        line = progress.line(fraction, iteration)
+        if self.hub is not None:
+            self.hub.emit("progress", data={"text": line, "percent": round(fraction * 100)}, summary=line)
+        else:
+            print(f"[{s.req.sut_file}] {line}", flush=True)
 
     def _metrics(self, s: "RunState", result: uc.VerificationResult, final: bool = False) -> None:
         """VIEW-5: the measured coverage against the file's ASIL targets, and the tests passed."""
@@ -1019,26 +1363,36 @@ class Orchestrator:
         s.record(0, f"stage A round {rounds}", result, bundle)
         return result
 
-    async def _generate(self, s: "RunState", plan: uc.UTPlan, observe: bool = True) -> uc.FileActionBundle:
+    async def _generate(self, s: "RunState", plan: uc.UTPlan, observe: bool = True,
+                        journal: dict[str, str] | None = None) -> uc.FileActionBundle:
         guidance = uc.KBGuidance()
         try:                                                           # advisory only [KB-18, SC-22]
+            functions = {sc.function for sc in plan.scenarios}
             guidance = await self.call("kb", "guidance", uc.GuidanceRequest(
                 language=self.layout.language, framework=self.layout.framework,
-                categories=sorted({r.classification for r in plan.repairs if r.classification})), uc.KBGuidance)
+                categories=sorted({r.classification for r in plan.repairs if r.classification}
+                                  | {e.cause for e in s.journal.entries if e.status == "open"}),
+                patterns=sorted({p for f in self.layout.functions if f.name in functions or f.qualified_name in functions
+                                 for p in uc.patterns_of(f, self.layout)})), uc.KBGuidance)
         except (Rejected, ba.AgentFault) as exc:
             LOG.warning("KB guidance unavailable: %s", exc)
         bundle = await self.call("generator", "generate", uc.GenerationRequest(
-            plan=plan, guidance=guidance, existing_suite=self.suite), uc.FileActionBundle)
+            plan=plan, guidance=guidance, existing_suite=self.suite, journal=journal or {},
+            item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
         self.check_bundle(bundle)
+        if bundle.trial:                                                                   # NC-7
+            bundle = await self._trial(s, bundle)
         if observe and bundle.observations:                            # A2-21f, A3-OBS1
             obs = await self.call("compilation", "observe", uc.VerifyRequest(
-                layout=self.layout, stage="observe", bundle=bundle), uc.VerificationResult)
+                layout=self.layout, stage="observe", bundle=bundle,
+                measure_tests=[t for t in bundle.tests if t not in s.test_items]), uc.VerificationResult)   # A3-OBS5
             self.check_result(obs, self.layout.sut_sha256)
             bundle = await self._drop_quarantined(s, bundle, obs)                       # A3-CL12
             s.test_items.update(obs.test_items)                            # what each test reached [A1-PL7]
             if bundle.observations:          # the probes may all have been in tests that did not compile [A3-CL12]
+                known = {n: items for n, items in s.test_items.items() if n in set(bundle.tests)}   # A3-OBS5
                 bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
-                    bundle=bundle, observed=obs.observed, test_items=obs.test_items), uc.FileActionBundle)
+                    bundle=bundle, observed=obs.observed, test_items=known), uc.FileActionBundle)
                 self.check_bundle(bundle)
         return await self._oracle_checks(s, bundle)
 
@@ -1051,6 +1405,9 @@ class Orchestrator:
             return bundle
         names = sorted({f.affected_test for f in result.quarantined if f.affected_test})
         tests = uc.test_sources(uc.suite_of(bundle))
+        for f in result.quarantined:                                     # the journal's facts [LA-2, LA-4]
+            if f.affected_test:
+                s.quarantine[f.affected_test] = (f.diagnostic, tests.get(f.affected_test, ""))
         for f in result.quarantined[:3]:
             with contextlib.suppress(Rejected, ba.AgentFault):
                 await self.call("kb", "learn", uc.LearningEvent(
@@ -1386,6 +1743,249 @@ def plain_proof(detail: str) -> str:
     return re.sub(r"\s*\[(?:A\d|COV)[^\]]*\]", "", text).strip()
 
 
+SETUP_MESSAGE = re.compile(r"undeclared identifier|no member named|no viable conversion|non-static member function|"
+                           r"unknown type name|is a private member|is a protected member|no matching (?:constructor|"
+                           r"function)|cannot bind|incomplete type|calls functions that do not exist|does not exist here|"
+                           r"no matching conversion|cannot initialize|was not declared", re.I)
+SCENARIO_ID = re.compile(r"\bS-[A-Za-z0-9_.\-]*[A-Za-z0-9_]")
+
+
+class Progress:
+    """VIEW-11: the share of a run's work that is done, over all SUT files of the run, and the time left."""
+
+    def __init__(self, files: int = 1):
+        self.files, self.done, self.started = max(1, files), 0, time.monotonic()
+
+    def line(self, fraction: float, iteration: int) -> str:
+        overall = min(1.0, (self.done + max(0.0, min(1.0, fraction))) / self.files)
+        elapsed = time.monotonic() - self.started
+        text = f"{overall * 100:.0f} % - file {min(self.done + 1, self.files)} of {self.files} - iteration {iteration}"
+        if 0.03 < overall < 1.0 and elapsed > 20:
+            left = elapsed / overall - elapsed
+            lo, hi = max(1, round(left * 0.7 / 60)), max(1, round(left * 1.4 / 60))
+            text += f" - about {lo}-{hi} min left" if hi > lo else f" - about {lo} min left"
+        return text
+
+
+class Journal:
+    """LA-2 .. LA-6: the failure journal of one SUT file - only deviations, never what was covered. Every entry
+    groups the items one cause blocked (LA-5); the excerpt of a function goes to the next attempt (LA-4)."""
+
+    def __init__(self, sut_file: str, folder: Path):
+        self.sut_file = sut_file
+        self.folder = folder
+        self.entries: list[uc.JournalEntry] = []
+        self.keys: set[str] = set()                  # cause signatures seen: a new one is progress [LA-7]
+        self.by_key: dict[str, uc.JournalEntry] = {}
+        self.just_closed: list[uc.JournalEntry] = []                 # closed by the last iteration [LA-8]
+
+    # ---------------------------------------------------------------- recording
+    @staticmethod
+    def attempts_of(plan: uc.UTPlan, iteration: int) -> list[uc.Scenario]:
+        """LA-5: the scenarios that count as an attempt - built and measured, made by a brain or written by one; the
+        rule-based tests and the search of the first iteration are facts, not attempts."""
+        return [sc for sc in plan.scenarios if not sc.inputs and (
+            sc.made_by.startswith("brain:") or iteration > 1 or sc.scenario_id.startswith("S-evidence-"))]
+
+    def _entry(self, function: str, items: list[str], cause: str, result: str, **fields: Any) -> bool:
+        """Adds or updates the entry of (function, cause, message); True when the cause is new [LA-7]."""
+        message = re.sub(r"\d+", "#", re.sub(r"\s+", " ", re.sub(r"\btest_\w+", "test", result)))[:80]
+        key = f"{function}|{cause}|{message}"
+        entry = self.by_key.get(key)
+        if entry is None or entry.status != "open":
+            entry = uc.JournalEntry(entry_id=f"J{len(self.entries) + 1}", function=function, cause=cause,
+                                    result=result[:600], **fields)
+            self.entries.append(entry)
+            self.by_key[key] = entry
+        else:
+            for name, value in fields.items():
+                setattr(entry, name, value)
+            entry.result = result[:600]
+        entry.items = list(dict.fromkeys(entry.items + items))
+        entry.next_action = uc.FIX_FORM.get(cause, "")
+        new = key not in self.keys
+        self.keys.add(key)
+        return new
+
+    def record(self, iteration: int, plan: uc.UTPlan, suite: str, quarantined: dict[str, tuple[str, str]],
+               result: uc.VerificationResult, attempts: dict[str, int], layout: uc.LayoutProfile,
+               notes: list[str], open_notes: set[str] | list[str]) -> bool:
+        """LA-2, LA-3: the deviations of one iteration with their root cause, decided by rules from the tools'
+        results. Returns True when a new root cause appeared (progress, LA-7)."""
+        open_now = {g.gap_id for fc in (result.coverage.functions if result.coverage else []) for g in fc.gaps}
+        sources = uc.test_sources(suite)
+        for name, (_, source) in quarantined.items():
+            sources.setdefault(name, source)
+        by_scenario: dict[str, list[str]] = {}
+        for name, source in sources.items():
+            for sid in set(SCENARIO_ID.findall(source)):
+                by_scenario.setdefault(sid, []).append(name)
+        status = {t.name: t for t in result.tests}
+        functions = {f.name: f for f in layout.functions} | {f.qualified_name: f for f in layout.functions}
+        new = False
+        attempted = self.attempts_of(plan, iteration)
+        written = [sc for sc in plan.scenarios if not sc.inputs and sc not in attempted and sc.scenario_id in by_scenario]
+        for sc in attempted + written:                    # a test the test writer wrote is an attempt too [LA-5]
+            tests = by_scenario.get(sc.scenario_id, [])
+            missed = any(n in quarantined for n in tests) or not tests or any(
+                status[n].status in ("failed", "crashed", "timeout") for n in tests if n in status)
+            items = [g for g in sc.gap_ids if g in open_now or (g.startswith("EVIDENCE:") and missed)]
+            if not items:
+                continue
+            fn = functions.get(sc.function)
+            brain = sc.made_by.split(":", 1)[1] if sc.made_by.startswith("brain:") else "test writer"
+            common = dict(iteration=iteration, attempt=max(attempts.get(g, 0) for g in items), brain=brain,
+                          strategy="brain scenario" if sc.made_by.startswith("brain:") else "test by the test writer")
+            failed_build = [(n, quarantined[n][0]) for n in tests if n in quarantined]
+            if not tests:
+                why = next((n for n in notes if n.startswith((sc.function + ":", sc.function.split("::")[-1] + ":"))
+                            and ("dropped" in n or "no LLM tests" in n or "cannot be named" in n)), "")
+                cause = "test_setup" if SETUP_MESSAGE.search(why) or "cannot be named" in why else "undetermined"
+                if not why and sc.test_name and sc.test_name in sources:
+                    why = f"the scenario repeats the existing test {sc.test_name}: nothing new was written"
+                new |= self._entry(sc.function, items, cause, why or "no test was written for the scenario",
+                                   tried=self._tried(sc), **common)
+            elif failed_build:
+                name, message = failed_build[0]
+                cause = "test_setup" if SETUP_MESSAGE.search(message) else "test_did_not_compile"
+                new |= self._entry(sc.function, items, cause, f"{name} does not compile: {message}",
+                                   tried=self._short(name, sources.get(name, "")), **common)
+            else:
+                ran = [status[n] for n in tests if n in status]
+                bad = [t for t in ran if t.status in ("failed", "crashed", "timeout")]
+                if bad:
+                    t = bad[0]
+                    cause = "wrong_expectation" if t.status == "failed" else "wrong_inputs"
+                    message = (f"{t.name} failed: expected {t.expected}, actual {t.actual}" if t.status == "failed"
+                               else f"{t.name} {t.status}: {t.message}")
+                    new |= self._entry(sc.function, items, cause, message,
+                                       tried=self._short(t.name, sources.get(t.name, "")), **common)
+                    continue
+                state = uc.keeps_state(fn, layout) if fn is not None else ""
+                short = (fn.qualified_name.split("::")[-1] if fn else sc.function.split("::")[-1])
+                repeated = sum(len(re.findall(r"\b" + re.escape(short) + r"\s*\(", x)) for x in sc.setup)
+                dependency = any(n.startswith(tuple(f"{g}: needs control of the real dependency" for g in items))
+                                 for n in open_notes)
+                cause = ("needs_dependency_control" if dependency else
+                         "needs_call_sequence" if state and not repeated else "wrong_inputs")
+                new |= self._entry(sc.function, items, cause,
+                                   f"the test(s) {', '.join(tests[:3])} ran and passed but did not reach "
+                                   f"{', '.join(items[:4])}" + (f" ({state})" if state else ""),
+                                   tried=self._short(tests[0], sources.get(tests[0], "")), **common)
+        failing = {t.name: t for t in result.tests if t.status in ("failed", "crashed", "timeout")}
+        recorded = {i for e in self.entries if e.iteration == iteration for i in e.items}
+        for name, t in failing.items():                   # every failing test gets a root cause [LA-3]
+            if f"test:{name}" in recorded:
+                continue
+            source = sources.get(name, "")
+            fn = next((f for f in layout.functions if re.search(
+                r"\b" + re.escape(f.qualified_name.split("::")[-1]) + r"\s*\(", source)), None)
+            cause = "wrong_expectation" if t.status == "failed" else "wrong_inputs"
+            message = (f"{name} failed: expected {t.expected}, actual {t.actual}" if t.status == "failed"
+                       else f"{name} {t.status}: {t.message}")
+            new |= self._entry(fn.qualified_name if fn else "", [f"test:{name}"], cause, message, iteration=iteration,
+                               strategy="test", tried=self._short(name, source))
+        for line in plan.planning:                                    # a function the brain could not plan
+            if "no scenario this time" not in line:
+                continue
+            fn_name = line.split(":", 1)[0]
+            items = [g.gap_id for g in plan.gaps if g.function in (fn_name, fn_name.split("::")[-1]) and
+                     g.gap_id in open_now]
+            if items:
+                cause = "test_setup" if SETUP_MESSAGE.search(line) else "undetermined"
+                new |= self._entry(fn_name, items, cause, line.split(" - ", 1)[-1], iteration=iteration,
+                                   strategy="brain planning", tried="no scenario passed the checks")
+        for g in plan.gaps:                                                     # deterministic proofs [LA-3]
+            if g.gap_id in open_now and ("infeasible" in g.detail or "unreachable_code" in g.detail):
+                if not any(g.gap_id in e.items and e.cause == "unreachable" for e in self.entries):
+                    new |= self._entry(g.function, [g.gap_id], "unreachable", g.detail[:300], iteration=iteration,
+                                       strategy="deterministic analysis", final_status="proven_unreachable")
+        self.close(open_now | {f"test:{n}" for n in failing}, failed_evidence={
+            g for e in self.entries if e.iteration == iteration for g in e.items if g.startswith("EVIDENCE:")})
+        return new
+
+    def close(self, open_now: set[str], failed_evidence: set[str] = frozenset()) -> list[uc.JournalEntry]:
+        """Items covered since: removed from their entries; an entry without open items is closed (LA-2)."""
+        closed = []
+        self.just_closed = closed
+        for e in self.entries:
+            if e.status != "open":
+                continue
+            still = [i for i in e.items if i in open_now or i in failed_evidence]
+            if not still:
+                e.status, e.final_status = "closed", "covered"
+                closed.append(e)
+        return closed
+
+    @staticmethod
+    def _tried(sc: uc.Scenario) -> str:
+        args = ", ".join(f"{a.name}={a.value}" for a in sc.args)
+        return (f"scenario {sc.test_name or sc.scenario_id}: args {args or '-'}"
+                + (f"; setup {' '.join(sc.setup)[:160]}" if sc.setup else ""))[:300]
+
+    @staticmethod
+    def _short(name: str, source: str) -> str:
+        body = " ".join(line.strip() for line in source.splitlines()[1:] if line.strip() not in ("{", "}"))
+        return f"{name}: {re.sub(r'/[*].*?[*]/', '', body)[:260]}"
+
+    # ---------------------------------------------------------------- the next attempt [LA-4]
+    def excerpt(self, limit_chars: int = 4500) -> dict[str, str]:
+        out: dict[str, list[str]] = {}
+        for e in reversed(self.entries):
+            if e.status != "open" or e.final_status:
+                continue
+            row = (f"- {', '.join(e.items[:6])} (attempt {e.attempt}, {e.brain or e.strategy}): tried {e.tried[:220]} "
+                   f"-> {e.result[:260]} -> cause: {uc.CAUSE_TEXT[e.cause]}"
+                   + (f" -> fix: {e.next_action}" if e.next_action else ""))
+            rows = out.setdefault(e.function, [])
+            if sum(len(r) for r in rows) + len(row) <= limit_chars:
+                rows.append(row)
+        return {fn: "\n".join(rows) for fn, rows in out.items()}
+
+    # ---------------------------------------------------------------- final status [LA-6]
+    def cause_of(self, item: str) -> uc.JournalEntry | None:
+        return next((e for e in reversed(self.entries) if item in e.items), None)
+
+    def final_status(self, item: str, function: str, proof: str, suggested: dict[str, str]) -> uc.ItemStatus:
+        entry = self.cause_of(item)
+        if proof or (entry is not None and entry.cause == "unreachable"):
+            status, reason = "proven_unreachable", proof or entry.result
+        elif item in suggested:
+            status = "needs_requirement" if suggested[item] == "required_defensive_code" else "needs_source_change"
+            reason = f"a checked source-change suggestion reaches it ({suggested[item].replace('_', ' ')}) [COV-12]"
+        elif entry is None:
+            status, reason = "undetermined", "no attempt recorded a cause"
+        elif entry.cause in ("test_setup", "test_did_not_compile", "pipeline_limitation", "needs_dependency_control"):
+            status, reason = "pipeline_limitation", f"{uc.CAUSE_TEXT[entry.cause]}: {entry.result[:240]}"
+        elif entry.cause in ("needs_requirement", "needs_source_change"):
+            status, reason = entry.cause, entry.result[:240]
+        else:
+            status, reason = "undetermined", f"{uc.CAUSE_TEXT[entry.cause]}: {entry.result[:240]}"
+        if entry is not None and entry.status == "open":
+            entry.final_status = status
+        return uc.ItemStatus(item_id=item, function=function, status=status, reason=reason, owner=uc.OWNER[status])
+
+    # ---------------------------------------------------------------- files [LA-2]
+    def write(self) -> str:
+        if not self.entries:
+            return ""
+        self.folder.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"[^\w.-]", "_", self.sut_file)
+        jsonl = self.folder / f"{stem}.jsonl"
+        jsonl.write_text("".join(e.model_dump_json() + "\n" for e in self.entries), encoding="utf-8")
+        rows = [f"# Failure journal: {self.sut_file} [LA-2]", "",
+                "Only deviations are recorded: what was tried, what the tools said, why it missed and what comes next.",
+                ""]
+        for e in self.entries:
+            rows += [f"## {e.entry_id} - {e.function} - {e.status}" + (f" ({e.final_status})" if e.final_status else ""),
+                     "", f"- Items: {', '.join(e.items)}", f"- Iteration {e.iteration}, attempt {e.attempt}, "
+                     f"{e.strategy}" + (f" by {e.brain}" if e.brain else ""), f"- Tried: {e.tried}",
+                     f"- Result: {e.result}", f"- Root cause ({e.decided_by}): {uc.CAUSE_TEXT[e.cause]}",
+                     *( [f"- Next: {e.next_action}"] if e.next_action else []), ""]
+        (self.folder / f"{stem}.md").write_text("\n".join(rows), encoding="utf-8")
+        return str(jsonl)
+
+
 class RunState:
     """What one pipeline run has seen so far."""
     def __init__(self, req: uc.PipelineRequest, repo: Path, out: Path, workspace: Path):
@@ -1442,6 +2042,28 @@ class RunState:
         self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
         self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
         self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
+        self.journal = Journal(req.sut_file, out / "journal")                          # LA-2
+        self.quarantine: dict[str, tuple[str, str]] = {}      # test -> (compiler message, source) of this iteration
+        self.tried_scenarios: set[str] = set()                # signatures of earlier scenarios [A1-PL4 g]
+        self.other_model_items: set[str] = set()              # LA-5: a third attempt by another model only
+        self.final_items: set[str] = set()                    # LA-6: no further attempt
+        self.item_brains: dict[str, set[str]] = {}            # item -> brains that attempted it [LA-5]
+        self.suggested: dict[str, str] = {}                   # item -> cause of a shown suggestion [COV-12, LA-6]
+        self.item_status: list[uc.ItemStatus] = []            # LA-6
+        self.lessons: list[str] = []                          # LA-8
+        self.decisions: list[str] = []                        # LA-9
+        self.deadline: float | None = None                    # LA-7: the safety ceiling in time
+        self.started = time.monotonic()
+        self.rerun_requirements: list[str] = []               # LA-9: requirement documents the user gave
+        self.item_kinds: dict[str, str] = {}                  # BP-3: item -> answer kind of its next attempt
+        self.kinds_tried: dict[str, list[str]] = {}           # BP-3, NC-5: item -> kinds asked so far
+        self.kinds_available: list[str] = list(uc.MINIMUM_KINDS)   # BP-9: of the brains available now
+        self.needs_kind: dict[str, str] = {}                  # BP-9: item -> kind no available brain may give
+        self.made: dict[str, str] = {}                        # BP-7: test -> brain/model kind
+        self.findings: list[uc.PipelineFinding] = []          # NC-5
+        self.recipes: list[str] = []                          # NC-2, NC-3
+        self.trials: list[str] = []                           # NC-7: what the trials decided
+        self.open_now: set[str] = set()                       # the items open before this iteration
 
     def take_plan(self, plan: uc.UTPlan) -> None:
         """Agent1's records of one plan: open items, who planned what, conflicts, look-ups, disputes."""
@@ -1565,8 +2187,22 @@ class RunState:
         if self.suggestions:
             rows.append(f"Review the {len(self.suggestions)} suggested source change(s) in coverage_suggestions/ - "
                         "each was measured on a trial copy; apply one in your source and run again [COV-13].")
-        elif self.not_reached:
-            rows.append("Change the source so that tests can reach these items, then run again [COV-7].")
+        by_status: dict[str, list[str]] = {}                                                  # LA-6
+        for st in self.item_status:
+            by_status.setdefault(st.status, []).append(st.item_id)
+        source = by_status.get("needs_source_change", []) + by_status.get("proven_unreachable", [])
+        if source and not self.suggestions:
+            rows.append(f"Change the source so that tests can reach {', '.join(source[:6])}"
+                        + (" ..." if len(source) > 6 else "") + ", then run again [COV-7, LA-6].")
+        if by_status.get("needs_requirement"):
+            rows.append(f"State the expected behaviour for {', '.join(by_status['needs_requirement'][:6])} in the "
+                        "requirement documents [A1-RQ1, LA-6].")
+        if by_status.get("pipeline_limitation"):
+            rows.append(f"{len(by_status['pipeline_limitation'])} item(s) are a limitation of the pipeline, not of your "
+                        "source (see the final status per item): reported to the pipeline's developers [LA-6].")
+        if by_status.get("undetermined"):
+            rows.append(f"{len(by_status['undetermined'])} item(s) without a decided cause: the journal and the "
+                        "evidence below show what was tried [LA-2, LA-6].")
         failing = [t.name for t in last.tests if t.status in ("failed", "crashed", "timeout")]
         if failing:                                                              # A4-23j: not a coverage matter
             rows.append(f"Review the failing test(s) {', '.join(failing[:6])}: the open items say what each expected "
@@ -1637,7 +2273,24 @@ class RunState:
                                for link in (self.layout.requirement_links if self.layout else [])],
             suggested_flags=list(self.build.suggested_flags) if self.build else [],
             fix_candidates=self.fix_candidates, reviews=self.reviews,
-            requirement_documents=[f"{d.name} sha256 {d.sha256} (given as {d.origin})" for d in self.requirement_docs])
+            requirement_documents=[f"{d.name} sha256 {d.sha256} (given as {d.origin})" for d in self.requirement_docs],
+            item_status=self.item_status, journal=self.journal.write(), lessons=self.lessons,
+            decisions=self.decisions, recipes=list(self.recipes), findings=list(self.findings),
+            kinds_used=self.kinds_used(last), trials=list(self.trials))
+
+    def kinds_used(self, last: uc.VerificationResult | None) -> dict[str, int]:
+        """BP-7: the answer kinds of the pieces in the measured suite (rules not counted)."""
+        bundle = self.best_bundle or self.bundle
+        present = set(bundle.tests) if bundle else set()
+        out: dict[str, int] = {}
+        for name, made in self.made.items():
+            if name not in present:
+                continue
+            for part in made.split("; "):
+                kind = part.rsplit(" ", 1)[-1]
+                if kind in uc.ANSWER_KINDS:
+                    out[kind] = out.get(kind, 0) + 1
+        return dict(sorted(out.items()))
 
 
 BRAIN_STOP = ("NO_BRAIN_AVAILABLE", "BRAIN_PLAN_FAILED")       # a run that cannot go on without a brain [ORC-34]
@@ -1675,6 +2328,19 @@ def report(r: uc.PipelineResult) -> str:
     if r.action_needed:                                                                  # COV-11
         rows += ["## Action needed", "", "The run did not wait for this; it stopped with the evidence below.", ""]
         rows += [f"- {line}" for line in r.action_needed] + [""]
+    if r.item_status:                                                                    # LA-6
+        rows += ["## Final status per item not covered [LA-6]", "", "| Item | Function | Status | Owner | Reason |",
+                 "| --- | --- | --- | --- | --- |"]
+        rows += [f"| {st.item_id} | {st.function} | {st.status.replace('_', ' ')} | {st.owner} | "
+                 f"{st.reason[:200].replace('|', '/')} |" for st in r.item_status[:80]] + [""]
+    if r.decisions:                                                                      # LA-9
+        rows += ["## Decisions [LA-9]", ""] + [f"- {d}" for d in r.decisions] + [""]
+    if r.findings or r.findings_overall:                                                 # NC-5
+        rows += ["## Pipeline findings [NC-5]", "",
+                 "What the pipeline itself could not do; fixed once in the pipeline, for every project.", ""]
+        rows += [f"- this run: {f.kind.replace('_', ' ')} - {f.subject} ({f.item}): {f.message[:200]} - seen "
+                 f"{f.count} time(s)" for f in r.findings[:30]]
+        rows += ["", "Across runs (most frequent first):", ""] + [f"- {line}" for line in r.findings_overall[:15]] + [""]
     if r.suggestions:                                                                    # COV-12, COV-13
         rows += ["## Source-change suggestions (measured on a trial copy, not applied)", ""]
         rows += [f"- {line}" for line in r.suggestions] + [""]
@@ -1727,15 +2393,23 @@ def report(r: uc.PipelineResult) -> str:
                          ("Requirements linked by the brain", r.requirement_links),
                          ("Flags suggested by the brain (estimated build)", r.suggested_flags),
                          ("Rules that needed the brain", r.escalations),
+                         ("Brain profiles of this run [BP-7]", r.profiles),
+                         ("Accepted pieces per answer kind [BP-7]", [f"{k}: {n}" for k, n in r.kinds_used.items()]),
+                         ("Trials of answers refused only by predictions [NC-7]", r.trials),
+                         ("Recipes [NC-2, NC-3]", r.recipes),
                          ("Brain calls and tokens per step", r.token_use),
                          ("Knowledge packs used", r.knowledge_packs),
-                         ("Coverage-guided search", r.fuzzing), ("Open items and notes", r.open_items),
+                         ("Coverage-guided search", r.fuzzing), ("Lessons [LA-8]", r.lessons),
+                         ("Open items and notes", r.open_items),
                          ("Files", r.files_generated + r.files_modified)):
         if items:
             rows += ["", f"## {title}", ""] + [f"- {item}" for item in items]
     rows += ["", f"Ledger: `{r.ledger}`"]
     if r.output_dir and (Path(r.output_dir) / "brain_answers.jsonl").is_file():
         rows.append("Brain answers, with what the agents fixed or refused: `brain_answers.jsonl` [ARCH-20]")
+    if r.journal:
+        rows.append(f"Failure journal (what was tried, why it missed): `{Path(r.journal).with_suffix('.md').name}` "
+                    "in journal/ [LA-2]")
     rows.append("")
     return "\n".join(rows)
 
@@ -2156,6 +2830,7 @@ class RepositoryRun:
     def _orchestrator(self) -> Orchestrator:
         orch = Orchestrator(self.config_path)
         orch.hub = self.hub
+        orch.progress = getattr(self, "progress", None)                                       # VIEW-11
         return orch
 
     def _open_viewer(self, out: Path) -> tuple[ba.ViewHub | None, ba.ViewerServer | None]:
@@ -2217,6 +2892,7 @@ class RepositoryRun:
         previous = cache.load_state()
         runs = [SutRun(sut, out / f"{i + 1:02d}-{slug(sut)}", out / "worktrees" / f"{i + 1:02d}")
                 for i, sut in enumerate(req.sut_files)]
+        self.progress = Progress(len(runs))                                                   # VIEW-11
         semaphore = asyncio.Semaphore(self.cfg.max_parallel_suts)                         # ORC-23
         key = hashlib.sha256(f"{req.repository}|{commit}|{req.build_command}|{req.compile_commands}".encode()).hexdigest()[:20]
 
@@ -2231,6 +2907,7 @@ class RepositoryRun:
                                                   compile_commands=req.compile_commands, requirements=req.requirements)
                     r.result, r.state = await self._orchestrator().run_state(
                         pipeline, workspace=r.workspace, out=r.out, origin=origin)
+                    self.progress.done += 1
                 except (GitError, ba.AgentFault, OSError) as exc:          # this SUT file only; the others go on
                     message = exc.message if isinstance(exc, ba.AgentFault) else str(exc)
                     r.result = uc.PipelineResult(final_state="incomplete", reason=f"not run: {message}"[:500],
@@ -2272,11 +2949,20 @@ class RepositoryRun:
                 result.reason = "no production file was found to test [ORC-35]"
                 self._summary(result, out)
                 return result
+        self.progress = Progress(len(req.sut_files))                                          # VIEW-11
         for sut in req.sut_files:
             r = await self._orchestrator().run(uc.PipelineRequest(
                 repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
                 stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands,
                 requirements=req.requirements))
+            again = [d.split(": ", 1)[1].split(" - ", 1)[0] for d in r.decisions
+                     if d.startswith("requirement documents given: ")]
+            if again:                                                   # LA-9: once more with the documents
+                r = await self._orchestrator().run(uc.PipelineRequest(
+                    repo_root=str(Path(req.repository).resolve()), sut_file=sut, test_dir=req.test_dir,
+                    stub_dir=req.stub_dir, build_command=req.build_command, compile_commands=req.compile_commands,
+                    requirements=list(req.requirements) + again))
+            self.progress.done += 1
             r.delivery = "written to the folder (local folder input)"
             result.results.append(r)
             result.deliveries.append(uc.DeliveryRecord(kind="written_to_folder", sut_files=[sut], reason=r.output_dir))
@@ -2714,6 +3400,119 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
     return 0 if all(s["false_fixes"] == 0 for s in summaries.values()) else 1
 
 
+def corpus_cases(only: list[str] | None = None) -> list[tuple[str, Path, dict[str, Any]]]:
+    """NC-4: the cases of the construct corpus: (name, folder, case.json)."""
+    out = []
+    for folder in sorted(CONSTRUCTS.iterdir()) if CONSTRUCTS.is_dir() else []:
+        spec = folder / "case.json"
+        if spec.is_file() and (not only or folder.name in only):
+            out.append((folder.name, folder, json.loads(spec.read_text(encoding="utf-8"))))
+    return out
+
+
+def calibration_config(config_path: Path, brain: str, out: Path) -> Path:
+    """BP-8: a copy of the configuration for one brain: only that brain, the profile "full" (every kind is tried),
+    a fresh resolution memory (stored recipes would answer without the brain) and no viewer. Relative paths of the
+    original are made absolute, so they mean the same files."""
+    raw = load_config(config_path)
+    base = config_path.resolve().parent
+    absolute = lambda v: str(Path(v) if Path(v).is_absolute() else base / v)
+    raw.setdefault("brain", {}).setdefault("engine", {})["brain_order"] = [brain]
+    profiles = raw.setdefault("profiles", {})
+    profiles["brains"] = {**(profiles.get("brains") or {}), brain: "full"}
+    comp = raw.setdefault("compilation", {})
+    comp["tools_manifest"] = str(uc.manifest_path(config_path))
+    comp["work_dir"] = absolute(comp.get("work_dir", "ut_work"))
+    kb = raw.setdefault("kb", {})
+    kb["db_path"] = str(out / "kb.sqlite3")
+    kb["resolutions_path"] = str(out / "resolutions.sqlite3")
+    pipe = raw.setdefault("pipeline", {})
+    pipe["output_dir"] = str(out / "runs")
+    pipe["repo_cache"] = absolute(pipe.get("repo_cache", "ut_cache"))
+    raw.setdefault("viewer", {})["enabled"] = False
+    raw.setdefault("knowledge", {})["dirs"] = [absolute(d) if not Path(d).is_absolute() and (base / d).is_dir()
+                                              else d for d in raw.get("knowledge", {}).get("dirs", ["knowledge"])]
+    path = out / "calibration_config.json"
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    return path
+
+
+def kinds_of_run(result: uc.PipelineResult) -> tuple[set[str], set[str]]:
+    """BP-8: the answer kinds a run asked its brain for, and those whose answers passed the checks and the tool."""
+    asked, passed = set(), set(result.kinds_used)
+    log = Path(result.output_dir) / "brain_answers.jsonl" if result.output_dir else None
+    refused: set[str] = set()
+    answered: set[str] = set()
+    for line in log.read_text(encoding="utf-8").splitlines() if log and log.is_file() else []:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        kind = uc.STEP_KIND.get(rec.get("step", ""), "")
+        if not kind:
+            continue
+        asked.add(kind)
+        (refused if rec.get("kind") == "refused" else answered).add(kind)
+        if rec.get("step") == "A1.plan" and "calls_before" in json.dumps(rec.get("answer", "")):
+            asked.add("call_sequence")
+    passed |= {k for k in answered - refused if k in ("values", "repair", "decision")}
+    return asked, passed & asked if asked else passed
+
+
+async def calibrate(config_path: Path, brain: str, only: list[str] | None = None) -> int:
+    """BP-8: runs the construct corpus with one real brain - a command, not a test (TP-21) - and records per answer
+    kind the cases whose answers passed the checks and the tool. Writes a profile proposal; the configuration is
+    never changed: the user copies the proposal."""
+    cases = corpus_cases(only)
+    if not cases:
+        print(f"No construct corpus at {CONSTRUCTS} [NC-4].")
+        return 1
+    orchestrator = Orchestrator(config_path)
+    out = orchestrator.output_root / "calibration" / f"{brain}-{time.strftime('%Y%m%d-%H%M%S')}"
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = calibration_config(config_path, brain, out)
+    share = orchestrator.book.calibration_share
+    asked_n: dict[str, int] = {}
+    passed_n: dict[str, int] = {}
+    rows = []
+    for name, folder, spec in cases:
+        work = out / "cases" / name
+        shutil.copytree(folder, work)
+        print(f"[{name}] {spec.get('construct', '')} ...", flush=True)
+        try:
+            result = await Orchestrator(cfg).run(uc.PipelineRequest(repo_root=str(work), sut_file=spec["sut"]))
+        except ba.AgentFault as exc:
+            rows.append({"case": name, "outcome": f"{exc.code}: {exc.message}"[:300]})
+            continue
+        asked, passed = kinds_of_run(result)
+        for k in asked:
+            asked_n[k] = asked_n.get(k, 0) + 1
+        for k in passed:
+            passed_n[k] = passed_n.get(k, 0) + 1
+        rows.append({"case": name, "construct": spec.get("construct", ""), "final_state": result.final_state,
+                     "asked": sorted(asked), "passed": sorted(passed), "output": result.output_dir})
+        print(f"[{name}] {result.final_state}; kinds asked {sorted(asked)}, passed {sorted(passed)}", flush=True)
+    per_kind = {k: {"asked": asked_n[k], "passed": passed_n.get(k, 0),
+                    "share": round(passed_n.get(k, 0) / asked_n[k], 2)} for k in sorted(asked_n)}
+    kinds = [k for k in uc.ANSWER_KINDS if k in per_kind and per_kind[k]["share"] >= share]
+    kinds += [k for k in uc.MINIMUM_KINDS if k not in kinds and k not in per_kind]   # not measured: the floor stays
+    proposal = {"definitions": {f"calibrated_{brain}": {"kinds": [k for k in uc.ANSWER_KINDS if k in kinds]}},
+                "brains": {brain: f"calibrated_{brain}"}}
+    data = {"brain": brain, "share_needed": share, "cases": rows, "per_kind": per_kind, "proposal": proposal}
+    (out.parent / f"{brain}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    md = [f"# Calibration of {brain} [BP-8]", "", f"A kind is proposed when at least {share:.0%} of its cases passed "
+          "the checks and the tool. Copy the proposal into the \"profiles\" section of ut_config.json to use it; "
+          "this command never changes the configuration.", "", "| Kind | Cases asked | Passed | Share | Proposed |",
+          "| --- | --- | --- | --- | --- |"]
+    md += [f"| {k} | {v['asked']} | {v['passed']} | {v['share']:.0%} | {'yes' if k in kinds else 'no'} |"
+           for k, v in per_kind.items()]
+    md += ["", "Proposal:", "", "```json", json.dumps(proposal, indent=2), "```", ""]
+    (out.parent / f"{brain}.md").write_text("\n".join(md), encoding="utf-8")
+    print("\n".join(md))
+    print(f"Results: {out.parent / (brain + '.json')}")
+    return 0
+
+
 def show_run(folder: Path, port: int = 0, open_browser: bool = True) -> int:
     """VIEW-4: an earlier run again - writes viewer.html (offline) and serves the page until Ctrl+C."""
     events = folder / "events.jsonl"
@@ -2766,6 +3565,8 @@ def main() -> int:
     run.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     run.add_argument("--view", dest="view", action="store_true", default=None, help="live viewer on [VIEW-3]")
     run.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
+    run.add_argument("--interactive", action="store_true", default=None,
+                     help="ask at a decision point (source change or requirement needed) [LA-9]")
     bench = sub.add_parser("benchmark", help="Seeded-defect benchmark on the pilots [ORC-16].")
     bench.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     bench.add_argument("--case", action="append", help="run only these case ids")
@@ -2773,6 +3574,11 @@ def main() -> int:
                        help="with or without the knowledge packs, or both to compare them [KP-8]")
     bench.add_argument("--view", dest="view", action="store_true", default=None, help="live viewer on [VIEW-3]")
     bench.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
+    cal = sub.add_parser("calibrate", help="Run the construct corpus with one real brain and propose its profile "
+                                           "[BP-8].")
+    cal.add_argument("brain", help="a brain of the configuration, e.g. sonnet, qwen_remote")
+    cal.add_argument("--config", type=Path, default=HERE / "ut_config.json")
+    cal.add_argument("--case", action="append", help="run only these corpus cases")
     view = sub.add_parser("view", help="Show the viewer of an earlier run again: live page and viewer.html [VIEW-4].")
     view.add_argument("folder", type=Path, help="a run folder (it holds events.jsonl)")
     view.add_argument("--port", type=int, default=0)
@@ -2789,7 +3595,9 @@ def main() -> int:
     args = parser.parse_args()
     ba.logging.basicConfig(level=ba.logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s %(message)s")
     ba.logging.getLogger("ut").setLevel(ba.logging.INFO)
-    global VIEW_OVERRIDE
+    global VIEW_OVERRIDE, INTERACTIVE_OVERRIDE
+    if getattr(args, "interactive", None):
+        INTERACTIVE_OVERRIDE = True
     if getattr(args, "view", None) is not None:
         VIEW_OVERRIDE = args.view
     try:
@@ -2801,8 +3609,10 @@ def main() -> int:
             return 0 if ok else 1
         if args.command == "check":
             return asyncio.run(check_setup(args.config))
-        if args.command in ("run", "benchmark"):
+        if args.command in ("run", "benchmark", "calibrate"):
             keep_awake()                                                                     # ORC-36
+        if args.command == "calibrate":
+            return asyncio.run(calibrate(args.config, args.brain, args.case))
         if args.command == "benchmark":
             return asyncio.run(benchmark(args.config, args.case, args.knowledge))
         if args.command == "run":
@@ -2815,6 +3625,11 @@ def main() -> int:
                                          build_command=args.build_command, compile_commands=database,
                                          requirements=documents)
                 result = asyncio.run(Orchestrator(args.config).run(req))
+                again = [d.split(": ", 1)[1].split(" - ", 1)[0] for d in result.decisions
+                         if d.startswith("requirement documents given: ")]
+                if again:                                                 # LA-9: once more with the documents
+                    result = asyncio.run(Orchestrator(args.config).run(req.model_copy(
+                        update={"requirements": list(req.requirements) + again})))
                 print(report(result))
                 return 0 if result.final_state != "incomplete" else 3
             repo_req = uc.RepositoryRequest(repository=args.repo if is_link(args.repo) else str(Path(args.repo).resolve()),

@@ -1,0 +1,36 @@
+{
+  "construct": "C++ class with internal linkage (unnamed namespace), reached through its caller",
+  "sut": "src/filter.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": [
+          "LC:filter_add:22"
+        ],
+        "name": "test_filter_add_large_sample",
+        "purpose": "reach the item",
+        "args": [
+          {
+            "name": "sample",
+            "value": "500"
+          }
+        ],
+        "setup": [],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

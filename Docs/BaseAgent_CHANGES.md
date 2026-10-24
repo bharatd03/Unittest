@@ -1,5 +1,26 @@
 # BaseAgent changes
 
+## 2026-10-24 (night): brains per step - what a brain may answer, and a step's own brain order
+
+For the unit-test generator's brain profiles (BP-1 .. BP-10). BaseAgent stays application-agnostic: it does not know
+answer kinds or profiles, only which brains may answer a step.
+
+* **`AgentCore.brains_for_step`** (optional, set by the application): `brains_for_step(step, available brain names)`
+  returns the names allowed for that step, or `None` for no restriction. `generate()` and `decide()` apply it before
+  any brain is asked. A step no available brain may answer fails at once with **`NO_BRAIN_FOR_STEP`** (in
+  `NO_BRAIN_CODES`, so `resolve()` records the case as "needs a brain"); no brain is called.
+* **`AgentCore.step_order`** (optional): `step_order(step)` returns a step's own brain order, or `None`. The router
+  tries those brains first, the others after them in the configured order (`prefer=` of `BrainRouter.generate` and
+  `BrainRouter.decide`).
+* Without either hook every agent behaves exactly as before.
+
+## 2026-10-24: progress at a glance in the live viewer
+
+**Why.** A run over many files takes an hour or more, and the viewer showed no overall progress (VIEW-11).
+
+* **New viewer event `progress`** (`VIEW_KINDS`). The application sends a short text, such as "35 % - file 8 of 23 - iteration 2 - about 30-60 min left". The page shows it in a pill next to the run status.
+* Nothing else in BaseAgent changed; the unit-test pipeline computes the text.
+
 ## 2026-10-23 (night): decisions and refused answers in the answer log
 
 **Why.** In the first pilot run with the remote Qwen, a failing test was classified by `decide()`, and Agent4's three requests for source-change candidates ended as `MODEL_OUTPUT_INVALID`. None of these answers was in `brain_answers.jsonl`, so the log could not show why the run stopped.

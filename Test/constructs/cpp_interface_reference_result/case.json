@@ -1,0 +1,17 @@
+{
+  "construct": "C++ injected interface with a method that returns a reference",
+  "sut": "src/router.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {},
+    "note": "needs the answer kind stub: with the profile minimum a pipeline limitation [BP-9]"
+  },
+  "answers": {
+    "fakes": [
+      {
+        "code": "class ut_fake_ITable : public ITable { public: mutable Route lookup_return{}; mutable int lookup_calls = 0; const Route& lookup(int dest) const override { (void)dest; ++lookup_calls; return lookup_return; } };"
+      }
+    ]
+  }
+}

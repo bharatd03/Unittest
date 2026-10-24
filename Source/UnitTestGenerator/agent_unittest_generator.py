@@ -93,6 +93,41 @@ class GeneratedTest(BaseModel):
 
 class GeneratedTests(BaseModel):
     tests: list[GeneratedTest]
+    shared: str = Field(default="", description=(
+        "only when the task asks for SHARED SET-UP: static helper functions and variables these tests use, every "
+        "name starting with ut_; otherwise empty"))
+
+
+# ============================================================================ building blocks [NC-1, BP-2]
+class SetupBlock(BaseModel):
+    """NC-1, BP-2 setup: how a test builds the object a member function is called on."""
+    lines: list[str] = Field(description="C++ statements that declare the object and every argument of its "
+                                         "constructor as a named variable before it (never a temporary); every "
+                                         "variable you declare starts with ut_", max_length=16)
+    call: str = Field(description="the object and the method to call, for example ut_obj.update")
+
+
+class FakeClass(BaseModel):
+    """NC-1, BP-2 stub: a fake of an injected interface the rules cannot fake."""
+    code: str = Field(description="the complete C++ class definition, nothing else")
+
+
+SETUP_TASK = (
+    "Build the object for a unit test: the test calls the member function {method} of the class {cls}, and the rules "
+    "cannot build the object it is called on. Write the statements that declare the object and, before it, every argument of its "
+    "constructor as a named variable (never a temporary bound to a reference); use a fake class ut_fake_<Interface> "
+    "where one is shown for an interface. Use only the declarations shown. Name every variable you declare ut_<name>. "
+    "Return JSON {{\"lines\": [statements], \"call\": \"<object>.{method}\"}}.")
+FAKE_TASK = (
+    "Write a fake of the C++ interface {iface} for unit tests: the class {fake} derives publicly from {iface} and "
+    "overrides every pure virtual method. For each method keep a call counter <method>_calls and return a member "
+    "<method>_return of the result type (for a reference result: a member of the referenced type, returned by "
+    "reference). Members are public and initialised with {{}}. Return JSON {{\"code\": \"class {fake} : public "
+    "{iface} {{ ... }};\"}} - the class definition only, no #include, no other code.")
+BLOCK_MARK = "/* building block {key} [NC-2] */"
+SHARED_BLOCK = re.compile(r"/\* ut_shared (\S+) \[BP-2 suite_part\] \*/.*?/\* ut_shared end \*/", re.S)
+SHARED_BEGIN = "/* ut_shared {function} [BP-2 suite_part] */"
+SHARED_END = "/* ut_shared end */"
 
 
 # ============================================================================ source helpers
@@ -297,7 +332,7 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
                           for m in [re.search(r"\b(ut_stub_\w+)\s*(?:\[[^\]]*\])?\s*;", line)] if m]
             decl_lines[d0:] = [f"namespace {ns} {{", *decl_lines[d0:], "}", *[f"using {ns}::{n};" for n in names_here]]
             def_lines[f0:] = [f"namespace {ns} {{", *def_lines[f0:], "}"]
-    if layout.sut_state:                     # A2-21s: the SUT's state as before the first test
+    if uc.reset_state(layout):               # A2-21s: the SUT's state as before the first test
         decl_lines.append(('extern "C" ' if cpp else "") + "void ut_sut_reset(void);")
         reset.insert(0, "    ut_sut_reset();")
     guard = "UT_STUBS_H"
@@ -646,6 +681,10 @@ def setter_vars(plan: uc.UTPlan) -> list[uc.StateVar]:
     for fn in layout.functions:
         for var, _ in decision_state(fn, "\n".join(lines[fn.line_start - 1: fn.line_end]), layout, macros):
             seen.setdefault(var.name, var)
+    asked = " ".join(x for sc in plan.scenarios for x in sc.setup)     # a setter a checked scenario uses [A1-PL4]
+    for var in layout.sut_state:
+        if var.name not in seen and re.search(r"\b" + re.escape(state_setter(var)) + r"\s*\(", asked):
+            seen[var.name] = var
     return list(seen.values())
 
 
@@ -812,7 +851,7 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
     layout = plan.layout
     statics = static_functions(layout)
     setters = setter_vars(plan)                                                                # A2-21z
-    if not statics and not layout.sut_state and not layout.header_sut:
+    if not statics and not uc.reset_state(layout) and not layout.header_sut:
         return None
     ext = "cpp" if layout.language == "cpp" else "c"
     test_dir = layout.writable_test_dir.rstrip("/")
@@ -825,8 +864,8 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
         args = ", ".join(p.name or f"a{i}" for i, p in enumerate(fn.params))
         call = f"{callee}({args})"
         rows += [wrapper_signature(fn), "{", f"    {'return ' if (fn.return_type or 'void') != 'void' else ''}{call};", "}", ""]
-    if layout.sut_state:                                                                     # A2-21s
-        rows.append(uc.sut_reset_source(layout.sut_state, layout.language == "cpp"))
+    if uc.reset_state(layout):                                                               # A2-21s
+        rows.append(uc.sut_reset_source(uc.reset_state(layout), layout.language == "cpp"))
     if setters:                                                       # A2-21z: SUT state set by the tests
         rows += ["/* A2-21z: the tests set SUT state the functions read in their decisions. */",
                  *[setter_source(v) for v in setters], ""]
@@ -865,8 +904,10 @@ def test_at_line(text: str, line: int) -> str:
     return ""
 
 
-def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_header: str | None) -> str:
-    """tests: (name, full test source incl. evidence comment, evidence class)."""
+def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_header: str | None,
+                   shared: list[str] | None = None) -> str:
+    """tests: (name, full test source incl. evidence comment, evidence class); ``shared``: the shared set-up of suite
+    parts (BP-2), placed before the tests."""
     layout = plan.layout
     sut_headers = [include_name(h, layout) for h in layout.headers]
     declared = set()
@@ -907,6 +948,8 @@ def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_head
         extra.append("#include <stdexcept>")                  # exception types of UT_EXPECT_THROW [A3-45e]
     lines += ["#include <string.h>", *extra, ""] + prototypes + ([""] if prototypes else []) + \
         helpers + ([""] if helpers else [])
+    for block in shared or []:                                                          # BP-2 suite_part
+        lines += [block, ""]
     for _, source, _ in tests:
         lines += [source, ""]
     lines.append("UT_SUITE_BEGIN")
@@ -1616,12 +1659,17 @@ def scenario_comment(sc: uc.Scenario) -> str:
     return f"{sc.scenario_id}: {sc.purpose or sc.description[:120]}" + (f" [{', '.join(cited)}]" if cited else "")
 
 
-def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str) -> str | None:
+def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
+                      block: tuple[list[str], str] | None = None) -> str | None:
     """A2-21m: a checked brain scenario whose values are all given becomes a test without an LLM; None
-    when it needs code the scenario does not contain (an object, a missing argument)."""
+    when it needs code the scenario does not contain (an object, a missing argument). ``block``: the object's
+    building block from a recipe or the brain, in place of the rule's (NC-1, NC-2)."""
     layout = plan.layout
     fn = next((f for f in layout.functions if sc.function in (f.name, f.qualified_name)), None)
-    if fn is None or fn.member or (fn.is_static and not fn.from_frontend):
+    if fn is None or (fn.is_static and not fn.from_frontend):
+        return None
+    recipe = block or (uc.object_recipe(fn, layout) if fn.member else None)             # A2-21ae, NC-1
+    if fn.member and recipe is None and not uc.static_member(fn, layout):
         return None
     given = {a.name: a.value for a in sc.args}
     names = param_names(fn)
@@ -1631,7 +1679,7 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str) -> str | None
     for s in plan.stubs:
         stubs[s.function] = s
         stubs[s.qualified_name or s.function] = s
-    lines = []
+    lines = list(recipe[0]) if recipe else []                   # the object and its named arguments first [A2-21ae]
     for sv in sc.stub_values:
         spec = stubs.get(sv.stub)
         if spec is None or not sv.returns:
@@ -1657,7 +1705,10 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str) -> str | None
         preset = {(reg, mask) for reg, mask, _ in waits
                   if re.search(re.escape(reg) + r"\s*(\|=|=)[^;]*\b" + re.escape(mask) + r"\b", given_setup)}
         lines += wait_setup(waits, preset)
-    call = f"{callee_of(fn)}({', '.join(given[n] for n in names)})"
+    lines += list(sc.calls_before)                    # the earlier calls that build up the state [BP-2]
+    target = recipe[1] if recipe else (f"{uc.class_of(fn)}::{fn.qualified_name.split('::')[-1]}" if fn.member
+                                       else callee_of(fn))
+    call = f"{target}({', '.join(given[n] for n in names)})"
     full = return_of(fn)
     ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", full or "void").strip()
     if not sc.characterization and sc.expected_return:
@@ -2015,6 +2066,7 @@ class GeneratorAgent(ba.AgentCore):
         super().__init__(settings, router=router)
         self._recipes: dict[tuple[str, int], tuple[tuple[list[str], str], ba.RuleFailure, str]] = {}   # A2-21ac
         self._confirmed: set[tuple[str, int]] = set()
+        self._pending_blocks: dict[str, tuple[str, str, str]] = {}   # mark -> (rule, key, recipe JSON) [NC-2]
 
     def tools(self) -> list[ba.ContractTool]:
         def pre(payload: uc.GenerationRequest, request):
@@ -2054,6 +2106,13 @@ class GeneratorAgent(ba.AgentCore):
         existing_text = req.existing_suite or (suite_path.read_text(encoding="utf-8") if suite_path.is_file() else "")
         existing = parse_suite(existing_text)
         notes, changes = [], []
+        self._confirm_blocks(existing_text, notes)                                           # NC-2, NC-3
+        trial: dict[str, str] = {}                     # refused only by predictions: the tool decides [NC-7]
+        trial_targets: dict[str, list[str]] = {}
+        made: dict[str, str] = {}                      # BP-7
+        recipes: dict[str, str] = {}                   # NC-2
+        needs_kind: dict[str, str] = {}                # BP-9
+        shared = {m.group(1): m.group(0) for m in SHARED_BLOCK.finditer(existing_text)}      # BP-2 suite_part
         # Failing tests named by Agent1, or found from a diagnostic's line in the suite.
         drop = set(plan.drop_tests)
         rewrite: dict[str, uc.RepairItem] = {}
@@ -2106,17 +2165,44 @@ class GeneratorAgent(ba.AgentCore):
                 if sc.inputs:
                     continue
                 if sc.checked:                                                        # A2-21m
+                    if sc.kind in ("test", "suite_part") and not sc.trial:    # BP-3: the assembled form missed
+                        llm_scenarios.append(sc)
+                        continue
                     name = self._test_name(sc, names)
-                    body = assemble_scenario(sc, plan, name)
-                    problem = self._body_problem(body, allowed | setup_names(sc.setup)) if body is not None else "?"
-                    if body is not None and not problem:
+                    fn = next((f for f in layout.functions if sc.function in (f.name, f.qualified_name)), None)
+                    block, block_by, pending = None, "", []
+                    if fn is not None and fn.member and not uc.static_member(fn, layout) and \
+                            not uc.internal_member(fn, layout):                                     # NC-1
+                        block, block_by, pending, missing = await self._building_block(fn, plan, sc.kind, req, notes)
+                        if missing and not await uc.brains_for(self, "test", "A2.tests"):
+                            needs_kind.update({g: missing for g in sc.gap_ids})   # not even a whole test [BP-9]
+                    body = assemble_scenario(sc, plan, name, block)
+                    problem = self._body_problem(body, allowed | setup_names(sc.setup) | setup_names(
+                        block[0] if block else [])) if body is not None else "?"
+                    predicted = bool(problem) and body is not None and uc.check_kind(problem) == "prediction"
+                    if body is not None and (not problem or predicted):
                         evidence = sc.strongest_class if not sc.characterization else "E8"
-                        new_tests.append((name, render_test(name, body, evidence, sc.linked, scenario_comment(sc)),
+                        if sc.made_by.startswith("brain:"):                                         # BP-7
+                            made[name] = f"{sc.made_by.split(':', 1)[1]} {sc.kind}"
+                        if block_by:
+                            made[name] = (made.get(name, "") + f"; object: {block_by}").strip("; ")
+                        by = f" - by {made[name]} [BP-7]" if name in made else ""
+                        new_tests.append((name, render_test(name, body, evidence, sc.linked, scenario_comment(sc) + by),
                                           evidence))
                         names.add(name)
                         assembled += 1
                         if sc.linked and evidence != "E8":
                             linked.add(name)
+                        if sc.trial or predicted:                                                 # NC-7
+                            trial[name] = "; ".join(sc.trial + ([problem] if predicted else []))[:600]
+                            trial_targets[name] = list(sc.gap_ids)
+                        for mark, rule, key, raw in pending:                                       # NC-2
+                            self._pending_blocks[mark] = (rule, key, raw)
+                            recipes[name] = raw
+                        continue
+                    if sc.trial:                       # a trial scenario that cannot be assembled is not rewritten
+                        notes.append(f"{name}: refused by predictions ({'; '.join(sc.trial)[:160]}) and not "
+                                     "assembled; dropped [NC-7]")
                         continue
                     llm_scenarios.append(sc)
                 elif not sc.characterization:                                         # A2-21n
@@ -2126,11 +2212,19 @@ class GeneratorAgent(ba.AgentCore):
             if assembled:
                 notes.append(f"{assembled} tests assembled from scenarios the brain planned and Agent1 checked [A2-21m]")
             if self.cfg.mode in ("deterministic_then_llm", "llm") and (llm_scenarios or rewrite):
-                llm_tests, llm_notes, llm_linked = await self._llm_tests(plan, req, names, llm_scenarios, rewrite,
-                                                                         existing, allowed)
+                llm_tests, llm_notes, llm_linked, llm_trial, llm_made, llm_shared = await self._llm_tests(
+                    plan, req, names, llm_scenarios, rewrite, existing, allowed)
                 new_tests += llm_tests
                 notes += llm_notes
                 linked |= llm_linked
+                for name, why in llm_trial.items():                                              # NC-7
+                    trial[name] = why
+                    sc_ids = re.findall(r"\bS-[A-Za-z0-9_.\-]*[A-Za-z0-9_]", next((src for n, src, _ in llm_tests
+                                                                                if n == name), ""))
+                    trial_targets[name] = sorted({g for sc in plan.scenarios if sc.scenario_id in sc_ids
+                                                  for g in sc.gap_ids})
+                made.update(llm_made)
+                shared.update(llm_shared)
         for name in sorted(drop & set(existing)):
             replacement = next((t for t in new_tests if t[0] == name), None)
             old = existing[name]
@@ -2143,7 +2237,7 @@ class GeneratorAgent(ba.AgentCore):
             elif name in rewrite and replacement is None:
                 notes.append(f"{name}: not rewritten; dropped [A2-21p]")
         tests = kept + new_tests
-        suite = assemble_suite(plan, tests, stub_header)
+        suite = assemble_suite(plan, tests, stub_header, [shared[k] for k in sorted(shared)])
         actions.append(uc.FileAction(path=layout.suite_file, action="replace" if existing_text else "create",
                                      role="testsuite", content=suite,
                                      evidence_classes={n: e for n, _, e in tests},
@@ -2152,9 +2246,175 @@ class GeneratorAgent(ba.AgentCore):
                                      tests=[n for n, _, _ in tests], new_tests=[n for n, _, _ in new_tests],
                                      characterization_tests=[n for n, _, e in tests if e == "E8"],
                                      observations=re.findall(r'UT_OBSERVE_\w+\(\s*"([^"]+)"', suite),
-                                     expectation_changes=changes, notes=notes)
+                                     expectation_changes=changes, notes=notes,
+                                     trial={n: w for n, w in trial.items() if n in {x for x, _, _ in tests}},
+                                     trial_targets={n: g for n, g in trial_targets.items() if n in trial},
+                                     made={n: m for n, m in made.items() if n in {x for x, _, _ in tests}},
+                                     recipes=recipes, needs_kind=needs_kind)
         bundle.validation = self.validate(bundle, plan)
         return bundle
+
+    # ---------------------------------------------------------------- building blocks [NC-1, NC-2, NC-3]
+    def _confirm_blocks(self, existing_text: str, notes: list[str]) -> None:
+        """NC-2: a block whose test is part of the suite Agent3 measured (a test that did not compile is left out of
+        it, A3-CL12) was accepted by the compiler: it is stored as a project recipe."""
+        for mark, (rule, key, raw) in list(self._pending_blocks.items()):
+            if mark not in existing_text:
+                continue
+            del self._pending_blocks[mark]
+            if self.resolutions is None:
+                continue
+            recipe = uc.Recipe.model_validate_json(raw)
+            stored = next(iter(self.resolutions.get(self.name, rule, key)), "")
+            if stored:
+                with_uses = uc.Recipe.model_validate_json(stored)
+                recipe.uses = with_uses.uses
+            recipe.uses += 1
+            self.resolutions.put(self.name, rule, key, recipe.model_dump_json())
+            notes.append(f"recipe stored after the compiler accepted it: {recipe.kind} {recipe.signature} - used for "
+                         f"{recipe.uses} item(s) [NC-2]")
+
+    def _recipe(self, kind: str, signature: str, params: dict[str, str]) -> uc.Recipe | None:
+        """NC-2, NC-3: a stored project recipe first, then the application's library."""
+        key = uc.finding_signature(kind, signature)
+        if self.resolutions is not None:
+            for raw in self.resolutions.get(self.name, uc.RECIPE_RULES[kind], key):
+                try:
+                    recipe = uc.Recipe.model_validate_json(raw)
+                except ValueError:
+                    continue
+                if recipe.complete(params):
+                    return recipe
+        library = getattr(self, "_library", None)
+        if library is None:
+            library = self._library = uc.application_recipes()
+        return next((r for r in library if r.kind == kind and r.signature == signature and r.complete(params)), None)
+
+    @staticmethod
+    def _block_problem(lines: list[str], call: str = "", fake: bool = False) -> str:
+        """BP-4: the guards of a building block - nothing forbidden, no assertion, placed in the test only. Names,
+        types and syntax are not predicted here: the compiler decides (NC-8). A fake is a class: its methods may have
+        any name, so only what no generated code may contain is refused."""
+        text = "\n".join(lines)
+        if re.search(r"#\s*include|\bmain\s*\(|\bsystem\s*\(|\bpopen\s*\(|__asm|\basm\b|\bUT_TEST\s*\(", text):
+            return "a forbidden construct"
+        if not fake and FORBIDDEN.search(text):
+            return "a forbidden construct"
+        if re.search(r"\bUT_(EXPECT|OBSERVE|ASSERT)", text):
+            return "a building block must not assert or observe anything"
+        if not fake and not call.strip():
+            return "the call target is empty"
+        return ""
+
+    async def _building_block(self, fn: uc.FunctionInfo, plan: uc.UTPlan, kind: str, req: uc.GenerationRequest,
+                              notes: list[str]) -> tuple[tuple[list[str], str] | None, str, list[tuple[str, str, str, str]],
+                                                         str]:
+        """NC-1: the object a member function is called on, as a building block: a stored recipe first (NC-2), then
+        the rule (A2-21ae), then the brain within its profile (BP-2: stub for a fake the rules cannot write, setup for
+        the object). Returns (block, made_by, pending recipes [(mark, rule, key, json)], kind no brain may give)."""
+        layout = plan.layout
+        signature, params = uc.construct_of(fn, layout)
+        short_cls = uc.class_of(fn).split("::")[-1]
+        if not signature or uc.internal_member(fn, layout) or \
+                fn.qualified_name.split("::")[-1] in (short_cls, "~" + short_cls):    # a constructor needs no object
+            return None, "", [], ""
+        uc.resolution_project(self, layout)
+        journal = req.journal.get(fn.qualified_name) or req.journal.get(fn.name, "")
+        headers = self._headers_text(layout)
+        made, pending, lines = "", [], []
+        short = fn.qualified_name.split("::")[-1]
+        cls = uc.class_of(fn)
+        ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
+                 .endswith(f"{cls.split('::')[-1]}::{cls.split('::')[-1]}")]
+        ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
+        # stub: a fake of an injected interface the rules cannot fake (a reference result) [A2-21aa, BP-2]
+        for p in (ctor.params if ctor else []):
+            base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
+            iface = next((f for f in layout.interfaces if f.name.split("::")[-1] == base.split("::")[-1]), None)
+            if iface is None or fake_supported(iface):
+                continue
+            fake_sig = f"fake of the interface {iface.name}"
+            recipe = self._recipe("stub", fake_sig, {})
+            if recipe is not None:
+                lines += recipe.lines
+                made = made or f"recipe {recipe.made_by}"
+                continue
+            if not await uc.brains_for(self, "stub", "A2.stub"):
+                notes.append(f"{fn.qualified_name}: the fake of {iface.name} needs the answer kind stub, which no available "
+                             "brain's profile allows [BP-9]")
+                return None, "", [], "stub"
+            failure = ba.RuleFailure(rule="NC-1 stub", failure=f"no rule writes a fake of {iface.name} (a method "
+                                     "returns a reference)", subject=fake_sig, message=journal[:1500])
+            answer = await self.resolve(
+                failure, task=FAKE_TASK.format(iface=iface.name, fake=fake_name(iface)),
+                context=[uc.part("interface", f"INTERFACE {iface.name}:\n" + "\n".join(
+                    f"{m.return_type} {m.name}({', '.join(f'{a} {b}' for a, b in m.params)}){m.suffix}"
+                    for m in iface.methods)), uc.part("headers", f"HEADERS:\n{headers}", uc.P_EVIDENCE, 2000)],
+                output_model=FakeClass, verify=lambda a: self._block_problem([a.code], fake=True), step="A2.stub",
+                attempts=self.cfg.rule_attempts, project=layout.repo_root, remember=False,
+                need=ba.OutputNeed(items=1, tokens_per_item=600, overhead=200))
+            if answer is None:
+                notes.append(f"{fn.qualified_name}: no fake of {iface.name} [NC-1]")
+                return None, "", [], ""
+            code = answer.code.strip()
+            key = uc.finding_signature("stub", fake_sig)
+            mark = BLOCK_MARK.format(key=key[:12])
+            lines += [mark, code]
+            made = f"{self.brain_of_call().get('brain', '')} stub"
+            pending.append((mark, uc.RECIPE_RULES["stub"], key,
+                            uc.Recipe(kind="stub", signature=fake_sig, lines=[code],
+                                      made_by=made.split(" ")[0]).model_dump_json()))
+        rule = uc.object_recipe(fn, layout)
+        if rule is not None and kind != "setup":
+            return ((lines + rule[0], rule[1]) if lines else None), made, pending, ""
+        recipe = self._recipe("setup", signature, params)
+        if recipe is not None and kind != "setup" or recipe is not None and not journal:
+            body, call = recipe.instantiate(params)
+            return (lines + body, call), f"recipe {recipe.made_by}", pending, ""
+        if not await uc.brains_for(self, "setup", "A2.setup"):
+            notes.append(f"{fn.qualified_name}: the object needs the answer kind setup, which no available brain's "
+                         "profile allows [BP-9]")
+            return ((lines + rule[0], rule[1]) if rule and lines else None), made, pending, \
+                ("setup" if rule is None else "")                  # with a rule's object the rule is tried [BP-9]
+        failure = ba.RuleFailure(rule="NC-1 setup", failure=f"no rule builds the object of {cls}"
+                                 + (" that compiles" if rule is not None else ""), subject=signature,
+                                 message=journal[:1500])
+        context = [uc.part("construct", f"CONSTRUCT: {signature}\nCONSTRUCTORS: " + "; ".join(
+                       c.signature for c in ctors[:4]) + f"\nFAKES: {', '.join(fake_name(i) for i in layout.interfaces)}"
+                       + (f"\nTHE RULE BUILT (the compiler rejected it): {' '.join(rule[0])}" if rule else "")),
+                   uc.part("headers", f"HEADERS:\n{headers}", uc.P_EVIDENCE, 2000)]
+        answer = await self.resolve(failure, task=SETUP_TASK.format(method=short, cls=cls), context=context,
+                                    output_model=SetupBlock, verify=lambda a: self._block_problem(a.lines, a.call),
+                                    step="A2.setup", attempts=self.cfg.rule_attempts, project=layout.repo_root,
+                                    remember=False, need=ba.OutputNeed(items=1, tokens_per_item=400, overhead=200))
+        if answer is None:
+            notes.append(f"{fn.qualified_name}: no object block from the brain [NC-1]")
+            return None, made, pending, ""
+        body, call = [x.strip() for x in answer.lines if x.strip()], answer.call.strip()
+        if not call.endswith(short):
+            call = f"{call.rstrip('.')}.{short}" if "." not in call else call
+        key = uc.finding_signature("setup", signature)
+        mark = BLOCK_MARK.format(key=key[:12])
+        brain = self.brain_of_call().get("brain", "")
+        tpl_lines, tpl_call = uc.templated(body, call, params)
+        pending.append((mark, uc.RECIPE_RULES["setup"], key,
+                        uc.Recipe(kind="setup", signature=signature, lines=tpl_lines, call=tpl_call,
+                                  made_by=brain).model_dump_json()))
+        return (lines + [mark] + body, call), f"{brain} setup", pending, ""
+
+    @staticmethod
+    def _shared_problem(text: str) -> str:
+        """BP-4: shared set-up of a suite part defines only helpers of the test file (names ut_...), nothing of the SUT,
+        and nothing forbidden."""
+        if FORBIDDEN.search(text) or re.search(r"\bUT_(EXPECT|OBSERVE)", text):
+            return "the shared set-up contains a forbidden construct or a check"
+        code = code_only(text)
+        names = re.findall(r"(?:^|[;}])\s*(?:static\s+)?(?:const\s+)?[A-Za-z_][\w:<>,\s*&]*?\b([A-Za-z_]\w*)\s*(?:\(|=|;|\[)",
+                           code, re.M)
+        bad = sorted({n for n in names if not n.startswith("ut_") and n not in ("return", "if", "for", "while")})
+        if bad:
+            return f"the shared set-up may define only helpers named ut_...: {', '.join(bad[:4])}"
+        return ""
 
     @staticmethod
     def _headers_text(layout: uc.LayoutProfile) -> str:
@@ -2171,7 +2431,11 @@ class GeneratorAgent(ba.AgentCore):
     # ---------------------------------------------------------------- LLM tests
     async def _llm_tests(self, plan: uc.UTPlan, req: uc.GenerationRequest, names: set[str],
                          scenarios: list[uc.Scenario], rewrite: dict[str, uc.RepairItem],
-                         existing: dict[str, dict[str, str]], allowed: set[str]) -> tuple[list, list[str], set[str]]:
+                         existing: dict[str, dict[str, str]], allowed: set[str]
+                         ) -> tuple[list, list[str], set[str], dict[str, str], dict[str, str], dict[str, str]]:
+        """Tests the brain writes (A2-21n..A2-21p); returns (tests, notes, linked, trial, made, shared): the tests
+        refused only by predictions go to a trial (NC-7), ``made`` names the brain and kind of every test (BP-7),
+        ``shared`` the checked shared set-up of a suite part (BP-2)."""
         layout = plan.layout
         root = Path(layout.repo_root)
         sut_lines = (root / layout.sut_file).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2195,11 +2459,13 @@ class GeneratorAgent(ba.AgentCore):
             async def run():
                 fn = next((f for f in layout.functions if fn_name in (f.name, f.qualified_name)), None)
                 if fn is None or (fn.is_static and not fn.from_frontend):
-                    return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, []
+                    return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, [], {}, "", ""
+                if uc.internal_member(fn, layout):                                                # A2-21ae
+                    return [], [f"{fn_name}: {uc.call_form(fn, layout)}"], fn, [], {}, "", ""
                 to_rewrite = rewrites_of.get(fn.name, [])
                 call_as = f"Call it as {wrapper_name(fn)}(...): it is static [A2-21k]. " if fn.is_static else ""
-                member = "It is a class member: construct an object in the test (see HEADERS) and call it on the " \
-                    "object. " if fn.member else ""
+                member = (uc.call_form(fn, layout) or "It is a class member: construct an object in the test (see "
+                          "HEADERS) and call it on the object.") + " " if fn.member else ""                 # A2-21ae
                 params = "; ".join(f"{p.name}: {p.type} ({p.kind}{', may be NULL' if p.nullable else ''})" for p in fn.params)
                 source = "\n".join(f"{n:4d}| {sut_lines[n - 1]}" for n in range(fn.line_start, fn.line_end + 1))
                 evidence: dict[str, uc.EvidenceRef] = {}
@@ -2246,6 +2512,12 @@ class GeneratorAgent(ba.AgentCore):
                     *([uc.part("state", "SUT STATE SETTERS (set a variable of the SUT before the call) [A2-21z]:\n" +
                                "\n".join(f"void {state_setter(v)}(long long v);  /* {v.type} {v.name} */"
                                          for v in setter_vars(plan)))] if setter_vars(plan) else []),
+                    *([uc.part("journal", "JOURNAL (why earlier tests of this function missed; remove the cause) "
+                               "[LA-4]:\n" + (req.journal.get(fn.qualified_name) or req.journal.get(fn.name, "")))]
+                      if req.journal.get(fn.qualified_name) or req.journal.get(fn.name) else []),
+                    *([uc.part("lessons", "LESSONS (verified fixes of the same causes) [LA-8]:\n" + "\n".join(
+                        f"- {k.snippet[:400]}" for k in req.guidance.lessons[:4]), uc.P_EXAMPLES)]
+                      if req.guidance.lessons else []),
                     uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
                     uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
                                        "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),
@@ -2279,14 +2551,36 @@ class GeneratorAgent(ba.AgentCore):
                     "and set evidence_class to E8. Never guess an expected value. Every test contains at least one "
                     "UT_EXPECT_... or UT_OBSERVE_...; in C++ it uses only public members of a class (never a private "
                     "member such as count_), and an object is declared once: MotorCtrl ctrl(enc);")
+                part = any(s.kind == "suite_part" for s in fn_scenarios)                           # BP-2, BP-3
+                part_brains = await uc.brains_for(self, "suite_part", "A2.tests") if part else []
+                if part and part_brains:
+                    task += (" SHARED SET-UP: these tests may share static helper functions and variables in the field "
+                             "shared (every name starting with ut_); a test calls them [BP-2].")
                 dropped: list[str] = []
-                check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite), fn.name, dropped)
+                tried: dict[str, str] = {}
+                check = self._grounding(allowed, names - set(to_rewrite),
+                                        set(to_rewrite), fn.name, dropped, {n: existing[n]["source"] for n in to_rewrite},
+                                        trial=tried, shared_ok=bool(part_brains))
                 try:
                     result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
-                                                 project=layout.repo_root, check=check)
+                                                 project=layout.repo_root, check=check,
+                                                 allowed=part_brains or None)
                 except ba.AgentFault as exc:
-                    return [], [f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})"], fn, to_rewrite
-                own_notes = [f"{fn.qualified_name}: {d}" for d in dropped]
+                    return [], [f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})"], fn, \
+                        to_rewrite, {}, "", ""
+                used = self.brain_of_call()
+                made_by = f"{used.get('brain', '')}/{used.get('model_id', '')} {'suite_part' if part_brains else 'test'}"
+                shared_text = ""
+                if part_brains and result.shared.strip():
+                    problem = self._shared_problem(result.shared)
+                    if problem:
+                        dropped.append(f"shared set-up refused: {problem} [BP-4]")
+                    else:
+                        shared_text = (SHARED_BEGIN.format(function=_ident(fn.qualified_name)) + "\n"
+                                       + result.shared.strip() + "\n" + SHARED_END)
+                own_notes = [f"{fn.qualified_name}: {d}" for d in dropped] + \
+                    [f"{fn.qualified_name}: {n} refused only by predictions ({w[:120]}); built in a trial [NC-7]"
+                     for n, w in tried.items()]
                 produced = []
                 for t in result.tests[: self.cfg.max_llm_tests_per_function]:
                     ids = [i for i in t.evidence_ids if i in evidence and evidence[i].evidence_class != "E8"]
@@ -2312,15 +2606,20 @@ class GeneratorAgent(ba.AgentCore):
                               f"{t.purpose or (fn_scenarios[0].purpose or fn_scenarios[0].description[:100] if fn_scenarios else '')}" \
                               + (f" [{', '.join(cited)}]" if cited else "")
                     produced.append((t, cls, is_linked, purpose, texts, bool_ok))
-                return produced, own_notes, fn, to_rewrite
+                return produced, own_notes, fn, to_rewrite, tried, made_by, shared_text
             return run
         work = list(by_function.items())
         results = await self.in_parallel([job(fn_name, fn_scenarios) for fn_name, fn_scenarios in work])
+        trial_out: dict[str, str] = {}
+        made_out: dict[str, str] = {}
+        shared_out: dict[str, str] = {}
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-            produced, own_notes, fn, to_rewrite = result
+            produced, own_notes, fn, to_rewrite, tried, made_by, shared_text = result
             notes.extend(own_notes)
+            if shared_text and fn is not None:
+                shared_out[_ident(fn.qualified_name)] = shared_text
             # a name already used, or kept for the rewrite of another function's test, is changed [A2-24, A2-21q]
             reserved = names | (set(rewrite) - set(to_rewrite))
             for t, cls, is_linked, purpose, texts, bool_ok in produced:
@@ -2335,11 +2634,14 @@ class GeneratorAgent(ba.AgentCore):
                                  "evidence; observed instead of asserted [A2-21u]")
                     if "UT_OBSERVE" in body:
                         cls, is_linked = "E8", False
-                out.append((name, render_test(name, body, cls, is_linked, purpose), cls))
+                out.append((name, render_test(name, body, cls, is_linked, f"{purpose} - by {made_by} [BP-7]"), cls))
                 names.add(name)
                 if is_linked:
                     linked.add(name)
-        return out, notes, linked
+                if t.name in tried:                                                          # NC-7
+                    trial_out[name] = tried[t.name]
+                made_out[name] = made_by                                                     # BP-7
+        return out, notes, linked, trial_out, made_out, shared_out
 
     async def _brain_values(self, plan: uc.UTPlan, allowed: set[str], existing_text: str,
                             notes: list[str]) -> dict[tuple[str, int], tuple[list[str], str]]:
@@ -2448,9 +2750,12 @@ class GeneratorAgent(ba.AgentCore):
 
     @classmethod
     def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None,
-                   function: str = "", dropped: list[str] | None = None):
+                   function: str = "", dropped: list[str] | None = None, old_sources: dict[str, str] | None = None,
+                   trial: dict[str, str] | None = None, shared_ok: bool = False):
         """The check of one LLM answer, test by test [A2-21t]: names are repaired (A2-21q), a test whose body
-        fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left."""
+        fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left. With
+        ``trial``, a test refused only by a prediction is kept and named there: the tool decides (NC-6, NC-7).
+        ``shared_ok``: helpers of the shared set-up (ut_...) count as known names (BP-2)."""
         rewritten = rewritten or set()
 
         def check(parsed: GeneratedTests) -> None:
@@ -2462,12 +2767,24 @@ class GeneratorAgent(ba.AgentCore):
                     name = readable_test_name(t.name, function, existing_names | seen | rewritten)
                     if name != t.name:
                         t = t.model_copy(update={"name": name})
-                problem = cls._body_problem(t.body, allowed | setup_names([t.body]))
+                helpers = set(re.findall(r"\b(ut_\w+)\s*\(", parsed.shared)) if shared_ok else set()
+                problem = cls._body_problem(t.body, allowed | setup_names([t.body]) | helpers)
+                if problem and trial is not None and uc.check_kind(problem) == "prediction" and \
+                        CHECKS.search(code_only(t.body)):                                    # NC-7
+                    trial[t.name] = problem
+                    problem = ""
+                old = (old_sources or {}).get(t.name)
+                if not problem and old is not None and t.body.strip() and \
+                        uc.normalized_body(t.body) in uc.normalized_body(old):
+                    problem = ("the rewrite is the same as the failing test: change what the diagnostic and the "
+                               "JOURNAL show [A2-21p, LA-4]")
                 if not problem and not CHECKS.search(code_only(t.body)):
                     problem = ("checks nothing: no UT_EXPECT_... or UT_OBSERVE_... in the body - assert the expected "
                                "value or observe the result [A2-21t]")
                 if problem:
                     problems.append(f"{t.name}: {problem}")
+                    if trial is not None:
+                        trial.pop(t.name, None)
                     continue
                 seen.add(t.name)
                 kept.append(t)
@@ -2628,6 +2945,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Genera
     agent = GeneratorAgent(settings, config=GeneratorConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
     agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
+    uc.apply_profiles(agent, config_path)                         # BP-1, BP-3, BP-6
     return agent
 
 
