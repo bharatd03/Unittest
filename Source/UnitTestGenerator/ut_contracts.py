@@ -845,6 +845,9 @@ class PlanRequest(Contract):
     disputed_evidence: list[str] = Field(default_factory=list)       # A1-PL13
     avoid_brains: list[str] = Field(default_factory=list)            # COV-6: ask the next brain
     failed_tests: dict[str, str] = Field(default_factory=dict)   # test -> why it failed in this run [A1-PL8]
+    refused: dict[str, list[str]] = Field(default_factory=dict)  # function -> scenarios refused earlier [A1-PL8]
+    crashed_calls: list[str] = Field(default_factory=list)       # rule-based test inputs that crashed [A2-21f]
+    inputs_only: bool = False          # only the search's inputs as scenarios, no brain [ORC-5a, A1-18c]
 
 
 class DependencyRequest(Contract):
@@ -937,6 +940,7 @@ class FileActionBundle(Contract):
     claims_verification: bool = False                       # must stay False [A2-33]
     new_tests: list[str] = Field(default_factory=list)       # added by this bundle (minimization candidates)
     notes: list[str] = Field(default_factory=list)
+    crashed_calls: list[str] = Field(default_factory=list)   # rule-based inputs that crashed or hung [A2-21f]
 
 
 class KBExample(Contract):

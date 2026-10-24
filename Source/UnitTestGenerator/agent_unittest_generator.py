@@ -1674,11 +1674,29 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str) -> str | None
 
 
 def setup_names(statements: list[str]) -> set[str]:
-    """Local variables a test body declares (function pointers among them may be called)."""
+    """Local variables a test body declares (function pointers among them may be called), and objects it
+    constructs - "MotorCtrl ctrl(enc);" declares ctrl, it does not call a function ctrl [A2-20]."""
     names = set()
     for stmt in statements:
         names |= set(re.findall(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(", stmt))
+        for m in DECLARED_OBJECT.finditer(code_only(stmt)):
+            if m.group(1) not in NOT_A_TYPE:
+                names.add(m.group(2))
     return names
+
+
+# "Type name(args)" or "Type name{args}" at the start of a statement: an object, not a call [A2-20]
+DECLARED_OBJECT = re.compile(r"(?:^|[;{}])\s*(?:(?:const|static|volatile|constexpr)\s+)*"
+                             r"([A-Za-z_][\w:]*(?:<[^;(){}]*>)?)\s*[&*]*\s+([A-Za-z_]\w*)\s*[({]", re.M)
+NOT_A_TYPE = {"return", "else", "case", "goto", "throw", "new", "delete", "sizeof", "typedef", "using", "do",
+              "co_return", "co_yield", "co_await", "not", "and", "or"}
+CODE_NOISE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
+CHECKS = re.compile(r"\bUT_(?:EXPECT|OBSERVE|ASSERT)\w*\s*\(")
+
+
+def code_only(text: str) -> str:
+    """The text without comments, string and character literals: braces in a comment are not code [A2-24]."""
+    return CODE_NOISE.sub(" ", text)
 
 
 def _has_auto(function: str, auto_names: list[str], layout: uc.LayoutProfile) -> bool:
@@ -2258,7 +2276,9 @@ class GeneratorAgent(ba.AgentCore):
                     "When the EVIDENCE states the expected result, assert it, put the "
                     "EVIDENCE ids (as written there, for example EV-clamp_percent-1; never the classes E1-E8) into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
                     "evidence's class (E1-E7). Otherwise record the result with UT_OBSERVE_INT(\"<test name>_<n>\", expr) "
-                    "and set evidence_class to E8. Never guess an expected value.")
+                    "and set evidence_class to E8. Never guess an expected value. Every test contains at least one "
+                    "UT_EXPECT_... or UT_OBSERVE_...; in C++ it uses only public members of a class (never a private "
+                    "member such as count_), and an object is declared once: MotorCtrl ctrl(enc);")
                 dropped: list[str] = []
                 check = self._grounding(allowed, names - set(to_rewrite), set(to_rewrite), fn.name, dropped)
                 try:
@@ -2301,9 +2321,12 @@ class GeneratorAgent(ba.AgentCore):
                 raise result
             produced, own_notes, fn, to_rewrite = result
             notes.extend(own_notes)
+            # a name already used, or kept for the rewrite of another function's test, is changed [A2-24, A2-21q]
+            reserved = names | (set(rewrite) - set(to_rewrite))
             for t, cls, is_linked, purpose, texts, bool_ok in produced:
-                name = t.name if t.name in to_rewrite else \
-                    readable_test_name(t.name, fn.name, names) if t.name in names else t.name
+                name = t.name if t.name in to_rewrite and t.name not in names else \
+                    readable_test_name(t.name, fn.name, reserved) if t.name in reserved else t.name
+                reserved.add(name)
                 # A2-21u; a rewritten test keeps its evidence and goes through the oracle-strength check (A2-21p)
                 body, unstated = (t.body, 0) if t.name in to_rewrite else \
                     ground_expectations(t.body, name, texts, bool_ok)
@@ -2407,12 +2430,20 @@ class GeneratorAgent(ba.AgentCore):
         """A2-20, A2-21: only symbols that exist here, no forbidden constructs, balanced."""
         if FORBIDDEN.search(body):
             return "forbidden construct in the body"
-        calls = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body)} - {"if", "for", "while", "switch", "return"}
+        calls = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", code_only(body))} - {
+            "if", "for", "while", "switch", "return", "sizeof", "catch"}
         unknown = sorted(c for c in calls if c not in allowed)
         if unknown:
             return f"calls functions that do not exist here: {', '.join(unknown[:5])} [A2-20]"
-        if body.count("{") != body.count("}") or body.count("(") != body.count(")"):
+        code = code_only(body)
+        if code.count("{") != code.count("}") or code.count("(") != code.count(")"):
             return "unbalanced braces or parentheses"
+        statements = [part.strip() for part in re.sub(r"/\*.*?\*/|//[^\n]*", " ", body, flags=re.S).split(";")]
+        for first, second in zip(statements, statements[1:]):
+            a, b = PLAIN_ASSIGNMENT.fullmatch(first), PLAIN_ASSIGNMENT.fullmatch(second)
+            if a and b and a.group(1) == b.group(1) and "(" not in a.group(2) and a.group(1) not in b.group(2):
+                return (f"{a.group(1)} is set twice in a row ({a.group(2).strip()}, then {b.group(2).strip()}): only "
+                        "the last value counts - set it once to the value the test needs [A2-21t]")
         return ""
 
     @classmethod
@@ -2432,6 +2463,9 @@ class GeneratorAgent(ba.AgentCore):
                     if name != t.name:
                         t = t.model_copy(update={"name": name})
                 problem = cls._body_problem(t.body, allowed | setup_names([t.body]))
+                if not problem and not CHECKS.search(code_only(t.body)):
+                    problem = ("checks nothing: no UT_EXPECT_... or UT_OBSERVE_... in the body - assert the expected "
+                               "value or observe the result [A2-21t]")
                 if problem:
                     problems.append(f"{t.name}: {problem}")
                     continue
@@ -2464,10 +2498,15 @@ class GeneratorAgent(ba.AgentCore):
         cases = re.findall(r"UT_CASE\(\s*(\w+)\s*\)", suite.content)
         if len(names) != len(set(names)) or sorted(names) != sorted(cases):
             raise ba.AgentFault("CONTRACT_VIOLATION", "duplicate tests or registration mismatch [A2-24]")
-        if suite.content.count("{") != suite.content.count("}"):
+        code = code_only(suite.content)                     # braces in comments and strings are not code [A2-24]
+        if code.count("{") != code.count("}"):
             raise ba.AgentFault("CONTRACT_VIOLATION", "suite braces are unbalanced")
         checks += ["single writer per file", "no duplicate tests", "every test registered", "balanced suite"]
         return checks
+
+
+# "x = value" with nothing else: a second one in a row makes the first without effect [A2-21t]
+PLAIN_ASSIGNMENT = re.compile(r"([A-Za-z_][\w.\[\]>-]*)\s*=(?!=)\s*(.+)", re.S)
 
 
 def _assertions(source: str) -> list[str]:
@@ -2574,6 +2613,7 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
     if unreached:
         calls = [m.group(1).strip() for n in sorted(unreached)
                  for m in [re.search(r"\(void\)\((.*)\);\s*/\* not observed", sources[n])] if m]
+        out.crashed_calls = list(dict.fromkeys(out.crashed_calls + calls))[:40]           # facts for the brain [A2-21f]
         out = uc.without_tests(out, sorted(unreached), f"{len(unreached)} characterization test(s) left out: the "
                                "function crashed or did not return before any observation (input that crashes the SUT, "
                                f"characterization only), e.g. {'; '.join(calls[:3])} [A2-21f]"[:600])

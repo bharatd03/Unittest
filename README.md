@@ -73,6 +73,7 @@ Run without a command, the `.bat` shows a menu.
 | `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
 | `pilot-embedded`, `pilot-embedded-cpp` | the full pipeline on the embedded pilots: registers, register polling, a superloop, interrupt flags, target keywords and assembly; an injected interface, exceptions, a static object in a function and a header-only template |
 | `pilot-realrepo` | the full pipeline on patterns found in real repositories: a header that needs its configuration header first, `T * const` parameters, a header next to the source only, `_Atomic` and callback fields, a handle whose `Instance` points to registers, C++ namespaces |
+| `pilot-all` | every pilot folder, every production file Agent1 selects (23 files, the header-only template of the embedded C++ pilot included), each pilot on a fresh copy; one summary at the end (`ut_output/pilots/pilot_all_summary.txt`) |
 | `benchmark [on\|off\|both]` | seeded-defect benchmark on the pilots |
 | `run REPO [SUT\|all] [--branch NAME] [--requirements FILE_OR_FOLDER]` | a git repository link or a folder, and the source file to test; without a file (or `all`) every production file of the commit is selected and tested (ORC-35); `--requirements` adds the project's requirement documents - ReqIF, Markdown, text or CSV - for the run (A1-RQ1) |
 | `view RUN_FOLDER` | replay an earlier run in the viewer |

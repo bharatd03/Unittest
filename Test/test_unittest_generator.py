@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import unittest
+import types
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -193,6 +194,7 @@ class UTBrain:
 
     async def predict(self, state, questions):
         self.decide_calls += 1
+        self.states = getattr(self, "states", []) + [state]
         key = next(iter(questions))
         self.questions.append(key)
         labels = list(questions[key]["criteria"])
@@ -248,10 +250,12 @@ def scripted_plan(fn: str, context: str) -> list[dict]:
         return []
     block = re.search(r"PARAMETERS:\n((?:- .*\n?)*)", context)
     args, setup = [], []
-    for k, row in enumerate(re.findall(r"^- (\w+): (.*?) \((\w+)(?:; (.*))?\)$", block.group(1) if block else "", re.M)):
-        name, ptype, kind, extra = row
+    rows = re.findall(r"^- (\w+) \(type (.*?), (\w+)(?:; (.*?))?\)(?: - suggested values: (.*))?$",
+                      block.group(1) if block else "", re.M)                 # "name (type T, kind; ...)" [ARCH-20]
+    for k, row in enumerate(rows):
+        name, ptype, kind, extra, suggested = row
         base = re.sub(r"\b(const|volatile)\b", "", ptype).replace("&", "").strip()
-        value = "0"
+        value = suggested.split(",")[0].strip() if suggested and kind in ("int", "bool") else "0"
         if kind == "enum":
             m = re.search(r"enumerators ([^,;]+)", extra)
             value = m.group(1).strip() if m else "0"
@@ -536,6 +540,97 @@ class RuleValueTests(unittest.TestCase):
         cpp = [uc.StateVar(name="n", type="int"), uc.StateVar(name="s", type="std::string")]
         self.assertIn("&n", uc.sut_reset_source(cpp, True))
         self.assertNotIn("&s", uc.sut_reset_source(cpp, True))                     # only plain C++ state
+
+
+class BodyCheckTests(unittest.TestCase):
+    def test_a_value_set_twice_in_a_row_is_refused(self):                                  # A2-21t
+        allowed = {"thermostat_command", "UT_EXPECT_EQ_INT"}
+        problem = a2.GeneratorAgent._body_problem(
+            "ut_stub_read_sensor_return = 17; ut_stub_read_sensor_return = 18; "
+            "UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1); /* EV-thermostat_command-1 */", allowed)
+        self.assertIn("ut_stub_read_sensor_return is set twice in a row (17, then 18)", problem)
+        for body in ("ut_stub_read_sensor_return = 17; UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);",
+                     "x = 1; thermostat_command(1, 2); x = 2;", "s.a = 1; s.b = 2;", "x = 1; x = x + 1;",
+                     "x = 1; x += 2;", "volatile int k = 1; k = 2;"):
+            self.assertEqual(a2.GeneratorAgent._body_problem(body, allowed), "", body)
+
+    def test_objects_braces_in_comments_and_tests_that_check_nothing(self):               # A2-20, A2-21t, A2-24
+        """From the first run on every pilot file: "MotorCtrl ctrl(enc);" constructs an object, it does not call a
+        function ctrl; a purpose such as "if (sum > 5000) {" in a comment is not code; a test with no check is
+        dropped."""
+        body = "MotorCtrl ctrl(enc); RateLimiter lim{3, 100}; UT_EXPECT_EQ_INT(ctrl.step(lim.left()), 0);"
+        allowed = {"step", "left", "UT_EXPECT_EQ_INT"} | a2.setup_names([body])
+        self.assertEqual(a2.GeneratorAgent._body_problem(body, allowed), "")
+        self.assertIn("ctrl", a2.GeneratorAgent._body_problem("int x = ctrl(1); UT_EXPECT_EQ_INT(x, 0);",
+                                                             {"UT_EXPECT_EQ_INT"}))           # a real unknown call
+        self.assertEqual(a2.GeneratorAgent._body_problem('/* if (sum > 5000) { */ UT_EXPECT_EQ_INT(f(1), 0); '
+                                                         '/* "}" */', {"f", "UT_EXPECT_EQ_INT"}), "")
+        check = a2.GeneratorAgent._grounding({"ut_stub_call", "f", "UT_EXPECT_EQ_INT"}, set(), function="f")
+        answer = a2.GeneratedTests.model_validate({"tests": [
+            {"name": "test_f_nothing_checked", "scenario_ids": [], "body": "ut_stub_call(); /* line never executed */",
+             "evidence_class": "E2"},
+            {"name": "test_f_returns_zero", "scenario_ids": [], "body": "UT_EXPECT_EQ_INT(f(1), 0);",
+             "evidence_class": "E2"}]})
+        check(answer)
+        self.assertEqual([t.name for t in answer.tests], ["test_f_returns_zero"])
+
+    def test_a_suite_with_braces_in_comments_is_valid(self):                              # A2-24
+        plan = types.SimpleNamespace(layout=types.SimpleNamespace(writable_test_dir="tests", writable_stub_dir="tests/stubs"))
+        suite = ('/* Cover BC at line 13: if (sum > 5000) { */\nUT_TEST(test_a) { UT_EXPECT_EQ_INT(1, 1); }\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_a)\nUT_SUITE_END\n')
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+            path="tests/test_a.c", action="create", role="testsuite", content=suite)])
+        self.assertIn("balanced suite", a2.GeneratorAgent.validate(bundle, plan))
+
+    def test_no_finalize_when_every_observing_test_was_left_out(self):                    # A2-21f, A3-CL12
+        """From the first run on every pilot file: the only probe was in a test that did not compile; the bundle
+        goes on without the finalize step (which refuses a bundle without probes) instead of ending the run."""
+        layout = types.SimpleNamespace(writable_test_dir="tests", writable_stub_dir="tests/stubs", language="cpp",
+                                       framework="ut_harness", sut_sha256="abc")
+        suite = ("UT_TEST(test_a) { UT_EXPECT_EQ_INT(1, 1); }\nUT_TEST(test_probe) { UT_OBSERVE_INT(\"test_probe_1\", 2); }\n"
+                 "UT_SUITE_BEGIN\nUT_CASE(test_a)\nUT_CASE(test_probe)\nUT_SUITE_END\n")
+        bundle = uc.FileActionBundle(bundle_id="b", observations=["test_probe_1"], tests=["test_a", "test_probe"],
+                                     actions=[uc.FileAction(path="tests/test_a.cpp", action="create", role="testsuite",
+                                                            content=suite)])
+        observed = uc.VerificationResult(run_id="r", stage="observe", sut_sha256="abc", suite_sha256="", decision="gaps_remain",
+                                       quarantined=[
+            uc.Failure(failure_id="q", kind="compile", classification="test_generation_defect", route="agent1",
+                       affected_test="test_probe", diagnostic="'state_' is a private member")])
+        calls = []
+
+        async def call(agent, tool, request, model):
+            calls.append(tool)
+            return {"generate": bundle, "observe": observed}.get(tool, uc.KBGuidance())
+        orch = object.__new__(up.Orchestrator)
+        orch.layout, orch.suite, orch.call, orch._stage = layout, "", call, lambda *a, **k: None
+        s = types.SimpleNamespace(notes=[], quarantined=[], test_items={})
+        loose = lambda **fields: fields                           # the requests are not the subject here
+        with mock.patch.multiple(up.uc, GenerationRequest=loose, GuidanceRequest=loose, VerifyRequest=loose):
+            out = run(orch._generate(s, types.SimpleNamespace(repairs=[])))
+        self.assertNotIn("finalize", calls)
+        self.assertEqual(out.tests, ["test_a"])
+        self.assertEqual(out.observations, [])
+
+    def test_the_computer_stays_awake_during_a_run(self):                                  # ORC-36
+        self.assertFalse(up.keep_awake()) if os.name != "nt" else None
+        asked = []
+        fake = types.SimpleNamespace(windll=types.SimpleNamespace(kernel32=types.SimpleNamespace(
+            SetThreadExecutionState=lambda flags: asked.append(flags) or 1)))
+        with mock.patch.object(up.os, "name", "nt"), mock.patch.dict(sys.modules, {"ctypes": fake}):
+            self.assertTrue(up.keep_awake())
+        self.assertEqual(asked, [0x80000001])                         # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+
+    def test_back_to_the_test_when_no_source_change_exists(self):                         # A4-23j
+        from types import SimpleNamespace
+        s = SimpleNamespace(open_items=set())
+        failure = uc.Failure(failure_id="test-t1", kind="test", classification="source_behavior_defect",
+                             route="agent4", affected_test="t1", diagnostic="expected 1, actual 0")
+        up.Orchestrator._back_to_the_test(s, failure)
+        up.Orchestrator._back_to_the_test(s, failure)                       # again: the same note once
+        self.assertEqual((failure.classification, failure.route), ("undetermined", "agent1"))
+        self.assertEqual(failure.diagnostic.count("[A4-23j]"), 1)
+        self.assertEqual(len(s.open_items), 1)
+        self.assertIn("t1: failed against its evidence (expected 1, actual 0)", next(iter(s.open_items)))
 
 
 class GeneratorTests(unittest.TestCase):
@@ -877,7 +972,9 @@ class CompilationTests(unittest.TestCase):
         if os.name != "nt":
             self.assertIn("SIGSEGV", status["test_crash"].message)
         self.assertEqual(status["test_spins"].status, "timeout")
-        self.assertIn("within 2 s", status["test_spins"].message)
+        # ended by Agent3's time limit for the single run (2 s) or by the harness's own time limit per test
+        # (A3-45d, also 2 s): whichever comes first, both are a timeout
+        self.assertRegex(status["test_spins"].message, r"within 2 s|time limit")
         self.assertTrue(any("one by one [A3-45a]" in line for line in logs.output))
         self.assertIsNotNone(r.coverage)                                   # the tests after the crash count
 
@@ -904,6 +1001,7 @@ class CompilationTests(unittest.TestCase):
         failure = next(f for f in r.failures if f.affected_test == "test_clamp")
         self.assertEqual(failure.classification, "test_generation_defect")
         self.assertEqual(fake.decide_calls, 1)
+        self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 99);", str(fake.states[0]))   # its own code [A3-156]
         self.assertTrue(resp.meta.model_invoked)
 
     def test_no_brain_means_undetermined_not_guessed(self):
@@ -1041,7 +1139,8 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual((status["test_write"], status["test_cleared"], status["test_after"]),
                          ("passed", "passed", "passed"), r.tests)
         self.assertEqual(status["test_outside"], "crashed")                 # outside every window: a real fault
-        self.assertTrue(any(p.endswith("40021000") for p in r.register_pages), r.register_pages)
+        size = 0x10000 if os.name == "nt" else os.sysconf("SC_PAGE_SIZE")   # Windows maps in 64 KiB units
+        self.assertTrue(any(int(p, 16) <= 0x40021010 < int(p, 16) + size for p in r.register_pages), r.register_pages)
 
     def test_an_endless_loop_is_expected_and_a_spin_ends_at_the_time_limit(self):        # A2-21y, A3-45d
         tests = ('UT_TEST(test_superloop) { UT_EXPECT_NO_RETURN(for (;;) { (void)clamp_percent(1); }); }\n'
@@ -1079,6 +1178,22 @@ class CompilationTests(unittest.TestCase):
         isolated = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(tests)))
         self.assertEqual({t.name: t.status for t in isolated.tests}, {"test_first": "passed", "test_second": "passed"})
         self.assertIsNotNone(isolated.coverage)                     # the child processes' profiles are merged
+
+    def test_a_probe_without_tests_is_measured_when_every_test_runs_alone(self):         # A3-45c, A3-60
+        """From test-full on Windows: an SUT with a function-local static runs every test in a run of its own;
+        a suite without tests (the probe of a new SUT) is measured by one run of the program, as on Linux and macOS."""
+        layout = self.layout.model_copy(update={"local_statics": [uc.StateVar(name="f::count", type="int")]})
+        with mock.patch.object(a3, "ONE_BY_ONE", True):                    # the Windows path, on this system
+            r = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(
+                "UT_SUITE_BEGIN\nUT_SUITE_END\n")))                                # a suite without tests
+            tests = ('UT_TEST(test_first) { UT_EXPECT_EQ_INT(clamp_percent(50), 50); }\n'
+                     'UT_SUITE_BEGIN\nUT_CASE(test_first)\nUT_SUITE_END\n')
+            one = self.agent.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=self.bundle(tests)))
+        self.assertNotEqual(r.decision, "environment_error", r.reason)
+        self.assertIsNotNone(r.coverage)
+        self.assertEqual(r.tests, [])
+        self.assertEqual([(t.name, t.status) for t in one.tests], [("test_first", "passed")])
+        self.assertIsNotNone(one.coverage)
 
     def test_code_after_an_endless_loop_is_never_counted_as_executed(self):                # A3-HW5
         repo = Path(self.layout.repo_root)
@@ -2086,6 +2201,38 @@ class PipelineTests(unittest.TestCase):
                                     text=True).stdout
             self.assertEqual(status, "")                                         # nothing changed in the worktree
 
+    def test_a_wrong_brain_test_is_rewritten_when_no_source_change_exists(self):
+        """A4-23j, from the first pilot run with the remote Qwen: the brain's test sets a temperature at the edge of the
+        band and expects heating; the classification blames the source, Agent4 finds no change - the test is
+        rewritten, the run ends verified and the report keeps the item for the developer."""
+        wrong = "ut_stub_read_sensor_return = 18;\nUT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);"
+        right = "ut_stub_read_sensor_return = 10;\nUT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);"
+
+        class RewritingBrain(UTBrain):
+            async def generate(self, task, context, schema, validate):
+                # also where the name is only mentioned: the generator keeps one test per name [A2-24]
+                if "TESTS TO REWRITE" in str(context) and "test_thermostat_heats_below_band" in str(context):
+                    self.generate_calls.append(task)
+                    return {"model": self.model_id, "output": validate({"tests": [
+                        {"name": "test_thermostat_heats_below_band", "scenario_ids": [], "body": right,
+                         "evidence_class": "E2"}]}), "usage": {}}
+                return await UTBrain.generate(self, task, context, schema, validate)
+        tests = dict(CANNED_TESTS, thermostat_command=[{"name": "test_thermostat_heats_below_band", "scenario_ids": [],
+                                                         "body": wrong, "evidence_class": "E2"}])
+        same = {"original_fragment": "return 1;", "corrected_fragment": "return 1;", "rationale": "E2: @return 1"}
+        repo = copy_pilot("c_pilot", self.d)
+        with brain(RewritingBrain(tests=tests, candidates=[same])):
+            result = self.run_pipeline(repo, "src/thermostat.c")
+        print("\n" + up.report(result))
+        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        self.assertEqual(result.source_fixes, [])
+        self.assertTrue(any("[A4-23j]" in item and "test_thermostat_heats_below_band" in item
+                            for item in result.open_items), result.open_items)
+        suite = (repo / "tests/test_thermostat.c").read_text()
+        self.assertIn("ut_stub_read_sensor_return = 10;", suite)                     # rewritten, delivered
+        self.assertNotIn("ut_stub_read_sensor_return = 18;", suite)
+        self.assertEqual(sum("agent_sourcecode_corrector.candidates" in item for item in result.open_items), 1)
+
     def test_brain_plans_the_documented_behaviour(self):
         """A1-PL1, A1-25y, A2-21m: after the deterministic tests, the brain plans a check of the stated
         behaviour; Agent1 checks it and Agent2 assembles it into an asserting test."""
@@ -2107,6 +2254,45 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 100);", suite)
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
+
+    def test_cheap_tests_first_and_the_search_during_the_planning(self):
+        """A1-PL1: with nothing measured, iteration 1 runs the rule-based tests and the search; the brain plans what
+        they left. ORC-5a: the search runs while the brain plans, its inputs join that plan (inputs only, no brain),
+        and the search of the run stays within its budget (A3-FZ3)."""
+        repo = copy_pilot("c_deps_pilot", self.d)
+        if not (have_tool("cmake") and have_tool("ninja")):
+            self.skipTest("cmake and ninja are not in the tool manifest")
+        calls = []
+        original = up.Orchestrator.call
+
+        async def timed(orch, role, tool, payload, expect):
+            start = time.monotonic()
+            try:
+                return await original(orch, role, tool, payload, expect)
+            finally:
+                calls.append((tool, start, time.monotonic(), payload))
+        with brain(UTBrain()), mock.patch.object(up.Orchestrator, "call", timed):
+            result = run(up.Orchestrator(pipeline_config(self.d, fuzz_seconds=10, fuzz_budget_seconds=40)).run(
+                uc.PipelineRequest(repo_root=str(repo), sut_file="src/brake_ctrl.c")))
+        plans = [c for c in calls if c[0] == "plan" and c[3].iteration >= 1]
+        first = [c for c in plans if c[3].iteration == 1 and not c[3].inputs_only]
+        self.assertTrue(first, plans)
+        self.assertTrue(any(p.startswith("cheap tests first") for p in result.planning), result.planning)
+        searches = [c for c in calls if c[0] == "fuzz"]
+        self.assertTrue(searches, result.fuzzing)
+        self.assertTrue(any(p[1] < s[2] and s[1] < p[2] for s in searches for p in plans if p[3].iteration > 1),
+                        [(c[0], round(c[1], 2), round(c[2], 2)) for c in calls])          # at the same time
+        granted = sum(s[3].seconds * len(s[3].functions) for s in searches)
+        self.assertLessEqual(granted, 40)                                                   # one budget per run
+        self.assertTrue(all(s[3].seconds >= 5 for s in searches))
+        orch = up.Orchestrator(pipeline_config(self.d, fuzz_seconds=3, fuzz_budget_seconds=0))
+        state = up.RunState(uc.PipelineRequest(repo_root=str(repo), sut_file="src/brake_ctrl.c"), repo, self.d, repo)
+        last = next(c for c in calls if c[0] == "fuzz")[3]
+        verified = uc.VerificationResult(run_id="r", stage="verify", sut_sha256="x", suite_sha256="", build_ok=True, decision="gaps_remain",
+                                         coverage=uc.CoverageReport(toolchain="t", definitions="d", functions=[
+                                             uc.FunctionCoverage(name=g.function, gaps=[g]) for g in last.gaps[:1]]))
+        self.assertIsNone(run(orch._fuzz(state, verified, 3)))                             # the budget is used up
+        self.assertIn("budget", state.fuzzing[-1])
 
     def test_requirement_documents_given_for_the_run(self):
         """A1-RQ1, A1-RQ3, A1-RQ5: a document from outside the repository is copied, recorded in the ledger,
@@ -2425,6 +2611,11 @@ def measured(layout, gaps, decision="gaps_remain", tests=()):
             uc.FunctionCoverage(name=name, gaps=items) for name, items in functions.items()]))
 
 
+# The answers of the remote Qwen3 8B (qwen3-8b, thinking off, JSON schema) to Agent1's plan requests for the C pilot,
+# recorded on the user's PC on 2026-10-23 - every scenario but one refused by the check before ARCH-20's format fixes.
+REMOTE_QWEN_ANSWERS = json.loads('[["select_mode", {"scenarios": [{"gap_ids": ["BC:select_mode:29:10:T"], "name": "Window open or unoccupied and no frost", "purpose": "Ensure the function returns MODE_ECO when the window is open or the house is unoccupied and frost protection is not active.", "args": [{"name": "window_open", "value": ":1"}, {"name": "occupied", "value": ":0"}, {"name": "frost", "value": ":0"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":1", "expected_after": [], "evidence_ids": ["EV-select_mode-1", "EV-select_mode-2"], "quotes": [{"evidence_id": "EV-select_mode-1", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}, {"evidence_id": "EV-select_mode-2", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}, {"gap_ids": ["LC:select_mode:30"], "name": "Window closed and occupied with frost", "purpose": "Ensure the function returns MODE_COMFORT when the window is closed, the house is occupied, and frost protection is active.", "args": [{"name": "window_open", "value": ":0"}, {"name": "occupied", "value": ":1"}, {"name": "frost", "value": ":1"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":2", "expected_after": [], "evidence_ids": [], "quotes": [], "classification": "characterization_gap", "conflict": "", "information_sought": ""}]}], ["select_mode", {"scenarios": [{"gap_ids": ["BC:select_mode:29:10:T"], "name": "Ensure the function returns MODE_ECO when window is open or nobody is home, and frost protection is not active", "purpose": "Ensure the function returns MODE_ECO when the condition (window_open || !occupied) is true and frost is not active.", "args": [{"name": "window_open", "value": ":1"}, {"name": "occupied", "value": ":0"}, {"name": "frost", "value": ":0"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":1", "expected_after": [], "evidence_ids": ["EV-select_mode-1"], "quotes": [{"evidence_id": "EV-select_mode-1", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}, {"gap_ids": ["LC:select_mode:30"], "name": "Ensure the function returns MODE_COMFORT when the condition is not met", "purpose": "Ensure the function returns MODE_COMFORT when the condition (window_open || !occupied) is false or frost is active.", "args": [{"name": "window_open", "value": ":0"}, {"name": "occupied", "value": ":1"}, {"name": "frost", "value": ":1"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":2", "expected_after": [], "evidence_ids": ["EV-select_mode-2"], "quotes": [{"evidence_id": "EV-select_mode-2", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["thermostat_command", {"scenarios": [{"gap_ids": ["EV-thermostat_command-1"], "name": "Test thermostat_command when sensor returns error", "purpose": "Check the behaviour when the sensor returns an error.", "args": [{"name": "setpoint", "value": "20"}, {"name": "hysteresis", "value": "5"}], "setup": ["int t = SENSOR_ERROR;"], "stubs": [{"stub": "read_sensor", "returns": ["SENSOR_ERROR"]}], "variables": [], "expected_return": "-1", "expected_after": [], "evidence_ids": ["EV-thermostat_command-1"], "quotes": [{"evidence_id": "EV-thermostat_command-1", "text": "Heater command for the current room temperature. @param setpoint target temperature in degrees Celsius @param hysteresis allowed band below the setpoint, must be >= 0 @return 1 to heat, 0 to stay off, -1 when the sensor reports an error"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["thermostat_command", {"scenarios": [{"gap_ids": ["EV-thermostat_command-1"], "name": "Check the behaviour when the sensor returns an error", "purpose": "Verify that the function returns -1 when the sensor reports an error.", "args": [{"name": "setpoint", "value": "20"}, {"name": "hysteresis", "value": "5"}], "setup": ["int t = SENSOR_ERROR;"], "stubs": [{"stub": "read_sensor", "returns": ["SENSOR_ERROR"]}], "variables": [], "expected_return": "-1", "expected_after": [], "evidence_ids": ["EV-thermostat_command-1"], "quotes": [{"evidence_id": "EV-thermostat_command-1", "text": "Heater command for the current room temperature. @return 1 to heat, 0 to stay off, -1 when the sensor reports an error"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["clamp_percent", {"scenarios": [{"gap_ids": ["EVIDENCE:clamp_percent: check the behaviour the EVIDENCE states (results, error values, limits) with asserted expected values"], "name": "Test clamp_percent with value less than 0", "purpose": "Verify that the function returns 0 when the input value is less than 0.", "args": [{"name": "value", "value": "-5"}], "setup": [], "stubs": [], "variables": [], "expected_return": "0", "expected_after": [], "evidence_ids": ["EV-clamp_percent-1"], "quotes": [], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["clamp_percent", {"scenarios": [{"gap_ids": ["EVIDENCE:clamp_percent"], "name": "Verify that the function returns 0 when value is negative", "purpose": "Check the behavior when the input value is negative, as specified in the evidence.", "args": [{"name": "value", "value": "-5"}], "setup": [], "stubs": [], "variables": [], "expected_return": "0", "expected_after": [], "evidence_ids": ["EV-clamp_percent-1"], "quotes": [{"evidence_id": "EV-clamp_percent-1", "text": "@return value limited to the range 0..100"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}]]')
+
+
 class BrainPlanningTests(unittest.TestCase):
     """A1-PL1 .. A1-PL14: the brain suggests, Agent1 checks every scenario deterministically."""
     def setUp(self):
@@ -2525,9 +2716,19 @@ class BrainPlanningTests(unittest.TestCase):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout)))          # nothing measured yet
         self.assertFalse(b.generate_calls)
         self.assertTrue(all(s.made_by == "rule" for s in plan.scenarios))
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:      # A1-PL1: cheap tests first
+            plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
+                                                      iteration=1)))                   # no test measured yet
+        self.assertFalse(b.generate_calls)
+        self.assertTrue(any(p.startswith("cheap tests first") for p in plan.planning), plan.planning)
+        tested = measured(self.layout, self.gaps, tests=[uc.TestResult(name="test_x_auto_1", status="passed")])
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
+            plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=tested, iteration=1)))   # tests exist
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
+        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
-                                                      iteration=1)))                   # the first coverage plan
+                                                      iteration=2)))                   # after the cheap tests
         mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
         self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
         with brain(DownBrain()):                                                       # a new agent, a new router
@@ -2552,16 +2753,124 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning),
                         plan.planning)
 
-    def test_when_no_function_gets_a_scenario_the_planning_fails(self):
-        """A1-PL8, ORC-34: no function of the plan got a scenario that passed the check - BRAIN_PLAN_FAILED."""
+    def test_the_next_brain_is_another_model_not_the_same_model_on_another_server(self):
+        """A1-PL8, ARCH-19: the remote Qwen's scenarios failed the check - the Qwen in Ollama (the same model, on a
+        slower computer) is not asked; a brain of another model would be."""
+        remote, local = UTBrain(name="qwen_remote", plans={"thermostat_command": []}), UTBrain(name="qwen")
+        remote.family = local.family = "qwen3-8b"
+        with mock.patch.object(ba, "build_router", lambda settings, injected=None: ba.BrainRouter([remote, local], 0.0)):
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
+                                                              iteration=2)))
+        self.assertFalse([c for c in local.generate_calls if "function thermostat_command " in c])
+        self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning))
+        other = UTBrain(name="haiku", plans={"thermostat_command": [self.good()]})
+        remote2 = UTBrain(name="qwen_remote", plans={"thermostat_command": []})
+        remote2.family = "qwen3-8b"
+        with mock.patch.object(ba, "build_router", lambda settings, injected=None: ba.BrainRouter([remote2, other], 0.0)):
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
+                                                              iteration=2)))
+        self.assertTrue(any(s.made_by.startswith("brain:haiku") for s in plan.scenarios
+                            if s.function == "thermostat_command"), plan.planning)
+
+    def test_when_no_function_gets_a_scenario_the_run_goes_on(self):
+        """A1-PL8, ORC-34: no function got a scenario that passed the check - no rule plan in the brain's place,
+        but no stop either: the gaps are left to the rule-based tests and the search; the failures are recorded."""
         gaps = [uc.GapItem(gap_id=f"LC:{fn}:{line}", function=fn, metric="LC", line=line)
                 for fn, line in (("thermostat_command", 11), ("clamp_percent", 19), ("select_mode", 30))]
         with brain(UTBrain(plans={"thermostat_command": [], "clamp_percent": [], "select_mode": []})):
-            with self.assertRaises(ba.AgentFault) as caught:
-                run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
-                                                           iteration=2)))
-        self.assertEqual(caught.exception.code, "BRAIN_PLAN_FAILED")
-        self.assertIn("clamp_percent", caught.exception.message)
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                              iteration=2)))
+        self.assertFalse([s for s in plan.scenarios if not s.inputs and s.made_by != "rule" and
+                          not s.scenario_id.startswith("S-evidence-")])
+        for fn in ("thermostat_command", "clamp_percent", "select_mode"):
+            self.assertTrue(any(p.startswith(f"{fn}: no scenario this time") for p in plan.planning), plan.planning)
+
+    def test_the_remote_qwen_answers_of_the_first_pc_run_are_accepted(self):
+        """ARCH-20, A1-PL4: the six answers the remote Qwen gave on the user's PC. The content was right; a stray
+        ':' before every value, an evidence id or a copied OPEN GAPS line as the gap id made the check refuse
+        them. Now the form is fixed and recorded, and the unchanged checks accept what is right."""
+        gaps = [uc.GapItem(gap_id="BC:select_mode:29:10:T", function="select_mode", metric="BC", line=29, column=10,
+                           detail="(window_open || !occupied) never true"),
+                uc.GapItem(gap_id="LC:select_mode:30", function="select_mode", metric="LC", line=30)]
+        answers: dict[str, list] = {}
+        for fn, answer in REMOTE_QWEN_ANSWERS:
+            answers.setdefault(fn, []).append(answer["scenarios"])
+        replies = {fn: (lambda queue: (lambda ctx: queue.pop(0) if queue else []))(list(seq))
+                   for fn, seq in answers.items()}
+        with brain(UTBrain(plans=replies)):
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                              iteration=2)))                # after the cheap tests
+        by_fn = {}
+        for s in plan.scenarios:
+            if s.made_by.startswith("brain:"):
+                by_fn.setdefault(s.function, []).append(s)
+        modes = [{a.name: a.value for a in s.args} for s in by_fn.get("select_mode", [])]
+        self.assertIn({"window_open": "1", "occupied": "0", "frost": "0"}, modes, plan.planning)
+        self.assertIn({"window_open": "0", "occupied": "1", "frost": "1"}, modes)
+        self.assertTrue(all(g in {"BC:select_mode:29:10:T", "LC:select_mode:30"}
+                            for s in by_fn["select_mode"] for g in s.gap_ids))
+        thermo = by_fn.get("thermostat_command", [])
+        self.assertTrue(thermo and thermo[0].gap_ids == ["EVIDENCE:thermostat_command"], plan.planning)
+        self.assertEqual((thermo[0].expected_return, thermo[0].stub_values[0].returns), ("-1", ["SENSOR_ERROR"]))
+        self.assertFalse(thermo[0].characterization)                       # normative: quoted E2 evidence
+        self.assertTrue(by_fn.get("clamp_percent"), plan.planning)
+        notes = " ".join(plan.planning)
+        self.assertIn("args.window_open: ':1' -> '1'", notes)              # every fix recorded [ARCH-20]
+        self.assertIn("-> 'EVIDENCE:thermostat_command'", notes)
+
+    def test_format_fixes_never_change_content(self):
+        """ARCH-20: only noise is removed; what is left is checked by the unchanged strict checks."""
+        cases = {":1": "1", " = 0": "0", "window_open: 1": "1", "window_open = MODE_ECO": "MODE_ECO",
+                 "`MODE_ECO`": "MODE_ECO", '"1"': "1", "1;": "1", "1, ": "1", "1 /* open */": "1",
+                 "-5 // below": "-5", "::Mode::ECO": "::Mode::ECO", "/dev/null": "/dev/null", "{setpoint}": "{setpoint}",
+                 "'a'": "'a'", '"abc def"': '"abc def"'}
+        for raw, expected in cases.items():
+            self.assertEqual(a1.fix_value(raw, "window_open"), expected, raw)
+        self.assertEqual(a1.fix_value('"OK"', "name", keep_quotes=True), '"OK"')     # a string parameter
+        open_ids = {"BC:select_mode:29:10:T", "LC:select_mode:30"}
+        self.assertEqual(a1.fix_gap_id("LC:select_mode:30 [LC] line 30: `return MODE_ECO;`", open_ids, "select_mode",
+                                       set()), "LC:select_mode:30")
+        self.assertEqual(a1.fix_gap_id("LC:select_mode:3", open_ids, "select_mode", set()), "LC:select_mode:3")
+        self.assertEqual(a1.fix_gap_id("EV-f-1", {"EVIDENCE:f"}, "f", {"EV-f-1"}), "EVIDENCE:f")
+        self.assertEqual(a1.fix_gap_id("EV-f-1", {"EVIDENCE:f", "LC:f:3"}, "f", {"EV-f-1"}), "EV-f-1")  # ambiguous
+        constants = {"MODE_ECO": 1}
+        for value in ("!0", "1.0", "(int)1"):                                # valid C, accepted [A1-PL4]
+            self.assertIsNotNone(a1.eval_int(value, constants) if value != "1.0" else 1.0, value)
+        fn = next(f for f in self.layout.functions if f.name == "select_mode")
+        p = a1.text_params(fn)[0]
+        for value, ok in (("!0", True), ("1.0", True), ("/dev/null", False), ("{setpoint}", False), ("1.5", False)):
+            problem = self.agent._value_problem(p, value, fn, constants, set(), set(), self.layout)
+            self.assertEqual(problem == "", ok, (value, problem))
+
+    def test_the_request_shows_suggested_values_an_example_and_the_history(self):
+        """A1-PL2, A1-PL3, A1-PL8, A2-21f: what the brain sees."""
+        gaps = [uc.GapItem(gap_id="LC:select_mode:30", function="select_mode", metric="LC", line=30)]
+        seen, tasks = [], []
+        b = UTBrain(plans={"select_mode": lambda ctx: seen.append(ctx) or []})
+        req = uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps), iteration=3,
+                             refused={"select_mode": ["select_mode: no scenario this time - window_open: ':1' is not an "
+                                                      "integer value"]},
+                             crashed_calls=["select_mode(INT_MIN, 0, 0)", "clamp_percent(5)"])
+        with brain(b):
+            run(a1.AnalyzerAgent().plan(req))
+        context = seen[0]
+        self.assertIn("- window_open (type int, int) - suggested values: 0, 1", context)
+        self.assertNotIn("- window_open: int", context)                       # the form Qwen copied into values
+        self.assertIn("REFUSED earlier: select_mode: no scenario this time - window_open: ':1'", context)
+        self.assertIn("CRASHED or did not end: select_mode(INT_MIN, 0, 0)", context)
+        self.assertNotIn("clamp_percent(5)", context)
+        task = next(t for t in b.generate_calls if "function select_mode " in t)
+        self.assertIn('"args": [{"name": "a", "value": "1"}', task)          # the example scenario [A1-PL3]
+        self.assertIn("never a ':' or '=' before a value", task)
+        seen.clear()                                                   # a refused answer: the re-ask shows the form
+        bad = planned(gap_ids=["LC:select_mode:30"], name="test_select_mode_x", purpose="x",
+                      args=[{"name": "window_open", "value": "/dev/null"}, {"name": "occupied", "value": "0"},
+                            {"name": "frost", "value": "0"}])
+        with brain(UTBrain(plans={"select_mode": lambda ctx: seen.append(ctx) or [bad]})):
+            run(a1.AnalyzerAgent().plan(req))
+        self.assertIn("window_open: '/dev/null' is not an integer value", seen[1])
+        self.assertIn('Expected form: every value exactly as C code, for example {"name": "window_open", "value": "1"}',
+                      seen[1])
 
     def test_a_scenario_whose_test_failed_is_not_accepted_again(self):
         """A1-PL8: the brain sees the failed test among the facts; the same scenario again is refused by name."""
@@ -3661,6 +3970,23 @@ class TargetDependencyTests(unittest.TestCase):
         last = uc.VerificationResult(run_id="r", stage="build_check", sut_sha256="x", suite_sha256="", build_ok=False,
                                      decision="setup_blocked", reason=message)
         self.assertIn("does not compile here", a1.AnalyzerAgent._revision(dep, last, None))
+
+
+class MemberNameTests(unittest.TestCase):
+    """A1-DA21: a member function defined outside its class but inside a namespace keeps its class in its name.
+    Found on QP/C++ qf_mem.cpp: `namespace QP { void * QMPool::get(...) {...} }` was named QP::get, so no test and
+    no search could call it (5.7 % lines; 52.9 % after the fix, with the scripted brain)."""
+    def test_semantic_owner_wins_over_the_enclosing_namespace(self):
+        index = a1.AstIndex("", Path("."), Path("."))
+        record = {"id": "0x2", "kind": "CXXRecordDecl", "name": "QMPool", "inner": []}
+        method = {"id": "0x3", "kind": "CXXMethodDecl", "name": "get", "parentDeclContextId": "0x2"}
+        free = {"id": "0x4", "kind": "FunctionDecl", "name": "helper"}
+        index._index({"id": "0x1", "kind": "NamespaceDecl", "name": "QP", "inner": [record, method, free]}, "", "")
+        self.assertEqual(index.qualified_name(method), "QP::QMPool::get")
+        self.assertEqual(index.qualified_name(free), "QP::helper")
+        outside = {"id": "0x5", "kind": "CXXMethodDecl", "name": "put", "parentDeclContextId": "0x2"}
+        index._index(outside, "", "")                                   # `void QP::QMPool::put() {}` at file scope
+        self.assertEqual(index.qualified_name(outside), "QP::QMPool::put")
 
 
 class ReadOnceTests(unittest.TestCase):

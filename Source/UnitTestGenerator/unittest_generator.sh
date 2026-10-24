@@ -8,6 +8,7 @@
 #    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
 #    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp | pilot-realrepo
 #                                              every SUT file of a pilot, one live viewer page for all
+#    ./unittest_generator.sh pilot-all         every pilot, every production file (23 files), one summary
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 #    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 #    ./unittest_generator.sh benchmark [on|off|both]
@@ -44,7 +45,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|benchmark|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-all|benchmark|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -107,7 +108,7 @@ case "$ACTION" in
         if [ "${!i}" = "--branch" ]; then j=$((i + 1)); SETUP+=(--branch "${!j}"); fi
       done
     fi ;;
-  pilot-deps) SETUP=(ensure --repo "$PILOTS/c_deps_pilot") ;;
+  pilot-deps|pilot-all) SETUP=(ensure --repo "$PILOTS/c_deps_pilot") ;;
 esac
 "$PY" ut_setup.py "${SETUP[@]}"
 RC=$?
@@ -160,6 +161,18 @@ case "$ACTION" in
   pilot-embedded) pilot c_embedded_pilot src/gpio_driver.c src/scheduler.c src/critical.c src/main_loop.c "$@" ;;
   pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
   pilot-realrepo) pilot c_realrepo_pilot kernel/src/klist.c kernel/src/kqueue.c codec/ring.c drivers/crc_drv.c "$@" && pilot cpp_realrepo_pilot src/dispatcher.cpp "$@" ;;
+  pilot-all)
+    # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named
+    SUMMARY="$HERE/ut_output/pilots/pilot_all_summary.txt"; mkdir -p "$HERE/ut_output/pilots"
+    echo "Every pilot, every production file - $(date)" > "$SUMMARY"; ALL=0
+    for dir in "$PILOTS"/*/; do
+      name="$(basename "$dir")"; suts=()
+      [ "$name" = cpp_embedded_pilot ] && suts=(src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp)
+      echo; echo "==== $name: every production file ..."
+      if pilot "$name" ${suts[@]+"${suts[@]}"} "$@"; then echo "  $name: every file verified" >> "$SUMMARY"
+      else echo "  $name: not every file verified (exit code $?) - see its report above" >> "$SUMMARY"; ALL=3; fi
+    done
+    echo; echo "---- every pilot ----"; cat "$SUMMARY"; exit $ALL ;;
   benchmark) "$PY" ut_pipeline.py benchmark --config ut_config.json --knowledge "${1:-on}" ;;
   run)
     if [ $# -lt 1 ]; then echo "Usage: $0 run REPO [SUT|all] [options]"; exit 2; fi

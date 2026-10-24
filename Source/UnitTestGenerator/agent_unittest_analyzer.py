@@ -71,7 +71,8 @@ class AnalyzerConfig(BaseModel):
     max_definition_units: int = 40           # translation units parsed to find one definition [A1-DA5]
     requirement_files: list[str] = []        # glob patterns, relative to the repository [A1-25x]
     max_brain_calls_per_function: int = 2    # re-ask included [A1-PL9, ORC-7]
-    max_brain_scenarios: int = 8
+    max_brain_scenarios: int = 4             # per call: shorter answers, faster on a small brain [ORC-7]
+    rules_first: bool = True                 # no test measured yet: cheap tests first, then the brain [A1-PL1]
     max_lookups_per_function: int = 6        # A1-PL6, ORC-7
     # Expected answer per brain scenario, in tokens: sets the answer limit and window [ARCH-11]
     tokens_per_scenario: int = 320
@@ -610,8 +611,10 @@ class AstIndex:
         nid = node.get("id", "")
         name = self.qualified.get(nid) or node.get("name", "")
         owner = node.get("parentDeclContextId")
-        if owner and owner in self.qualified and "::" not in name:
-            name = f"{self.qualified[owner]}::{node.get('name', '')}"
+        # The semantic owner wins over the place of the definition: `namespace QP { void *QMPool::get() {} }` is
+        # QP::QMPool::get, not QP::get (a member defined outside its class, inside a namespace) [A1-DA21]
+        if owner and owner in self.qualified and node.get("name"):
+            name = f"{self.qualified[owner]}::{node['name']}"
         return name
 
     def namespace_of(self, node: dict) -> str:
@@ -1653,7 +1656,14 @@ PLAN_TASK = (
     "characterization_gap when no evidence states the result: leave expected_return empty, the result is observed. "
     "conflicting_evidence when evidence items contradict each other (say which in conflict). "
     "insufficient_evidence when you need more evidence (say what in information_sought).\n"
-    "- Never guess an expected value.")
+    "- Never guess an expected value.\n"
+    "Example of one scenario in this form (for a function int f(int a, int b) with an open gap LC:f:12):\n"
+    '{{"gap_ids": ["LC:f:12"], "name": "test_f_negative_b", "purpose": "b below 0 returns the error", '
+    '"args": [{{"name": "a", "value": "1"}}, {{"name": "b", "value": "-1"}}], "setup": [], "stubs": [], '
+    '"variables": [], "expected_return": "", "expected_after": [], "evidence_ids": [], "quotes": [], '
+    '"classification": "characterization_gap", "conflict": "", "information_sought": ""}}\n'
+    "Values are C code exactly as in the example (\"1\", \"-1\", a macro or enumerator name): never a ':' or '=' "
+    "before a value, never the parameter name, a file path or a placeholder.")
 LINK_TASK = (
     "Some REQUIREMENTS below do not name a function. For each one, decide which FUNCTIONS (if any) implement the "
     "behaviour it states. Return JSON {\"links\": [{\"requirement_id\", \"functions\", \"quote\", \"probability\"}]}: "
@@ -1691,6 +1701,43 @@ def norm_text(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[/*]+", " ", text)).strip().lower()
 
 
+# ARCH-20, A1-PL4: form is forgiven, content is not. Harmless format noise of a brain answer is removed before the
+# unchanged strict checks; every fix is recorded with the value before and after.
+VALUE_PREFIX = re.compile(r"^\s*(?:=|:(?!:))\s*")           # a stray ':' or '=' (never the '::' of a C++ name)
+
+
+def fix_value(value: str, name: str = "", keep_quotes: bool = False) -> str:
+    """A value as a brain may write it, without format noise: comments, a copied 'name:' or 'name =', a stray ':'
+    or '=', a trailing ';' or ',', backticks, or double quotes around a number or name (unless a string is meant)."""
+    v = str(value).strip()
+    v = re.sub(r"/\*.*?\*/", " ", v)
+    v = re.sub(r"//.*$", "", v).strip()
+    if name:
+        v = re.sub(r"^\s*" + re.escape(name) + r"\s*(?:=|:(?!:))\s*", "", v)
+    v = VALUE_PREFIX.sub("", v)
+    v = v.rstrip(";,").strip()
+    if len(v) >= 2 and v[0] == v[-1] == "`":
+        v = v[1:-1].strip()
+    if not keep_quotes and len(v) >= 2 and v[0] == v[-1] == '"' and re.fullmatch(r"[-+!~]?[\w.:]+", v[1:-1].strip()):
+        v = v[1:-1].strip()
+    return v
+
+
+def fix_gap_id(gap_id: str, open_ids: set[str], function: str, evidence_ids: set[str]) -> str:
+    """A gap id as a brain may write it: a copied OPEN GAPS line is read as the id it starts with; an evidence id of
+    the function is read as EVIDENCE:<function> when that is the function's only open item."""
+    g = str(gap_id).strip().strip("`").lstrip("- ").strip()
+    if g in open_ids:
+        return g
+    starts = [o for o in open_ids if g.startswith(o) and (len(g) == len(o) or g[len(o)] in " :|[(-")]
+    if starts:
+        return max(starts, key=len)
+    only = f"EVIDENCE:{function}"
+    if open_ids == {only} and (g in evidence_ids or g.startswith(f"EV-{function}-") or g == function):
+        return only
+    return g
+
+
 def eval_int(expr: str, constants: dict[str, int]) -> int | None:
     """Integer value of a C constant expression made of literals, enumerators and macros (no calls)."""
     e = expr.strip()
@@ -1701,7 +1748,7 @@ def eval_int(expr: str, constants: dict[str, int]) -> int | None:
     e = re.sub(r"'\\?(.)'", lambda m: str(ord(m.group(1))), e)              # character literals
     e = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", e)
     e = re.sub(r"\b0([0-7]+)\b", lambda m: str(int(m.group(1), 8)), e)
-    e = e.replace("&&", " and ").replace("||", " or ").replace("!", " not ").replace(" not =", "!=")
+    e = e.replace("&&", " and ").replace("||", " or ").replace("!", " not ").replace(" not =", "!=").strip()
     try:
         tree = ast.parse(e, mode="eval")
     except SyntaxError:
@@ -1813,6 +1860,7 @@ class AnalyzerAgent(ba.AgentCore):
                  router: ba.BrainRouter | None = None):
         self.cfg = config or AnalyzerConfig()
         self._link_cache: dict[str, list[uc.RequirementLink]] = {}
+        self.last_fixes: list[str] = []                              # format fixes of the last check [ARCH-20]
         self._variant_cache: dict[str, list[tuple[uc.BuildVariant, dict[str, int]]]] = {}   # A1-37a, A1-37e
         self._sources: dict[str, dict[str, tuple[tuple[int, int], str]]] = {}                # A1-31b
         super().__init__(settings, router=router)
@@ -2682,6 +2730,8 @@ class AnalyzerAgent(ba.AgentCore):
             if p.kind == "enum" and v.split("::")[-1] in {x.split("::")[-1] for x in p.enum_values}:
                 return ""
             n = eval_int(v, constants)
+            if n is None and re.fullmatch(r"[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?[fF]?", v) and float(v.rstrip("fF")).is_integer():
+                n = int(float(v.rstrip("fF")))                          # 1.0 for an int: valid C [A1-PL4]
             if n is None:
                 return f"{p.name}: {v!r} is not an integer value (literal, enumerator or macro)"
             if p.kind == "bool" and n not in (0, 1):
@@ -2718,10 +2768,46 @@ class AnalyzerAgent(ba.AgentCore):
                    w not in KEYWORDS and w not in constants]
         return f"{p.name}: unknown names in {v!r}: {', '.join(unknown[:4])}" if unknown else ""
 
+    @staticmethod
+    def _normalize_planned(planned: "PlannedScenario", fn: uc.FunctionInfo, open_ids: set[str],
+                           evidence: dict[str, uc.EvidenceRef]) -> list[str]:
+        """ARCH-20, A1-PL4: format noise removed from values and gap ids; returns "field: 'before' -> 'after'"."""
+        fixes: list[str] = []
+        strings = {p.name for p in text_params(fn) if p.kind == "cstring"}
+
+        def fixed(field: str, value: str, name: str = "", keep: bool = False) -> str:
+            new = fix_value(value, name, keep)
+            if new != value and new:
+                fixes.append(f"{field}: {value!r} -> {new!r}")
+                return new
+            return value
+        for a in planned.args:
+            a.value = fixed(f"args.{a.name}", a.value, a.name, a.name in strings)
+        for v in planned.variables:
+            v.value = fixed(f"variables.{v.name}", v.value, v.name)
+        for st in planned.stubs:
+            st.returns = [fixed(f"stubs.{st.stub}", r) for r in st.returns]
+        if planned.expected_return.strip():
+            planned.expected_return = fixed("expected_return", planned.expected_return, "",
+                                            bool(re.search(r"char\s*\*", return_type_of(fn) or "")))
+        for c in planned.expected_after:
+            c.value = fixed(f"expected_after.{c.expr}", c.value)
+        ids = []
+        for g in planned.gap_ids:
+            new = fix_gap_id(g, open_ids, fn.name, set(evidence))
+            if new != g:
+                fixes.append(f"gap_ids: {g[:60]!r} -> {new!r}")
+            if new not in ids:
+                ids.append(new)
+        planned.gap_ids = ids
+        return fixes
+
     def _check_planned(self, planned: "PlannedScenario", fn: uc.FunctionInfo, open_ids: set[str],
                        infeasible: set[str], evidence: dict[str, uc.EvidenceRef], stubs: list[uc.StubSpec], constants: dict[str, int],
                        known: set[str], layout: uc.LayoutProfile) -> tuple[uc.Scenario | None, list[str]]:
-        """A1-PL4: every check, deterministically, before Agent2 receives the scenario."""
+        """A1-PL4: every check, deterministically, before Agent2 receives the scenario. The format fixes of ARCH-20
+        are applied first and recorded in ``self.last_fixes``."""
+        self.last_fixes = self._normalize_planned(planned, fn, open_ids, evidence)
         reasons: list[str] = []
         claim = WAY_OUT.search(" ".join([planned.name, planned.purpose, planned.information_sought, planned.conflict]))
         if claim:                                                                          # COV-5
@@ -2847,6 +2933,70 @@ class AnalyzerAgent(ba.AgentCore):
             expected="as stated by the evidence" if normative else "observe it", linked=linked and normative)
         return scenario, notes
 
+    @staticmethod
+    def _expected_form(fn: uc.FunctionInfo, open_ids: set[str]) -> str:
+        """ARCH-20: the re-ask shows the form each field is expected in, not only what was wrong."""
+        params = text_params(fn)
+        args = ", ".join('{"name": "%s", "value": "1"}' % p.name for p in params[:3]) or "(no parameters)"
+        return ("Expected form: every value exactly as C code, for example " + args + " - a number, an enumerator, "
+                "a macro or a variable from setup; never a ':' or '=' before it, never the parameter name, a file path "
+                "or a placeholder. gap_ids exactly as written at the start of an OPEN GAPS line, for example "
+                + ", ".join(f'"{g}"' for g in sorted(open_ids)[:2]) + ".")
+
+    def _suggested_values(self, fn: uc.FunctionInfo, sut_text: str, stubs: list[uc.StubSpec],
+                          constants: dict[str, int] | None = None) -> dict[str, list[str]]:
+        """A1-PL2: per parameter and stub, the values the function itself decides on (literals, enumerators and
+        macros compared with it, and the values next to them); 0 and 1 for a value used as true or false."""
+        body = strip_comments("\n".join(sut_text.splitlines()[fn.line_start - 1: fn.line_end]))
+        head, _, code = body.partition("{")
+        names = {p.name: [p.name] for p in text_params(fn)}
+        for p in text_params(fn):                                        # fields of a struct or pointer parameter
+            used = {m.group(2) for m in re.finditer(r"\b" + re.escape(p.name) + r"\s*(->|\.)\s*([A-Za-z_]\w*)", code)}
+            for field in sorted({f.name for f in p.fields[:16]} | used):
+                names[f"{p.name}->{field}" if "*" in p.type or "->" in code else f"{p.name}.{field}"] = [
+                    re.escape(p.name) + r"\s*(?:->|\.)\s*" + re.escape(field)]
+        for st in stubs:
+            if st.kind == "variable" or not st.return_type or st.return_type.strip() in ("void", ""):
+                continue
+            short = st.function.split("::")[-1]
+            holders = re.findall(r"\b([A-Za-z_]\w*)\s*=\s*(?:\([^()]*\)\s*)?" + re.escape(short) + r"\s*\(", code)
+            names[f"{st.function}()"] = holders + [short + r"\s*\([^()]*\)"]
+        out: dict[str, list[str]] = {}
+        op = r"(==|!=|<=|>=|<|>)"
+        value = r"([-+]?(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*|'[^']'|[A-Za-z_]\w*(?:::\w+)*)"
+        for key, patterns in names.items():
+            found: list[str] = []
+            for pat in patterns:
+                ident = pat if ("(" in pat or "\\" in pat) else re.escape(pat)
+                for m in re.finditer(r"\b" + ident + r"\s*" + op + r"\s*" + value, code):
+                    found.append(m.group(2) + ("|edge" if m.group(1) in "<><=>=" else ""))
+                for m in re.finditer(value + r"\s*" + op + r"\s*" + (r"\b" if not ident.startswith("\\") else "")
+                                     + ident + r"\b", code):
+                    found.append(m.group(1) + ("|edge" if m.group(2) in "<><=>=" else ""))
+                for m in re.finditer(r"\b" + ident + r"\s*&\s*" + value, code):
+                    found += ["0", m.group(1)]
+                truth = [m for m in re.finditer(r"(?:\|\||&&|!|\(|\?)\s*!?\s*" + ident + r"\s*(?:\|\||&&|\)|\?)", code)
+                         if not re.search(r"\b(switch|sizeof|return)\s*$", code[:m.start()])]
+                if truth or re.search(r"(?:\|\||&&)\s*!?\s*" + ident + r"\b", code):
+                    found += ["0", "1"]                                  # used as true or false
+            values: list[str] = []
+            for f in found:
+                v, edge = f.split("|")[0], f.endswith("|edge")
+                if v in names or v in KEYWORDS or (re.fullmatch(r"[A-Za-z_][\w:]*", v) and constants is not None
+                                                     and v.split("::")[-1] not in constants):
+                    continue                                   # only literals, enumerators and macros
+                more = [v]
+                number = re.fullmatch(r"([-+]?\d+)[uUlL]*", v)
+                if edge and number:
+                    n = int(number.group(1))
+                    more = [str(n - 1), str(n), str(n + 1)]
+                for x in more:
+                    if x not in values:
+                        values.append(x)
+            if values:
+                out[key] = values[:8]
+        return out
+
     def _facts(self, fn: uc.FunctionInfo, gaps: list[uc.GapItem], open_ids: set[str], layout: uc.LayoutProfile,
                req: uc.PlanRequest, sut_text: str, stubs: list[uc.StubSpec], evidence: list[uc.EvidenceRef]) -> list[ba.ContextPart]:
         """A1-PL2 (facts first) and A1-PL12 (what was tried)."""
@@ -2854,15 +3004,22 @@ class AnalyzerAgent(ba.AgentCore):
         root = Path(layout.repo_root)
         source = "\n".join(f"{n:4d}| {lines[n - 1]}" for n in range(fn.line_start, min(fn.line_end, len(lines)) + 1))
         params = []
+        suggested = self._suggested_values(fn, sut_text, stubs, self._constants_for_values(layout))   # A1-PL2
         for p in text_params(fn):
             extra = []
             if p.enum_values:
                 extra.append("enumerators " + ", ".join(p.enum_values[:20]))
             if p.fields:
-                extra.append("fields " + ", ".join(f"{f.name}: {f.type}" for f in p.fields[:12]))
+                extra.append("fields " + ", ".join(f"{f.name} ({f.type})" for f in p.fields[:12]))
             if p.nullable:
                 extra.append("may be NULL")
-            params.append(f"- {p.name}: {p.type} ({p.kind}{'; ' + '; '.join(extra) if extra else ''})")
+            if p.kind in ("ptr_scalar", "ptr_struct", "buffer", "struct", "ptr_void"):
+                extra.append("pass a variable declared in setup, e.g. &v")
+            # "name (type)", never "name: type" - a smaller brain copies that form into the value [ARCH-20]
+            params.append(f"- {p.name} (type {p.type}, {p.kind}{'; ' + '; '.join(extra) if extra else ''})"
+                          + (f" - suggested values: {', '.join(suggested[p.name])}" if p.name in suggested else ""))
+            params += [f"  - field {key} - suggested values: {', '.join(values)}" for key, values in suggested.items()
+                       if key.startswith((p.name + "->", p.name + "."))]
         gap_rows = []
         for g in gaps:
             code = lines[g.line - 1].strip() if 0 < g.line <= len(lines) else ""
@@ -2877,7 +3034,9 @@ class AnalyzerAgent(ba.AgentCore):
                             "limits) with asserted expected values")
         called = [s for s in stubs if s.kind != "variable" and (s.function in fn.calls or
                                                                   (s.qualified_name or s.function) in fn.calls)]
-        stub_rows = [f"- {s.function}: {s.declaration or s.return_type + ' ' + s.function + '(...)'}" for s in called]
+        stub_rows = [f"- {s.function} - {s.declaration or s.return_type + ' ' + s.function + '(...)'}"
+                     + (f" - suggested return values: {', '.join(suggested[s.function + '()'])}"
+                        if s.function + "()" in suggested else "") for s in called]
         var_rows = [f"- {s.function}: {s.var_type}" for s in stubs if s.kind == "variable" and not s.is_const]
         real = [d.name for d in (layout.dependencies.entries if layout.dependencies else []) if d.decision != "stub"]
         ev_rows = [f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
@@ -2896,6 +3055,10 @@ class AnalyzerAgent(ba.AgentCore):
                               f"\n{body}")
             if len(tried_rows) >= 6:
                 break
+        for reason in req.refused.get(fn.name, [])[-6:]:                     # earlier refusals [A1-PL2, A1-PL8]
+            tried_rows.append(f"- REFUSED earlier: {reason[:300]}")
+        for call in [c for c in req.crashed_calls if re.match(r"\s*(?:\(void\)\s*\(?\s*)?" + re.escape(short) + r"\s*\(", c)][:6]:
+            tried_rows.append(f"- CRASHED or did not end: {call[:200]} (a rule-based test; do not plan it again) [A2-21f]")
         style = []
         for case in layout.existing_tests[:2]:
             path = root / case.file
@@ -2992,15 +3155,18 @@ class AnalyzerAgent(ba.AgentCore):
         if not open_ids:
             return []                                                        # nothing to plan [ARCH-16]
         limit = self.cfg.max_brain_calls_per_function
-        available = await self._available_brains()
+        available, family = await self._available_brains()
 
         def next_brains() -> list[str] | None:
-            """COV-6: the next available brain in the brain order; none left - the same brains again with the
-            facts of what was tried. A1-PL8: a brain whose scenarios all failed the check is not asked again."""
+            """COV-6: the next available brain of another model in the brain order; none left - the same brains
+            again with the facts of what was tried. A1-PL8: a model whose scenarios all failed the check is not
+            asked again - neither on another server (the remote Qwen and the one in Ollama are one model) [ARCH-19]."""
             if not (req.avoid_brains or tried):
                 return None
-            pool = [b for b in available if b not in tried]
-            return [b for b in pool if b not in req.avoid_brains] or pool
+            failed = {family.get(b, b) for b in tried}
+            avoid = {family.get(b, b) for b in req.avoid_brains}
+            pool = [b for b in available if family.get(b, b) not in failed]
+            return [b for b in pool if family.get(b, b) not in avoid] or pool
         while calls < limit:
             calls += 1
             context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence)
@@ -3016,7 +3182,7 @@ class AnalyzerAgent(ba.AgentCore):
                 if allowed is not None and not allowed:
                     raise ba.AgentFault("NO_BRAIN_AVAILABLE", "every allowed brain was tried")
                 answer = await self.generate(task, context, PlannedScenarios, need=need, step="A1.plan",
-                                             project=layout.repo_root, allowed=allowed)
+                                             project=layout.repo_root, allowed=allowed, vary=calls > 1)  # ARCH-20
             except ba.AgentFault as exc:
                 failures.append(f"{exc.code}: {exc.message}"[:300])
                 if exc.code in ba.NO_BRAIN_CODES and not accepted and not brain:
@@ -3036,7 +3202,13 @@ class AnalyzerAgent(ba.AgentCore):
                     continue
                 scenario, reasons = self._check_planned(planned, fn, open_ids, infeasible, ev_map, stubs, constants,
                                                         known, layout)
+                fixes = list(self.last_fixes)
+                if fixes:                                                   # form forgiven, recorded [ARCH-20]
+                    self.log_answer("A1.plan", "fixed", function=fn.name, scenario=k, fixes=fixes)
+                    plan_notes["planning"].append(f"{fn.name}: format fixed in scenario {k}: {'; '.join(fixes[:4])}"
+                                                  [:400] + " [ARCH-20]")
                 if scenario is None:
+                    self.log_answer("A1.plan", "refused", function=fn.name, scenario=k, reasons=reasons)
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): " + "; ".join(reasons))
                     continue
                 scenario.made_by = brain
@@ -3073,7 +3245,8 @@ class AnalyzerAgent(ba.AgentCore):
                 break
             extra = ("\n\nYOUR PREVIOUS ANSWER WAS CHECKED. Scenarios already accepted cover: "
                      + (", ".join(sorted(covered)) or "nothing") + ". Plan only these gaps now: " + ", ".join(remaining)
-                     + ("\nProblems found (fix them):\n" + "\n".join(problems) if problems else "")
+                     + ("\nProblems found (fix them):\n" + "\n".join(problems) + "\n" + self._expected_form(fn, open_ids)
+                        if problems else "")
                      + ("\nNew evidence from the look-up:\n" + "\n".join(
                          f"- {e.evidence_id} {e.evidence_class} (linked by look-up) {e.source}:{e.line}: {e.text[:300]}"
                          for e in found) if found else ""))
@@ -3224,8 +3397,15 @@ class AnalyzerAgent(ba.AgentCore):
         stubs = self._stubs(layout, last)
         disputed = set(req.disputed_evidence)
         notes: dict[str, list[str]] = {"planning": [], "conflicts": [], "lookups": []}
-        # The brain plans from the first coverage plan on; the rule tests are extra tests and facts [A1-PL1, ARCH-24].
-        brain_ok = last is not None
+        if req.inputs_only:                      # the search's inputs only, no brain [ORC-5a, A1-18c]
+            return uc.UTPlan(**base, stage="coverage", stubs=stubs, scenarios=self._input_scenarios(layout, req),
+                             reason="inputs found by the coverage-guided search [A1-18c]")
+        # The brain plans every gap; with nothing measured yet the cheap tests go first and their results are facts of
+        # the brain's first plan [A1-PL1, ARCH-24].
+        brain_ok = last is not None and not (self.cfg.rules_first and req.iteration <= 1 and not last.tests)
+        if not brain_ok and last is not None:
+            notes["planning"].append("cheap tests first: the rule-based tests and the coverage-guided search run in "
+                                     "this iteration; the brain plans every gap they leave [A1-PL1]")
         if last is not None and last.decision == "complete":
             pending = self._evidence_scenarios(layout, req, disputed)
             if pending and brain_ok:                                       # A1-25y with the brain [A1-PL1]
@@ -3301,16 +3481,9 @@ class AnalyzerAgent(ba.AgentCore):
             if f.classification == "undetermined" and not evidence:
                 repairs[-1].diagnostic += " | no further expected-behaviour evidence found [A1-25j]"
         disputed |= new_disputes
-        by_fuzz: set[str] = set()
-        for k, inp in enumerate(req.fuzz.inputs if req.fuzz else []):           # A1-18c
-            fn = next((f for f in layout.functions if inp.function in (f.name, f.qualified_name)), None)
-            if fn is None:
-                continue
-            by_fuzz |= set(inp.covers)
-            scenarios.append(uc.Scenario(
-                scenario_id=f"S-fuzz-{fn.name.replace('::', '_')}-{k + 1}", function=fn.name, gap_ids=inp.covers,
-                description=f"Inputs found by coverage-guided search reach {', '.join(inp.covers[:4])}",
-                inputs=[inp], expected="observe it", characterization=True))
+        found = self._input_scenarios(layout, req)                                # A1-18c
+        by_fuzz: set[str] = {g for sc in found for g in sc.gap_ids}
+        scenarios += found
         real = {d.name: d for d in (layout.dependencies.entries if layout.dependencies else []) if d.decision == "real"}
         lines = sut_text.splitlines()
         active_by_fn: dict[str, list[uc.GapItem]] = {}
@@ -3365,16 +3538,31 @@ class AnalyzerAgent(ba.AgentCore):
                          disputed_evidence=sorted(new_disputes), **notes)
 
     @staticmethod
+    def _input_scenarios(layout: uc.LayoutProfile, req: uc.PlanRequest) -> list[uc.Scenario]:
+        """A1-18c: the inputs the coverage-guided search found, as characterization scenarios (no brain)."""
+        out = []
+        for k, inp in enumerate(req.fuzz.inputs if req.fuzz else []):
+            fn = next((f for f in layout.functions if inp.function in (f.name, f.qualified_name)), None)
+            if fn is None:
+                continue
+            out.append(uc.Scenario(
+                scenario_id=f"S-fuzz-{fn.name.replace('::', '_')}-{req.iteration}-{k + 1}", function=fn.name,
+                gap_ids=inp.covers, description=f"Inputs found by coverage-guided search reach {', '.join(inp.covers[:4])}",
+                inputs=[inp], expected="observe it", characterization=True))
+        return out
+
+    @staticmethod
     def _open_gaps(last: uc.VerificationResult) -> bool:
         return last.coverage is not None and any(fc.gaps for fc in last.coverage.functions)
 
-    async def _available_brains(self) -> list[str]:
-        """The allowed brains this run can still reach, in the brain order (ARCH-1a)."""
+    async def _available_brains(self) -> tuple[list[str], dict[str, str]]:
+        """The allowed brains this run can still reach, in the brain order (ARCH-1a), and the model of each."""
         try:
             router = await self._brains()
         except ba.AgentFault:
-            return []
-        return [b for b in router.available if b in self.allowed_brains]
+            return [], {}
+        names = [b for b in router.available if b in self.allowed_brains]
+        return names, {b: router.family_of(b) for b in names}
 
     async def _with_brain(self, scenarios: list[uc.Scenario], active_by_fn: dict[str, list[uc.GapItem]],
                           infeasible: set[str], layout: uc.LayoutProfile, req: uc.PlanRequest, stubs: list[uc.StubSpec],
@@ -3409,10 +3597,6 @@ class AnalyzerAgent(ba.AgentCore):
                 return found, own, before
             return run
         results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
-        failed = [r for r in results if isinstance(r, ba.AgentFault) and r.code == "BRAIN_PLAN_FAILED"]
-        if work and len(failed) == len(work):                     # no function got a scenario: the run stops [ORC-34]
-            raise failed[0] if len(failed) == 1 else ba.AgentFault(
-                "BRAIN_PLAN_FAILED", " | ".join(f.message[:300] for f in failed[:3]) + " [A1-PL8]")
         for (name, *_), result in zip(work, results):
             if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
                 # A1-PL8: this function gets no scenario in this plan - never a rule plan; the other functions go on

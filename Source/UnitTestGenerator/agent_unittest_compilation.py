@@ -312,6 +312,7 @@ static DWORD WINAPI ut_watchdog(LPVOID arg) {
             /* Windows cannot interrupt the test: report it and end the program; Agent3 runs the rest [A3-45a] */
             if (ut_no_return) ut_emit("UT_RESULT|", ut_name, "|PASS\n");
             else ut_emit("UT_RESULT|", ut_name, "|TIMEOUT|time limit: the test does not end\n");
+            ut_emit("UT_WATCHDOG|", ut_name, "\n");    /* the program ends here on purpose, not by a crash */
             exit(4);
         }
     }
@@ -793,6 +794,10 @@ def _program_event(cmd: list[str], code: int, seconds: float) -> None:
     ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
                   data={"program": name, "outcome": outcome, "seconds": round(seconds, 2)},
                   summary=f"UT-Compilation ran {name}: {outcome}")
+
+
+# Windows has no fork: with function-local statics every test runs in a run of its own [A3-45c]
+ONE_BY_ONE = os.name == "nt"
 
 
 def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None = None,
@@ -1326,7 +1331,8 @@ NEEDS_BRAIN = "needs: brain classification"
 CLASSIFY_QUESTION = {
     "root_cause": ba.Question(type="choice", instructions=(
         "A generated unit test failed. Decide the most likely root cause from the evidence only."), criteria={
-        "test_generation_defect": "The test's inputs, call or expected value are wrong.",
+        "test_generation_defect": "The test's inputs, call or expected value are wrong - for example the values "
+                                  "test_code sets do not create the condition the test's purpose names.",
         "stub_defect": "A stub returns or records the wrong thing for this scenario.",
         "source_behavior_defect": "The test is valid and supported by the evidence; the SUT behaves incorrectly.",
         "undetermined": "The evidence is insufficient or conflicting."})}
@@ -3368,7 +3374,7 @@ class CompilationAgent(ba.AgentCore):
         prof = run_dir / "prof"
         prof.mkdir(exist_ok=True)
         env = chain.env(LLVM_PROFILE_FILE=str(prof / "run-%p.profraw"))
-        one_by_one = isolate and os.name == "nt"
+        one_by_one = isolate and ONE_BY_ONE
         if one_by_one:
             code, text = 0, ""
         else:
@@ -3399,6 +3405,9 @@ class CompilationAgent(ba.AgentCore):
                 LOG.warning("The test program ended abnormally (%s); running its %d tests one by one [A3-45a].",
                             _exit_text(code, text), len(names))
             results = []
+            if not names:                  # no test to run alone: one run of the program writes the profile [A3-60]
+                c, t = _run([str(binary)], run_dir, self.cfg.test_timeout, env, quiet=True)
+                outputs.append(t)
             for name in names:
                 c, t = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, env, quiet=True)
                 outputs.append(t)
@@ -3407,7 +3416,9 @@ class CompilationAgent(ba.AgentCore):
                 done = next((r for r in single if r.name == name), None)
                 if done is not None and summ is None and done.message == "test did not complete":
                     done = None                                   # the harness could not report it: say why
-                if done is None or (summ is None and done.status not in ("failed", "timeout")):
+                # the Windows watchdog reported the test and then ended the program on purpose [A3-45d]
+                watchdog = done is not None and f"UT_WATCHDOG|{name}" in t.replace("\r", "").splitlines()
+                if done is None or (summ is None and done.status not in ("failed", "timeout") and not watchdog):
                     timed_out = "UT_TIMEOUT" in t
                     done = uc.TestResult(name=name, status="timeout" if timed_out else "crashed",
                                          message=(f"did not finish within {self.cfg.test_timeout:g} s" if timed_out
@@ -3735,10 +3746,13 @@ class CompilationAgent(ba.AgentCore):
             return result
         sut = Path(result.run_dir) / "repo" / req.layout.sut_file
         excerpt = self._excerpt(sut, None)
+        suite = next((a.content for a in (req.bundle.actions if req.bundle else []) if a.role == "testsuite"), "")
+        codes = uc.test_sources(suite) if suite else {}
         for failure in pending:
             failure.evidence.remove(NEEDS_BRAIN)
             test = next((t for t in result.tests if t.name == failure.affected_test), None)
-            state = json.dumps({"failing_test": failure.affected_test, "assertion": failure.diagnostic,
+            state = json.dumps({"failing_test": failure.affected_test,                     # A3-156: its own code
+                                "test_code": codes.get(failure.affected_test, "")[:3000], "assertion": failure.diagnostic,
                                 "expected": test.expected if test else "", "actual": test.actual if test else "",
                                 "evidence": failure.evidence, "sut_source": excerpt})
             try:

@@ -955,6 +955,9 @@ class QwenSettings(StrictModel):
     Ollama is reached on a loopback address only, never through an HTTP proxy.
     """
     enabled: bool = True
+    # The model behind this brain. Brains with the same family are one model on different servers (the remote
+    # Qwen and the one in Ollama): an unusable answer is never passed from one to the other (ARCH-19).
+    family: str = Field(default="qwen3-8b", pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     base_url: str = "http://127.0.0.1:11434"
     # Ollama's tag for Qwen3 8B (about 5-6 GB). Check yours with: ollama list
     model: str = Field(default="qwen3:8b", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
@@ -1576,6 +1579,9 @@ def plan_context(parts: list[ContextPart], *, fixed_chars: int, messages: int, o
     return "\n\n".join(part.text for part in kept_parts if part.text)
 
 
+_ANSWER_LOG_LOCK = threading.Lock()
+
+
 def _accepts(method: Callable[..., Any], name: str) -> bool:
     """Engines written before the budget (test doubles, custom brains) take no ``plan``."""
     try:
@@ -1651,6 +1657,7 @@ class ClaudeEngine:
         self.settings = settings
         self.brain_name = brain
         self.model_id = settings.models.get(brain, CLAUDE_BRAINS[brain])
+        self.family = self.model_id
         self.client = client
         self.usage: dict[str, int] = {}
 
@@ -1958,6 +1965,7 @@ class QwenEngine:
 
     def __init__(self, settings: QwenSettings, *, opener: Any = None):
         self.settings = settings
+        self.family = settings.family
         self.model_id = "ollama:" + settings.model
         self.http = OllamaHTTP(settings.base_url, opener)
         self.gate = asyncio.Semaphore(settings.max_concurrency)
@@ -2139,7 +2147,8 @@ class QwenEngine:
 
     async def _ask(self, messages: list[dict[str, str]], fmt: dict[str, Any], timeout: float,
                    budget: tuple[list[int], int, float] | None, plan: TokenPlan | None,
-                   check: Callable[[dict[str, Any]], Any], reask: Callable[[dict[str, Any], AgentFault], str]) -> Any:
+                   check: Callable[[dict[str, Any]], Any], reask: Callable[[dict[str, Any], AgentFault], str],
+                   vary: bool = False) -> Any:
         """Send, check, re-ask. ``budget`` = (windows, answer limit, characters per token).
 
         Without a plan the call uses the fixed window (as before BaseAgent planned budgets). With
@@ -2158,7 +2167,7 @@ class QwenEngine:
             raise AgentFault("MODEL_BUSY", "The local model is busy with other requests.", True) from exc
         try:
             usage = {"input_tokens": 0, "output_tokens": 0}
-            attempt, varied = 0, False
+            attempt, varied = 0, vary
             while True:
                 try:
                     reply = await self._post_chat(messages, fmt, window, out, timeout, varied)
@@ -2241,9 +2250,11 @@ class QwenEngine:
         return {"model": self.model_id, "answers": answers, "usage": usage}
 
     async def generate(self, task: str, context: str, schema: dict[str, Any],
-                       validate: Callable[[Any], Any], plan: TokenPlan | None = None) -> dict[str, Any]:
+                       validate: Callable[[Any], Any], plan: TokenPlan | None = None,
+                       vary: bool = False) -> dict[str, Any]:
         """Structured output (plan, test code, patch): JSON constrained to ``schema`` by Ollama,
-        checked by ``validate`` (the pydantic contract), one corrective re-ask."""
+        checked by ``validate`` (the pydantic contract), one corrective re-ask. ``vary``: an agent's re-ask after
+        it refused the last answer - other sampling, so that the same answer is not given again [ARCH-20]."""
         if not self.started:
             await self.start()
         settings = self.settings
@@ -2256,7 +2267,7 @@ class QwenEngine:
 
         result, usage = await self._ask(
             messages, schema, settings.generate_timeout, self._budget("generate", plan), plan,
-            lambda reply: validate(parse_generated(reply["message"].get("content"))), reask)
+            lambda reply: validate(parse_generated(reply["message"].get("content"))), reask, vary=vary)
         return {"model": self.model_id, "output": result, "usage": usage}
 
     async def close(self) -> None:
@@ -2443,6 +2454,11 @@ class BrainRouter:
         simulation) have no ``brain_name``; they are code-injected and named "injected"."""
         return getattr(brain, "brain_name", None) or "injected"
 
+    def family_of(self, name: str) -> str:
+        """The model behind a brain: the same model on two servers is one family (ARCH-19)."""
+        brain = next((b for b in self.brains if self.name_of(b) == name), None)
+        return str(getattr(brain, "family", "") or name) if brain is not None else name
+
     @property
     def names(self) -> list[str]:
         return [self.name_of(brain) for brain in self.brains]
@@ -2488,8 +2504,12 @@ class BrainRouter:
                      fixed_chars: int, need: int | None, plans: list[TokenPlan] | None,
                      call: Callable[[Any, str, TokenPlan], Any]) -> tuple[Any, Any, list[str]]:
         skipped, budget_fault, output_fault = [], None, None
+        unusable: set[str] = set()                      # families whose answer stayed unusable [ARCH-19]
         for brain in candidates:
             name = self.name_of(brain)
+            if self.family_of(name) in unusable:
+                skipped.append(name)            # the same model on another server: same answer, only slower
+                continue
             wait = self.retry_after.get(name, 0.0)
             if wait == math.inf or (time.monotonic() < wait and brain is not candidates[-1]):
                 skipped.append(name)
@@ -2512,8 +2532,10 @@ class BrainRouter:
                     # Work output (a plan, tests, a patch) that stayed unusable after the brain's own
                     # retries: the next allowed brain is asked; the work is still checked and verified
                     # afterwards. Decisions are never shopped around this way. No cooldown [ARCH-19].
-                    LOG.warning("Brain %s gave no usable answer (%s); asking the next brain.", name, exc.message)
+                    LOG.warning("Brain %s gave no usable answer (%s); asking the next brain of another model.",
+                                name, exc.message)
                     output_fault = exc
+                    unusable.add(self.family_of(name))
                     skipped.append(name)
                     continue
                 if exc.code not in AVAILABILITY_FAULTS:
@@ -2568,8 +2590,8 @@ class BrainRouter:
 
     async def generate(self, task: str, context: str | None, schema: dict[str, Any], validate: Callable[[Any], Any],
                        allowed: list[str] | None = None, *, parts: list[ContextPart] | None = None,
-                       need: int | None = None, step: str = "",
-                       plans: list[TokenPlan] | None = None) -> tuple[dict[str, Any], Any, list[str]]:
+                       need: int | None = None, step: str = "", plans: list[TokenPlan] | None = None,
+                       vary: bool = False) -> tuple[dict[str, Any], Any, list[str]]:
         """Structured generation with the same fallback rules as ``decide``.
         Returns (result with "output", brain that answered, brains skipped)."""
         allowed = allowed or list(BRAIN_NAMES)
@@ -2581,9 +2603,10 @@ class BrainRouter:
         fixed = len(GENERATE_SYSTEM_PROMPT) + len(generate_prompt(task, ""))
 
         async def call(brain: Any, text: str, plan: TokenPlan) -> Any:
+            extra = {"vary": True} if vary and _accepts(brain.generate, "vary") else {}   # ARCH-20
             if _accepts(brain.generate, "plan"):
-                return await brain.generate(task, text, schema, validate, plan=plan)
-            return await brain.generate(task, text, schema, validate)
+                return await brain.generate(task, text, schema, validate, plan=plan, **extra)
+            return await brain.generate(task, text, schema, validate, **extra)
         return await self._route("generate", candidates, step, parts, fixed, need, plans, call)
 
     async def close(self) -> None:
@@ -3844,7 +3867,10 @@ class AgentCore:
             self.token_plans.extend(plan.record() for plan in plans)
             self._brain_answer(step, plans)
         self._brain_used(router, brain, skipped)
-        return validate_answers(raw, profile)
+        answers = validate_answers(raw, profile)
+        self.log_answer(step, "decision", brain=router.name_of(brain), model=str(getattr(brain, "model_id", "")),
+                        answer=answers)                                                            # ARCH-20
+        return answers
 
     def _brain_answer(self, step: str, plans: list[TokenPlan]) -> None:
         last = plans[-1] if plans else None
@@ -3866,15 +3892,16 @@ class AgentCore:
     async def generate(self, task: str, context: str | list[ContextPart], output_model: type[BaseModel], *,
                        need: OutputNeed | None = None, step: str = "", project: str | Path | None = None,
                        check: Callable[[BaseModel], Any] | None = None,
-                       allowed: list[str] | None = None) -> BaseModel:
+                       allowed: list[str] | None = None, vary: bool = False) -> BaseModel:
         """Schema-checked structured output (a plan, test code, a patch).
 
         ``context`` may be prioritized parts (ARCH-11); ``need`` is the expected answer, which
         sets the answer limit and window (none: the configured size); ``step`` adds that step's
         knowledge packs, ``project`` the project's own packs. ``allowed`` narrows the brains for this call
         (for example to ask the next brain after one made no progress). ``check`` (optional) is the agent's own
-        check of the parsed answer; an AgentFault from it is answered with the one corrective re-ask.
-        Every plan goes to meta.token_plans."""
+        check of the parsed answer; an AgentFault from it is answered with the one corrective re-ask. ``vary``: the
+        agent asks again after refusing the last answer - the brain samples differently (ARCH-20).
+        Every plan goes to meta.token_plans; every answer to the answer log (ARCH-20)."""
         if need is not None and need.items <= 0:
             raise AgentFault("NO_WORK", "Nothing to ask a brain for in this step (ARCH-16).")
         router = await self._brains()
@@ -3892,12 +3919,34 @@ class AgentCore:
                 task, None, schema, validate, [b for b in (allowed or self.allowed_brains) if b in self.allowed_brains]
                 or self.allowed_brains,
                 parts=self.context_parts(context, step, project), need=need.tokens if need else None,
-                step=step, plans=plans)
+                step=step, plans=plans, vary=vary)
+        except AgentFault as exc:                      # an answer no check let through is logged too [ARCH-20]
+            self.log_answer(step, "refused", brain=plans[-1].brain if plans else "", task=task[:400],
+                            varied=vary, code=exc.code, reason=exc.message[:1500])
+            raise
         finally:
             self.token_plans.extend(plan.record() for plan in plans)
             self._brain_answer(step, plans)
         self._brain_used(router, brain, skipped)
-        return result["output"]
+        output = result["output"]
+        self.log_answer(step, "answer", brain=router.name_of(brain), model=str(getattr(brain, "model_id", "")),
+                        task=task[:400], varied=vary,
+                        answer=output.model_dump(mode="json") if isinstance(output, BaseModel) else output)
+        return output
+
+    def log_answer(self, step: str, kind: str, **data: Any) -> None:
+        """ARCH-20: a brain answer, or what the agent did with it (refused, fixed), appended to the answer log of
+        the run (the file named in BASEAGENT_ANSWER_LOG). Never raises; keys and tokens are never part of it."""
+        path = os.environ.get("BASEAGENT_ANSWER_LOG", "")
+        if not path:
+            return
+        record = {"time": round(time.time(), 3), "agent": self.name, "step": step, "kind": kind, **data}
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str)
+            with _ANSWER_LOG_LOCK, open(path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except (OSError, TypeError, ValueError):
+            pass
 
     async def resolve(self, failure: RuleFailure, *, task: str, context: str | list[ContextPart],
                       output_model: type[BaseModel], verify: Callable[[BaseModel], Any], step: str = "",

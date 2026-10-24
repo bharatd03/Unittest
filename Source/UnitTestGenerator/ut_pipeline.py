@@ -123,6 +123,7 @@ class PipelineConfig(BaseModel):
     max_workspace_mb: int = 200
     fuzz_after_stagnation: bool = True       # ORC-5a
     fuzz_seconds: int = Field(default=60, ge=1, le=3600)
+    fuzz_budget_seconds: int = Field(default=300, ge=0, le=36_000)   # the search of a whole run [ORC-5a, A3-FZ3]
     # the documented-behaviour round after every target is met; 0 = no limit [ORC-32, ORC-7]
     after_target_seconds: float = Field(default=600.0, ge=0)
     repo_cache: str = "ut_cache"             # one clone per repository and PC [ORC-20]
@@ -377,6 +378,8 @@ class Orchestrator:
         if state.origin.get("commit"):                                    # ORC-19: bound to the tested commit
             self.ledger.append(agent="ut_pipeline", tool="tested_commit", repository=state.origin.get("repository", ""),
                                branch=state.origin.get("branch", ""), commit=state.origin["commit"])
+        answer_log = os.environ.get("BASEAGENT_ANSWER_LOG")
+        os.environ["BASEAGENT_ANSWER_LOG"] = str(out / "brain_answers.jsonl")    # every brain answer [ARCH-20]
         try:
             async with contextlib.AsyncExitStack() as stack:
                 await self.connect(stack, out / "logs")
@@ -409,6 +412,10 @@ class Orchestrator:
             else:
                 LOG.exception("pipeline run failed")
                 result = state.stopped(f"ended by an error ({type(exc).__name__}: {exc})"[:400])
+        if answer_log is None:
+            os.environ.pop("BASEAGENT_ANSWER_LOG", None)
+        else:
+            os.environ["BASEAGENT_ANSWER_LOG"] = answer_log
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         delivered = self._deliver(state, result)
@@ -621,6 +628,7 @@ class Orchestrator:
         fuzz: uc.FuzzResult | None = None
         next_brain_asked = False
         budget = asyncio.timeout(None)          # set when every target is met [ORC-32]
+        pending: asyncio.Task | None = None     # the search running while the brain plans [ORC-5a]
         try:
             async with budget:
                 for iteration in range(1, s.iter_limit + 1):
@@ -629,10 +637,26 @@ class Orchestrator:
                         " - targets met: checking the documented behaviour [A1-25y, ORC-32]" if s.targets_met_at else ""))
                     if self._needs_revision(last, s):                                  # A1-DA12
                         await self._dependencies(s, last)
-                    plan = await self.call("analyzer", "plan", uc.PlanRequest(
+                    planning = self.call("analyzer", "plan", uc.PlanRequest(
                         layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
                         fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
-                        avoid_brains=sorted(s.avoid_brains), failed_tests=dict(s.failed_tests)), uc.UTPlan)
+                        avoid_brains=sorted(s.avoid_brains), failed_tests=dict(s.failed_tests),
+                        refused={fn: lines[-6:] for fn, lines in s.rejected.items()},           # A1-PL2, A1-PL8
+                        crashed_calls=s.crashed_calls[-40:]), uc.UTPlan)
+                    if pending is None:
+                        plan = await planning
+                    else:                       # the brain plans while the search runs on this computer [ORC-5a]
+                        plan, searched = await asyncio.gather(planning, pending, return_exceptions=True)
+                        pending = None
+                        if isinstance(plan, BaseException):
+                            raise plan
+                        if isinstance(searched, uc.FuzzResult) and searched.inputs:
+                            extra = await self.call("analyzer", "plan", uc.PlanRequest(
+                                layout=self.layout, last=last, iteration=iteration, fuzz=searched, inputs_only=True),
+                                uc.UTPlan)
+                            known = {sc.scenario_id for sc in plan.scenarios}
+                            plan = plan.model_copy(update={"scenarios": plan.scenarios + [
+                                sc for sc in extra.scenarios if sc.scenario_id not in known]})
                     s.take_plan(plan)
                     s.note_plan(plan, iteration)                                       # COV-6, COV-10
                     fuzz = None
@@ -657,6 +681,7 @@ class Orchestrator:
                     for item in [g for sc in plan.scenarios for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
                         s.attempts[item] = s.attempts.get(item, 0) + 1
                     bundle = await self._generate(s, plan)
+                    s.crashed_calls = list(dict.fromkeys(s.crashed_calls + bundle.crashed_calls))   # A2-21f
                     result = await self.call("compilation", "verify", uc.VerifyRequest(
                         layout=self.layout, stage="verify", bundle=bundle, previous=last_good), uc.VerificationResult)
                     self.check_result(result, self.layout.sut_sha256)
@@ -677,10 +702,16 @@ class Orchestrator:
                     if result.decision == "environment_error":
                         return s.finish("incomplete", "environment: " + result.reason, result)
                     fixed = False
+                    for failure in [f for f in result.failures if f.route == "agent4"]:
+                        if failure.failure_id in s.no_source_fix:             # Agent4 is not asked again [A4-23j]
+                            self._back_to_the_test(s, failure)
                     for failure in [f for f in result.failures if f.route == "agent4"][:1]:      # A3-177
                         verified = await self._correct_source(s, failure, result, last_good)
                         if verified is not None:
                             result, fixed = verified, True
+                        else:
+                            s.no_source_fix.add(failure.failure_id)
+                            self._back_to_the_test(s, failure)
                     for failure in [f for f in result.failures if f.route == "stop"]:
                         return s.finish("incomplete", "environment: " + failure.diagnostic, result)
                     progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures)
@@ -701,9 +732,11 @@ class Orchestrator:
                         continue                      # Agent1 decides whether the documented behaviour is checked [A1-25y]
                     if not result.failures and result.coverage is not None and self.cfg.fuzz_after_stagnation \
                             and self._open(result):
-                        fuzz = await self._fuzz(s, result, iteration)                  # ORC-5a, A3-FZ1, COV-6
-                        if fuzz is not None and fuzz.inputs:
-                            stagnant = 0                                           # new inputs are progress in the making
+                        pending = asyncio.create_task(self._fuzz(s, result, iteration))   # ORC-5a, A3-FZ1, COV-6
+                        if stagnant >= self.cfg.stagnation_limit:      # the search may be the progress: wait for it
+                            fuzz, pending = await pending, None
+                            if fuzz is not None and fuzz.inputs:
+                                stagnant = 0                                   # new inputs are progress in the making
                     if stagnant >= self.cfg.stagnation_limit:
                         if not next_brain_asked and s.brains_last and self._open(result):      # COV-6: the next brain
                             next_brain_asked = True
@@ -727,6 +760,9 @@ class Orchestrator:
                 return s.finish("verified_measured", VERIFIED_REASON + "; documented-behaviour round cut by its time "
                                 "limit [ORC-32]", best)
             return s.stopped("stopped by the time limit after the targets were met [ORC-32]")
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     @staticmethod
     def _open(result: uc.VerificationResult) -> bool:
@@ -910,10 +946,16 @@ class Orchestrator:
             return None
         s.fuzzed.add(key)
         functions = sorted({g.function for g in gaps})
+        left = self.cfg.fuzz_budget_seconds - s.fuzz_spent                    # one budget per run [ORC-5a, A3-FZ3]
+        seconds = min(self.cfg.fuzz_seconds, left // max(1, len(functions)))
+        if seconds < min(5, self.cfg.fuzz_seconds):                # at least 5 s per function, or the configured time
+            s.fuzzing.append(f"not run: the search budget of the run ({self.cfg.fuzz_budget_seconds} s) is used up")
+            return None
+        s.fuzz_spent += seconds * len(functions)
         try:
             fuzz = await self.call("compilation", "fuzz", uc.FuzzRequest(
                 layout=self.layout, bundle=s.bundle, functions=functions, gaps=gaps,
-                covered=result.coverage.covered_items, seconds=self.cfg.fuzz_seconds), uc.FuzzResult)
+                covered=result.coverage.covered_items, seconds=seconds), uc.FuzzResult)
         except (Rejected, ba.AgentFault) as exc:
             s.fuzzing.append(f"not run: {exc}")
             return None
@@ -994,9 +1036,10 @@ class Orchestrator:
             self.check_result(obs, self.layout.sut_sha256)
             bundle = await self._drop_quarantined(s, bundle, obs)                       # A3-CL12
             s.test_items.update(obs.test_items)                            # what each test reached [A1-PL7]
-            bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
-                bundle=bundle, observed=obs.observed, test_items=obs.test_items), uc.FileActionBundle)
-            self.check_bundle(bundle)
+            if bundle.observations:          # the probes may all have been in tests that did not compile [A3-CL12]
+                bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
+                    bundle=bundle, observed=obs.observed, test_items=obs.test_items), uc.FileActionBundle)
+                self.check_bundle(bundle)
         return await self._oracle_checks(s, bundle)
 
     async def _drop_quarantined(self, s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult,
@@ -1045,6 +1088,19 @@ class Orchestrator:
                             action.content = action.content.replace(current, old_tests[change.test])
                 s.open_items.add(f"{change.test}: expectation change rejected ({verdict.decision}); original test kept")
         return bundle
+
+    @staticmethod
+    def _back_to_the_test(s: "RunState", failure: uc.Failure) -> None:
+        """A4-23j: Agent4 found no source change for this failure, so the source is not shown to be wrong. The
+        failure goes back to Agent1 as undetermined: the test is rewritten (A2-21p) and, after its attempts, dropped
+        (A1-36); the report keeps the open item for the developer."""
+        note = "Agent4 found no source change that passes its checks: rewrite the test [A4-23j]"
+        failure.classification, failure.route = "undetermined", "agent1"
+        if note not in failure.diagnostic:
+            failure.diagnostic = f"{failure.diagnostic} | {note}"[:600]
+        s.open_items.add(f"{failure.affected_test or failure.failure_id}: failed against its evidence "
+                         f"({failure.diagnostic.split(' | ')[0][:200]}); Agent4 found no source change, so the test is "
+                         "rewritten - review whether the source or the test is wrong [A4-23j]")
 
     async def _correct_source(self, s: "RunState", failure: uc.Failure, result: uc.VerificationResult,
                               last_good: uc.VerificationResult | None) -> uc.VerificationResult | None:
@@ -1382,7 +1438,10 @@ class RunState:
         self.reviews: list[str] = []                          # A4-23h
         self.fix_details: dict[str, dict[str, Any]] = {}      # per published fix, for the pull request [ORC-25]
         self.requirement_docs: list[uc.RequirementDocument] = []    # given for the run [A1-RQ1, A1-RQ3]
+        self.no_source_fix: set[str] = set()                  # failures Agent4 found no change for [A4-23j]
         self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
+        self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
+        self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
 
     def take_plan(self, plan: uc.UTPlan) -> None:
         """Agent1's records of one plan: open items, who planned what, conflicts, look-ups, disputes."""
@@ -1442,10 +1501,10 @@ class RunState:
                 self.proofs[g.gap_id] = g.detail
                 self.note(g.gap_id, f"iteration {iteration}: deterministic analysis: no test can reach it")
         for line in plan.planning:
-            if "[COV-5]" in line or "dropped by the check" in line:
+            if "[COV-5]" in line or "dropped by the check" in line or "no scenario this time" in line:
                 fn = line.split(":", 1)[0]
                 if line not in self.rejected.setdefault(fn, []):
-                    self.rejected[fn].append(line[:300])
+                    self.rejected[fn].append(line[:600])              # also facts of the next plan [A1-PL8]
 
     def evidence(self, last: uc.VerificationResult) -> list[uc.ItemEvidence]:
         """COV-10: every item not reached, from measured data and the agents' own analysis only."""
@@ -1498,16 +1557,20 @@ class RunState:
             rows.append(f"{i.item_id} ({i.function}, line {i.line}): {why}")
         if len(self.not_reached) > 8:
             rows.append(f"... and {len(self.not_reached) - 8} more item(s): see the report")
-        functions = sorted({i.function for i in self.not_reached})
-        if self.layout is not None and not self.layout.requirement_files:
+        functions = sorted({i.function for i in self.not_reached if i.function})
+        if functions and self.layout is not None and not self.layout.requirement_files:
             rows.append("Provide the requirement documents for " + ", ".join(functions[:6]) + " (analyzer."
                         "requirement_files in ut_config.json, or docs/requirements.md in the repository) and run again: "
                         "the suggestions then rest on what the code must do [COV-11, COV-12].")
         if self.suggestions:
             rows.append(f"Review the {len(self.suggestions)} suggested source change(s) in coverage_suggestions/ - "
                         "each was measured on a trial copy; apply one in your source and run again [COV-13].")
-        else:
+        elif self.not_reached:
             rows.append("Change the source so that tests can reach these items, then run again [COV-7].")
+        failing = [t.name for t in last.tests if t.status in ("failed", "crashed", "timeout")]
+        if failing:                                                              # A4-23j: not a coverage matter
+            rows.append(f"Review the failing test(s) {', '.join(failing[:6])}: the open items say what each expected "
+                        "and what was measured - either the source or the test is wrong [A4-23j].")
         rows.append("The next run continues from the stored build capture and the tests already verified [COV-11].")
         return rows
 
@@ -1670,7 +1733,10 @@ def report(r: uc.PipelineResult) -> str:
                          ("Files", r.files_generated + r.files_modified)):
         if items:
             rows += ["", f"## {title}", ""] + [f"- {item}" for item in items]
-    rows += ["", f"Ledger: `{r.ledger}`", ""]
+    rows += ["", f"Ledger: `{r.ledger}`"]
+    if r.output_dir and (Path(r.output_dir) / "brain_answers.jsonl").is_file():
+        rows.append("Brain answers, with what the agents fixed or refused: `brain_answers.jsonl` [ARCH-20]")
+    rows.append("")
     return "\n".join(rows)
 
 
@@ -2669,6 +2735,19 @@ def show_run(folder: Path, port: int = 0, open_browser: bool = True) -> int:
     return 0
 
 
+def keep_awake() -> bool:
+    """ORC-36: while a run or the benchmark works, the computer does not go to sleep by itself (Windows:
+    SetThreadExecutionState; the setting ends with the process). A sleep stops every brain call, compiler and
+    test program, and after it the agents' connections time out. Sleep the user chooses still works."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001))  # CONTINUOUS|SYSTEM
+    except (AttributeError, OSError):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ut_pipeline: the unit-test orchestrator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2722,6 +2801,8 @@ def main() -> int:
             return 0 if ok else 1
         if args.command == "check":
             return asyncio.run(check_setup(args.config))
+        if args.command in ("run", "benchmark"):
+            keep_awake()                                                                     # ORC-36
         if args.command == "benchmark":
             return asyncio.run(benchmark(args.config, args.case, args.knowledge))
         if args.command == "run":

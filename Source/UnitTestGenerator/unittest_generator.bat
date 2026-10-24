@@ -13,6 +13,7 @@ rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot
 rem    unittest_generator.bat pilot-embedded    full pipeline on the embedded C pilot (registers, superloop, asm; four files)
 rem    unittest_generator.bat pilot-embedded-cpp  full pipeline on the embedded C++ pilot (fakes, exceptions, template; four files)
 rem    unittest_generator.bat pilot-realrepo    full pipeline on patterns of real repositories (include order, T * const, namespaces; five files)
+rem    unittest_generator.bat pilot-all         full pipeline on every pilot, every production file (23 files), one summary
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
@@ -160,6 +161,7 @@ if /i "%ACTION%"=="setup" set "SETUP_ARGS=ensure --force"
 if /i "%ACTION%"=="run" if defined REPO set "SETUP_ARGS=ensure --repo "%REPO%""
 if /i "%ACTION%"=="run" if defined REPO if defined BRANCH set "SETUP_ARGS=ensure --repo "%REPO%" --branch "%BRANCH%""
 if /i "%ACTION%"=="pilot-deps" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
+if /i "%ACTION%"=="pilot-all" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
 "%PY%" ut_setup.py %SETUP_ARGS%
 set "UT_EXIT=%errorlevel%"
 if "%UT_EXIT%"=="0" goto tools_ready
@@ -201,9 +203,10 @@ if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="pilot-embedded" goto pilot_embedded
 if /i "%ACTION%"=="pilot-embedded-cpp" goto pilot_embedded_cpp
 if /i "%ACTION%"=="pilot-realrepo" goto pilot_realrepo
+if /i "%ACTION%"=="pilot-all" goto pilot_all
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, benchmark, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-all, benchmark, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -303,6 +306,37 @@ set "PILOT=%NEXT_PILOT%"
 set "NEXT_PILOT="
 set "SUTS=--sut src\dispatcher.cpp"
 goto pilot
+
+:pilot_all
+rem  Every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT of the embedded C++
+rem  pilot is named, because a header is never selected on its own. Each pilot runs on a fresh copy.
+set "UT_HOME=%~dp0"
+set "ALL_SUMMARY=%~dp0ut_output\pilots\pilot_all_summary.txt"
+if not exist "%~dp0ut_output\pilots" mkdir "%~dp0ut_output\pilots"
+> "%ALL_SUMMARY%" echo Every pilot, every production file - %DATE% %TIME%
+set "ALL_EXIT=0"
+for /d %%P in ("%PILOTS%\*") do call :pilot_one "%%~nxP"
+echo.
+echo ---- every pilot ----
+type "%ALL_SUMMARY%"
+echo Each pilot's report and summary: %~dp0ut_output\pilots\PILOT\ut_output
+set "UT_EXIT=%ALL_EXIT%"
+goto end
+:pilot_one
+set "PILOT=%~1"
+set "SUTS="
+if /i "%PILOT%"=="cpp_embedded_pilot" set "SUTS=--sut src\motor_ctrl.cpp --sut src\counter.cpp --sut src\app_main.cpp --sut include\ring_buffer.hpp"
+set "REPO=%UT_HOME%ut_output\pilots\%PILOT%"
+if exist "%REPO%" rmdir /s /q "%REPO%"
+xcopy "%PILOTS%\%PILOT%" "%REPO%\" /E /I /Q /Y >nul
+echo.
+echo ==== %PILOT%: every production file - this can take several minutes ...
+"%PY%" ut_pipeline.py run --repo "%REPO%" %SUTS% --config ut_config.json %EXTRA%
+set "ONE=%errorlevel%"
+if "%ONE%"=="0" >> "%ALL_SUMMARY%" echo   %PILOT%: every file verified
+if not "%ONE%"=="0" >> "%ALL_SUMMARY%" echo   %PILOT%: not every file verified (exit code %ONE%) - see its report above
+if not "%ONE%"=="0" set "ALL_EXIT=3"
+exit /b 0
 
 :view_run
 if not defined VIEWDIR (echo Usage: unittest_generator.bat view RUN_FOLDER & set "UT_EXIT=2" & goto end)

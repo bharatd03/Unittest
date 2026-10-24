@@ -72,20 +72,21 @@ flowchart TD
     end
 
     subgraph stageB ["Stage B: coverage"]
-        builds -- yes --> covPlan["Agent1 coverage plan<br/>facts: gaps, MC/DC vectors, evidence, what was tried<br/>the brain plans from the first plan on,<br/>Agent1 checks (A1-PL, ARCH-24)"]
+        builds -- yes --> covPlan["Agent1 coverage plan<br/>iteration 1 with nothing measured: cheap tests first<br/>(rule-based tests + search, A1-PL1);<br/>then the brain plans every gap left, with what was tried,<br/>suggested values and earlier refusals as facts;<br/>format fixed, content checked (A1-PL, ARCH-20)"]
         covPlan --> kb["KB guidance<br/>fetched by the orchestrator"]
         kb --> gen["Agent2 generate<br/>suites, test cases, stubs"]
         gen --> verify["Agent3 verify<br/>build, run all tests, measure"]
         verify --> route{"Agent3 routing<br/>A3-177"}
         route -- "test or stub defect" --> covPlan
         route -- "gaps remain" --> covPlan
-        route -- "gaps remain,<br/>no new tests reach them" --> fuzz["Agent3 fuzz<br/>libFuzzer or ut_search,<br/>inputs that reach the gaps"]
+        route -- "gaps remain,<br/>no new tests reach them" --> fuzz["Agent3 fuzz<br/>libFuzzer or ut_search, inputs that reach the gaps;<br/>runs while the brain plans the next iteration,<br/>one time budget per run (ORC-5a)"]
         fuzz --> covPlan
         covPlan -. "coverage 100%,<br/>stated behaviour unchecked<br/>A1-25y" .-> gen
         route -- "undetermined" --> covPlan
         route -- "source defect" --> corr["Agent4 candidates<br/>staging copy only"]
         corr --> reverify["Agent3 reverifies each,<br/>Agent4 checks, second brain<br/>reviews the smallest, re-baseline"]
         reverify --> route
+        corr -- "no source change passes:<br/>the test is rewritten,<br/>open item for the developer (A4-23j)" --> covPlan
     end
 
     route -- "every ASIL target reached,<br/>measured, behaviour checked" --> done(["verified_measured<br/>(COV-1, COV-3)"])
@@ -93,7 +94,7 @@ flowchart TD
     handover --> stop(["incomplete,<br/>with reason"])
     route -- "environment" --> stop
     builds -- "budget exhausted" --> stop
-    covPlan -- "no brain answers, or no scenario<br/>passes the check (A1-PL8)" --> stopped(["stopped: what Agent3 verified<br/>is delivered (ORC-34)"])
+    covPlan -- "no brain answers at all<br/>(A1-PL8)" --> stopped(["stopped: what Agent3 verified<br/>is delivered (ORC-34)"])
 ```
 
 Agent1 is the only agent that sends work to Agent2 [A1-35]. Agent3 decides the routing; the orchestrator executes it [ORC-6].
@@ -237,6 +238,21 @@ flowchart LR
 | Agent4, Agent1 planning | already brain steps (A4-23g, COV-12, A1-PL1) | as before | Agent3's verify |
 
 The result and the report list every case under "Rules that needed the brain".
+
+### 4b. A brain answer: form forgiven, content checked [ARCH-20]
+
+```mermaid
+flowchart LR
+    ans(["brain answer"]) --> fix["agent's format fixes<br/>':1' -> 1, copied gap line -> its id;<br/>each fix recorded"]
+    fix --> check{"agent's strict check<br/>(unchanged)"}
+    check -- passes --> use(["used; Agent3 compiles,<br/>runs and measures"])
+    check -- refused --> reask["re-ask: each refused item,<br/>its reason and the form expected;<br/>other sampling"]
+    reask --> ans
+    reask -- "still refused" --> other["next brain of ANOTHER model<br/>(never the same model on a slower server)"]
+    other -- "none" --> later(["no scenario this time; the refusals<br/>are facts of the next plan"])
+```
+
+Every answer, fix and refusal is written to `<run>/brain_answers.jsonl`.
 
 ## 5. Which brain answers, and how the agents are reached
 

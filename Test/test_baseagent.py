@@ -941,6 +941,12 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, "BRAIN_NO_ACCESS")
         self.assertNotIn("wrong-key", ctx.exception.message)
 
+    async def test_a_varied_reask_samples_differently(self):
+        engine = self.engine()
+        await engine.generate("Plan it.", "facts", {"type": "object"}, lambda raw: raw, vary=True)
+        body = FakeOpenAI.chat_bodies()[-1]
+        self.assertEqual((body["temperature"], body["seed"]), (0.4, 43))                  # ARCH-20
+
     async def test_server_without_json_schema_gets_json_object(self):
         FakeOpenAI.reject_schema = True
         engine = self.engine()
@@ -2014,6 +2020,29 @@ class GenerateTests(unittest.IsolatedAsyncioTestCase):
                 "t", "c", {}, ba.model_validator_for(GenPlan))
         self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
 
+    async def test_unusable_answer_is_not_passed_to_the_same_model_on_another_server(self):
+        """ARCH-19: the remote Qwen's unusable plan is not given to the Qwen in Ollama (the same model, slower);
+        a brain of another model is asked. When the remote one is down, the one in Ollama still answers."""
+        def qwen(name, **kw):
+            brain = GenBrain(name, **kw)
+            brain.family = "qwen3-8b"
+            return brain
+        remote, local = qwen("qwen_remote", reply={"x": 1}), qwen("qwen")
+        with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault) as ctx:
+            await ba.BrainRouter([remote, local]).generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual((ctx.exception.code, local.calls), ("MODEL_OUTPUT_INVALID", 0))
+        other = GenBrain("haiku")
+        with self.assertLogs("baseagent", "WARNING"):
+            _, brain, skipped = await ba.BrainRouter([qwen("qwen_remote", reply={"x": 1}), qwen("qwen"), other]).generate(
+                "t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual((brain.brain_name, skipped), ("haiku", ["qwen_remote", "qwen"]))
+        router = ba.BrainRouter([qwen("qwen_remote", fail="MODEL_UNAVAILABLE"), qwen("qwen")])
+        with self.assertLogs("baseagent", "WARNING"):
+            _, brain, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual(brain.brain_name, "qwen")                                  # remote down: the local one
+        self.assertEqual(router.family_of("qwen_remote"), router.family_of("qwen"))
+        self.assertEqual(ba.QwenRemoteEngine(ba.QwenRemoteSettings()).family, ba.QwenEngine(ba.QwenSettings()).family)
+
     async def test_demo_cannot_generate(self):
         with self.assertRaises(ba.AgentFault) as ctx:
             await ba.BrainRouter([ba.DemoEngine()]).generate("t", "c", {}, ba.model_validator_for(GenPlan))
@@ -2335,6 +2364,51 @@ class SeqBrain(GenBrain):
         self.calls += 1
         self.tasks.append(task)
         return {"model": self.model_id, "output": validate(self.replies.pop(0)), "usage": {}}
+
+
+class AnswerHandlingTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-20: a re-ask after a refused answer is sampled differently; every answer goes to the run's log."""
+    async def test_vary_reaches_brains_that_take_it_and_the_answer_log_is_written(self):
+        class VaryBrain(SeqBrain):
+            async def generate(self, task, context, schema, validate, vary=False):
+                self.varied = getattr(self, "varied", []) + [vary]
+                return await SeqBrain.generate(self, task, context, schema, validate)
+        brain = VaryBrain([PLAN_REPLY, PLAN_REPLY])
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "brain_answers.jsonl"
+            with mock.patch.dict(os.environ, {"BASEAGENT_ANSWER_LOG": str(log)}):
+                await agent.generate("Plan it.", "facts", GenPlan, step="S.plan")
+                await agent.generate("Plan it again.", "facts", GenPlan, step="S.plan", vary=True)
+                agent.log_answer("S.plan", "refused", item="scenario 1", reason="':1' is not an integer value")
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(brain.varied, [False, True])
+        self.assertEqual([(r["kind"], r.get("varied")) for r in records], [("answer", False), ("answer", True),
+                                                                          ("refused", None)])
+        self.assertEqual((records[0]["brain"], records[0]["answer"]["name"]), ("sonnet", PLAN_REPLY["name"]))
+        old = SeqBrain([PLAN_REPLY])                                     # a brain without ``vary`` still answers
+        await EchoAgent(router=ba.BrainRouter([old])).generate("t", "c", GenPlan, vary=True)
+        self.assertEqual(old.calls, 1)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BASEAGENT_ANSWER_LOG", None)
+            agent.log_answer("S.plan", "refused")                         # no log configured: nothing, no error
+
+    async def test_decisions_and_answers_no_check_let_through_are_logged_too(self):
+        brain = SeqBrain([{"name": 1}] * 6)                           # never a valid plan
+        agent = EchoAgent(router=ba.BrainRouter([GenBrain("sonnet")]))
+        bad = EchoAgent(router=ba.BrainRouter([brain]))
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "brain_answers.jsonl"
+            with mock.patch.dict(os.environ, {"BASEAGENT_ANSWER_LOG": str(log)}):
+                await agent.decide("a customer asks for a refund", PROFILE.questions, step="S.decide")
+                with self.assertRaises(ba.AgentFault) as caught:
+                    await bad.generate("Plan it.", "facts", GenPlan, step="S.plan")
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([r["kind"] for r in records], ["decision", "refused"])
+        self.assertEqual((records[0]["step"], records[0]["brain"]), ("S.decide", "sonnet"))
+        self.assertIn("queue", records[0]["answer"])
+        self.assertEqual((records[1]["step"], records[1]["code"]), ("S.plan", caught.exception.code))
+        self.assertTrue(records[1]["reason"])
 
 
 class ResolveTests(unittest.IsolatedAsyncioTestCase):

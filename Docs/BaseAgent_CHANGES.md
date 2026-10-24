@@ -1,5 +1,26 @@
 # BaseAgent changes
 
+## 2026-10-23 (night): decisions and refused answers in the answer log
+
+**Why.** In the first pilot run with the remote Qwen, a failing test was classified by `decide()`, and Agent4's three requests for source-change candidates ended as `MODEL_OUTPUT_INVALID`. None of these answers was in `brain_answers.jsonl`, so the log could not show why the run stopped.
+
+* **`AgentCore.decide()` logs its answer (ARCH-20)** as kind `decision`, with the brain, the model and the validated answers.
+* **`AgentCore.generate()` logs an answer that no check let through** as kind `refused`, with the brain, the task, the fault code and its reason, and then raises as before.
+* **Tests.** `AnswerHandlingTests.test_decisions_and_answers_no_check_let_through_are_logged_too`.
+
+## 2026-10-23 (evening): form is forgiven, content is not
+
+**Why.** In the first run with the remote Qwen, Agent1 refused 6 of 7 answers. The scenarios were right in substance (for `select_mode`: `1, 0, 0` reaches `return MODE_ECO`), but every value had a stray `:` in front (`":1"`), or the gap id was an evidence id or a copied line of the request. The re-ask ran with the same seed and temperature 0, so Qwen gave the same answer again. Any brain can make such slips; the checks are the same for every brain.
+
+* **Re-ask with other sampling (ARCH-20).** `AgentCore.generate(..., vary=True)` and `BrainRouter.generate(..., vary=True)`: an agent that refused the last answer asks again with other sampling (seed + 1, temperature at least 0.4 for Qwen), so a deterministic brain does not repeat itself. Engines without the parameter are called as before.
+* **Answer log (ARCH-20).** `AgentCore.log_answer(step, kind, **data)` appends to the file named in `BASEAGENT_ANSWER_LOG`:
+  * every structured answer;
+  * what the agent did with it: `fixed`, with the value before and after, or `refused`, with the reasons.
+
+  It never raises, and keys and tokens are never part of it. The unit-test pipeline sets it to `<run>/brain_answers.jsonl`.
+* **The agents declare the format fixes.** BaseAgent only provides the re-ask and the log; what counts as harmless noise is domain knowledge. The fixed value always goes through the agent's unchanged strict check.
+* **Tests.** `AnswerHandlingTests` checks that the re-ask is sampled differently and that the answer log is written. The rule "the next brain is another model, not the same model on another server" is tested in the unit-test generator's tests (`test_the_next_brain_is_another_model_not_the_same_model_on_another_server`). 202 BaseAgent tests in total, with the 3 known stand-in errors.
+
 ## 2026-10-23: Qwen on a remote server before the local Ollama
 
 **Why.** Qwen3 8B now also runs on a server with an OpenAI-compatible API. BaseAgent should use it whenever no Claude model is available, and fall back to Ollama on this PC only when that server cannot be reached.
@@ -20,6 +41,7 @@
   * Model not served: `MODEL_NOT_FOUND`.
   * The answer cut at its limit: as before (re-ask with more room, then salvage).
 * **Proxy.** The remote server is reached through the system proxy settings; the local Ollama still never is.
+* **Same model, one brain (ARCH-19).** Each brain has a `family`: the model behind it (Claude: its model id; Qwen: `qwen.family` / `qwen_remote.family`, default `qwen3-8b`). An answer that stays unusable is passed on only to a brain of another family. The Qwen in Ollama is the same model as the remote one, only slower, so it answers only when the remote server is not available. `BrainRouter.family_of(name)` gives the family. Found in the first run on the user's PC: one plan answer of the remote Qwen failed Agent1's check, and Agent1 asked Ollama on the laptop's CPU twice - 333 s and 303 s for the same kind of answer.
 * **User-Agent.** Requests carry `User-Agent: BaseAgent/1.0` (`qwen_remote.user_agent`). On the user's PC, the server refused Python's default `Python-urllib/3.12` with HTTP 403 while the same key worked with curl.
 * **Unchanged.** `qwen` (Ollama on the loopback address), the Claude models, and configurations that name their own `brain_order`. A configuration that lists `brain_order` without `qwen_remote` does not use the remote server.
 * **baseagent.bat.** Shows whether `QWEN_REMOTE_API_KEY` is set; the brain list names `qwen_remote`.
