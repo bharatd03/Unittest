@@ -551,6 +551,103 @@ class RuleValueTests(unittest.TestCase):
         self.assertNotIn("&s", uc.sut_reset_source(cpp, True))                     # only plain C++ state
 
 
+class AnswersThatCanBeRightTests(unittest.TestCase):
+    """ARCH-20a, A1-PL3, A1-PL4: the forms that refused 124 planning answers in the pilot runs - closed lists in the
+    schema, names resolved, an unusable expectation kept as characterization."""
+    SRC = """#include "brk.h"
+typedef unsigned int TickType_t;
+TickType_t ticks(void);
+void log_event(int id);
+static int g_last_torque;
+int brake_step(int state, const brake_input_t *in)
+{
+    if (in->pedal_pct > 10 && in->speed_kph > 1) { g_last_torque = state; log_event(1); return state + ticks(); }
+    return 0;
+}
+int limit(int request, int top)
+{
+    return request > top ? top : request;
+}
+"""
+
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.addCleanup(self.tmp.cleanup)
+        repo = Path(self.tmp.name)
+        (repo / "src").mkdir()
+        (repo / "include").mkdir()
+        (repo / "src/brk.c").write_text(self.SRC)
+        (repo / "include/brk.h").write_text("typedef struct { int pedal_pct; int speed_kph; int status; } brake_input_t;\n"
+                                            "int brake_step(int state, const brake_input_t *in);\nint limit(int request, int top);\n")
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/brk.c"))
+        self.layout = layout.model_copy(update={
+            "sut_state": [uc.StateVar(name="ctrl::g_last_torque", type="int")], "typedefs": {"TickType_t": "unsigned int"},
+            "enums": [uc.EnumInfo(name="MonitorState", values={"MonitorState::Ok": 0, "MonitorState::Fault": 1})]})
+        self.fn = {f.name: f for f in self.layout.functions}
+        self.stubs = [uc.StubSpec(function="ticks", declaration="TickType_t ticks(void)", return_type="TickType_t"),
+                      uc.StubSpec(function="log_event", declaration="void log_event(int id)", return_type="void",
+                                  params=[["int", "id"]])]
+        self.agent = a1.AnalyzerAgent()
+        self.known = self.agent._known_names(self.layout, self.stubs)
+
+    def planned(self, **kw):
+        return a1.PlannedScenario(**{**dict(gap_ids=["LC:brake_step:9"], name="test_brake_step_case", purpose="p",
+                                            args=[], setup=[], stubs=[], variables=[], expected_return="",
+                                            expected_after=[], evidence_ids=[], quotes=[],
+                                            classification="characterization_gap", conflict="",
+                                            information_sought=""), **kw})
+
+    def check(self, planned, fn="brake_step", evidence=None):
+        evidence = evidence or {}
+        return self.agent._check_planned(planned, self.fn[fn], set(planned.gap_ids), set(), evidence, self.stubs, {},
+                                         self.known, self.layout)
+
+    def test_the_answer_schema_lists_what_exists(self):                                  # ARCH-20a, A1-PL3
+        model = self.agent._plan_model(self.fn["brake_step"], {"LC:brake_step:9", "EVIDENCE:brake_step"},
+                                       [uc.EvidenceRef(evidence_id="EV-brake_step-1", evidence_class="E2",
+                                                       source="include/brk.h", line=2, text="x")], self.stubs)
+        schema = json.dumps(ba.llm_schema(model.model_json_schema()))
+        for listed in ('["EVIDENCE:brake_step", "LC:brake_step:9"]', '["in", "state"]', '["ticks"]',
+                       '["EV-brake_step-1"]'):
+            self.assertIn(listed, schema)                         # log_event returns nothing: not a choice
+        parsed = model.model_validate({"scenarios": [self.planned(gap_ids=["XX"]).model_dump()]})
+        self.assertEqual(parsed.scenarios[0].gap_ids, ["XX"])      # still parsed: the check is the judge [ARCH-20]
+
+    def test_names_are_resolved_and_an_unusable_expectation_is_observed(self):          # A1-PL4
+        fields = [a1.PlannedValue(name="state", value="2"), a1.PlannedValue(name="in->pedal_pct", value="11"),
+                  a1.PlannedValue(name="in->speed_kph", value="2")]
+        scenario, notes = self.check(self.planned(
+            args=fields, setup=["ut_state_set_g_last_torque(0);"],             # the variable's short name
+            stubs=[a1.PlannedStub(stub="ticks", returns=["0", "5"]),           # TickType_t is a scalar
+                   a1.PlannedStub(stub="log_event", returns=["0"])]))          # returns nothing: dropped
+        self.assertIsNotNone(scenario, notes)
+        self.assertEqual({a.name: a.value for a in scenario.args}, {"state": "2", "in": "&in_v"})
+        self.assertIn("in_v.pedal_pct = 11;", scenario.setup)
+        self.assertIn("ut_state_set_ctrl_g_last_torque(0);", scenario.setup)
+        self.assertEqual([s.stub for s in scenario.stub_values], ["ticks"])
+        self.assertTrue(any("log_event return nothing" in f for f in self.agent.last_fixes))
+        ev = {"EV-limit-1": uc.EvidenceRef(evidence_id="EV-limit-1", evidence_class="E1", source="r.md", line=1,
+                                           text="limit returns the request below the top")}
+        confirmed = dict(gap_ids=["LC:limit:14"], classification="confirmed_gap", evidence_ids=["EV-limit-1"],
+                         quotes=[a1.PlannedQuote(evidence_id="EV-limit-1", text="returns the request")],
+                         args=[a1.PlannedValue(name="request", value="50"), a1.PlannedValue(name="top", value="100")])
+        scenario, _ = self.check(self.planned(expected_return="request", **confirmed), "limit", ev)
+        self.assertEqual((scenario.expected_return, scenario.characterization), ("50", False))   # the parameter's value
+        scenario, _ = self.check(self.planned(expected_after=[a1.PlannedCheck(expr="g_last_torque", value="MonitorState::Ok")],
+                                              **confirmed), "limit", ev)
+        self.assertEqual(scenario.expected_after[0].expr, "ut_state_get_ctrl_g_last_torque()")  # read by its getter
+        scenario, notes = self.check(self.planned(expected_return="top_local_name", **confirmed), "limit", ev)
+        self.assertIsNotNone(scenario)                                          # kept, observed [A1-PL4]
+        self.assertTrue(scenario.characterization)
+        self.assertIn("expectation not usable", " ".join(notes))
+        literal, why = self.check(self.planned(setup=["int a = 100; int b = 100;", "brake_input_t v = {0};"],
+                                               args=fields[:1] + [a1.PlannedValue(name="in", value="&v")],
+                                               stubs=[a1.PlannedStub(stub="ticks", returns=["a", "b"])]))
+        self.assertIsNotNone(literal, why)
+        self.assertEqual(literal.stub_values[0].returns, ["100", "100"])
+        self.assertIn("UT_EXPECT_NO_RETURN", self.known)                      # every harness macro
+
+
 class LearningBetweenAttemptsTests(unittest.TestCase):
     """LA-1 .. LA-10, A2-21ae, A1-PL4, A2-21p, A3-CL14, KB-22, VIEW-11: the pieces, without a whole run."""
 
@@ -1945,6 +2042,54 @@ class KnowledgeBaseTests(unittest.TestCase):
         self.assertEqual([e.snippet for e in g.positive], ["p1", "g1"])          # verified complete first
         self.assertEqual(g.negative, [])                                          # other language filtered [SC-24]
 
+    def example(self, function, signature, snippet, step="A2.tests", language="c", pattern="language c"):
+        return uc.LearningEvent(kind="plan_example" if step == "A1.plan" else "test_example", language=language,
+                                framework="ut_harness", category="BC", snippet=snippet, step=step, function=function,
+                                signature=signature, pattern=pattern, context="reached: BC:x:3:1:T `if (len == 0)`",
+                                verification={"verified": True, "tests": "passed", "reached": ["BC:x:3:1:T"]})
+
+    @unittest.skipUnless(HAVE_LANGGRAPH, "langgraph not installed")
+    def test_an_example_needs_its_measurement(self):                                     # KB-23
+        unmeasured = self.example("crc8", "uint8_t crc8(const uint8_t *d, size_t n)", "UT_TEST(t) { crc8(0, 0); }")
+        unmeasured.verification = {"verified": True, "tests": "passed", "reached": []}
+        self.assertEqual(run(self.kb.call_local("learn", unmeasured)).status, "rejected")
+        ok = self.example("crc8", "uint8_t crc8(const uint8_t *d, size_t n)", "UT_TEST(t) { crc8(0, 0); }")
+        self.assertEqual(run(self.kb.call_local("learn", ok)).status, "success")
+
+    def test_examples_are_found_per_function(self):                                     # KB-24, KB-25
+        for fn, sig, body in (
+                ("crc8", "uint8_t crc8(const uint8_t *data, size_t len)", "UT_TEST(t_crc8) { uint8_t b[2] = {1, 2}; "
+                 "UT_EXPECT_EQ_INT(crc8(b, 2), 7); }"),
+                ("crc8_copy", "uint8_t crc8_copy(const uint8_t *data, size_t len)", "UT_TEST(t_crc8_copy) { uint8_t b[2] = "
+                 "{1, 2}; UT_EXPECT_EQ_INT(crc8_copy(b, 2), 7); }"),                  # nearly the same: left out
+                ("bcm_setBits", "void bcm_setBits(uint8_t *reg, int bits)", "UT_TEST(t_bits) { uint8_t r = 0; "
+                 "bcm_setBits(&r, 3); UT_EXPECT_EQ_INT(r, 8); }"),
+                ("filter_step", "float filter_step(float x)", "UT_TEST(t_f) { UT_EXPECT_EQ_DBL(filter_step(1.0f), 0.5, 1e-6); }")):
+            self.assertTrue(self.kb.learn(self.example(fn, sig, body)).stored)
+        self.kb.learn(self.example("crc16", "uint16_t crc16(const uint8_t *data, size_t len)", "UT_TEST(cpp) {}",
+                                   language="cpp"))
+        self.kb.learn(self.example("crc8", "uint8_t crc8(const uint8_t *data, size_t len)",
+                                   "args data=b, len=0; setup uint8_t b[1] = {0};", step="A1.plan"))
+        query = uc.ExampleQuery(step="A2.tests", function="crc16_ccitt", patterns=["language c"],
+                                text="uint16_t crc16_ccitt(const uint8_t *buf, size_t len) BC if (len == 0)")
+        request = uc.GuidanceRequest(language="c", framework="ut_harness", functions=[
+            query, uc.ExampleQuery(step="A1.plan", function="crc16_ccitt", text=query.text),
+            uc.ExampleQuery(step="A2.tests", function="set_bits", text="void set_bits(uint8_t *r, int bits)")])
+        found = self.kb.guidance(request).examples
+        first = [e.function for e in found[uc.example_key("A2.tests", "crc16_ccitt")]]
+        self.assertEqual(first[0], "crc8")                                     # the most similar first
+        self.assertNotIn("crc8_copy", first)                                   # no near-duplicate
+        self.assertNotIn("crc16", first)                                       # the same language only [SC-24]
+        self.assertEqual([e.step for e in found[uc.example_key("A1.plan", "crc16_ccitt")]], ["A1.plan"])
+        self.assertEqual(found[uc.example_key("A2.tests", "set_bits")][0].function, "bcm_setBits")   # setBits: set, bits
+        self.assertEqual(self.kb.guidance(uc.GuidanceRequest(language="c", framework="ut_harness")).positive, [])
+        self.kb.fts = False                                                    # an SQLite without FTS5
+        fallback = [e.function for e in self.kb.guidance(request).examples[uc.example_key("A2.tests", "crc16_ccitt")]]
+        self.assertIn(fallback[0], ("crc8", "crc8_copy"))                      # equally similar
+        self.assertFalse({"crc8", "crc8_copy"} <= set(fallback))
+        with mock.patch.dict(os.environ, {"UT_KNOWLEDGE": "off"}):                  # KP-8: the variant without
+            self.assertEqual(self.kb.guidance(request).examples, {})
+
     def test_memory_fallback(self):
         (Path(self.tmp.name) / "blocker").write_text("a file where a folder is expected")
         store = kb.KnowledgeBaseAgent(config=kb.KBConfig(db_path=str(Path(self.tmp.name) / "blocker" / "kb.sqlite3")))
@@ -2427,6 +2572,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(third.cache_use, [])
         self.assertEqual(len(scripted.generate_calls) + scripted.decide_calls, calls[0])
         self.assertIn("dependency analysis of an earlier run", use)                     # CA-10
+        import sqlite3                                                                     # KB-23, KB-25
+        with contextlib.closing(sqlite3.connect(self.d / "kb.sqlite3")) as db:
+            kept = dict(db.execute("SELECT kind, COUNT(*) FROM examples GROUP BY kind").fetchall())
+        print("KB examples:", kept, "\n".join(first.brain_answers), sep="\n")
+        self.assertGreater(kept.get("test_example", 0) + kept.get("plan_example", 0), 0)
+        self.assertTrue(any(row.startswith("A1.plan:") for row in first.brain_answers), first.brain_answers)
         # CA-10: a stored Stage A result that does not build here is replaced, never the end of the run
         for entry in (self.d / "run_cache" / "stage_a").rglob("*.json"):
             stored = json.loads(entry.read_text())
@@ -3331,6 +3482,63 @@ class BrainGenerationTests(unittest.TestCase):
                       "return ut_stub_read_sensor_returns[ut_stub_read_sensor_calls - 1];", source)
         self.assertIn("if (ut_stub_read_sensor_calls < INT_MAX) ++ut_stub_read_sensor_calls;", source)   # never overflows
         self.assertIn("    ut_stub_call();", source)                                                 # A3-45b
+
+    def test_examples_reach_both_brains(self):                                          # KB-24, KB-25
+        example = uc.KBExample(example_id="KB-1", kind="test_example", language="c", framework="ut_harness",
+                               category="BC", step="A2.tests", function="crc8", signature="uint8_t crc8(int n)",
+                               context="reached: BC:4:9:T `if (n == 0)`", snippet="UT_TEST(t_example) { crc8(0); }")
+        scenario = self.scenario(gap_ids=["EVIDENCE:thermostat_command"], characterization=True, expected_return="",
+                                 classification="characterization_gap", evidence=[])
+        plan = self.plan.model_copy(update={"stage": "coverage", "scenarios": [scenario]})
+        req = uc.GenerationRequest(plan=plan, guidance=uc.KBGuidance(examples={
+            uc.example_key("A2.tests", "thermostat_command"): [example]}))
+        agent = a2.GeneratorAgent()
+        seen = []
+
+        async def generate(task, context, model, **kw):
+            seen.append("\n".join(p.text for p in context))
+            raise ba.AgentFault("MODEL_UNAVAILABLE", "scripted")
+        agent.generate = generate
+        with brain(DownBrain()):                                                   # TP-21
+            run(agent._llm_tests(plan, req, set(), [scenario], {}, {}, set()))
+        self.assertTrue(seen)
+        self.assertIn("EXAMPLES (verified tests of similar functions in other code", seen[0])
+        self.assertIn("UT_TEST(t_example) { crc8(0); }", seen[0])
+        self.assertNotIn("KB GUIDANCE", seen[0])                          # no suite openings any more [KB-25]
+        fn = next(f for f in self.layout.functions if f.name == "thermostat_command")
+        sut = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
+        facts = a1.AnalyzerAgent()._facts(fn, [], {"LC:x"}, self.layout, uc.PlanRequest(
+            layout=self.layout, examples={"thermostat_command": "- for f: items ... chosen: args n=0"}), sut, [], [])
+        self.assertIn("EXAMPLES (scenarios that reached similar items", "\n".join(p.text for p in facts))
+
+    def test_the_orchestrator_asks_for_examples_per_function(self):                    # KB-24
+        orch = up.Orchestrator.__new__(up.Orchestrator)
+        orch.layout = self.layout
+        s = up.RunState(req=uc.PipelineRequest(repo_root=self.layout.repo_root, sut_file="src/thermostat.c"),
+                        repo=Path(self.layout.repo_root), out=Path(self.tmp.name) / "out",
+                        workspace=Path(self.layout.repo_root))
+        fn = next(f for f in self.layout.functions if f.name == "thermostat_command")
+        line = fn.line_start + 2
+        query = orch._example_queries(s, "A1.plan", {"thermostat_command": [f"BC:thermostat_command:{line}:5:T"]})[0]
+        code = (Path(self.layout.repo_root) / self.layout.sut_file).read_text().splitlines()[line - 1].strip()
+        self.assertIn(code[:40], query.text)
+        self.assertEqual(query.function, fn.qualified_name)
+        asked = []
+
+        async def call(role, tool, payload, expect):
+            asked.append(payload)
+            return uc.KBGuidance(examples={uc.example_key("A1.plan", fn.qualified_name): [uc.KBExample(
+                example_id="KB-2", kind="plan_example", language="c", framework="ut_harness", category="BC",
+                step="A1.plan", function="g", signature="int g(int)", context="items: BC:3:1:T", snippet="args a=1")]})
+        orch.call = call
+        last = uc.VerificationResult.model_construct(stage="verify", coverage=uc.CoverageReport(
+            toolchain="llvm", definitions="d", functions=[
+            uc.FunctionCoverage(name="thermostat_command", gaps=[uc.GapItem(
+                gap_id=f"BC:thermostat_command:{line}:5:T", function="thermostat_command", metric="BC", line=line)])]))
+        self.assertEqual(run(orch._planning_examples(s, last, 1)), {})            # the rule round: no brain plans
+        found = run(orch._planning_examples(s, last, 2))
+        self.assertIn("chosen: args a=1", found[fn.qualified_name])
+        self.assertEqual(s.examples_given, {"A1.plan": 1})
 
     def test_checked_brain_scenario_is_assembled_without_llm(self):
         plan = self.plan.model_copy(update={"stage": "coverage", "scenarios": [self.scenario()]})

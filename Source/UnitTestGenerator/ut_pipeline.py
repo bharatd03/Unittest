@@ -456,6 +456,8 @@ class Orchestrator:
                     self._store_verified_tests(state)                                        # CA-4
                 with contextlib.suppress(Exception):
                     self._store_journal(state)                                               # CA-8
+                with contextlib.suppress(Exception):                     # KB-18: never fails the run
+                    await self._learn_examples(state)                                        # KB-23
         except Rejected as exc:
             result = state.finish("incomplete", f"{exc.agent} refused: {exc.reason}")
         except ba.AgentFault as exc:
@@ -489,6 +491,7 @@ class Orchestrator:
                 os.environ[name] = value
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         result.cache_use = self._cache_use(out, state)                                       # CA-1
+        result.brain_answers = self._brain_answer_counts(out, state)                         # KB-25
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         brains = set()
         for made in state.made.values():                                     # "brain/model kind; object: brain setup"
@@ -762,6 +765,7 @@ class Orchestrator:
                     s.open_now = {g.gap_id for fc in (last.coverage.functions if last.coverage else []) for g in fc.gaps}
                     widest = max([self.cfg.journal_tokens] + [p.journal_tokens for p in self.book.profiles.values()])
                     journal = s.journal.excerpt(widest * 3)              # each agent cuts it to its brain's [BP-5]
+                    examples = await self._planning_examples(s, last, iteration)                    # KB-24, KB-25
                     planning = self.call("analyzer", "plan", uc.PlanRequest(
                         layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
                         fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
@@ -770,7 +774,8 @@ class Orchestrator:
                         crashed_calls=s.crashed_calls[-40:], journal=journal,                   # LA-4
                         tried_scenarios=sorted(s.tried_scenarios), other_model_items=sorted(s.other_model_items),
                         final_items=sorted(s.final_items), lessons=await self._lesson_texts(s),
-                        item_kinds=dict(s.item_kinds), iterations_left=s.iter_limit - iteration), uc.UTPlan)
+                        item_kinds=dict(s.item_kinds), iterations_left=s.iter_limit - iteration,
+                        examples=examples), uc.UTPlan)
                     if pending is None:
                         plan = await planning
                     else:                       # the brain plans while the search runs on this computer [ORC-5a]
@@ -820,6 +825,9 @@ class Orchestrator:
                                                    "it [LA-6, LA-7]", last)
                     for item in [g for sc in attempted for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
                         s.attempts[item] = s.attempts.get(item, 0) + 1
+                    for sc in plan.scenarios:                    # what a planning example is made of [KB-23]
+                        if sc.made_by.startswith("brain:") and sc.scenario_id:
+                            s.brain_scenarios[sc.scenario_id] = sc
                     for sc in attempted:
                         if sc.made_by.startswith("brain:"):
                             s.tried_scenarios.add(uc.scenario_signature(sc))                    # A1-PL4 g
@@ -1036,6 +1044,143 @@ class Orchestrator:
         s.notes.append(note)
         self._stage(note)
         return len(reused)
+
+    # ---------------------------------------------------------------- KB-23 .. KB-25: examples for the brains
+    def _function_of(self, name: str) -> "uc.FunctionInfo | None":
+        return next((f for f in self.layout.functions if name in (f.name, f.qualified_name)), None)
+
+    def _example_queries(self, s: "RunState", step: str, work: dict[str, list[str]]) -> list[uc.ExampleQuery]:
+        """KB-24: per function its signature, the code of its open items and the causes in the journal."""
+        if not work:
+            return []
+        lines = uc.read_source(Path(s.workspace) / self.layout.sut_file).splitlines()
+        out = []
+        for name, items in work.items():
+            fn = self._function_of(name)
+            if fn is None:
+                continue
+            rows = []
+            for item in list(dict.fromkeys(items))[:12]:
+                metric, _, line, _ = uc.item_parts(item)
+                if 0 < line <= len(lines):
+                    rows.append(f"{metric} {lines[line - 1].strip()[:160]}")
+            causes = sorted({e.cause for e in s.journal.entries if e.status == "open" and e.function in (fn.name,
+                                                                                                         fn.qualified_name)})
+            out.append(uc.ExampleQuery(step=step, function=fn.qualified_name, patterns=uc.patterns_of(fn, self.layout),
+                                       text=" ".join([fn.signature or fn.qualified_name, *rows, *causes])[:3000]))
+        return out
+
+    async def _planning_examples(self, s: "RunState", last: uc.VerificationResult, iteration: int) -> dict[str, str]:
+        """KB-24, KB-25: the planning examples of the functions with open items (not in the rule round, A1-PL1)."""
+        if iteration <= 1 or last.coverage is None:
+            return {}
+        work = {fc.name: [g.gap_id for g in fc.gaps] for fc in last.coverage.functions if fc.gaps and fc.name != "<file>"}
+        work = dict(sorted(work.items(), key=lambda kv: -len(kv[1]))[:120])
+        try:
+            found = await self.call("kb", "guidance", uc.GuidanceRequest(
+                language=self.layout.language, framework=self.layout.framework,
+                functions=self._example_queries(s, "A1.plan", work)), uc.KBGuidance)
+        except Exception as exc:                                  # examples are advice: never a reason to fail
+            LOG.info("planning examples unavailable: %s", exc)
+            return {}
+        out = {}
+        for key, examples in found.examples.items():
+            name = key.split("|", 1)[1]
+            out[name] = "\n".join(f"- for {e.signature or e.function}: {e.context[:500]}\n  chosen: {e.snippet[:900]}"
+                                  for e in examples)
+            s.examples_given["A1.plan"] = s.examples_given.get("A1.plan", 0) + len(examples)
+        return out
+
+    def _example_items(self, fn: "uc.FunctionInfo", items: list[str], lines: list[str]) -> list[str]:
+        """The items of a function, each with its code line: what an example reached."""
+        out = []
+        for item in items:
+            metric, _, line, _ = uc.item_parts(item)
+            if metric == "VEC" or not fn.line_start <= line <= fn.line_end:
+                continue
+            out.append(f"{item} `{lines[line - 1].strip()[:120]}`" if 0 < line <= len(lines) else item)
+        return out
+
+    async def _learn_examples(self, s: "RunState") -> int:
+        """KB-23: the brain's tests and scenarios Agent3 measured - the test passed in the last measured suite and,
+        alone, reached items of its function - go to the KB as examples (the KB checks the verification)."""
+        result, bundle = s.best_result or s.last, s.best_bundle or s.bundle
+        if result is None or bundle is None or self.layout is None:
+            return 0
+        passed = {t.name for t in result.tests if t.status == "passed"}
+        sources = uc.test_sources(uc.suite_of(bundle))
+        lines = uc.read_source(Path(s.workspace) / self.layout.sut_file).splitlines()
+        project = s.origin.get("repository") or self.layout.project or str(Path(s.repo).resolve())
+        base = dict(language=self.layout.language, framework=self.layout.framework, project=project)
+        events = []
+        for name, made in s.made.items():                           # tests a brain wrote [BP-7]
+            source = sources.get(name, "")
+            if name not in passed or not source or made.startswith("object:"):
+                continue
+            fn = next((f for f in self.layout.functions if re.search(
+                r"\b" + re.escape(f.qualified_name.split("::")[-1]) + r"\s*\(", source[source.find("{"):])), None)
+            reached = self._example_items(fn, s.test_items.get(name, []), lines) if fn else []
+            if fn is None or not reached:
+                continue
+            events.append((len(reached), uc.LearningEvent(
+                kind="test_example", step="A2.tests", category=" ".join(sorted({r.split(":")[0] for r in reached})),
+                snippet=source[:2500], function=fn.qualified_name, signature=fn.signature, context="reached: " +
+                "; ".join(reached[:8]), pattern="; ".join(uc.patterns_of(fn, self.layout)), reason=made,
+                verification={"verified": True, "tests": "passed", "reached": reached[:12]}, **base)))
+        for sid, sc in s.brain_scenarios.items():                  # scenarios whose test reached what they aimed at
+            tests = [n for n, src in sources.items() if sid in SCENARIO_ID.findall(src) and n in passed]
+            fn = self._function_of(sc.function)
+            if fn is None or not tests:
+                continue
+            aimed = {uc.item_key(g) for g in sc.gap_ids}
+            reached = [g for n in tests for g in s.test_items.get(n, []) if uc.item_key(g) in aimed]
+            if not reached:
+                continue
+            items = self._example_items(fn, list(dict.fromkeys(reached)), lines)
+            chosen = "; ".join(filter(None, [
+                "args " + ", ".join(f"{a.name}={a.value}" for a in sc.args) if sc.args else "",
+                "setup " + " ".join(sc.setup) if sc.setup else "",
+                "stubs " + ", ".join(f"{v.stub} -> {', '.join(v.returns)}" for v in sc.stub_values) if sc.stub_values
+                else "", "variables " + ", ".join(f"{v.name}={v.value}" for v in sc.variables) if sc.variables else "",
+                "earlier calls " + " ".join(sc.calls_before) if sc.calls_before else ""]))
+            if not chosen or not items:
+                continue
+            context = "items: " + "; ".join(items[:6]) + (" | PATH CONDITIONS: " + " && ".join(sc.required_conditions[:6])
+                                                         if sc.required_conditions else "")
+            events.append((len(items), uc.LearningEvent(
+                kind="plan_example", step="A1.plan", category=" ".join(sorted({i.split(":")[0] for i in items})),
+                snippet=chosen[:1500], function=fn.qualified_name, signature=fn.signature, context=context,
+                pattern="; ".join(uc.patterns_of(fn, self.layout)), reason=sc.made_by,
+                verification={"verified": True, "tests": "passed", "reached": list(dict.fromkeys(reached))[:12]},
+                **base)))
+        stored = 0
+        for kind in uc.EXAMPLE_KINDS:                               # the most items first, a bounded number per run
+            for _, event in sorted((e for e in events if e[1].kind == kind), key=lambda e: -e[0])[:30]:
+                with contextlib.suppress(Rejected, ba.AgentFault):
+                    ack = await self.call("kb", "learn", event, uc.LearnAck)
+                    stored += ack.stored and not ack.duplicate
+        if stored:
+            s.notes.append(f"{stored} verified test(s) and scenario(s) of the brain stored as examples [KB-23]")
+        return stored
+
+    @staticmethod
+    def _brain_answer_counts(out: Path, s: "RunState") -> list[str]:
+        """KB-25: per brain step the answers accepted, fixed by the agent and refused, and the examples given."""
+        counts: dict[str, dict[str, int]] = {}
+        with contextlib.suppress(OSError):
+            for line in (out / "brain_answers.jsonl").read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(ValueError):
+                    rec = json.loads(line)
+                    kind = {"answer": "accepted", "decision": "accepted"}.get(rec.get("kind"), rec.get("kind", ""))
+                    if kind in ("accepted", "fixed", "refused"):
+                        row = counts.setdefault(str(rec.get("step", "?")), {})
+                        row[kind] = row.get(kind, 0) + 1
+        rows = []
+        for step in sorted(set(counts) | set(s.examples_given)):
+            c = counts.get(step, {})
+            rows.append(f"{step}: {c.get('accepted', 0)} accepted, {c.get('fixed', 0)} fixed, {c.get('refused', 0)} "
+                        f"refused" + (f"; {s.examples_given[step]} example(s) given" if s.examples_given.get(step) else ""))
+        return rows
 
     # ---------------------------------------------------------------- CA-10: the result of Stage A
     STAGE_A_FIELDS = ("build", "compile_flags", "build_flags_source", "dependencies", "functions", "enums", "sut_state",
@@ -1805,12 +1950,24 @@ class Orchestrator:
         guidance = uc.KBGuidance()
         try:                                                           # advisory only [KB-18, SC-22]
             functions = {sc.function for sc in plan.scenarios}
+            brain_work: dict[str, list[str]] = {}                # the functions the brain writes tests for [KB-24]
+            for sc in plan.scenarios:
+                if not plan.rules_only and (sc.made_by.startswith("brain:") or any(
+                        g.startswith("EVIDENCE:") for g in sc.gap_ids)):
+                    brain_work.setdefault(sc.function, []).extend(sc.gap_ids)
+            queries: list[uc.ExampleQuery] = []
+            with contextlib.suppress(Exception):                 # examples are advice: never a reason to fail
+                queries = self._example_queries(s, "A2.tests", brain_work)
             guidance = await self.call("kb", "guidance", uc.GuidanceRequest(
                 language=self.layout.language, framework=self.layout.framework,
                 categories=sorted({r.classification for r in plan.repairs if r.classification}
                                   | {e.cause for e in s.journal.entries if e.status == "open"}),
                 patterns=sorted({p for f in self.layout.functions if f.name in functions or f.qualified_name in functions
-                                 for p in uc.patterns_of(f, self.layout)})), uc.KBGuidance)
+                                 for p in uc.patterns_of(f, self.layout)}),
+                functions=queries), uc.KBGuidance)
+            given = getattr(s, "examples_given", None)
+            if isinstance(given, dict):                                                          # KB-25
+                given["A2.tests"] = given.get("A2.tests", 0) + sum(map(len, guidance.examples.values()))
         except (Rejected, ba.AgentFault) as exc:
             LOG.warning("KB guidance unavailable: %s", exc)
         bundle = await self.call("generator", "generate", uc.GenerationRequest(
@@ -2506,6 +2663,8 @@ class RunState:
         self.unmeasured = 0                                   # iterations in a row not measured [A3-60b]
         self.declarations_dropped: list[str] = []             # the brain's declarations that did not build [A1-PL14]
         self.replaced_dependencies: dict[str, uc.Dependency] = {}   # what a proposed declaration replaced
+        self.brain_scenarios: dict[str, uc.Scenario] = {}            # what planning examples are made of [KB-23]
+        self.examples_given: dict[str, int] = {}                      # per brain step [KB-25]
         self.stage_a_cached = False                   # Stage A started from a stored result [CA-10]
         self.stage_a_original: tuple[Any, Any] = (None, None)
         self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
@@ -2866,6 +3025,7 @@ def report(r: uc.PipelineResult) -> str:
                          ("Recipes [NC-2, NC-3]", r.recipes),
                          ("Brain calls and tokens per step", r.token_use),
                          ("What the caches saved [CA-1]", r.cache_use),
+                         ("Brain answers per step: accepted, fixed, refused; examples given [KB-25]", r.brain_answers),
                          ("Knowledge packs used", r.knowledge_packs),
                          ("Coverage-guided search", r.fuzzing), ("Lessons [LA-8]", r.lessons),
                          ("Open items and notes", r.open_items),
@@ -3914,7 +4074,8 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
                                      "reasks": reasks, "brain_calls": len(answered),
                                      "tokens": sum(p.get("used_input_tokens", 0) + p.get("used_output_tokens", 0)
                                                    for p in answered),
-                                     "fixes": [f.rationale[:200] for f in fixes], "output": result.output_dir})
+                                     "fixes": [f.rationale[:200] for f in fixes], "output": result.output_dir,
+                                     "answers": _answer_counts(result.brain_answers)})                 # KB-25
                 print(f"[{case['id']}, knowledge {variant}] {outcome}; {result.final_state}", flush=True)
             seeded = [r for r in variant_rows if r.get("find")]
             controls = [r for r in variant_rows if not r.get("find")]
@@ -3926,7 +4087,10 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
                 "iterations": sum(r["iterations"] for r in done),
                 "brain_scenarios_accepted": sum(r["brain_scenarios"] for r in done),
                 "reasks": sum(r["reasks"] for r in done), "brain_calls": sum(r["brain_calls"] for r in done),
-                "tokens": sum(r["tokens"] for r in done)}
+                "tokens": sum(r["tokens"] for r in done),
+                "answers": {step: {k: sum(r.get("answers", {}).get(step, {}).get(k, 0) for r in done)
+                                   for k in ("accepted", "fixed", "refused", "examples")}
+                            for step in sorted({st for r in done for st in r.get("answers", {})})}}       # KB-25
             rows += variant_rows
     finally:
         if previous is None:
@@ -3941,6 +4105,10 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
     md += [f"| {v} | {s['seeded_defects']} | {s['detected']} | {s['restored_exactly']} | {s['controls']} | "
            f"{s['false_fixes']} | {s['iterations']} | {s['brain_scenarios_accepted']} | {s['reasks']} | "
            f"{s['brain_calls']} | {s['tokens']:,} |" for v, s in summaries.items()]
+    md += ["", "| Knowledge | Brain step | Accepted | Fixed | Refused | Examples given |",              # KB-25
+           "| --- | --- | --- | --- | --- | --- |"]
+    md += [f"| {v} | {step} | {c['accepted']} | {c['fixed']} | {c['refused']} | {c['examples']} |"
+           for v, s in summaries.items() for step, c in s.get("answers", {}).items()]
     md += ["", "| Case | Knowledge packs | Defect | Outcome | Final state |", "| --- | --- | --- | --- | --- |"]
     md += [f"| {r['id']} | {r['knowledge']} | {r['description']} | {r['outcome']} | {r.get('final_state', '-')} |"
            for r in rows]
@@ -3948,6 +4116,18 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
     print("\n".join(md))
     print(f"\nResults: {out}")
     return 0 if all(s["false_fixes"] == 0 for s in summaries.values()) else 1
+
+
+def _answer_counts(lines: list[str]) -> dict[str, dict[str, int]]:
+    """KB-25: the report's "step: n accepted, n fixed, n refused; n example(s) given" lines as numbers."""
+    out = {}
+    for line in lines:
+        step, _, rest = line.partition(": ")
+        nums = {k: int(m.group(1)) for k in ("accepted", "fixed", "refused")
+                for m in [re.search(r"(\d+) " + k, rest)] if m}
+        m = re.search(r"(\d+) example", rest)
+        out[step] = {**{k: 0 for k in ("accepted", "fixed", "refused")}, **nums, "examples": int(m.group(1)) if m else 0}
+    return out
 
 
 def corpus_cases(only: list[str] | None = None) -> list[tuple[str, Path, dict[str, Any]]]:

@@ -103,7 +103,9 @@
     "build_commands": {}
   },
   "corrector": {"max_fragment_lines": 30, "min_independent_evidence": 2, "candidates": 3, "suggestions": 3},
-  "kb": {"db_path": "ut_kb.sqlite3", "resolutions_path": "ut_resolutions.sqlite3"},
+  "kb": {"db_path": "ut_kb.sqlite3", "resolutions_path": "ut_resolutions.sqlite3",
+         "_comment": "KB-23..KB-25: verified tests and scenarios of the brain as examples per function; UT_KNOWLEDGE=off or examples false switches them off",
+         "examples": true, "examples_per_function": 2, "max_examples": 3000},
   "cache": {"_comment": "CA-1: caches of earlier work - they save time, never decide a result; run --no-cache or UT_CACHE=off to switch them off",
             "enabled": true, "dir": "ut_cache/run_cache", "max_mb": 4096, "brain_answers": true, "test_coverage": true,
             "verified_tests": true, "objects": true, "build_capture": true, "failure_journal": true,

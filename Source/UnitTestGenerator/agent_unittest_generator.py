@@ -2773,6 +2773,8 @@ class GeneratorAgent(ba.AgentCore):
                           "HEADERS) and call it on the object.") + " " if fn.member else ""                 # A2-21ae
                 params = "; ".join(f"{p.name}: {p.type} ({p.kind}{', may be NULL' if p.nullable else ''})" for p in fn.params)
                 source = "\n".join(f"{n:4d}| {sut_lines[n - 1]}" for n in range(fn.line_start, fn.line_end + 1))
+                examples = req.guidance.examples.get(uc.example_key("A2.tests", fn.qualified_name)) or \
+                    req.guidance.examples.get(uc.example_key("A2.tests", fn.name), [])          # KB-25
                 evidence: dict[str, uc.EvidenceRef] = {}
                 for s in fn_scenarios:
                     for e in s.evidence:
@@ -2834,9 +2836,13 @@ class GeneratorAgent(ba.AgentCore):
                         "- none (all expected values must be observed)"), uc.P_EVIDENCE),
                     uc.part("headers", f"HEADERS:\n{headers}", uc.P_EVIDENCE, min_chars=2000),
                     uc.part("names", "EXISTING TEST NAMES (do not reuse): " + ", ".join(sorted(names)), uc.P_TRIED),
-                    uc.part("kb", "KB GUIDANCE:\n" + "\n".join(
-                        [f"+ {k.snippet[:300]}" for k in req.guidance.positive[:3]] +
-                        [f"- avoid: {k.snippet[:200]} ({k.reason})" for k in req.guidance.negative[:3]]), uc.P_EXAMPLES),
+                    *([uc.part("kb", "KB GUIDANCE (patterns that failed before):\n" + "\n".join(
+                        f"- avoid: {k.snippet[:200]} ({k.reason})" for k in req.guidance.negative[:3]), uc.P_EXAMPLES)]
+                      if req.guidance.negative else []),
+                    *([uc.part("examples", "EXAMPLES (verified tests of similar functions in other code: follow their "
+                               "form; their names and values do not exist here and are not evidence) [KB-25]:\n"
+                               + "\n".join(f"--- for {e.signature or e.function} ({e.context[:200]}):\n{e.snippet[:1500]}"
+                                           for e in examples), uc.P_EXAMPLES)] if examples else []),
                 ]
                 need = ba.OutputNeed(items=min(self.cfg.max_llm_tests_per_function,
                                                max(len(fn_scenarios) + len(to_rewrite), 1)),

@@ -1173,6 +1173,7 @@ class PlanRequest(Contract):
     item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
     iterations_left: int = 0                                      # after this one: the brain's rounds [A1-PL16]
     no_brain_declarations: list[str] = Field(default_factory=list)   # the brain's declaration did not build [A1-PL14]
+    examples: dict[str, str] = Field(default_factory=dict)       # function -> planning examples of the KB [KB-25]
 
 
 class DependencyRequest(Contract):
@@ -1274,9 +1275,13 @@ class FileActionBundle(Contract):
     needs_kind: dict[str, str] = Field(default_factory=dict)  # item -> answer kind no available brain may give [BP-9]
 
 
+EXAMPLE_KINDS = ("test_example", "plan_example")                  # KB-23
+LEARN_KINDS = Literal["positive", "gap_closure", "negative", "lesson", "test_example", "plan_example"]
+
+
 class KBExample(Contract):
     example_id: str
-    kind: Literal["positive", "gap_closure", "negative", "lesson"]
+    kind: LEARN_KINDS
     language: str
     framework: str
     category: str
@@ -1284,12 +1289,22 @@ class KBExample(Contract):
     reason: str = ""
     uses: int = 1
     pattern: str = ""                  # LA-8: the construct a lesson applies to
+    step: str = ""                     # KB-23: the brain step an example is for (A1.plan, A2.tests)
+    function: str = ""
+    signature: str = ""
+    context: str = ""                  # what it reached, with the code of the items
 
 
 class KBGuidance(Contract):
     positive: list[KBExample] = Field(default_factory=list)
     negative: list[KBExample] = Field(default_factory=list)
     lessons: list[KBExample] = Field(default_factory=list)      # verified lessons [LA-8, KB-22]
+    examples: dict[str, list[KBExample]] = Field(default_factory=dict)   # "<step>|<function>" -> examples [KB-24]
+
+
+def example_key(step: str, function: str) -> str:
+    """KB-24: the key of a function's examples in KBGuidance.examples."""
+    return f"{step}|{function}"
 
 
 class GenerationRequest(Contract):
@@ -1481,16 +1496,26 @@ class PublishResult(Contract):
 
 
 # ============================================================================ KB
+class ExampleQuery(Contract):
+    """KB-24: one function the brain plans or writes tests for - what its examples are found by."""
+    step: Literal["A1.plan", "A2.tests"]
+    function: str
+    text: str                          # its signature, the code and path conditions of its open items, causes
+    patterns: list[str] = Field(default_factory=list)            # its constructs [LA-8]
+
+
 class GuidanceRequest(Contract):
     language: str
     framework: str
     categories: list[str] = Field(default_factory=list)
     k: int = Field(default=4, ge=1, le=12)
     patterns: list[str] = Field(default_factory=list)           # constructs of the SUT, for lessons [LA-8]
+    functions: list[ExampleQuery] = Field(default_factory=list)  # examples per function [KB-24]
+    examples_per_function: int = Field(default=2, ge=0, le=6)
 
 
 class LearningEvent(Contract):
-    kind: Literal["positive", "gap_closure", "negative", "lesson"]
+    kind: Literal["positive", "gap_closure", "negative", "lesson", "test_example", "plan_example"]
     language: str
     framework: str
     category: str
@@ -1498,6 +1523,11 @@ class LearningEvent(Contract):
     reason: str = ""
     pattern: str = ""                                           # LA-8
     verification: dict[str, Any] = Field(default_factory=dict)
+    step: str = ""                                              # KB-23: A1.plan or A2.tests
+    function: str = ""
+    signature: str = ""
+    context: str = ""                                           # the items it reached, with their code
+    project: str = ""
 
 
 class LearnAck(Contract):
@@ -1665,6 +1695,7 @@ class PipelineResult(Contract):
     reviews: list[str] = Field(default_factory=list)           # second opinions [A4-23h]
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
     cache_use: list[str] = Field(default_factory=list)         # what each cache saved in this run [CA-1]
+    brain_answers: list[str] = Field(default_factory=list)     # per brain step: accepted, fixed, refused [KB-25]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
     escalations: list[str] = Field(default_factory=list)       # rules that needed the brain, with outcome [ARCH-22]
     item_status: list[ItemStatus] = Field(default_factory=list)    # final status per item not covered [LA-6]
@@ -2115,6 +2146,39 @@ def names_a_run(text: str, *roots: str | Path) -> bool:
         return True
     return any(form in text for root in roots if len(str(root)) > 3
                for form in _root_forms(str(Path(root).resolve())) + _root_forms(str(root)))
+
+
+_CODE_STOP = {"if", "else", "for", "while", "do", "return", "void", "const", "static", "inline", "volatile",
+              "struct", "enum", "union", "class", "the", "a", "an", "of", "and", "or", "to", "in", "is", "ut", "test",
+              "expect", "eq", "int", "line", "true", "false", "null", "nullptr", "observe", "e8", "evidence", "x", "n"}
+
+
+def item_parts(item: str) -> tuple[str, str, int, str]:
+    """(metric, function, line, rest) of a coverage item - a gap as BC:ns::f:28:13:F or LC:f:12, an item a test
+    reached as BC:28:13:F or LC:12 (no function); line 0 when it has none (EVIDENCE:f)."""
+    m = re.match(r"^([A-Z]+):(?:(.*?[A-Za-z_~].*?):)?(\d+)((?::[^:]*)*)$", item)
+    if m:
+        return m.group(1), m.group(2) or "", int(m.group(3)), m.group(4)
+    head, _, rest = item.partition(":")
+    return head, rest, 0, ""
+
+
+def item_key(item: str) -> str:
+    """A gap and the item a test reached, in one form: metric:line:rest."""
+    metric, _, line, rest = item_parts(item)
+    return f"{metric}:{line}{rest}" if line else item
+
+
+def code_words(text: str) -> list[str]:
+    """KB-24: the words of a text for the example search - code names also by their parts (bcm_set_bits: bcm,
+    set, bits; setBits: set, bits), lower case, without the words every text has."""
+    out: list[str] = []
+    for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+", text):
+        parts = [p for chunk in word.split("_") for p in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", chunk) if p]
+        for w in [word.lower(), *(p.lower() for p in parts)]:
+            if len(w) > 1 and w not in _CODE_STOP and not w.isdigit():
+                out.append(w)
+    return list(dict.fromkeys(out))
 
 
 def neutral_failure(text: str, *folders: str | Path) -> str:

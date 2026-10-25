@@ -36,9 +36,9 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 import ut_contracts as uc
 from ut_contracts import ba
@@ -2073,6 +2073,32 @@ class PlannedScenarios(BaseModel):
     scenarios: list[PlannedScenario]
 
 
+def _listed(values: Any) -> Any:
+    """ARCH-20a: a text field whose values are known: the brain's schema lists them; the agent's check stays the
+    judge (the value is still a str when it is parsed). An empty list adds nothing."""
+    values = sorted({str(v) for v in values if str(v).strip()})
+    return Annotated[str, Field(json_schema_extra={"enum": values})] if values else str
+
+
+def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, variables: Any) -> type[BaseModel]:
+    """ARCH-20a, A1-PL3: the answer of one planning call with the lists of this function - its open items, its
+    evidence, its parameters, the stubs whose return value a test can set and the stub variables."""
+    arg = create_model("PlannedArg", __base__=PlannedValue,
+                       name=(_listed(params), Field(description="a parameter name from PARAMETERS")))
+    stub = create_model("PlannedStubChoice", __base__=PlannedStub,
+                        stub=(_listed(stubs), Field(description="function name of a stub listed under STUBS")))
+    var = create_model("PlannedVariable", __base__=PlannedValue,
+                       name=(_listed(variables), Field(description="a stub variable from STUB VARIABLES")))
+    quote = create_model("PlannedQuoteChoice", __base__=PlannedQuote, evidence_id=(_listed(evidence_ids), ...))
+    scenario = create_model(
+        "PlannedScenarioChoice", __base__=PlannedScenario,
+        gap_ids=(list[_listed(open_ids)], Field(description="ids from OPEN GAPS that this scenario closes")),
+        args=(list[arg], Field(description="one entry per parameter, by parameter name")),
+        stubs=(list[stub], ...), variables=(list[var], Field(description="stub variables to set before the call")),
+        evidence_ids=(list[_listed(evidence_ids)], ...), quotes=(list[quote], ...))
+    return create_model("PlannedScenariosChoice", __base__=PlannedScenarios, scenarios=(list[scenario], ...))
+
+
 class LinkAnswer(BaseModel):
     requirement_id: str
     functions: list[str] = Field(description="names of FUNCTIONS whose behaviour the requirement states")
@@ -3212,6 +3238,7 @@ class AnalyzerAgent(ba.AgentCore):
         the stubs' control variables and generated callbacks."""
         root = Path(layout.repo_root)
         names = set(PLAN_SAFE_CALLS) | set(LIMITS) | {"NULL", "nullptr", "true", "false"}
+        names |= set(re.findall(r"^#define\s+([A-Za-z_]\w*)", uc.HARNESS_H, re.M))       # every harness macro [A1-PL4]
         for f in layout.functions:
             names.add(f.name.split("::")[-1])
             names |= set(f.qualified_name.split("::"))
@@ -3234,6 +3261,17 @@ class AnalyzerAgent(ba.AgentCore):
         names |= {uc.state_setter_name(v) for v in uc.settable_state(layout)}                        # A2-21z
         names |= {uc.state_getter_name(v) for v in uc.settable_state(layout)}
         return names
+
+    @staticmethod
+    def _plan_model(fn: uc.FunctionInfo, open_ids: set[str], evidence: list[uc.EvidenceRef],
+                    stubs: list[uc.StubSpec]) -> type[BaseModel]:
+        """ARCH-20a: the lists of this function for the brain's schema."""
+        settable = [s.function for s in stubs if s.kind not in ("variable", "constructor") and
+                    re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", s.return_type).strip()
+                    not in ("", "void")]
+        variables = [s.function for s in stubs if s.kind == "variable" and not s.is_const]
+        return planned_model(open_ids, [e.evidence_id for e in evidence], [p.name for p in text_params(fn)],
+                             settable, variables)
 
     @staticmethod
     def _calls_known(text: str, known: set[str]) -> list[str]:
@@ -3292,26 +3330,107 @@ class AnalyzerAgent(ba.AgentCore):
         return f"{p.name}: unknown names in {v!r}: {', '.join(unknown[:4])}" if unknown else ""
 
     @staticmethod
+    def _state_aliases(layout: uc.LayoutProfile) -> dict[str, str]:
+        """A1-PL4, A2-21z: every name a brain may give a SUT state variable -> the suffix of its setter and getter:
+        the suffix itself, the variable's name, its name without the unnamed namespace and its short name (only
+        when one variable has it)."""
+        out: dict[str, str] = {}
+        shorts: dict[str, list[str]] = {}
+        for v in uc.settable_state(layout):
+            suffix = uc.state_setter_name(v)[len("ut_state_set_"):]
+            plain = v.name.replace("(anonymous namespace)::", "")
+            for name in (suffix, v.name, plain):
+                out.setdefault(name, suffix)
+            shorts.setdefault(plain.split("::")[-1], []).append(suffix)
+        for short, suffixes in shorts.items():
+            if len(set(suffixes)) == 1:
+                out.setdefault(short, suffixes[0])
+        return out
+
+    @staticmethod
+    def _fold_fields(planned: "PlannedScenario", params: dict[str, uc.ParamInfo]) -> list[str]:
+        """A1-PL4: fields of a structure parameter given as arguments of their own (p->f, p.f) - one variable of
+        the structure in the set-up, its fields assigned there, the variable (or its address) as the argument."""
+        fields: dict[str, list[tuple[str, str]]] = {}
+        keep = []
+        for a in planned.args:
+            m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*)\s*", a.name)
+            if m and m.group(1) in params and not any(x.name == m.group(1) for x in planned.args):
+                fields.setdefault(m.group(1), []).append((re.sub(r"\s*(?:->|\.)\s*", ".", m.group(2)), a.value))
+            else:
+                keep.append(a)
+        if not fields:
+            return []
+        out = []
+        for name, values in fields.items():
+            p = params[name]
+            var = name if name in setup_locals(planned.setup) else f"{name}_v"
+            if var != name:
+                base = re.sub(r"\b(const|volatile)\b", "", p.base or p.type).replace("*", "").replace("&", "").strip()
+                planned.setup.append(f"{base} {var} = {{0}};")
+            planned.setup += [f"{var}.{field} = {value};" for field, value in values]
+            pointer = p.kind == "ptr_struct" or "*" in p.type
+            keep.append(type(planned.args[0])(name=name, value=("&" + var) if pointer else var))
+            out.append(f"args: fields of {name} ({', '.join(f for f, _ in values)}) set in the set-up of {var}")
+        planned.args = keep
+        return out
+
+    @staticmethod
     def _normalize_planned(planned: "PlannedScenario", fn: uc.FunctionInfo, open_ids: set[str],
                            evidence: dict[str, uc.EvidenceRef], layout: uc.LayoutProfile | None = None) -> list[str]:
         """ARCH-20, A1-PL4: format noise removed from values and gap ids; returns "field: 'before' -> 'after'"."""
         fixes: list[str] = []
         if layout is not None:                       # a setter for a visible variable, an assignment of a hidden one
             state = {uc.state_setter_name(v)[len("ut_state_set_"):]: v.name for v in uc.settable_state(layout)}
+            alias = AnalyzerAgent._state_aliases(layout)                                      # A1-PL4: by its names
             visible = uc.headers_text(layout)
+
+            def helpers(text: str) -> str:
+                """ut_state_set_/ut_state_get_ of a variable named by another of its names -> the real helper."""
+                def one(m: "re.Match[str]") -> str:
+                    real = alias.get(m.group(2))
+                    return f"ut_state_{m.group(1)}_{real}" if real and m.group(2) not in state else m.group(0)
+                return re.sub(r"\but_state_(set|get)_(\w+)\b", one, text)
             setup = []
             for stmt in planned.setup:
-                new = stmt
-                m = re.fullmatch(r"\s*ut_state_set_(\w+)\s*\((.*)\)\s*;?\s*", stmt, re.S)
+                new = helpers(stmt)
+                m = re.fullmatch(r"\s*ut_state_set_(\w+)\s*\((.*)\)\s*;?\s*", new, re.S)
                 if m and m.group(1) not in state and re.search(r"\b" + re.escape(m.group(1)) + r"\b", visible):
                     new = f"{m.group(1)} = {m.group(2).strip()};"
-                m = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*=(?!=)\s*([^;]+);?\s*", stmt)
-                if m and m.group(1) in state and not re.search(r"\b" + re.escape(m.group(1)) + r"\b", visible):
-                    new = f"ut_state_set_{m.group(1)}({m.group(2).strip()});"
+                m = re.fullmatch(r"\s*([A-Za-z_][\w:]*)\s*=(?!=)\s*([^;]+);?\s*", new)
+                if m and alias.get(m.group(1)) and not re.search(r"\b" + re.escape(m.group(1)) + r"\b", visible):
+                    new = f"ut_state_set_{alias[m.group(1)]}({m.group(2).strip()});"
                 if new != stmt:
                     fixes.append(f"setup: {stmt.strip()[:60]!r} -> {new[:60]!r}")
                 setup.append(new)
             planned.setup = setup
+            calls = [helpers(c) for c in planned.calls_before or []]
+            if calls != list(planned.calls_before or []):
+                fixes.append("calls_before: state helpers named by the variable's other name")
+                planned.calls_before = calls
+            for c in planned.expected_after:                  # a state variable read through its getter [A2-21z]
+                new = helpers(c.expr)
+                name = new.strip()
+                if alias.get(name) and not re.search(r"\b" + re.escape(name) + r"\b", visible):
+                    new = f"ut_state_get_{alias[name]}()"
+                if new != c.expr:
+                    fixes.append(f"expected_after: {c.expr[:60]!r} -> {new[:60]!r}")
+                    c.expr = new
+        params = {p.name: p for p in text_params(fn)}
+        fixes += AnalyzerAgent._fold_fields(planned, params)                                  # A1-PL4
+        given = {a.name: a.value for a in planned.args}
+        named = planned.expected_return.strip()
+        if named in params and given.get(named, "").strip():        # "returns request": the value given for it
+            planned.expected_return = given[named]
+            fixes.append(f"expected_return: {named!r} -> {given[named]!r} (the value of the parameter)")
+        literals = dict(re.findall(r"(?:^|;)\s*(?:(?:const|unsigned|signed|static)\s+)*[A-Za-z_][\w:]*\s+([A-Za-z_]\w*)\s*="
+                                   r"\s*([+-]?(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)[uUlLfF]*)\s*(?=;)",
+                                   ";".join(planned.setup)))
+        for st in planned.stubs:                        # a stub value named by a set-up variable: its literal
+            values = [literals.get(r.strip(), r) for r in st.returns]
+            if values != st.returns:
+                fixes.append(f"stubs.{st.stub}: {st.returns!r} -> {values!r} (the literals of the set-up)")
+                st.returns = values
         strings = {p.name for p in text_params(fn) if p.kind == "cstring"}
 
         def fixed(field: str, value: str, name: str = "", keep: bool = False) -> str:
@@ -3414,6 +3533,12 @@ class AnalyzerAgent(ba.AgentCore):
         for s in stubs:
             stub_specs[s.function] = s
             stub_specs[s.qualified_name or s.function] = s
+        void = [sv.stub for sv in planned.stubs if sv.stub in stub_specs and stub_specs[sv.stub].kind != "variable" and (
+            stub_specs[sv.stub].kind == "constructor" or re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "",
+                                                                 stub_specs[sv.stub].return_type).strip() in ("", "void"))]
+        if void:                       # nothing to set: the entry carries no information - form, not content [ARCH-20]
+            planned.stubs = [sv for sv in planned.stubs if sv.stub not in void]
+            self.last_fixes.append(f"stubs: {', '.join(void)} return nothing - their entries dropped [A1-PL4]")
         for sv in planned.stubs:                                                           # d)
             spec = stub_specs.get(sv.stub)
             if spec is None or spec.kind == "variable":
@@ -3426,6 +3551,8 @@ class AnalyzerAgent(ba.AgentCore):
             if not sv.returns or len(sv.returns) > 16:
                 reasons.append(f"{sv.stub}: give 1 to 16 return values")
                 continue
+            ret = layout.typedefs.get(ret, ret) if int_range(ret) is None else ret          # TickType_t [A1-PL4]
+            ret = re.sub(r"\b(const|volatile)\b", "", ret).strip()
             scalar = int_range(ret) is not None or ret.endswith("*") or \
                 any(e.name.split("::")[-1] == ret.replace("enum ", "").split("::")[-1] for e in layout.enums) or \
                 re.fullmatch(r"(float|double|long double)", ret)
@@ -3462,26 +3589,11 @@ class AnalyzerAgent(ba.AgentCore):
         if planned.classification == "confirmed_gap" and not normative:
             notes.append("downgraded to characterization: no quoted E1-E7 evidence or no expected value [A1-PL4 c]")
         if normative:
-            full = return_type_of(fn)
-            ret = re.sub(r"\b(const|volatile|static|inline)\b", "", full).strip()
-            if planned.expected_return.strip():
-                if not ret or ret == "void":
-                    return None, [f"{fn.name} returns nothing; expected_return must be empty"]
-                kind = "float" if re.fullmatch(r"(float|double|long double)", ret) else \
-                    "cstring" if re.fullmatch(r"(const\s+)?char\s*\*", full.strip()) else \
-                    "other" if ret.endswith("*") else "int"
-                problem = self._value_problem(uc.ParamInfo(name="return value", type=ret, kind=kind, nullable=True),
-                                              planned.expected_return, fn, constants, local, known, layout)
-                if problem:
-                    return None, [problem]
-            for check in planned.expected_after:
-                names = set(re.findall(r"\b([A-Za-z_]\w*)\b", check.expr)) - KEYWORDS
-                if not names or any(n not in local and n not in known for n in names):
-                    return None, [f"expected_after: {check.expr!r} is not a variable of the setup or a stub control"]
-                if eval_int(check.value, constants) is None and not re.fullmatch(
-                        r"[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?[fF]?", check.value.strip()) and not \
-                        string_literal(check.value):
-                    return None, [f"expected_after: {check.value!r} is not a value"]
+            problem = self._expectation_problem(planned, fn, constants, local, known, layout)
+            if problem:              # the inputs stay, the result is observed instead of asserted [A1-PL4]
+                normative = False
+                notes.append(f"expectation not usable ({problem}): kept as a characterization scenario, its result "
+                             "is observed [A1-PL4]")
         linked = bool(strong) and all(e.linked_by for e in strong)       # rests only on brain links
         scenario = uc.Scenario(
             scenario_id="", function=fn.name, gap_ids=gaps, description=planned.purpose[:300] or "planned by the brain",
@@ -3502,6 +3614,34 @@ class AnalyzerAgent(ba.AgentCore):
                           for s in planned.calls_before if s.strip()],                         # BP-2
             trial=trial)                                                                       # NC-7
         return scenario, notes
+
+    def _expectation_problem(self, planned: "PlannedScenario", fn: uc.FunctionInfo, constants: dict[str, int],
+                             local: set[str], known: set[str], layout: uc.LayoutProfile) -> str:
+        """A1-PL4 c): why the expected return value or an expected check cannot be asserted; "" when they can."""
+        full = return_type_of(fn)
+        ret = re.sub(r"\b(const|volatile|static|inline)\b", "", full).strip()
+        enumerators = {k.split("::")[-1] for e in layout.enums for k in e.values}
+        if planned.expected_return.strip():
+            if not ret or ret == "void":
+                return f"{fn.name} returns nothing; expected_return must be empty"
+            kind = "float" if re.fullmatch(r"(float|double|long double)", ret) else \
+                "cstring" if re.fullmatch(r"(const\s+)?char\s*\*", full.strip()) else \
+                "other" if ret.endswith("*") else "int"
+            if not (kind == "int" and planned.expected_return.strip().split("::")[-1] in enumerators):
+                problem = self._value_problem(uc.ParamInfo(name="return value", type=ret, kind=kind, nullable=True),
+                                              planned.expected_return, fn, constants, local, known, layout)
+                if problem:
+                    return problem
+        for check in planned.expected_after:
+            names = set(re.findall(r"\b([A-Za-z_]\w*)\b", check.expr)) - KEYWORDS
+            if not names or any(n not in local and n not in known for n in names):
+                return f"expected_after: {check.expr!r} is not a variable of the setup or a stub control"
+            value = check.value.strip()
+            if eval_int(value, constants) is None and not re.fullmatch(
+                    r"[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?[fF]?", value) and not string_literal(value) \
+                    and value.split("::")[-1] not in enumerators:                  # MonitorState::Ok is a value
+                return f"expected_after: {check.value!r} is not a value"
+        return ""
 
     @staticmethod
     def _expected_form(fn: uc.FunctionInfo, open_ids: set[str]) -> str:
@@ -3682,6 +3822,7 @@ class AnalyzerAgent(ba.AgentCore):
                          "build up (see JOURNAL). For them give calls_before: the earlier calls, in order, each one "
                          "statement" + (" on the same object ut_obj" if fn.member else "") + "; then the call of args.")
         dep_code = uc.dependency_code(fn, layout)                               # what the real code computes
+        examples = req.examples.get(fn.qualified_name) or req.examples.get(fn.name, "")          # KB-25
         return [uc.part("facts", "\n\n".join(facts)),
                 *([uc.part("real dependency code", "CODE OF THE REAL DEPENDENCIES IT CALLS (they run in the test; "
                            "choose inputs and globals so that their results meet the PATH CONDITIONS):\n" + dep_code,
@@ -3699,7 +3840,10 @@ class AnalyzerAgent(ba.AgentCore):
                                   if re.search(r"(?:^|_)" + re.escape(fn.name.split("::")[-1]) + r"(?:_|$)", name)),
                         uc.P_TRIED),
                 uc.part("style", "EXISTING TEST STYLE:\n" + ("\n---\n".join(style) or f"- {layout.framework}"),
-                        uc.P_EXAMPLES)]
+                        uc.P_EXAMPLES),
+                *([uc.part("examples", "EXAMPLES (scenarios that reached similar items in verified tests of other code: "
+                           "follow how their inputs meet the PATH CONDITIONS; their names and values do not exist "
+                           "here and are not evidence) [KB-25]:\n" + examples, uc.P_EXAMPLES)] if examples else [])]
 
     def _source_for_brain(self, fn: uc.FunctionInfo, lines: list[str], focus: list[int],
                           profile: uc.BrainProfile | None = None) -> str:
@@ -3855,8 +3999,9 @@ class AnalyzerAgent(ba.AgentCore):
                     raise ba.AgentFault("NO_BRAIN_AVAILABLE", "every allowed brain was tried")
                 if sequence:                                   # BP-3: only a brain whose profile allows it [BP-2]
                     allowed = [b for b in (allowed if allowed is not None else seq_brains) if b in seq_brains] or allowed
-                answer = await self.generate(task, context, PlannedScenarios, need=need, step="A1.plan",
-                                             project=layout.repo_root, allowed=allowed, vary=calls > 1)  # ARCH-20
+                answer = await self.generate(task, context, self._plan_model(fn, open_ids, evidence, stubs),
+                                             need=need, step="A1.plan", project=layout.repo_root, allowed=allowed,
+                                             vary=calls > 1)                                # ARCH-20, ARCH-20a
             except ba.AgentFault as exc:
                 failures.append(f"{exc.code}: {exc.message}"[:300])
                 if exc.code in ba.NO_BRAIN_CODES and not accepted and not brain:
