@@ -3287,6 +3287,7 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Genera
     agent = GeneratorAgent(settings, config=GeneratorConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
     agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
+    agent.answer_cache = uc.answer_cache(config_path)              # CA-2
     uc.apply_profiles(agent, config_path)                         # BP-1, BP-3, BP-6
     return agent
 

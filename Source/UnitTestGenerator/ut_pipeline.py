@@ -433,7 +433,14 @@ class Orchestrator:
             self.ledger.append(agent="ut_pipeline", tool="tested_commit", repository=state.origin.get("repository", ""),
                                branch=state.origin.get("branch", ""), commit=state.origin["commit"])
         self.run_env = {"BASEAGENT_ANSWER_LOG": str(out / "brain_answers.jsonl"),  # every brain answer [ARCH-20]
-                        ba.VIEW_RUN_ENV: getattr(self, "view_prefix", "") + req.sut_file}   # its events' file [VIEW-12]
+                        ba.VIEW_RUN_ENV: getattr(self, "view_prefix", "") + req.sut_file,   # its events' file [VIEW-12]
+                        "UT_CACHE_LOG": str(out / "cache_hits.jsonl")}                     # what the caches saved [CA-1]
+        if getattr(self, "no_cache", False) or ba.cache_switched_off():                       # CA-1: --no-cache
+            self.run_env["UT_CACHE"] = "off"
+        elif not getattr(self, "_pruned", False):                  # the size limit, once per process [CA-1]
+            self._pruned = True
+            with contextlib.suppress(Exception):
+                uc.prune_cache(self.config_path)
         # an agent in this process reads the process environment: only then is it set there [ORC-23 (c)]
         in_process = self.in_process()
         before = {name: os.environ.get(name) for name in self.run_env}
@@ -445,6 +452,10 @@ class Orchestrator:
                 await self._run_start(state)
                 result = await self._run(state)
                 await self._requirement_status(state, result)                            # A1-RQ5
+                with contextlib.suppress(Exception):                     # a cache never fails a run [CA-1]
+                    self._store_verified_tests(state)                                        # CA-4
+                with contextlib.suppress(Exception):
+                    self._store_journal(state)                                               # CA-8
         except Rejected as exc:
             result = state.finish("incomplete", f"{exc.agent} refused: {exc.reason}")
         except ba.AgentFault as exc:
@@ -477,6 +488,7 @@ class Orchestrator:
             else:
                 os.environ[name] = value
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
+        result.cache_use = self._cache_use(out, state)                                       # CA-1
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         brains = set()
         for made in state.made.values():                                     # "brain/model kind; object: brain setup"
@@ -651,18 +663,28 @@ class Orchestrator:
             return s.finish("incomplete", "layout blocked: " + (self.layout.blocked_reason or ""))
         s.build = await self.call("compilation", "capture", uc.CaptureRequest(
             layout=self.layout, command=s.req.build_command, compile_commands=s.req.compile_commands,
-            cache_key=s.origin.get("cache_key", "")), uc.BuildDescription)
+            cache_key=s.origin.get("cache_key", "") or self._folder_capture_key(s)), uc.BuildDescription)
         try:                                         # estimated: A3-BD11..A3-BD13; captured: A3-BD16
             s.build = await self.call("compilation", "suggest_flags", uc.FlagRequest(
                 layout=self.layout, build=s.build), uc.BuildDescription)
         except (Rejected, ba.AgentFault) as exc:
             s.notes.append(f"flag suggestion not run: {exc}"[:300])
-        await self._dependencies(s, None)
+        stage_a_key, s.stage_a_cached = "", False
+        with contextlib.suppress(Exception):                             # a cache never fails a run [CA-1]
+            stage_a_key = self._stage_a_key(s)
+            s.stage_a_cached = self._stage_a_from_cache(s, stage_a_key)                       # CA-10
+        if not s.stage_a_cached:
+            await self._dependencies(s, None)
         if self.layout.blocked:
             return s.finish("incomplete", "layout blocked: " + (self.layout.blocked_reason or ""))
         last = await self.call("compilation", "probe", uc.VerifyRequest(layout=self.layout, stage="probe",
                                                                           static_analysis=True), uc.VerificationResult)
         self.check_result(last, self.layout.sut_sha256)
+        if s.stage_a_cached and last.decision == "environment_error":       # CA-10: never the end of a run
+            await self._stage_a_cache_failed(s)
+            last = await self.call("compilation", "probe", uc.VerifyRequest(layout=self.layout, stage="probe",
+                                                                              static_analysis=True), uc.VerificationResult)
+            self.check_result(last, self.layout.sut_sha256)
         s.baseline_findings = list(last.analyzer_findings)
         s.record(0, "probe", last, None)
         try:                                       # delivered next to the tests, so they build anywhere
@@ -688,6 +710,10 @@ class Orchestrator:
             s.current = f"Stage A round {rounds}"
             before = self._problems(last)
             last = await self._stage_a_round(s, last, rounds)
+            if s.stage_a_cached and (not last.link_ok or last.decision in ("setup_blocked", "environment_error")):
+                rounds -= 1                    # CA-10: the stored result did not hold: not a round of this run
+                await self._stage_a_cache_failed(s)
+                continue
             if last.decision == "environment_error":
                 return s.finish("incomplete", "environment: " + last.reason)
             if (not last.link_ok or last.decision == "setup_blocked") and self._problems(last) == before:
@@ -695,7 +721,14 @@ class Orchestrator:
                     continue
                 return s.finish("incomplete", f"Stage A round {rounds} changed nothing; the same setup or build "
                                 "issues remain: " + last.reason)
+        with contextlib.suppress(Exception):                             # a cache never fails a run [CA-1]
+            if stage_a_key and not s.stage_a_cached:
+                self._store_stage_a(s, stage_a_key)                                           # CA-10
         # 3. Stage B: coverage loop [ORC-5], up to the iteration limit of the file's ASIL level [COV-9]
+        with contextlib.suppress(Exception):                             # a cache never fails a run [CA-1]
+            self._reuse_verified_tests(s)                                                     # CA-4
+        with contextlib.suppress(Exception):
+            self._reuse_journal(s)                                                            # CA-8
         last_good = last if not last.failures else None
         s.started = time.monotonic()                                      # LA-7 c: the ceiling scales with the file
         open_functions = {fc.name for fc in (last.coverage.functions if last.coverage else []) if fc.gaps} or \
@@ -912,6 +945,301 @@ class Orchestrator:
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
+
+    # ---------------------------------------------------------------- CA-4: verified tests of a SUT file
+    def _verified_store(self, s: "RunState") -> tuple["uc.RunCache | None", str]:
+        cache = uc.run_cache(self.config_path, "verified_tests") if not getattr(self, "no_cache", False) else None
+        if cache is None or self.layout is None:
+            return None, ""
+        return cache, cache.key("verified_tests", *self._file_of(s))
+
+    def _file_of(self, s: "RunState") -> tuple[str, str]:
+        """CA-4, CA-8: the project and the SUT file a stored entry belongs to."""
+        return (s.origin.get("repository") or self.layout.project or str(Path(s.repo).resolve()), self.layout.sut_file)
+
+    def _verified_context(self, s: "RunState") -> tuple[str, dict[str, str], dict[str, list[str]]]:
+        """(the environment's hash - headers, stub declarations, harness, language; each function's hash; the names
+        a test may call for each function)."""
+        layout = self.layout
+        lines = uc.read_source(Path(s.workspace) / layout.sut_file).splitlines()
+        stubs = sorted(f"{d.qualified_name or d.name}={d.declaration}" for d in
+                       (layout.dependencies.entries if layout.dependencies else []) if d.decision == "stub")
+        env = uc.sha256_bytes("|".join([uc.headers_text(layout), *stubs, uc.HARNESS_VERSION, layout.language,
+                                        uc.CACHE_VERSION]).encode("utf-8"))
+        hashes, names = {}, {}
+        for fn in layout.functions:
+            key = f"{fn.qualified_name}@{fn.signature}"
+            hashes[key] = uc.sha256_bytes("\n".join(lines[fn.line_start - 1: fn.line_end]).encode("utf-8"))
+            short = fn.name.split("::")[-1]
+            names[key] = [short, "ut_static_" + re.sub(r"\W", "_", fn.name.replace("(anonymous namespace)::", ""))]
+        return env, hashes, names
+
+    @staticmethod
+    def _functions_called(source: str, names: dict[str, list[str]]) -> list[str]:
+        code = re.sub(r"/\*.*?\*/|//[^\n]*", " ", source, flags=re.S)
+        return sorted(k for k, words in names.items()
+                      if any(re.search(r"(?<![\w])" + re.escape(w) + r"\s*\(", code) for w in words))
+
+    def _store_verified_tests(self, s: "RunState") -> int:
+        """CA-4: the tests a brain wrote or planned (BP-7) that passed in the last measured suite, with the hashes of
+        the functions they call; merged with what is stored for the file."""
+        cache, key = self._verified_store(s)
+        result, bundle = s.best_result or s.last, s.best_bundle or s.bundle
+        if cache is None or result is None or bundle is None:
+            return 0
+        passed = {t.name for t in result.tests if t.status == "passed"}
+        sources = uc.test_sources(uc.suite_of(bundle))
+        env, hashes, names = self._verified_context(s)
+        stored = cache.get_json(key, count=False)
+        entries = {e["name"]: e for e in (stored.get("tests", []) if isinstance(stored, dict) else [])
+                   if isinstance(e, dict) and "name" in e}
+        added = 0
+        for name, made in s.made.items():
+            if name not in passed or name not in sources:
+                continue
+            called = self._functions_called(sources[name], names)
+            if not called:
+                continue
+            entries[name] = {"name": name, "source": sources[name], "made": made, "env": env,
+                             "functions": {k: hashes[k] for k in called}}
+            added += 1
+        if added:
+            cache.put_json(key, {"tests": list(entries.values())[-2000:]})
+        return added
+
+    def _reuse_verified_tests(self, s: "RunState") -> int:
+        """CA-4: the stored tests whose environment and called functions are unchanged join the first iteration's
+        suite; Agent3 builds, runs and measures them like every other test."""
+        cache, key = self._verified_store(s)
+        if cache is None or self.layout is None:
+            return 0
+        stored = cache.get_json(key, count=False)
+        if not isinstance(stored, dict):
+            return 0
+        env, hashes, _ = self._verified_context(s)
+        present = set(uc.test_sources(self.suite)) if self.suite else set()
+        reused = []
+        for e in stored.get("tests", []):
+            if not isinstance(e, dict) or e.get("env") != env or e.get("name") in present or \
+                    not isinstance(e.get("functions"), dict) or not e["functions"] or not isinstance(e.get("source"), str):
+                continue
+            if all(hashes.get(k) == v for k, v in e["functions"].items()) and \
+                    re.search(r"\bUT_TEST\(\s*" + re.escape(e["name"]) + r"\s*\)", e["source"]):
+                reused.append(e)
+        if not reused:
+            return 0
+        self.suite = (self.suite.rstrip() + "\n\n" if self.suite else "") + "\n\n".join(e["source"] for e in reused) + "\n"
+        for e in reused:
+            s.made[e["name"]] = str(e.get("made", ""))
+        note = (f"{len(reused)} verified test(s) of earlier runs reused - the functions they call are unchanged; they "
+                "are built, run and measured with this run's tests [CA-4]")
+        s.notes.append(note)
+        self._stage(note)
+        return len(reused)
+
+    # ---------------------------------------------------------------- CA-10: the result of Stage A
+    STAGE_A_FIELDS = ("build", "compile_flags", "build_flags_source", "dependencies", "functions", "enums", "sut_state",
+                      "local_statics", "interfaces", "typedefs", "private_types", "requirement_links", "include_dirs")
+
+    def _stage_a_key(self, s: "RunState") -> str:
+        """CA-10: the SUT's version, the discover result, the run's build description, the toolchain, the
+        configuration (brains and budgets) and the pipeline's version; "" when the cache is off."""
+        if getattr(self, "no_cache", False) or not uc.cache_on(self.config_path, "stage_a") or self.layout is None:
+            return ""
+        root = str(Path(s.workspace))
+        manifest = uc.manifest_path(self.config_path)
+        chain = manifest.read_text(encoding="utf-8", errors="replace") if manifest.is_file() else ""
+        settings = {k: v for k, v in self.raw.items() if k not in ("cache", "viewer", "_comment")}
+        return uc.RunCache.key("stage_a", self.layout.sut_sha256, uc.HARNESS_VERSION,
+                               uc.unrooted(self.layout.model_dump_json(), root),
+                               uc.unrooted(s.build.model_dump_json() if s.build else "", root),
+                               uc.sha256_bytes(chain.encode("utf-8")), json.dumps(settings, sort_keys=True, default=str))
+
+    def _stage_a_from_cache(self, s: "RunState", key: str) -> bool:
+        """CA-10: the stored dependency analysis in place of the first one; Stage A builds with it as usual."""
+        cache = uc.run_cache(self.config_path, "stage_a") if key else None
+        stored = cache.get_json(key) if cache is not None else None
+        if not isinstance(stored, dict) or not isinstance(stored.get("fields"), str):
+            return False
+        root = str(Path(s.workspace))
+        fields = json.loads(uc.rooted(stored["fields"], root))
+        if not isinstance(fields, dict) or not set(fields) <= set(self.STAGE_A_FIELDS):
+            return False
+        layout = uc.LayoutProfile.model_validate({**self.layout.model_dump(mode="json"), **fields})
+        if layout.sut_sha256 != self.layout.sut_sha256 or layout.dependencies is None:
+            return False
+        s.stage_a_original = (self.layout, s.build)
+        self.layout = s.layout = layout
+        if layout.build is not None:
+            s.build = layout.build
+        s.declarations_dropped = [str(n) for n in stored.get("dropped", [])]
+        s.replaced_dependencies = {d["name"]: uc.Dependency.model_validate(d) for d in stored.get("replaced", [])
+                                   if isinstance(d, dict) and d.get("name")}
+        note = "the dependency analysis of an earlier run of the same SUT, build and toolchain is used; Stage A " \
+               "builds with it as usual [CA-10]"
+        s.notes.append(note)
+        self._stage(note)
+        return True
+
+    async def _stage_a_cache_failed(self, s: "RunState") -> None:
+        """CA-10: the stored result did not build here: back to the run's own layout and build, and the dependency
+        analysis runs anew; the entry is replaced when this Stage A links."""
+        s.stage_a_cached = False
+        self.layout = s.layout = s.stage_a_original[0]
+        s.build = s.stage_a_original[1]
+        s.declarations_dropped.clear()
+        s.replaced_dependencies.clear()
+        note = "the stored Stage A result did not build with this run: dependency analysis anew [CA-10]"
+        s.notes.append(note)
+        self._stage(note)
+        await self._dependencies(s, None)
+
+    def _store_stage_a(self, s: "RunState", key: str) -> None:
+        """CA-10: what a Stage A that linked ended with."""
+        cache = uc.run_cache(self.config_path, "stage_a")
+        if cache is None or self.layout is None or self.layout.dependencies is None:
+            return
+        dump = self.layout.model_dump(mode="json")
+        fields = {name: dump[name] for name in self.STAGE_A_FIELDS if name in dump}
+        text = uc.unrooted(json.dumps(fields), str(Path(s.workspace)))
+        if uc.names_a_run(text, self.output_root):          # a path of this run is left: it would point elsewhere
+            return
+        cache.put_json(key, {"fields": text,
+                             "dropped": sorted(s.declarations_dropped),
+                             "replaced": [d.model_dump(mode="json") for d in s.replaced_dependencies.values()]})
+
+    # ---------------------------------------------------------------- CA-8: the failure journal across runs
+    def _function_keys(self, s: "RunState") -> dict[str, tuple[str, str]]:
+        """Every name a journal entry or a crashed call may give a function -> (the function's key of CA-4, its
+        hash with its first line)."""
+        env, hashes, _ = self._verified_context(s)
+        out: dict[str, tuple[str, str]] = {}
+        for fn in self.layout.functions:
+            key = f"{fn.qualified_name}@{fn.signature}"
+            mark = (key, f"{hashes.get(key, '')}@{fn.line_start}")
+            for name in (fn.qualified_name, fn.name):
+                out.setdefault(name, mark)
+        return out
+
+    @staticmethod
+    def _call_function(call: str, names: dict[str, tuple[str, str]]) -> str:
+        m = re.match(r"\s*\(?\s*([\w:~]+)\s*\(", call)
+        if not m:
+            return ""
+        name = m.group(1)
+        return name if name in names else next((n for n in names if n.split("::")[-1] == name.split("::")[-1]), "")
+
+    def _store_journal(self, s: "RunState") -> int:
+        """CA-8: the open entries of this run and the still-open ones of earlier runs, with the crashed calls, per
+        function and its hash."""
+        cache = uc.run_cache(self.config_path, "failure_journal") if not getattr(self, "no_cache", False) else None
+        if cache is None or self.layout is None:
+            return 0
+        env, _, _ = self._verified_context(s)
+        names = self._function_keys(s)
+        last = s.best_result or s.last
+        open_now = {g.gap_id for fc in (last.coverage.functions if last and last.coverage else []) for g in fc.gaps}
+        rows = []
+        for e in s.journal.entries:
+            if e.status == "open" and not e.final_status and e.function in names and any(i in open_now for i in e.items):
+                key, mark = names[e.function]
+                rows.append({"function": e.function, "key": key, "mark": mark, "row": Journal.row(e),
+                             "items": list(e.items)})
+        for row in s.journal.earlier_rows:            # an earlier run's entry while its items are still open
+            if any(i in open_now for i in row.get("items", [])) and row["row"] not in {r["row"] for r in rows}:
+                rows.append(row)
+        crashed = []
+        for call in s.crashed_calls:
+            fn = self._call_function(call, names)
+            if fn:
+                crashed.append({"function": fn, "key": names[fn][0], "mark": names[fn][1], "call": call})
+        cache.put_json(cache.key("failure_journal", *self._file_of(s)), {"env": env, "rows": rows[-500:],
+                                                                 "crashed": crashed[-200:]})
+        return len(rows)
+
+    def _reuse_journal(self, s: "RunState") -> int:
+        """CA-8: what missed in earlier runs of the unchanged functions goes to the brain with this run's journal;
+        their crashed calls are avoided. Nothing of it is a final status or an attempt of this run."""
+        cache = uc.run_cache(self.config_path, "failure_journal") if not getattr(self, "no_cache", False) else None
+        if cache is None or self.layout is None:
+            return 0
+        stored = cache.get_json(cache.key("failure_journal", *self._file_of(s)))
+        env, _, _ = self._verified_context(s)
+        if not isinstance(stored, dict) or stored.get("env") != env:
+            return 0
+        marks = {key: mark for key, mark in self._function_keys(s).values()}
+        used = 0
+        for row in stored.get("rows", []):
+            if isinstance(row, dict) and isinstance(row.get("row"), str) and marks.get(row.get("key")) == row.get("mark"):
+                s.journal.earlier.setdefault(str(row.get("function", "")), []).append(row["row"])
+                s.journal.earlier_rows.append(row)
+                used += 1
+        calls = [str(c["call"]) for c in stored.get("crashed", []) if isinstance(c, dict) and "call" in c
+                 and marks.get(c.get("key")) == c.get("mark")]
+        s.crashed_calls = list(dict.fromkeys(s.crashed_calls + calls))
+        if used or calls:
+            note = (f"what missed in earlier runs of the unchanged functions is in the brain's journal: {used} entr"
+                    f"{'y' if used == 1 else 'ies'}, {len(calls)} crashed call(s) [CA-8]")
+            s.notes.append(note)
+            self._stage(note)
+        return used + len(calls)
+
+    def _cache_use(self, out: Path, s: "RunState") -> list[str]:
+        """CA-1: hits per cache in this run (the agents' log and the answer log)."""
+        counts: dict[str, list[int]] = {}
+        with contextlib.suppress(OSError):
+            for line in (out / "cache_hits.jsonl").read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(ValueError):
+                    rec = json.loads(line)
+                    pair = counts.setdefault(str(rec.get("cache")), [0, 0])
+                    pair[0 if rec.get("hit") else 1] += 1
+        cached = 0
+        with contextlib.suppress(OSError):
+            for line in (out / "brain_answers.jsonl").read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(ValueError):
+                    cached += bool(json.loads(line).get("cached"))
+        rows = [f"brain answers: {cached} from the cache [CA-2]"] if cached else []
+        labels = {"test_coverage": "coverage of tests alone [CA-3]", "objects": "compiled objects [CA-5]",
+                  "failure_analysis": "decisions on failures and source-fix candidates [CA-9]",
+                  "code_analysis": "front-end parses [CA-11]",
+                  "mutations": "mutation checks [CA-12]", "search_corpus": "search corpora as seeds [CA-13]"}
+        rows += [f"{labels.get(k, k)}: {h} reused, {m} new" for k, (h, m) in sorted(counts.items())
+                 if h and k in labels]
+        if counts.get("suite_parts", [0, 0])[0]:
+            rows.append(f"test suite compiled in parts: {counts['suite_parts'][0]} build(s) [CA-14]")
+        rows += [n for n in s.notes if any(f"[CA-{k}]" in n for k in (4, 8, 10))]
+        if s.build is not None and s.build.reused and s.mode == "folder":
+            rows.append("build capture reused for an unchanged folder [CA-6]")
+        return rows
+
+    BUILD_FILES = re.compile(r"^(?:CMakeLists\.txt|.*\.cmake|CMakePresets\.json|GNUmakefile|[Mm]akefile.*|.*\.mk|"
+                             r"meson\.build|meson_options\.txt|compile_commands\.json|BUILD(?:\.bazel)?|"
+                             r"WORKSPACE(?:\.bazel)?|.*\.(?:vcxproj|sln|props|uvprojx|ewp|cproject|project))$")
+
+    def _folder_capture_key(self, s: "RunState") -> str:
+        """CA-6: a folder has no commit (ORC-22): its build description is reused while the build files, the list of
+        source files, the build command and the compiler are unchanged; "" when the cache is off."""
+        if s.mode != "folder" or not uc.cache_on(self.config_path, "build_capture"):
+            return ""
+        root = Path(s.workspace)
+        skip = {".git", ".svn", ".hg", "node_modules", ".venv", "__pycache__", "ut_output", "ut_work", "ut_cache"}
+        builds, sources = [], []
+        try:
+            for path in sorted(root.rglob("*")):
+                rel = path.relative_to(root)
+                if any(part in skip for part in rel.parts) or not path.is_file():
+                    continue
+                if self.BUILD_FILES.match(path.name):
+                    builds.append(f"{rel.as_posix()}={uc.sha256_bytes(path.read_bytes())}")
+                elif path.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".s"):
+                    sources.append(rel.as_posix())
+        except OSError:
+            return ""
+        manifest = uc.manifest_path(self.config_path)
+        chain = manifest.read_text(encoding="utf-8", errors="replace") if manifest.is_file() else ""
+        text = "|".join([uc.CACHE_VERSION, s.req.build_command, s.req.compile_commands, *builds, *sources,
+                         uc.sha256_bytes(chain.encode("utf-8"))])
+        return "folder" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:18]
 
     def _drop_brain_declarations(self, s: "RunState") -> bool:
         """A1-PL14, ARCH-21a: a Stage A round changed nothing while declarations the brain proposed are in the plan:
@@ -1890,6 +2218,8 @@ class Journal:
         self.keys: set[str] = set()                  # cause signatures seen: a new one is progress [LA-7]
         self.by_key: dict[str, uc.JournalEntry] = {}
         self.just_closed: list[uc.JournalEntry] = []                 # closed by the last iteration [LA-8]
+        self.earlier: dict[str, list[str]] = {}       # rows of earlier runs of unchanged functions [CA-8]
+        self.earlier_rows: list[dict[str, Any]] = []
 
     # ---------------------------------------------------------------- recording
     @staticmethod
@@ -2050,18 +2380,28 @@ class Journal:
         return f"{name}: {re.sub(r'/[*].*?[*]/', '', body)[:260]}"
 
     # ---------------------------------------------------------------- the next attempt [LA-4]
+    @staticmethod
+    def row(e: uc.JournalEntry) -> str:
+        return (f"- {', '.join(e.items[:6])} (attempt {e.attempt}, {e.brain or e.strategy}): tried {e.tried[:220]} "
+                f"-> {e.result[:260]} -> cause: {uc.CAUSE_TEXT[e.cause]}"
+                + (f" -> fix: {e.next_action}" if e.next_action else ""))
+
     def excerpt(self, limit_chars: int = 4500) -> dict[str, str]:
         out: dict[str, list[str]] = {}
         for e in reversed(self.entries):
             if e.status != "open" or e.final_status:
                 continue
-            row = (f"- {', '.join(e.items[:6])} (attempt {e.attempt}, {e.brain or e.strategy}): tried {e.tried[:220]} "
-                   f"-> {e.result[:260]} -> cause: {uc.CAUSE_TEXT[e.cause]}"
-                   + (f" -> fix: {e.next_action}" if e.next_action else ""))
+            row = self.row(e)
             rows = out.setdefault(e.function, [])
             if sum(len(r) for r in rows) + len(row) <= limit_chars:
                 rows.append(row)
-        return {fn: "\n".join(rows) for fn, rows in out.items()}
+        for fn, earlier in self.earlier.items():      # what missed in an earlier run of the same code [CA-8]
+            rows = out.setdefault(fn, [])
+            for row in earlier:
+                row = "- earlier run: " + row.removeprefix("- ")
+                if row not in rows and sum(len(r) for r in rows) + len(row) <= limit_chars:
+                    rows.append(row)
+        return {fn: "\n".join(rows) for fn, rows in out.items() if rows}
 
     # ---------------------------------------------------------------- final status [LA-6]
     def cause_of(self, item: str) -> uc.JournalEntry | None:
@@ -2166,6 +2506,8 @@ class RunState:
         self.unmeasured = 0                                   # iterations in a row not measured [A3-60b]
         self.declarations_dropped: list[str] = []             # the brain's declarations that did not build [A1-PL14]
         self.replaced_dependencies: dict[str, uc.Dependency] = {}   # what a proposed declaration replaced
+        self.stage_a_cached = False                   # Stage A started from a stored result [CA-10]
+        self.stage_a_original: tuple[Any, Any] = (None, None)
         self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
         self.journal = Journal(req.sut_file, out / "journal")                          # LA-2
         self.quarantine: dict[str, tuple[str, str]] = {}      # test -> (compiler message, source) of this iteration
@@ -2523,6 +2865,7 @@ def report(r: uc.PipelineResult) -> str:
                          ("Trials of answers refused only by predictions [NC-7]", r.trials),
                          ("Recipes [NC-2, NC-3]", r.recipes),
                          ("Brain calls and tokens per step", r.token_use),
+                         ("What the caches saved [CA-1]", r.cache_use),
                          ("Knowledge packs used", r.knowledge_packs),
                          ("Coverage-guided search", r.fuzzing), ("Lessons [LA-8]", r.lessons),
                          ("Open items and notes", r.open_items),
@@ -3805,6 +4148,7 @@ def main() -> int:
     run.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
     run.add_argument("--interactive", action="store_true", default=None,
                      help="ask at a decision point (source change or requirement needed) [LA-9]")
+    run.add_argument("--no-cache", action="store_true", help="no cache of earlier work in this run [CA-1]")
     batch = sub.add_parser("batch", help="Several folders or repositories one after another, on one viewer page "
                                          "[VIEW-12a].")
     batch.add_argument("--repo", action="append", required=True, help="a folder or repository link; repeatable")
@@ -3815,6 +4159,7 @@ def main() -> int:
     batch.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     batch.add_argument("--view", dest="view", action="store_true", default=None, help="live viewer on [VIEW-3]")
     batch.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
+    batch.add_argument("--no-cache", action="store_true", help="no cache of earlier work in this run [CA-1]")
     bench = sub.add_parser("benchmark", help="Seeded-defect benchmark on the pilots [ORC-16].")
     bench.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     bench.add_argument("--case", action="append", help="run only these case ids")
@@ -3859,6 +4204,9 @@ def main() -> int:
             return asyncio.run(check_setup(args.config))
         if args.command in ("run", "batch", "benchmark", "calibrate"):
             keep_awake()                                                                     # ORC-36
+        # CA-1: the brain being measured answers itself - calibration and benchmark never use a cache
+        if args.command in ("benchmark", "calibrate") or getattr(args, "no_cache", False):
+            os.environ["UT_CACHE"] = "off"
         if args.command == "batch":
             return run_batch(args)
         if args.command == "calibrate":

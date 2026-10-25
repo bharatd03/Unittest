@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -619,6 +619,7 @@ class CompilationConfig(BaseModel):
     search_seed: int = 1               # its fixed pseudo-random seed [A3-FZ10]
     search_input_timeout: int = 5      # seconds one input may run before it counts as a hang [A3-FZ10]
     search_restarts: int = 20          # ut_search starts again after a crash, at most this often [A3-FZ12]
+    split_suite_tests: int = 200       # a suite with more tests is compiled in parts; 0: always one file [CA-14]
     flag_rounds: int = 2               # A3-BD12, ORC-7
     flag_context_chars: int = 12_000   # build files given to the brain [A3-BD11]
     repair_rounds: int = 2             # brain repairs of the generated files per build [A3-CL14, ORC-7]
@@ -743,6 +744,115 @@ def _in_parallel(work: list[Any], count: int) -> list[Any]:
         return [quiet(job) for job in work]
     with ThreadPoolExecutor(max_workers=min(count, len(work)), thread_name_prefix="ut-run") as pool:
         return list(pool.map(quiet, work))
+
+
+# ---------------------------------------------------------------- CA-14: a large suite compiled in parts
+_MASK = re.compile(r"(?P<pp>^[ \t]*\#(?:[^\n\\]|\\.)*)|(?P<lc>//[^\n]*)|(?P<bc>/\*.*?(?:\*/|\Z))"
+                   r"|(?P<str>\"(?:[^\"\\\n]|\\.)*\"?)|(?P<chr>'(?:[^'\\\n]|\\.)*'?)", re.M | re.S)
+
+
+def _masked(text: str) -> str:
+    """The text with the contents of comments, string and character literals blanked (their quotes kept) and every
+    preprocessor line (with its continuations) written as '#' - same length, same line breaks."""
+    def mask(m: re.Match) -> str:
+        piece, kind = m.group(0), m.lastgroup
+        if kind == "pp":
+            return re.sub(r"[^\n]", "#", piece)
+        if kind in ("lc", "bc"):
+            return re.sub(r"[^\n]", " ", piece)
+        return piece[0] + re.sub(r"[^\n]", " ", piece[1:-1]) + piece[-1] if len(piece) > 1 else piece
+    return _MASK.sub(mask, text)
+
+
+def _closing(masked: str, at: int) -> int:
+    """The position of the brace that closes the one at ``at``; -1 when none does."""
+    depth = 0
+    for b in _BRACES.finditer(masked, at):
+        depth += 1 if b.group(0) == "{" else -1
+        if depth == 0:
+            return b.start()
+    return -1
+
+
+_BRACES = re.compile(r"[{}]")
+_PROTOTYPE = re.compile(r"^(?!.*\(\s*[*&^])[^=(){};]*\b[\w:~]+\s*\([^;{}=]*\)\s*(?:const\s*)?(?:noexcept\s*)?"
+                        r"(?:__attribute__\s*\(\(.*\)\)\s*)?;$", re.S)
+_DECLARATION = re.compile(r"^(?:typedef|using|static_assert|_Static_assert)\b|^extern\b(?!\s*\")[^=]*;$"
+                          r"|^(?:struct|union|enum|class)\s+[\w:]+\s*;$", re.S)
+_TYPE_BLOCK = re.compile(r"^(?:typedef\s+)?(?:struct|union|enum(?:\s+class)?|class)\b[^(=;]*$", re.S)
+_FUNCTION_HEAD = re.compile(r"^(?!\s*(?:namespace|extern)\b)[^=;{}]*\b[\w:~]+\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?"
+                            r"(?:override\s*)?(?:final\s*)?$", re.S)
+
+
+def _prologue_problem(masked: str) -> str:
+    """CA-14: why the text before the first test cannot be compiled once per part - it defines a variable, or a
+    function with a static variable, or anything not recognised as a declaration; "" when it can."""
+    i, n, start = 0, len(masked), 0
+    stops = re.compile(r"[{;]")
+    while True:
+        hit = stops.search(masked, i)
+        if hit is None:
+            break
+        i = hit.start()
+        if hit.group(0) == ";":
+            stmt = " ".join(masked[start:i + 1].replace("#", " ").split())
+            if stmt != ";" and not _DECLARATION.match(stmt) and not _PROTOTYPE.match(stmt):
+                return f"a definition that may be a variable ({stmt[:60]})"
+            i = start = i + 1
+            continue
+        head = " ".join(masked[start:i].replace("#", " ").split())
+        k = _closing(masked, i)
+        if k < 0:
+            return "unbalanced braces"
+        if _FUNCTION_HEAD.match(head):
+            if re.search(r"\bstatic\b", masked[i:k + 1]):
+                return f"a helper function with a static variable ({head[:60]})"
+            i = start = k + 1
+            continue
+        if not _TYPE_BLOCK.match(head):
+            return f"a block that is not a type or function ({head[:60]})"
+        end = masked.find(";", k)                           # the declarators after a type, if any
+        if end < 0:
+            return "a type without its closing semicolon"
+        rest = " ".join(masked[k + 1:end].replace("#", " ").split())
+        if rest and not head.startswith("typedef"):
+            return f"a variable of a type defined there ({rest[:60]})"
+        i = start = end + 1
+    if masked[start:].replace("#", " ").strip():
+        return "text after the last declaration"
+    return ""
+
+
+def split_suite(text: str, min_tests: int) -> tuple[str, list[tuple[str, int, str]], str, int] | None:
+    """CA-14: (the text before the first test, [(test, its first line, its text)], the table of tests, the table's
+    first line) of a suite whose parts can be compiled apart; None when it has min_tests tests or fewer, or anything
+    but comments between its tests, or a text before its first test that defines anything but declarations."""
+    masked = _masked(text)
+    starts = list(re.finditer(r"^[ \t]*UT_TEST\s*\(\s*(\w+)\s*\)", masked, re.M))
+    begin = masked.find("UT_SUITE_BEGIN")
+    if len(starts) <= max(1, min_tests) or begin < 0 or begin < starts[-1].start():
+        return None
+    finish = masked.find("UT_SUITE_END", begin)
+    if finish < 0 or masked[finish + len("UT_SUITE_END"):].strip():
+        return None
+    tests = []
+    line, at = 1, 0
+    for k, m in enumerate(starts):
+        brace = masked.find("{", m.end())
+        if brace < 0 or masked[m.end():brace].strip():
+            return None
+        j = _closing(masked, brace)
+        nxt = starts[k + 1].start() if k + 1 < len(starts) else begin
+        if j < 0 or j >= nxt or masked[j + 1:nxt].strip():         # only comments up to the next test
+            return None
+        line += text.count("\n", at, m.start())
+        at = m.start()
+        tests.append((m.group(1), line, text[m.start():j + 1]))
+    names = [name for name, _, _ in tests]
+    cases = re.findall(r"UT_CASE\s*\(\s*(\w+)\s*\)", masked[begin:finish])
+    if len(set(names)) != len(names) or not set(cases) <= set(names) or _prologue_problem(masked[:starts[0].start()]):
+        return None
+    return text[:starts[0].start()], tests, text[begin:finish + len("UT_SUITE_END")], line + text.count("\n", at, begin)
 
 
 # Windows has no fork: with function-local statics every test runs in a run of its own [A3-45c]
@@ -2454,6 +2564,7 @@ class CompilationAgent(ba.AgentCore):
         self._fault_baseline: dict[str, dict[str, bool]] = {}    # original-side mutant results [COV-19]
         self._host: dict[str, dict[str, list[str]]] = {}          # staged copy -> host adaptations [A3-HW2, HW3]
         self._unknown_outcomes: list[str] = []                    # NC-12, per execution
+        self.run_caches: dict[str, uc.RunCache | None] = {}       # CA-3, CA-5: set by build_agent
         super().__init__(settings, router=router)
 
     # ---------------------------------------------------------------- tools
@@ -2928,8 +3039,9 @@ class CompilationAgent(ba.AgentCore):
                 passed = [n for n in passed if n in wanted]
             if self.cfg.minimize_tests and 0 < len(passed) <= self.cfg.max_minimize_tests:
                 try:
-                    items = self._per_test_items(build["binary"], run_dir, repo, layout, passed, chain)
                     suite = "\n".join(a.content for a in req.bundle.actions if a.role == "testsuite") if req.bundle else ""
+                    items = self._per_test_items(build["binary"], run_dir, repo, layout, passed, chain,
+                                                 uc.test_sources(suite), self._build_context(req, layout, chain))
                     problem = self._per_test_problem(items, passed, uc.test_sources(suite), req.measure_tests is None or
                                                      set(passed) >= {t.name for t in tests if t.status == "passed"},
                                                      chain, build, run_dir, repo, layout)
@@ -3265,6 +3377,7 @@ class CompilationAgent(ba.AgentCore):
             units.append((str(run_dir / "harness" / "ut_empty_suite.c"), "harness", False, c_flags))
         diagnostics, objects, commands, compiled, mcdc_notes = [], [], [], True, []
         failed_output: list[str] = []                 # the tools' own messages of every failed step [A3-29d]
+        suite_path = next((a.path for a in actions if a.role == "testsuite"), "")
         sut_object = None
         for index, (path, role, instrument, flags) in enumerate(units):
             src = Path(path) if Path(path).is_absolute() else repo / path
@@ -3277,7 +3390,23 @@ class CompilationAgent(ba.AgentCore):
                    *chain.compile_flags(cpp_unit), *flags,
                    *self.cfg.extra_flags, *(chain.coverage_flags() if instrument else [])]
             commands.append(cmd)
-            code, text = _run(cmd, repo, self.cfg.compile_timeout, chain.env())
+            if role == "test" and suite_path and path == suite_path:                         # CA-14
+                parts = None
+                with contextlib.suppress(Exception):           # in parts or as one file: the same program [CA-1]
+                    parts = self._suite_parts(src, cmd, out, index, cpp_unit, layout, repo, run_dir, chain)
+                if parts is not None:
+                    objects.extend(parts)
+                    continue
+            objects_cache = self.run_caches.get("objects") if not instrument else None      # CA-5
+            entry = self._object_key(objects_cache, cmd, src, out, run_dir, chain) if objects_cache else ""
+            if entry and self._cached_object(objects_cache, entry, out, run_dir):
+                objects.append(out)
+                continue
+            depfile = out.with_suffix(".d")
+            code, text = _run(cmd + (["-MD", "-MF", str(depfile)] if entry else []), repo, self.cfg.compile_timeout,
+                              chain.env())
+            if code == 0 and entry:
+                self._store_object(objects_cache, entry, out, depfile, run_dir, repo)
             if code in (-126, -127):
                 diagnostics.append(uc.Diagnostic(message=text, category="tool_missing", role="build"))
                 compiled = False
@@ -3321,6 +3450,161 @@ class CompilationAgent(ba.AgentCore):
                 "failed_output": failed_output,
                 "mcdc_notes": mcdc_notes, "objects": objects, "commands": commands, "obj_dir": obj,
                 "sut_object": sut_object}
+
+    # ---------------------------------------------------------------- CA-14: a large suite in parts
+    PART_HEAD = ("/* part of the test suite, written for this build only by agent_unittest_compilation [CA-14] */\n"
+                 "#undef UT_TEST\n#define UT_TEST(name) void ut_part_##name(void)\n")
+
+    @staticmethod
+    def _part_groups(tests: list[tuple[str, int, str]], layout: uc.LayoutProfile) -> dict[str, list[int]]:
+        """The tests by the SUT function each calls first (its accessor of a static function included)."""
+        names: dict[str, str] = {}
+        for fn in layout.functions:
+            names.setdefault(fn.name.split("::")[-1], fn.qualified_name or fn.name)
+            names.setdefault("ut_static_" + re.sub(r"\W", "_", fn.name.replace("(anonymous namespace)::", "")),
+                             fn.qualified_name or fn.name)
+        groups: dict[str, list[int]] = {}
+        for k, (_, _, body) in enumerate(tests):
+            first = next((names[m.group(1)] for m in re.finditer(r"\b(\w+)\s*\(", body[body.find("{"):])
+                          if m.group(1) in names), "")
+            groups.setdefault(first, []).append(k)
+        return groups
+
+    def _suite_parts(self, src: Path, cmd: list[str], out: Path, index: int, cpp_unit: bool,
+                     layout: uc.LayoutProfile, repo: Path, run_dir: Path, chain: "Toolchain") -> list[Path] | None:
+        """CA-14: the objects of a large suite compiled in parts at the same time - an unchanged part's object from
+        CA-5 - or None: the suite is compiled as one file (also when any part does not compile, so the compiler's
+        messages are those of the suite)."""
+        limit = int(self.cfg.split_suite_tests or 0)
+        if limit <= 0:
+            return None
+        text = src.read_text(encoding="utf-8", errors="replace")
+        split = split_suite(text, limit)
+        if split is None:
+            return None
+        prologue, tests, table, table_line = split
+        folder = run_dir / "suite_parts"
+        folder.mkdir(parents=True, exist_ok=True)
+        header = folder / ("ut_suite_prologue.hpp" if cpp_unit else "ut_suite_prologue.h")
+        header.write_text(prologue, encoding="utf-8")
+        where = '"' + str(src).replace("\\", "\\\\").replace('"', '\\"') + '"'       # __FILE__ of the one-file build
+        count = 1
+        while count < 32 and len(tests) / count > 500:                 # a power of two: stable across rounds
+            count *= 2
+        count = max(2, count)
+        buckets: dict[int, list[int]] = {}
+        for group, members in self._part_groups(tests, layout).items():
+            buckets.setdefault(int(hashlib.sha1(group.encode("utf-8")).hexdigest(), 16) % count, []).extend(members)
+        files = []
+        for k in sorted(buckets):
+            body = "".join(f"#line {tests[i][1]} {where}\n{tests[i][2]}\n" for i in sorted(buckets[k]))
+            files.append(folder / f"part_{k:02d}{src.suffix}")
+            files[-1].write_text(self.PART_HEAD + body, encoding="utf-8")
+        files.append(folder / f"part_table{src.suffix}")
+        files[-1].write_text(self.PART_HEAD + "#undef UT_CASE\n#define UT_CASE(name) { #name, ut_part_##name },\n"
+                             + "".join(f"void ut_part_{name}(void);\n" for name, _, _ in tests)
+                             + f"#line {table_line} {where}\n{table}\n", encoding="utf-8")
+        at = cmd.index(str(src))
+        flags = cmd[at + 3:]                                              # after "<source> -o <object>"
+        cache = self.run_caches.get("objects")
+        objects, todo = [], []
+        for f in files:
+            obj = out.with_name(f"{index:02d}_{f.stem}.o")
+            command = [cmd[0], *cmd[1:at], str(f), "-o", str(obj), *flags, f"-iquote{src.parent}", "-include",
+                       str(header)]
+            key = self._object_key(cache, command, f, obj, run_dir, chain) if cache is not None else ""
+            objects.append(obj)
+            if not (key and self._cached_object(cache, key, obj, run_dir)):
+                todo.append((command, key, obj))
+        if todo:
+            pch = [cmd[0], *[c for c in cmd[1:at] if c != "-c"], "-x", "c++-header" if cpp_unit else "c-header", str(header), "-o",
+                   str(header) + ".pch", *flags, f"-iquote{src.parent}"]
+            code, _ = _run(pch, repo, self.cfg.compile_timeout, chain.env())     # without it: the text is read
+            if code != 0:
+                with contextlib.suppress(OSError):
+                    Path(str(header) + ".pch").unlink()
+            results = _in_parallel([lambda c=c, k=k, o=o: _run(c + (["-MD", "-MF", str(o.with_suffix(".d"))] if k else []),
+                                                                repo, self.cfg.compile_timeout, chain.env())
+                                    for c, k, o in todo], max(1, self.cfg.parallel_runs))
+            if any(code != 0 for code, _ in results):
+                return None
+            for (_, key, obj), _ in zip(todo, results):
+                if key:
+                    self._store_object(cache, key, obj, obj.with_suffix(".d"), run_dir, repo)
+        uc.cache_log("suite_parts", True)
+        ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
+                      data={"program": src.name, "outcome": "ok", "runs": len(todo)},
+                      summary=f"UT-Compilation compiled {src.name} in {len(files)} parts, {len(files) - len(todo)} "
+                              f"of them unchanged [CA-14]")
+        return objects
+
+    # ---------------------------------------------------------------- CA-5: objects of the files not measured
+    @staticmethod
+    def _neutral(text: str, run_dir: Path) -> str:
+        """A path or command without the run's own folder (the same in every run)."""
+        forms = {str(run_dir.resolve()), str(run_dir), str(run_dir.resolve()).replace("\\", "/")}
+        forms |= {f.replace("\\", "\\\\") for f in forms}             # as a C string (#line of CA-14)
+        for form in sorted(forms, key=len, reverse=True):
+            text = text.replace(form, "<run>")
+        return text
+
+    def _content_hash(self, path: Path, run_dir: Path) -> str:
+        """CA-5: a file's hash without the run's folder in it (the #line marks of a suite in parts, CA-14)."""
+        data = path.read_bytes()
+        if str(run_dir.name).encode() in data:
+            data = self._neutral(data.decode("utf-8", "surrogateescape"), run_dir).encode("utf-8", "surrogateescape")
+        return uc.sha256_bytes(data)
+
+    def _object_key(self, cache: uc.RunCache, cmd: list[str], src: Path, out: Path, run_dir: Path,
+                    chain: "Toolchain") -> str:
+        try:
+            source = self._content_hash(src, run_dir)
+        except OSError:
+            return ""
+        command = [self._neutral(c, run_dir) for c in cmd if c != str(out)]
+        return cache.key("objects", str(chain.version), *command, source)
+
+    def _cached_object(self, cache: uc.RunCache, key: str, out: Path, run_dir: Path) -> bool:
+        """The object of an unchanged command, source and headers (the compiler's dependency list) [CA-5]."""
+        manifest = cache.get_json(key, count=False)
+        found = isinstance(manifest, dict) and isinstance(manifest.get("deps"), dict) and bool(manifest.get("object"))
+        root = str(run_dir.resolve())
+        for name, digest in (manifest["deps"].items() if found else ()):
+            path = Path(name.replace("<run>", root, 1))
+            try:
+                if self._content_hash(path, run_dir) != digest:
+                    found = False                          # a header changed: the object is out of date
+                    break
+            except OSError:
+                found = False
+                break
+        hit = found and cache.get_file(str(manifest["object"]), out, ".o", count=False)
+        cache._count(hit)
+        return hit
+
+    def _store_object(self, cache: uc.RunCache, key: str, out: Path, depfile: Path, run_dir: Path, repo: Path) -> None:
+        try:
+            text = depfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        text = text.replace("\\\r\n", " ").replace("\\\n", " ")
+        rest = text.split(": ", 1)[1] if ": " in text else ""
+        root = run_dir.resolve()
+        deps = {}
+        for raw in re.findall(r"(?:\\ |\S)+", rest):
+            name = raw.replace("\\ ", " ")
+            path = Path(name) if Path(name).is_absolute() else repo / name
+            try:
+                path = path.resolve()
+                path.relative_to(root)                      # only the run's own files; the compiler's are in the key
+                deps[self._neutral(str(path), run_dir)] = self._content_hash(path, run_dir)
+            except (OSError, ValueError):
+                continue
+        if not deps:
+            return
+        object_key = cache.key("object-file", key, str(sorted(deps.items())))
+        cache.put_file(object_key, out, ".o")
+        cache.put_json(key, {"deps": deps, "object": object_key})
 
     def _quarantine(self, layout: uc.LayoutProfile, req: uc.VerifyRequest, repo: Path, run_dir: Path,
                     chain: Toolchain, build: dict[str, Any]) -> tuple[dict[str, Any], list[uc.Failure]]:
@@ -3557,15 +3841,35 @@ class CompilationAgent(ba.AgentCore):
                     f"({', '.join(missed[:4])})")
         return ""
 
+    def _build_context(self, req: uc.VerifyRequest, layout: uc.LayoutProfile, chain: "Toolchain") -> str:
+        """CA-3: everything of a build besides the test itself that decides what a test reaches - the SUT's version,
+        the other generated files, the harness, the compiler and the flags."""
+        others = sorted((a.path, uc.sha256_bytes(a.content.encode("utf-8"))) for a in
+                        (req.bundle.actions if req.bundle else []) if a.role != "testsuite")
+        return "|".join([layout.sut_sha256, str(others), uc.HARNESS_VERSION, chain.cc, chain.cxx, str(chain.version),
+                         " ".join(layout.build.sut_flags if layout.build else []), " ".join(self.cfg.extra_flags),
+                         str(self.cfg.stub_call_budget), str(self.cfg.test_time_limit_ms)])
+
     def _per_test_items(self, binary: Path, run_dir: Path, repo: Path, layout: uc.LayoutProfile,
-                        names: list[str], chain: Toolchain) -> dict[str, list[str]]:
+                        names: list[str], chain: Toolchain, sources: dict[str, str] | None = None,
+                        context: str = "") -> dict[str, list[str]]:
         """What each test covers on its own: covered items plus the MC/DC vectors it executes [A3-OBS5].
-        Keeping every item and vector keeps LC, SC, BC, DC and MC/DC unchanged."""
+        Keeping every item and vector keeps LC, SC, BC, DC and MC/DC unchanged. A test whose text and build are known
+        is taken from the cache, not run alone again [CA-3]."""
         base = run_dir / "per_test"
         base.mkdir(exist_ok=True)
         out = {}
         self._per_test_runs: dict[str, str] = {}
         started = time.monotonic()
+        cache = self.run_caches.get("test_coverage") if sources is not None and context else None
+        keys = {n: cache.key("test_coverage", context, sources.get(n, "")) for n in names if n in (sources or {})} \
+            if cache is not None else {}
+        for name in list(keys):
+            stored = cache.get_json(keys[name])
+            if isinstance(stored, list):
+                out[name] = [str(x) for x in stored]
+                self._per_test_runs[name] = "measured alone in an earlier run, taken from the cache [CA-3]"
+        names = [n for n in names if n not in out]
 
         def one(index: int, name: str):
             raw = base / f"t{index}.profraw"
@@ -3586,6 +3890,8 @@ class CompilationAgent(ba.AgentCore):
             self._per_test_runs[name] = how
             if items is not None:
                 out[name] = items
+                if cache is not None and code == 0 and name in keys:                           # CA-3
+                    cache.put_json(keys[name], items)
         if names:
             ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
                           data={"program": binary.name, "outcome": "tests_failed" if failed else "ok",
@@ -4079,11 +4385,13 @@ class CompilationAgent(ba.AgentCore):
         for k, line in enumerate(list(result.unknown_outcomes[:3])):
             name = line.split(":", 1)[0]
             try:
-                answer = (await self.decide([uc.part("outcome", line)], OUTCOME_QUESTION, step="A3.outcome",
-                                            project=req.layout.repo_root,
-                                            need=ba.OutputNeed(items=1, tokens_per_item=60, overhead=200)))["outcome"]
+                answer, brain, cached = await self._analysed(
+                    "A3.outcome", req.layout, uc.neutral_failure(line, result.run_dir), set(OUTCOME_QUESTION["outcome"].criteria),
+                    lambda: self.decide([uc.part("outcome", line)], OUTCOME_QUESTION, step="A3.outcome",
+                                        project=req.layout.repo_root,
+                                        need=ba.OutputNeed(items=1, tokens_per_item=60, overhead=200)), "outcome")
                 choice, p = answer["choice"], answer["probabilities"][answer["choice"]]
-                decided = f"decided by the brain {self.last_brain.get('brain', '')} (p={p:.2f})"
+                decided = f"decided by the brain {brain} (p={p:.2f}{cached})"
             except ba.AgentFault as exc:
                 choice, decided = "undetermined", f"no brain decision ({exc.code})"
             result.unknown_outcomes[k] = f"{line} -> {choice}, {decided} [NC-12]"[:600]
@@ -4114,9 +4422,12 @@ class CompilationAgent(ba.AgentCore):
                                 "evidence": failure.evidence, "sut_source": excerpt,
                                 "state_the_function_reads": reads, "how_the_test_sets_that_state": sets})   # A3-156a
             try:
-                answer = (await self.decide([uc.part("failure", state)], CLASSIFY_QUESTION, step="A3.root_cause",
-                                            project=req.layout.repo_root,
-                                            need=ba.OutputNeed(items=1, tokens_per_item=80, overhead=250)))["root_cause"]
+                answer, brain, cached = await self._analysed(
+                    "A3.root_cause", req.layout, uc.neutral_failure(state, result.run_dir, req.layout.repo_root),
+                    set(uc.ROUTES), lambda: self.decide([uc.part("failure", state)], CLASSIFY_QUESTION,
+                                                        step="A3.root_cause", project=req.layout.repo_root,
+                                                        need=ba.OutputNeed(items=1, tokens_per_item=80, overhead=250)),
+                    "root_cause")
             except ba.AgentFault as exc:
                 LOG.warning("Classification by the brain unavailable (%s); undetermined.", exc.code)
                 failure.evidence.append(f"brain unavailable: {exc.code}")
@@ -4126,8 +4437,26 @@ class CompilationAgent(ba.AgentCore):
                 choice = "undetermined"                    # A4-23b: not on the brain's word alone
             failure.classification, failure.confidence = choice, p
             failure.route = uc.ROUTES[choice]
-            failure.evidence.append(f"brain: {self.last_brain.get('brain', '')} p={p:.2f}")
+            failure.evidence.append(f"brain: {brain} p={p:.2f}{cached}")
         return result
+
+    async def _analysed(self, step: str, layout: uc.LayoutProfile, facts: str, choices: set[str], ask, question: str
+                        ) -> tuple[dict[str, Any], str, str]:
+        """CA-9: a brain's decision on a failure - from the store when the same failure of the same test of the same
+        SUT was decided by the same brains; asked and stored otherwise. (answer, brain, " - from the cache" or "")."""
+        cache = self.run_caches.get("failure_analysis")
+        key = cache.key(step, await uc.brains_of(self), layout.sut_sha256, facts) if cache is not None else ""
+        stored = cache.get_json(key) if cache is not None else None
+        if isinstance(stored, dict) and isinstance(stored.get("answer"), dict):
+            answer = stored["answer"]
+            probabilities = answer.get("probabilities")
+            if answer.get("choice") in choices and isinstance(probabilities, dict) and \
+                    isinstance(probabilities.get(answer["choice"]), (int, float)):
+                return answer, str(stored.get("brain", "")), " - from the cache [CA-9]"
+        answer = (await ask())[question]
+        if cache is not None:
+            cache.put_json(key, {"answer": answer, "brain": self.last_brain.get("brain", "")})
+        return answer, self.last_brain.get("brain", ""), ""
 
     @staticmethod
     def _excerpt(path: Path, t: Any, limit: int = 6000) -> str:
@@ -4229,6 +4558,9 @@ class CompilationAgent(ba.AgentCore):
             seconds = max(1, req.seconds)
             for byte in (0, 1, 255):                         # full-length seeds: every parameter is decoded
                 (corpus / f"seed_{byte}").write_bytes(bytes([byte]) * (plan.size + 8))
+            corpus_key = self._corpus_key(source, engine, repo)
+            with contextlib.suppress(Exception):                          # a cache never fails a run [CA-1]
+                self._seed_corpus(corpus, corpus_key)                                          # CA-13
             if engine == "libFuzzer":
                 problem, text = self._libfuzzer(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
                                                 corpus, seconds, plan, repo)
@@ -4239,6 +4571,8 @@ class CompilationAgent(ba.AgentCore):
                 result.unsupported.append(f"{fn.qualified_name}: {problem}")
                 continue
             (d / "fuzz.log").write_text(text, encoding="utf-8")
+            with contextlib.suppress(Exception):
+                self._keep_corpus(corpus, corpus_key)                                          # CA-13
             m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text)
             forked = re.findall(r"^#(\d+):\s+cov:", text, re.M)                  # -fork=1 prints progress only
             result.executions += int(m.group(1)) if m else int(forked[-1]) if forked else 0
@@ -4276,6 +4610,51 @@ class CompilationAgent(ba.AgentCore):
         result.reason = (f"{len(result.inputs)} input(s) reach uncovered items; {result.executions} executions"
                          if result.functions else "no function could be fuzzed")
         return result
+
+    # ---------------------------------------------------------------- CA-13: the search corpus across runs
+    CORPUS_INPUTS, CORPUS_INPUT_BYTES = 256, 64 * 1024
+    BASE_SEEDS = {"seed_0", "seed_1", "seed_255"}
+
+    def _corpus_key(self, target: str, engine: str, repo: Path) -> str:
+        cache = self.run_caches.get("search_corpus")
+        return cache.key("search_corpus", engine, uc.unrooted(target, str(repo))) if cache is not None else ""
+
+    def _seed_corpus(self, corpus: Path, key: str) -> int:
+        """The inputs an earlier search of the same target kept: seeds, replayed and measured first (A3-FZ4)."""
+        import zlib
+        data = self.run_caches["search_corpus"].get_bytes(key, ".zz") if key else None
+        if not data:
+            return 0
+        raw, at, count = zlib.decompress(data), 0, 0
+        limit = min(self.CORPUS_INPUTS, max(1, self.cfg.max_fuzz_replays // 2))    # room for new inputs [A3-FZ4]
+        while at + 4 <= len(raw) and count < limit:
+            size = int.from_bytes(raw[at:at + 4], "little")
+            item = raw[at + 4: at + 4 + size]
+            at += 4 + size
+            if len(item) != size:
+                break
+            (corpus / f"seed_c{hashlib.sha1(item).hexdigest()[:16]}").write_bytes(item)
+            count += 1
+        return count
+
+    def _keep_corpus(self, corpus: Path, key: str) -> None:
+        """The inputs this search kept (not the three fixed seeds), newest first, with the earlier run's."""
+        import zlib
+        if not key:
+            return
+        files = sorted((p for p in corpus.iterdir() if p.is_file() and p.name not in self.BASE_SEEDS),
+                       key=lambda p: (p.name.startswith("seed_c"), -p.stat().st_mtime, p.name))
+        items, seen = [], set()
+        for path in files:
+            item = path.read_bytes()
+            digest = hashlib.sha1(item).digest()
+            if len(item) <= self.CORPUS_INPUT_BYTES and digest not in seen:
+                seen.add(digest)
+                items.append(item)
+        items = items[: self.CORPUS_INPUTS]                       # this search's newest, then the earlier ones
+        if items:
+            blob = b"".join(len(x).to_bytes(4, "little") + x for x in items)
+            self.run_caches["search_corpus"].put_bytes(key, zlib.compress(blob, 6), ".zz")
 
     def _replay_order(self, inputs: list[Path], d: Path, chain: "Toolchain") -> list[Path]:
         """A3-FZ4: more inputs than the replay limit - the seeds first, then the inputs libFuzzer's merge (with value
@@ -4440,7 +4819,48 @@ class CompilationAgent(ba.AgentCore):
                 break
         return out[: self.cfg.max_mutants]
 
+    # ---------------------------------------------------------------- CA-12: mutation results
+    def _mutation_context(self, layout: uc.LayoutProfile) -> str:
+        """Besides the request: what decides a mutant's outcome - the headers and real dependencies the build reads,
+        the harness, the compiler and the mutant settings."""
+        chain = self.toolchain()
+        root = Path(layout.repo_root)
+        reals = [f"{rel}={uc.sha256_bytes((root / rel).read_bytes())}"
+                 for rel in (layout.dependencies.real_sources if layout.dependencies else []) if (root / rel).is_file()]
+        return "|".join([uc.sha256_bytes(uc.headers_text(layout).encode("utf-8")), *reals, uc.HARNESS_VERSION,
+                         chain.cc, chain.cxx, str(chain.version), " ".join(self.cfg.extra_flags),
+                         str(self.MUTATIONS), str(self.cfg.max_mutants), str(self.cfg.stub_call_budget),
+                         str(self.cfg.test_time_limit_ms), str(self.cfg.mutant_run_timeout)])
+
+    def _mutations_cached(self, kind: str, req: Any, work: Callable[[Any], Any], decisive: tuple[str, ...]) -> Any:
+        """CA-12: an oracle-strength or fault-detection check computed from the same inputs is not run again; only a
+        decided result is stored (a check cut by its time limit is not)."""
+        cache = self.run_caches.get("mutations")
+        key = ""
+        if cache is not None:
+            with contextlib.suppress(Exception):
+                request = req.model_dump(mode="json", exclude={"suggestion_id"})
+                key = cache.key("mutations", kind, self._mutation_context(req.layout),
+                                uc.unrooted(json.dumps(request, sort_keys=True), req.layout.repo_root))
+        stored = cache.get_json(key) if key else None
+        if isinstance(stored, dict):
+            model = uc.OracleResult if kind == "oracle" else uc.FaultCheckResult
+            with contextlib.suppress(Exception):
+                result = model.model_validate(stored)
+                if kind == "fault":
+                    result.suggestion_id = req.suggestion_id
+                return result
+        result = work(req)
+        if key and result.decision in decisive:
+            with contextlib.suppress(Exception):
+                cache.put_json(key, result.model_dump(mode="json"))
+        return result
+
     def oracle_check(self, req: uc.OracleRequest) -> uc.OracleResult:
+        """A3-85a .. A3-85k; an identical check of an earlier run or round comes from the store [CA-12]."""
+        return self._mutations_cached("oracle", req, self._oracle_check, ("accepted", "oracle_weakening"))
+
+    def _oracle_check(self, req: uc.OracleRequest) -> uc.OracleResult:
         fn = next((f for f in req.layout.functions if f.name == req.function), None)
         if fn is None:
             return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", reason="unknown function")
@@ -4518,6 +4938,10 @@ class CompilationAgent(ba.AgentCore):
         return await asyncio.to_thread(self.fault_check, payload)
 
     def fault_check(self, req: uc.FaultCheckRequest) -> uc.FaultCheckResult:
+        """COV-14 .. COV-19; the same check of an earlier run comes from the store [CA-12]."""
+        return self._mutations_cached("fault", req, self._fault_check, ("kept", "weakened", "not_applicable"))
+
+    def _fault_check(self, req: uc.FaultCheckRequest) -> uc.FaultCheckResult:
         """COV-14 .. COV-19: the compared mutants (same operator, same place, on a line the suggestion left
         unchanged) are run against the tests that pass on the trial copy, on the original source and on
         the suggested one. The suggestion keeps its fault detection when every compared mutant detected
@@ -4733,6 +5157,9 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Compil
     agent = CompilationAgent(settings, config=CompilationConfig(**load_section(config_path, "compilation")))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
     agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
+    agent.answer_cache = uc.answer_cache(config_path)              # CA-2
+    agent.run_caches = {name: uc.run_cache(config_path, name) for name in      # CA-3, CA-5, CA-9, CA-12, CA-13
+                        ("test_coverage", "objects", "failure_analysis", "mutations", "search_corpus")}
     uc.apply_profiles(agent, config_path)                         # BP-1, BP-3, BP-6
     return agent
 

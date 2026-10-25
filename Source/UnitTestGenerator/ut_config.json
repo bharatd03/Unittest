@@ -97,12 +97,17 @@
     "repair_rounds": 2,
     "rule_attempts": 2,
     "search_restarts": 20,
+    "split_suite_tests": 200,
     "test_time_limit_ms": 2000,
     "target_data_model": "",
     "build_commands": {}
   },
   "corrector": {"max_fragment_lines": 30, "min_independent_evidence": 2, "candidates": 3, "suggestions": 3},
   "kb": {"db_path": "ut_kb.sqlite3", "resolutions_path": "ut_resolutions.sqlite3"},
+  "cache": {"_comment": "CA-1: caches of earlier work - they save time, never decide a result; run --no-cache or UT_CACHE=off to switch them off",
+            "enabled": true, "dir": "ut_cache/run_cache", "max_mb": 4096, "brain_answers": true, "test_coverage": true,
+            "verified_tests": true, "objects": true, "build_capture": true, "failure_journal": true,
+            "failure_analysis": true, "stage_a": true, "code_analysis": true, "mutations": true, "search_corpus": true},
   "requirements": {"_comment": "A1-RQ1: requirement documents per repository - {\"repository link or folder\": [\"file or folder\", ...]}; relative paths: inside the repository"},
   "knowledge": {"enabled": true, "dirs": ["knowledge"], "project_dir": ".ut/knowledge"},
   "setup": {

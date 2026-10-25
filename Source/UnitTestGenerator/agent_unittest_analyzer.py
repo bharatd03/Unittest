@@ -1049,6 +1049,7 @@ def _walk(node: Any):
 
 class FrontEnd:
     """One parse of a translation unit with its flags: functions, references, headers, types."""
+    cache: "uc.RunCache | None" = None               # CA-11: set by build_agent
 
     def __init__(self, tools: uc.Tools, repo: Path, rel_file: str, flags: list[str], language: str):
         self.tools, self.repo, self.rel_file, self.language = tools, repo.resolve(), rel_file, language
@@ -1068,13 +1069,21 @@ class FrontEnd:
             cmd.insert(1, "-std=c++17" if cpp else "-std=c11")
         if Path(self.path).suffix.lower() in HEADER_EXT + (".inl", ".ipp", ".tpp"):
             cmd[-1:-1] = ["-x", "c++" if cpp else "c"]          # a header SUT parsed as a source [A1-DA19]
-        try:
-            proc = subprocess.run(cmd, cwd=str(self.repo), capture_output=True, timeout=timeout,
-                                  stdin=subprocess.DEVNULL, env={**os.environ, **self.tools.env()})
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            self.errors.append(f"front end did not run: {exc}")
-            return False
-        err = proc.stderr.decode("utf-8", "replace")
+        key = self._cache_key(cmd)
+        found = self._from_cache(key) if key else None                                       # CA-11
+        if found is not None:
+            text, err = found
+        else:
+            try:
+                proc = subprocess.run(cmd, cwd=str(self.repo), capture_output=True, timeout=timeout,
+                                      stdin=subprocess.DEVNULL, env={**os.environ, **self.tools.env()})
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self.errors.append(f"front end did not run: {exc}")
+                return False
+            err, text = proc.stderr.decode("utf-8", "replace"), proc.stdout.decode("utf-8", "replace")
+            if key and text.lstrip().startswith("{") and "file not found" not in err:   # a missing header may come
+                with contextlib.suppress(Exception):                     # a cache never fails a run [CA-1]
+                    self._to_cache(key, text, err)
         for line in err.splitlines():
             m = re.match(r"^\.+ (.+)$", line)
             if m:
@@ -1087,7 +1096,6 @@ class FrontEnd:
                 self.missing.append(m.group(1))
             elif ": error:" in line:
                 self.errors.append(line.strip()[:300])
-        text = proc.stdout.decode("utf-8", "replace")
         if not text.strip().startswith("{"):
             self.errors.append("no syntax tree: " + err.strip()[-300:])
             return False
@@ -1095,6 +1103,62 @@ class FrontEnd:
         repo_str = str(self.repo)
         self.ast.parse_chunks(lambda p: p.startswith(repo_str))
         return not self.missing
+
+    # ------------------------------------------------------------ CA-11: a parse of unchanged files
+    def _cache_key(self, cmd: list[str]) -> str:
+        if self.cache is None or ba.cache_switched_off():
+            return ""
+        try:
+            source = uc.sha256_bytes(Path(self.path).read_bytes())
+        except OSError:
+            return ""
+        return self.cache.key("code_analysis", json.dumps(self.tools.tc, sort_keys=True, default=str),
+                              uc.unrooted("\x1f".join(cmd), str(self.repo)), source)
+
+    def _headers_read(self, err: str) -> list[Path]:
+        out = []
+        for line in err.splitlines():
+            m = re.match(r"^\.+ (.+)$", line)
+            if m:
+                p = Path(m.group(1).strip())
+                out.append(p if p.is_absolute() else self.repo / p)
+        return out
+
+    def _from_cache(self, key: str) -> tuple[str, str] | None:
+        """The stored output while every header it read is unchanged; it must name the parsed file."""
+        import zlib
+        manifest = self.cache.get_json(key, count=False)
+        hit = None
+        if isinstance(manifest, dict) and isinstance(manifest.get("deps"), dict) and manifest.get("output"):
+            fresh = True
+            for name, digest in manifest["deps"].items():
+                try:
+                    if uc.sha256_bytes(Path(uc.rooted(name, str(self.repo))).read_bytes()) != digest:
+                        fresh = False
+                        break
+                except OSError:
+                    fresh = False
+                    break
+            data = self.cache.get_bytes(str(manifest["output"]), ".zz", count=False) if fresh else None
+            if data:
+                with contextlib.suppress(Exception):
+                    text, err = uc.rooted(zlib.decompress(data).decode("utf-8"), str(self.repo)).split("\x00", 1)
+                    if json.dumps(self.path)[1:-1] in text:
+                        hit = (text, err)
+        self.cache._count(hit is not None)
+        return hit
+
+    def _to_cache(self, key: str, text: str, err: str) -> None:
+        import zlib
+        deps = {}
+        for path in self._headers_read(err):
+            deps[uc.unrooted(str(path), str(self.repo))] = uc.sha256_bytes(path.read_bytes())   # unreadable: no entry
+        stored = uc.unrooted(text + "\x00" + err, str(self.repo))
+        if uc.names_a_run(stored[:20_000_000]) or json.dumps(self.path)[1:-1] not in text:
+            return
+        output = self.cache.key("code_analysis-output", key, str(sorted(deps.items())))
+        self.cache.put_bytes(output, zlib.compress(stored.encode("utf-8"), 1), ".zz")
+        self.cache.put_json(key, {"deps": deps, "output": output})
 
     def _rel(self, path: str) -> str:
         p = Path(path)
@@ -4687,6 +4751,8 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Analyz
     agent = AnalyzerAgent(settings, config=AnalyzerConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
     agent.resolutions = uc.resolution_memory(config_path)           # ARCH-23
+    agent.answer_cache = uc.answer_cache(config_path)              # CA-2
+    FrontEnd.cache = uc.run_cache(config_path, "code_analysis")     # CA-11
     uc.apply_profiles(agent, config_path)                         # BP-1, BP-3, BP-6
     return agent
 

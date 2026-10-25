@@ -27,6 +27,7 @@ Run as an MCP server:  python agent_sourcecode_corrector.py serve [--config ut_c
 from __future__ import annotations
 
 import difflib
+import contextlib
 import json
 import re
 import subprocess
@@ -283,7 +284,7 @@ class CorrectorAgent(ba.AgentCore):
                 "the smallest first.")
         check = self._fragment_check(region, signature)
         need = ba.OutputNeed(items=count, tokens_per_item=self.cfg.tokens_per_candidate, overhead=60)
-        proposals = await self._generate_candidates(task, context, check, need, layout.repo_root)
+        proposals = await self._generate_candidates(task, context, check, need, layout.repo_root, layout.sut_sha256)
         start = source.index(region)
         patches, seen, notes = [], set(), []
         author = self.last_brain.get("brain", "")
@@ -325,14 +326,34 @@ class CorrectorAgent(ba.AgentCore):
         return check
 
     async def _generate_candidates(self, task: str, context: list[ba.ContextPart], check, need: ba.OutputNeed,
-                                   project: str) -> list[PatchProposal]:
+                                   project: str, sut_sha: str = "") -> list[PatchProposal]:
         """generate() with the fragment check inside the brain's validate step: candidates that fail it
-        are left out; when none passes, the brain is asked once more with the reason [ARCH-5]."""
+        are left out; when none passes, the brain is asked once more with the reason [ARCH-5]. The candidates of the
+        same failure of the same SUT come from the store; they pass the same check and Agent3 reverifies them [CA-9]."""
         def rule(proposal: PatchProposal) -> str:
             check(proposal)                                  # raises with the reason [ARCH-20]
             return ""
+        cache = (getattr(self, "run_caches", None) or {}).get("failure_analysis")
+        key = cache.key("A4.candidates", await uc.brains_of(self), sut_sha, uc.neutral_failure(
+            task + "\n" + "\n".join(f"{p.name}: {p.text}" for p in context), project)) if cache is not None else ""
+        stored = cache.get_json(key, count=False) if cache is not None else None
+        kept = []
+        for raw in (stored if isinstance(stored, list) else []):
+            with contextlib.suppress(Exception):
+                proposal = PatchProposal.model_validate(raw)
+                check(proposal)
+                kept.append(proposal)
+        if cache is not None:
+            cache._count(bool(kept))
+        if kept:                     # the author stays the brain that wrote them: the review asks another [A4-23h]
+            self.last_brain = {**self.last_brain, "cached": True,
+                               "brain": str(next((r for r in stored if isinstance(r, dict)), {}).get("_brain", ""))}
+            return kept
         answer = await self.generate(task, context, PatchProposals, need=need, step="A4.candidates", project=project,
                                      check=ba.keep_valid("candidates", rule))
+        if cache is not None and answer.candidates:
+            brain = self.last_brain.get("brain", "")
+            cache.put_json(key, [{**p.model_dump(mode="json"), "_brain": brain} for p in answer.candidates])
         return list(answer.candidates)
 
     async def review(self, req: uc.ReviewRequest) -> uc.ReviewResult:
@@ -565,6 +586,8 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Correc
         section = json.loads(Path(config_path).read_text(encoding="utf-8")).get("corrector", {})
     agent = CorrectorAgent(settings, config=CorrectorConfig(**section))
     agent.packs = uc.knowledge_packs(config_path)                   # KP-3
+    agent.answer_cache = uc.answer_cache(config_path)              # CA-2
+    agent.run_caches = {"failure_analysis": uc.run_cache(config_path, "failure_analysis")}      # CA-9
     uc.apply_profiles(agent, config_path)                         # BP-1, BP-3
     return agent
 

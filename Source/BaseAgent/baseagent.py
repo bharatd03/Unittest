@@ -2742,7 +2742,11 @@ class BrainRouter:
 
     async def _route(self, kind: str, candidates: list[Any], step: str, parts: list[ContextPart],
                      fixed_chars: int, need: int | None, plans: list[TokenPlan] | None,
-                     call: Callable[[Any, str, TokenPlan], Any]) -> tuple[Any, Any, list[str]]:
+                     call: Callable[[Any, str, TokenPlan], Any],
+                     cached: tuple[Any, str, Callable[[Any], Any], Callable[[Any], Any]] | None = None
+                     ) -> tuple[Any, Any, list[str]]:
+        """``cached`` (CA-2): (the AnswerCache, the question's own text, how a stored answer is revived and checked,
+        how an answer is stored) - the same question to the same model is answered from the cache."""
         skipped, budget_fault, output_fault, busy_fault = [], None, None, None
         unusable: set[str] = set()                      # families whose answer stayed unusable [ARCH-19]
         faults: dict[str, str] = {}                     # what each brain of this call raised [ARCH-19]
@@ -2767,8 +2771,22 @@ class BrainRouter:
                 plans.append(plan)
             listed = getattr(getattr(brain, "settings", None), "think_steps", None)
             thinks = _THINK_STEP.set(bool(step) and isinstance(listed, (list, tuple, set)) and step in listed)  # ARCH-14a
+            key = ""
             try:
                 text = self._plan(brain, kind, step, parts, fixed_chars, need, plan)
+                if cached is not None:                                                          # CA-2
+                    key = cached[0].key(kind, name, str(getattr(brain, "model_id", "")), step, cached[1], text,
+                                        str(_THINK_STEP.get()))
+                    stored = cached[0].get(key)
+                    if stored is not None:
+                        try:
+                            result = cached[2](stored)
+                        except Exception:                          # its checks refuse it now: asked anew
+                            stored = None
+                        else:
+                            plan.outcome = "cached"
+                            self.retry_after[name], self.status[name] = 0.0, "available"
+                            return result, brain, skipped
                 result = await call(brain, text, plan)
             except AgentFault as exc:
                 plan.outcome = exc.code
@@ -2807,6 +2825,9 @@ class BrainRouter:
             self._observe(plan, result)
             self.retry_after[name], self.status[name] = 0.0, "available"
             self.last_fault.pop(name, None)
+            if cached is not None and key:                                                     # CA-2
+                with contextlib.suppress(Exception):
+                    cached[0].put(key, cached[3](result), name, str(getattr(brain, "model_id", "")), step)
             return result, brain, skipped
         if output_fault is not None:
             raise output_fault
@@ -2836,8 +2857,8 @@ class BrainRouter:
 
     async def decide(self, state: str, questions: dict[str, Any], allowed: list[str], *,
                      parts: list[ContextPart] | None = None, need: int | None = None, step: str = "",
-                     plans: list[TokenPlan] | None = None, prefer: list[str] | None = None
-                     ) -> tuple[dict[str, Any], Any, list[str]]:
+                     plans: list[TokenPlan] | None = None, prefer: list[str] | None = None,
+                     cache: "AnswerCache | None" = None) -> tuple[dict[str, Any], Any, list[str]]:
         """Returns (raw answers, brain that answered, brains skipped).
 
         ``parts`` (optional) replaces ``state`` with prioritized parts; ``need`` is the expected
@@ -2856,12 +2877,15 @@ class BrainRouter:
             if _accepts(brain.predict, "plan"):
                 return await brain.predict(text, questions, plan=plan)
             return await brain.predict(text, questions)
-        return await self._route("predict", candidates, step, parts, fixed, need, plans, call)
+        stored = (cache, json.dumps(questions, sort_keys=True, default=str), lambda raw: raw,
+                  lambda result: {k: v for k, v in result.items() if k != "usage"}) if cache is not None else None
+        return await self._route("predict", candidates, step, parts, fixed, need, plans, call, stored)
 
     async def generate(self, task: str, context: str | None, schema: dict[str, Any], validate: Callable[[Any], Any],
                        allowed: list[str] | None = None, *, parts: list[ContextPart] | None = None,
                        need: int | None = None, step: str = "", plans: list[TokenPlan] | None = None,
-                       vary: bool = False, prefer: list[str] | None = None) -> tuple[dict[str, Any], Any, list[str]]:
+                       vary: bool = False, prefer: list[str] | None = None,
+                       cache: "AnswerCache | None" = None) -> tuple[dict[str, Any], Any, list[str]]:
         """Structured generation with the same fallback rules as ``decide``.
         Returns (result with "output", brain that answered, brains skipped)."""
         allowed = allowed or list(BRAIN_NAMES)
@@ -2877,7 +2901,17 @@ class BrainRouter:
             if _accepts(brain.generate, "plan"):
                 return await brain.generate(task, text, schema, validate, plan=plan, **extra)
             return await brain.generate(task, text, schema, validate, **extra)
-        return await self._route("generate", candidates, step, parts, fixed, need, plans, call)
+
+        def revive(raw: Any) -> dict[str, Any]:              # a stored answer passes the same checks again [CA-2]
+            return {"model": raw.get("model", ""), "output": validate(raw["output"]), "usage": {}, "cached": True}
+
+        def keep(result: dict[str, Any]) -> dict[str, Any]:
+            output = result.get("output")
+            return {"model": result.get("model", ""),
+                    "output": output.model_dump(mode="json") if isinstance(output, BaseModel) else output}
+        stored = (cache, f"{task}\x1f{json.dumps(schema, sort_keys=True, default=str)}\x1fvary={vary}", revive, keep) \
+            if cache is not None else None
+        return await self._route("generate", candidates, step, parts, fixed, need, plans, call, stored)
 
     async def close(self) -> None:
         for brain in self.brains:
@@ -4014,6 +4048,65 @@ class ResolutionMemory:
                 con.close()
 
 
+_RUN_ID = re.compile(r"\b\d{8}-\d{6}-[0-9a-f]{6,8}\b")
+
+
+def cache_switched_off() -> bool:
+    """CA-1: UT_CACHE=off (the --no-cache option, the calibration, the benchmark, the tests) switches caches off."""
+    return os.environ.get("UT_CACHE", "").strip().lower() in ("0", "off", "false", "no")
+
+
+class AnswerCache:
+    """CA-2: brain answers by model and the exact question. SQLite, shared by the agent processes of a PC; every
+    error is swallowed - a lost cache never fails a run. The key leaves out the ids of a run (its folders)."""
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self.hits = 0
+
+    @staticmethod
+    def key(*parts: str) -> str:
+        return hashlib.sha256("\x1f".join(_RUN_ID.sub("<run>", p) for p in parts).encode("utf-8")).hexdigest()
+
+    def _db(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(self.path, timeout=10)
+        con.execute("CREATE TABLE IF NOT EXISTS answers (key TEXT PRIMARY KEY, answer TEXT, brain TEXT, model TEXT, "
+                    "step TEXT, uses INTEGER DEFAULT 0, created TEXT)")
+        return con
+
+    def get(self, key: str) -> Any | None:
+        if cache_switched_off():
+            return None
+        with self._lock, contextlib.suppress(Exception):
+            con = self._db()
+            try:
+                row = con.execute("SELECT answer FROM answers WHERE key=?", (key,)).fetchone()
+                if row is None:
+                    return None
+                con.execute("UPDATE answers SET uses=uses+1 WHERE key=?", (key,))
+                con.commit()
+                self.hits += 1
+                return json.loads(row[0])
+            finally:
+                con.close()
+        return None
+
+    def put(self, key: str, answer: Any, brain: str = "", model: str = "", step: str = "") -> None:
+        if cache_switched_off():
+            return
+        with self._lock, contextlib.suppress(Exception):
+            text = json.dumps(answer, default=str)
+            con = self._db()
+            try:
+                con.execute("INSERT OR REPLACE INTO answers (key, answer, brain, model, step, uses, created) "
+                            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                            (key, text, brain, model, step, datetime.now(timezone.utc).isoformat()))
+                con.commit()
+            finally:
+                con.close()
+
+
 @dataclass
 class ContractTool:
     name: str
@@ -4067,6 +4160,7 @@ class AgentCore:
         self.packs: KnowledgePacks | None = None
         # Rule failures handed to the brain (ARCH-21 .. ARCH-23): the application sets the memory.
         self.resolutions: ResolutionMemory | None = None
+        self.answer_cache: AnswerCache | None = None             # CA-2: set by the application
         self._failed_questions: dict[str, set[str]] = {}       # question -> models that failed it [ARCH-21a]
         self.escalations: list[dict[str, Any]] = []
         # The application may narrow the brains per step, for example by what each brain may write (its profile):
@@ -4182,14 +4276,14 @@ class AgentCore:
         try:
             raw, brain, skipped = await router.decide("", profile.brain_questions(), allowed,
                                                       parts=parts, need=need.tokens if need else None,
-                                                      step=step, plans=plans, prefer=prefer)
+                                                      step=step, plans=plans, prefer=prefer, cache=self.answer_cache)
         finally:
             self.token_plans.extend(plan.record() for plan in plans)
             self._brain_answer(step, plans)
         self._brain_used(router, brain, skipped)
         answers = validate_answers(raw, profile)
         self.log_answer(step, "decision", brain=router.name_of(brain), model=str(getattr(brain, "model_id", "")),
-                        answer=answers)                                                            # ARCH-20
+                        cached=bool(plans and plans[-1].outcome == "cached"), answer=answers)    # ARCH-20, CA-2
         return answers
 
     def _brain_answer(self, step: str, plans: list[TokenPlan]) -> None:
@@ -4198,7 +4292,7 @@ class AgentCore:
             self.emit("brain_answer", data={"step": step, "outcome": "no brain"}, summary=f"{self.view_label}: no brain available")
             return
         model = ""
-        if last.outcome == "answered" and self.router is not None:
+        if last.outcome in ("answered", "cached") and self.router is not None:
             brain = next((b for b in self.router.brains if self.router.name_of(b) == last.brain), None)
             model = getattr(brain, "model_id", "") or last.brain
         self.emit("brain_answer", data={"step": step, "brain": last.brain, "model": model, "outcome": last.outcome,
@@ -4207,7 +4301,9 @@ class AgentCore:
                                         "tokens": last.used_input_tokens + last.used_output_tokens},
                   summary=(f"{self.view_label}: {model} answered ({step})"
                            + (" - only the complete items of a cut answer used" if last.salvaged else "")
-                           if last.outcome == "answered" else f"{self.view_label}: brain {last.outcome} ({step})"))
+                           if last.outcome == "answered" else
+                           f"{self.view_label}: {model} answered from the cache ({step}) [CA-2]"
+                           if last.outcome == "cached" else f"{self.view_label}: brain {last.outcome} ({step})"))
 
     async def generate(self, task: str, context: str | list[ContextPart], output_model: type[BaseModel], *,
                        need: OutputNeed | None = None, step: str = "", project: str | Path | None = None,
@@ -4240,7 +4336,7 @@ class AgentCore:
             result, brain, skipped = await router.generate(
                 task, None, schema, validate, names,
                 parts=self.context_parts(context, step, project), need=need.tokens if need else None,
-                step=step, plans=plans, vary=vary, prefer=self._step_order(router, step))
+                step=step, plans=plans, vary=vary, prefer=self._step_order(router, step), cache=self.answer_cache)
         except AgentFault as exc:                      # an answer no check let through is logged too [ARCH-20]
             self.log_answer(step, "refused", brain=plans[-1].brain if plans else "", task=task[:400],
                             varied=vary, code=exc.code, reason=exc.message[:1500])
@@ -4251,7 +4347,7 @@ class AgentCore:
         self._brain_used(router, brain, skipped)
         output = result["output"]
         self.log_answer(step, "answer", brain=router.name_of(brain), model=str(getattr(brain, "model_id", "")),
-                        task=task[:400], varied=vary,
+                        task=task[:400], varied=vary, cached=bool(plans and plans[-1].outcome == "cached"),  # CA-2
                         answer=output.model_dump(mode="json") if isinstance(output, BaseModel) else output)
         return output
 

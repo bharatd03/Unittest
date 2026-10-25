@@ -1664,6 +1664,7 @@ class PipelineResult(Contract):
     fix_candidates: list[str] = Field(default_factory=list)    # candidates not chosen, with the reason [A4-23g]
     reviews: list[str] = Field(default_factory=list)           # second opinions [A4-23h]
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
+    cache_use: list[str] = Field(default_factory=list)         # what each cache saved in this run [CA-1]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
     escalations: list[str] = Field(default_factory=list)       # rules that needed the brain, with outcome [ARCH-22]
     item_status: list[ItemStatus] = Field(default_factory=list)    # final status per item not covered [LA-6]
@@ -1939,6 +1940,232 @@ APP_DIR = Path(__file__).resolve().parent
 
 def part(name: str, text: str, priority: int = P_FACTS, min_chars: int = 0) -> ba.ContextPart:
     return ba.ContextPart(name=name, text=text, priority=priority, min_chars=min_chars)
+
+
+# ============================================================================ caches of a run [CA-1 .. CA-7]
+CACHE_DEFAULTS = {"enabled": True, "dir": "ut_cache/run_cache", "max_mb": 4096, "brain_answers": True,
+                  "test_coverage": True, "verified_tests": True, "objects": True, "build_capture": True,
+                  "failure_journal": True, "failure_analysis": True, "stage_a": True, "code_analysis": True,
+                  "mutations": True, "search_corpus": True}           # CA-8 .. CA-13
+CACHE_VERSION = "1"            # the form of what the pipeline stores; a change makes every earlier entry a miss
+
+
+def cache_settings(config_path: str | Path | None) -> dict[str, Any]:
+    """CA-1: the "cache" section of ut_config.json over the defaults; the folder absolute (relative to the
+    configuration's folder)."""
+    section: dict[str, Any] = {}
+    if config_path and Path(config_path).is_file():
+        import json as _json
+        with __import__("contextlib").suppress(ValueError, OSError):
+            section = _json.loads(Path(config_path).read_text(encoding="utf-8")).get("cache", {}) or {}
+    out = {**CACHE_DEFAULTS, **{k: v for k, v in section.items() if not k.startswith("_")}}
+    base = Path(config_path).resolve().parent if config_path and Path(config_path).is_file() else APP_DIR
+    folder = Path(str(out["dir"]))
+    out["dir"] = str(folder if folder.is_absolute() else base / folder)
+    return out
+
+
+def cache_on(config_path: str | Path | None, name: str) -> bool:
+    """CA-1: a cache is used when the caches are on, this one is on, and UT_CACHE=off is not set."""
+    settings = cache_settings(config_path)
+    return bool(settings.get("enabled")) and bool(settings.get(name, True)) and not ba.cache_switched_off()
+
+
+def answer_cache(config_path: str | Path | None) -> "ba.AnswerCache | None":
+    """CA-2: the brain-answer cache of this PC, or None when it is off."""
+    if not cache_on(config_path, "brain_answers"):
+        return None
+    return ba.AnswerCache(Path(cache_settings(config_path)["dir"]) / "brain_answers.sqlite3")
+
+
+def cache_log(kind: str, hit: bool) -> None:
+    """CA-1: one use of a cache, for the report's "What the caches saved" (UT_CACHE_LOG of the run)."""
+    log = os.environ.get("UT_CACHE_LOG", "")
+    if log:
+        with __import__("contextlib").suppress(OSError):
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(f'{{"cache": "{kind}", "hit": {str(hit).lower()}}}\n')
+
+
+class RunCache:
+    """CA-1: a content-addressed store of one kind (JSON values or files) in the cache folder. A missing or damaged
+    entry is a miss; a write goes through a temporary file and a rename, so a reader in another process never sees
+    half of it. Hits and misses are counted, and appended to UT_CACHE_LOG when a run names one."""
+    def __init__(self, root: str | Path, kind: str):
+        self.root = Path(root) / kind
+        self.kind = kind
+        self.hits = self.misses = 0
+
+    @staticmethod
+    def key(*parts: Any) -> str:
+        text = "\x1f".join(str(p) for p in (CACHE_VERSION, *parts))
+        return hashlib.sha256(re.sub(r"\b\d{8}-\d{6}-[0-9a-f]{6,8}\b", "<run>", text).encode("utf-8",
+                                                                                         "replace")).hexdigest()
+
+    def _path(self, key: str, suffix: str) -> Path:
+        return self.root / key[:2] / f"{key}{suffix}"
+
+    def _count(self, hit: bool) -> None:
+        if hit:
+            self.hits += 1
+        else:
+            self.misses += 1
+        cache_log(self.kind, hit)
+
+    def get_json(self, key: str, count: bool = True) -> Any | None:
+        if ba.cache_switched_off():
+            return None
+        import json as _json
+        try:
+            value = _json.loads(self._path(key, ".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            if count:
+                self._count(False)
+            return None
+        if count:
+            self._count(True)
+        return value
+
+    def put_json(self, key: str, value: Any) -> None:
+        if ba.cache_switched_off():
+            return
+        import json as _json
+        self._write(self._path(key, ".json"), _json.dumps(value).encode("utf-8"))
+
+    def get_file(self, key: str, target: Path, suffix: str = ".bin", count: bool = True) -> bool:
+        if ba.cache_switched_off():
+            return False
+        try:
+            data = self._path(key, suffix).read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        except OSError:
+            if count:
+                self._count(False)
+            return False
+        if count:
+            self._count(True)
+        return True
+
+    def get_bytes(self, key: str, suffix: str = ".bin", count: bool = True) -> bytes | None:
+        if ba.cache_switched_off():
+            return None
+        try:
+            data = self._path(key, suffix).read_bytes()
+        except OSError:
+            data = None
+        if count:
+            self._count(data is not None)
+        return data
+
+    def put_bytes(self, key: str, data: bytes, suffix: str = ".bin") -> None:
+        if not ba.cache_switched_off():
+            self._write(self._path(key, suffix), data)
+
+    def put_file(self, key: str, source: Path, suffix: str = ".bin") -> None:
+        if ba.cache_switched_off():
+            return
+        with __import__("contextlib").suppress(OSError):
+            self._write(self._path(key, suffix), source.read_bytes())
+
+    @staticmethod
+    def _write(path: Path, data: bytes) -> None:
+        with __import__("contextlib").suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                os.replace(tmp, path)
+            except OSError:
+                with __import__("contextlib").suppress(OSError):
+                    os.unlink(tmp)
+
+
+ROOT_FORMS = ("{ut-root-json}", "{ut-root}", "{ut-root/}")
+
+
+def _root_forms(root: str) -> list[str]:
+    import json as _json
+    return [_json.dumps(root)[1:-1], root, root.replace("\\", "/")]
+
+
+def unrooted(text: str, root: str | Path) -> str:
+    """CA-10, CA-11: a text to store, with a folder of the run (as JSON text, as written, with forward slashes - the
+    same on Linux) replaced by marks that from_root() puts back for another run's folder."""
+    root = str(root)
+    if len(root) < 2:
+        return text
+    for form, mark in zip(_root_forms(root), ROOT_FORMS):
+        text = text.replace(form, mark)
+    return text
+
+
+def rooted(text: str, root: str | Path) -> str:
+    """CA-10, CA-11: a stored text with the marks of unrooted() replaced by this run's folder."""
+    for form, mark in zip(_root_forms(str(root)), ROOT_FORMS):
+        text = text.replace(mark, form)
+    return text
+
+
+def names_a_run(text: str, *roots: str | Path) -> bool:
+    """CA-10, CA-11: a text that still names a run's folder (a run id, or one of the given folders) is not stored -
+    in another run that path would point at the earlier run's files."""
+    if re.search(r"\b\d{8}-\d{6}-[0-9a-f]{6,8}\b", text):
+        return True
+    return any(form in text for root in roots if len(str(root)) > 3
+               for form in _root_forms(str(Path(root).resolve())) + _root_forms(str(root)))
+
+
+def neutral_failure(text: str, *folders: str | Path) -> str:
+    """CA-9: a failure as the tools reported it, without what differs between two runs of the same failure - the
+    run's folders (also as JSON text), addresses and measured durations."""
+    import json as _json
+    for folder in folders:
+        name = str(folder or "")
+        if len(name) < 4:
+            continue
+        for form in sorted({name, name.replace("\\", "/"), _json.dumps(name)[1:-1]}, key=len, reverse=True):
+            text = text.replace(form, "<run>")
+    text = re.sub(r"\b0x[0-9a-fA-F]{6,16}\b", "0x<addr>", text)
+    return re.sub(r"\b\d+(?:\.\d+)?\s?ms\b|\b\d+\.\d+\s?s\b", "<time>", text)
+
+
+async def brains_of(agent: Any) -> str:
+    """CA-9: the brains an agent may ask (name/model): part of the key of a stored brain decision."""
+    try:
+        router = await agent._brains()
+        return ",".join(sorted(f"{router.name_of(b)}/{getattr(b, 'model_id', '')}" for b in router.brains))
+    except Exception:                                   # no brain: nothing stored or found under it
+        return ""
+
+
+def run_cache(config_path: str | Path | None, name: str) -> RunCache | None:
+    """CA-1: the store of one cache, or None when it is off."""
+    if not cache_on(config_path, name):
+        return None
+    return RunCache(cache_settings(config_path)["dir"], name)
+
+
+def prune_cache(config_path: str | Path | None) -> int:
+    """CA-1: the oldest entries removed until the cache folder is under its size limit; returns the bytes removed.
+    Never raises: a file another process holds is left."""
+    settings = cache_settings(config_path)
+    root = Path(settings["dir"])
+    limit = int(float(settings.get("max_mb", 4096)) * 1024 * 1024)
+    try:
+        files = [(p.stat().st_mtime, p.stat().st_size, p) for p in root.rglob("*") if p.is_file()
+                 and p.suffix != ".sqlite3"]           # the answer store stays; its rows are small
+    except OSError:
+        return 0
+    total, removed = sum(s for _, s, _ in files), 0
+    for _, size, path in sorted(files):
+        if total - removed <= limit:
+            break
+        with __import__("contextlib").suppress(OSError):
+            path.unlink()
+            removed += size
+    return removed
 
 
 def resolution_memory(config_path: str | Path | None) -> ba.ResolutionMemory:

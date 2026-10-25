@@ -1,5 +1,25 @@
 # BaseAgent changes
 
+## 2026-10-25 (night): a cache of brain answers
+
+**Why.** About three quarters of a run's time is spent waiting for brain answers. A re-run of unchanged code asked
+every question again, and with Qwen's fixed seed it got the same answers.
+
+* **`AnswerCache`** (CA-2): SQLite, one file per PC, shared by the agent processes.
+  * **Key:** the brain's name and model, the step, the full text sent (task, the context as planned for that brain,
+    the schema or the typed questions), the re-ask sampling (`vary`) and thinking (ARCH-14a). Run ids
+    (`20261025-171605-e0f3ef`) are left out.
+  * **Errors:** every error is swallowed; a lost cache never fails a run.
+* **`BrainRouter._route(..., cached=)`**, **`generate(..., cache=)`**, **`decide(..., cache=)`**:
+  * the same question to the same model is answered from the cache, without a call;
+  * the answer goes through the same `validate`, including the agent's `check`; an answer the checks refuse now is
+    asked anew;
+  * only answers that passed are stored.
+* **`AgentCore.answer_cache`**: set by the application (None: no cache). The answer log marks `cached: true`, the
+  token plan's outcome is `cached`, and the live page says "answered from the cache".
+* **`cache_switched_off()`**: `UT_CACHE=off` switches every cache off (the `--no-cache` option, calibration,
+  benchmark, tests).
+
 ## 2026-10-25 (last): asking so that an answer can be right, for every brain
 
 **Why.** In Stage A the remote Qwen was asked twice, with the same facts and the same seed, to repair a stub header

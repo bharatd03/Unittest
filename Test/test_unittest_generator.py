@@ -81,6 +81,9 @@ ba.build_router = _hermetic_router
 
 # TP-20: "test" (UT_TESTS=quick) skips the tests that run a whole pipeline; "test-full" runs every test.
 QUICK = os.environ.get("UT_TESTS", "full") == "quick"
+# CA-1: the tests measure the agents and the scripted brain, never a cache of an earlier test; the cache tests switch
+# it on for themselves
+os.environ["UT_CACHE"] = "off"
 
 
 def full_run(item):
@@ -2385,6 +2388,64 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("test-style 1.0 (application)") for line in result.knowledge_packs))
         self.assertTrue(any(e.get("token_plans") for e in entries))                 # in the ledger [KP-7]
         self.assertIn("## Brain calls and tokens per step", (Path(result.output_dir) / "report.md").read_text())
+
+    def test_a_second_run_reuses_what_the_first_verified(self):                    # CA-1 .. CA-6
+        """The same file twice with the caches on: the second run takes the brain's answers, the verified tests, the
+        objects and the measurements of tests alone from the cache, asks the brain less and ends the same."""
+        config = pipeline_config(self.d)
+        raw = json.loads(config.read_text())
+        raw["cache"] = {"dir": str(self.d / "run_cache")}
+        config.write_text(json.dumps(raw))
+        results, calls = [], []
+        with mock.patch.dict(os.environ, {"UT_CACHE": ""}):
+            for k in range(2):                                    # the same folder each time, freshly copied
+                shutil.rmtree(self.d / "r", ignore_errors=True)
+                repo = copy_pilot("c_pilot", self.d / "r")
+                scripted = UTBrain()
+                with brain(scripted):
+                    results.append(run(up.Orchestrator(config).run(uc.PipelineRequest(
+                        repo_root=str(repo), sut_file="src/thermostat.c"))))
+                calls.append(len(scripted.generate_calls) + scripted.decide_calls)
+        first, second = results
+        print("\n" + up.report(second))
+        self.assertEqual(first.final_state, "verified_measured", first.reason)
+        self.assertEqual(second.final_state, "verified_measured", second.reason)
+        self.assertEqual(second.metrics.model_dump(), first.metrics.model_dump())        # the same result
+        self.assertLess(calls[1], calls[0])                                               # fewer brain calls
+        use = "\n".join(second.cache_use)
+        self.assertIn("[CA-2]", use)
+        self.assertIn("compiled objects [CA-5]", use)
+        self.assertIn("verified test(s) of earlier runs reused", use)                     # CA-4
+        self.assertIn("## What the caches saved [CA-1]", (Path(second.output_dir) / "report.md").read_text())
+        with mock.patch.dict(os.environ, {"UT_CACHE": "off"}):                              # --no-cache
+            shutil.rmtree(self.d / "r", ignore_errors=True)
+            repo = copy_pilot("c_pilot", self.d / "r")
+            scripted = UTBrain()
+            with brain(scripted):
+                third = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo),
+                                                                           sut_file="src/thermostat.c")))
+        self.assertEqual(third.cache_use, [])
+        self.assertEqual(len(scripted.generate_calls) + scripted.decide_calls, calls[0])
+        self.assertIn("dependency analysis of an earlier run", use)                     # CA-10
+        # CA-10: a stored Stage A result that does not build here is replaced, never the end of the run
+        for entry in (self.d / "run_cache" / "stage_a").rglob("*.json"):
+            stored = json.loads(entry.read_text())
+            fields = json.loads(stored["fields"])
+            for key in ("sut_flags",):
+                fields["build"][key] = fields["build"][key] + ["-include", "ut_no_such_header.h"]
+            fields["compile_flags"] = fields["compile_flags"] + ["-include", "ut_no_such_header.h"]
+            stored["fields"] = json.dumps(fields)
+            entry.write_text(json.dumps(stored))
+        with mock.patch.dict(os.environ, {"UT_CACHE": ""}):
+            shutil.rmtree(self.d / "r", ignore_errors=True)
+            repo = copy_pilot("c_pilot", self.d / "r")
+            with brain(UTBrain()):
+                fourth = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo),
+                                                                            sut_file="src/thermostat.c")))
+        self.assertEqual(fourth.final_state, "verified_measured", fourth.reason)
+        self.assertEqual(fourth.metrics.model_dump(), first.metrics.model_dump())
+        self.assertIn("did not build with this run", "\n".join(fourth.cache_use))
+        self.assertIn("front-end parses [CA-11]", "\n".join(fourth.cache_use))      # the analysis anew: parse reused
 
     def test_seeded_defect_is_fixed_on_a_branch(self):
         """Phase 5 gate: a valid E2 test exposes a real defect; the source is corrected and
@@ -5120,6 +5181,377 @@ class LargeFileRoundTests(unittest.TestCase):
         self.assertEqual(len(up.Journal.attempts_of(plan, 1)), 1)          # would count without the flag
         source = (SRC / "ut_pipeline.py").read_text(encoding="utf-8")
         self.assertIn("attempted = [] if plan.rules_only else Journal.attempts_of(plan, iteration)", source)
+
+
+class CacheTests(unittest.TestCase):
+    """CA-1 .. CA-14: what a cache keeps, when it is a miss, and that it never decides a result."""
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.d = Path(self.tmp.name)
+        self.addCleanup(setattr, a1.FrontEnd, "cache", a1.FrontEnd.cache)
+        a1.FrontEnd.cache = None                          # CA-11: no store of another test
+        patcher = mock.patch.dict(os.environ, {"UT_CACHE": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_store_keeps_values_and_files_and_a_missing_entry_is_a_miss(self):       # CA-1
+        cache = uc.RunCache(self.d / "c", "kind")
+        key = cache.key("a", "ut_work/20261025-171605-e0f3ef8a/repo/x.c")
+        self.assertEqual(key, cache.key("a", "ut_work/20261026-090000-aaaaaa/repo/x.c"))     # a run's id left out
+        self.assertIsNone(cache.get_json(key))
+        cache.put_json(key, {"x": [1, 2]})
+        self.assertEqual(cache.get_json(key), {"x": [1, 2]})
+        (self.d / "f.o").write_bytes(b"obj")
+        cache.put_file(key, self.d / "f.o", ".o")
+        self.assertTrue(cache.get_file(key, self.d / "g.o", ".o"))
+        self.assertEqual((self.d / "g.o").read_bytes(), b"obj")
+        self.assertEqual((cache.hits, cache.misses), (2, 1))
+        with mock.patch.dict(os.environ, {"UT_CACHE": "off"}):                             # switched off
+            self.assertIsNone(cache.get_json(key))
+        config = self.d / "ut_config.json"
+        config.write_text(json.dumps({"cache": {"dir": "rc", "max_mb": 0, "objects": False}}))
+        self.assertTrue(uc.cache_on(config, "test_coverage"))
+        self.assertFalse(uc.cache_on(config, "objects"))
+        self.assertIsNone(uc.run_cache(config, "objects"))
+        store = uc.run_cache(config, "test_coverage")
+        store.put_json("ab" + "0" * 62, [1])
+        self.assertGreater(uc.prune_cache(config), 0)                                  # the size limit
+        self.assertIsNone(store.get_json("ab" + "0" * 62))
+
+    def test_a_brain_answer_is_reused_and_still_checked(self):                          # CA-2
+        class Brain:
+            brain_name, model_id, simulation = "qwen", "scripted", False
+
+            def __init__(self):
+                self.calls = 0
+
+            async def start(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def generate(self, task, context, schema, validate):
+                self.calls += 1
+                return {"model": self.model_id, "output": validate({"declaration": "int f(void);"}), "usage": {}}
+        brain_ = Brain()
+        agent = a1.AnalyzerAgent(router=ba.BrainRouter([brain_], 0.0))
+        agent.answer_cache = ba.AnswerCache(self.d / "answers.sqlite3")
+        ask = lambda check=None: run(agent.generate("Declare f for run 20261025-171605-e0f3ef.", "ctx",
+                                                    a1.DeclarationAnswer, step="A1.declaration", check=check))
+        self.assertEqual(ask().declaration, "int f(void);")
+        self.assertEqual(ask().declaration, "int f(void);")
+        self.assertEqual(brain_.calls, 1)                                       # the same question: from the cache
+        self.assertEqual(agent.token_plans[-1]["outcome"], "cached")
+
+        def refuse(answer):
+            raise ba.AgentFault("MODEL_OUTPUT_INVALID", "not this one")
+        with self.assertRaises(ba.AgentFault):
+            ask(refuse)                                                         # the checks run on a cached answer
+        self.assertEqual(brain_.calls, 2)
+        with mock.patch.dict(os.environ, {"UT_CACHE": "off"}):
+            ask()
+        self.assertEqual(brain_.calls, 3)
+
+    def test_every_agent_process_is_built_with_its_caches(self):                          # CA-1, the stdio wiring
+        """What an agent process does at its start (build_agent with the configuration of the run) - so a cache a run
+        needs is never missing, and the switch reaches every process."""
+        config = self.d / "ut_config.json"
+        raw = json.loads((SRC / "ut_config.json").read_text())
+        raw["cache"] = {"dir": str(self.d / "rc")}
+        raw["kb"] = {"db_path": str(self.d / "kb.sqlite3")}
+        config.write_text(json.dumps(raw))
+        settings = ba.Settings.model_validate(raw.get("brain", {}))
+        import agent_sourcecode_corrector as a4
+        for module in (a1, a2, a3, a4):
+            with self.subTest(module.__name__):
+                agent = module.build_agent(settings, str(config))
+                self.assertIsInstance(agent.answer_cache, ba.AnswerCache)
+                self.assertEqual(Path(agent.answer_cache.path).parent, self.d / "rc")
+        agent3 = a3.build_agent(settings, str(config))
+        self.assertEqual(sorted(k for k, v in agent3.run_caches.items() if v is not None),
+                         ["failure_analysis", "mutations", "objects", "search_corpus", "test_coverage"])
+        self.assertIsNotNone(a4.build_agent(settings, str(config)).run_caches["failure_analysis"])     # CA-9
+        self.addCleanup(setattr, a1.FrontEnd, "cache", None)
+        a1.build_agent(settings, str(config))
+        self.assertEqual(a1.FrontEnd.cache.root.parent, self.d / "rc")                              # CA-11
+        with mock.patch.dict(os.environ, {"UT_CACHE": "off"}):
+            self.assertIsNone(a2.build_agent(settings, str(config)).answer_cache)
+            self.assertTrue(all(v is None for v in a3.build_agent(settings, str(config)).run_caches.values()))
+            self.assertIsNone(a4.build_agent(settings, str(config)).run_caches["failure_analysis"])
+            a1.build_agent(settings, str(config))
+            self.assertIsNone(a1.FrontEnd.cache)
+
+    def test_a_folder_capture_key_follows_the_build_files(self):                          # CA-6
+        repo = copy_pilot("c_pilot", self.d)
+        orch = up.Orchestrator.__new__(up.Orchestrator)
+        orch.config_path = self.d / "missing.json"
+        s = types.SimpleNamespace(mode="folder", workspace=repo, req=uc.PipelineRequest(repo_root=str(repo),
+                                                                                       sut_file="src/thermostat.c"))
+        first = orch._folder_capture_key(s)
+        self.assertTrue(first.startswith("folder"))
+        self.assertEqual(first, orch._folder_capture_key(s))
+        (repo / "src/thermostat.c").write_text((repo / "src/thermostat.c").read_text() + "\n/* edit */\n")
+        self.assertEqual(first, orch._folder_capture_key(s))                   # a source edit: the same build
+        (repo / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.10)\nproject(x C)\n")
+        self.assertNotEqual(first, orch._folder_capture_key(s))
+        s.mode = "repository"
+        self.assertEqual(orch._folder_capture_key(s), "")                      # a commit has its own key
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_objects_and_coverage_of_tests_alone_come_from_the_cache(self):             # CA-3, CA-5
+        repo = copy_pilot("c_pilot", self.d)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=layout)))
+        bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
+            uc.GenerationRequest(plan=plan)))
+
+        def agent():
+            comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w")),
+                                       router=ba.BrainRouter([DownBrain()], 0.0))
+            comp.run_caches = {k: uc.RunCache(self.d / "rc", k) for k in ("test_coverage", "objects")}
+            return comp
+        first = agent()
+        req = uc.VerifyRequest(layout=layout, stage="observe", bundle=bundle, measure_tests=list(bundle.tests))
+        one = first.execute(req)
+        self.assertTrue(one.link_ok, one.reason)
+        self.assertEqual(first.run_caches["objects"].hits, 0)
+        second = agent()
+        two = second.execute(req)
+        self.assertGreater(second.run_caches["objects"].hits, 0)              # harness, stubs, suite [CA-5]
+        self.assertEqual(two.test_items, one.test_items)                       # the same measurement [CA-3]
+        self.assertGreater(second.run_caches["test_coverage"].hits, 0)
+        self.assertTrue(all("from the cache" in second._per_test_runs[n] for n in two.test_items))
+        self.assertEqual([(t.name, t.status) for t in two.tests], [(t.name, t.status) for t in one.tests])
+        # a header the stubs read changes: their object is compiled again
+        header = next(p for p in (repo / "include").glob("*.h"))
+        header.write_text(header.read_text() + "\n/* changed */\n")
+        third = agent()
+        third.execute(req)
+        self.assertGreater(third.run_caches["objects"].misses, 0)
+
+
+    # ---------------------------------------------------------------- CA-8 .. CA-14
+    def _orchestrator(self, repo: Path):
+        config = self.d / "ut_config.json"
+        config.write_text(json.dumps({"cache": {"dir": str(self.d / "rc")}}))
+        orch = up.Orchestrator.__new__(up.Orchestrator)
+        orch.config_path, orch.hub, orch.no_cache = config, None, False
+        orch.layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        return orch
+
+    def test_what_missed_in_an_earlier_run_goes_to_the_brain(self):                   # CA-8
+        repo = copy_pilot("c_pilot", self.d)
+        orch = self._orchestrator(repo)
+        fn = orch.layout.functions[0]
+        req = uc.PipelineRequest(repo_root=str(repo), sut_file="src/thermostat.c")
+
+        def state():
+            s = up.RunState(req=req, repo=repo, out=self.d / f"out{uuid.uuid4().hex[:6]}", workspace=repo)
+            s.origin = {}
+            return s
+        s = state()
+        s.journal._entry(fn.qualified_name, ["G1"], "wrong_inputs", "test_x failed: expected 1, actual 0",
+                         tried="UT_TEST(test_x) ...", iteration=1, attempt=1, brain="qwen", strategy="brain scenario")
+        s.journal._entry(fn.qualified_name, ["G2"], "wrong_inputs", "covered since", iteration=1)
+        s.crashed_calls = [f"{fn.name}(-1)"]
+        gaps = [types.SimpleNamespace(gap_id="G1")]                        # G2 was covered by the end of the run
+        s.best_result = types.SimpleNamespace(coverage=types.SimpleNamespace(functions=[types.SimpleNamespace(gaps=gaps)]))
+        self.assertEqual(orch._store_journal(s), 1)
+        later = state()
+        self.assertEqual(orch._reuse_journal(later), 2)
+        excerpt = later.journal.excerpt()[fn.qualified_name]
+        self.assertIn("earlier run: G1", excerpt)
+        self.assertNotIn("G2", excerpt)
+        self.assertIn(f"{fn.name}(-1)", later.crashed_calls)
+        self.assertEqual(later.attempts, {})                                    # not an attempt of this run [LA-5]
+        self.assertTrue(any("[CA-8]" in n for n in later.notes))
+        # the function changes: nothing of it is shown again
+        sut = repo / "src/thermostat.c"
+        lines = sut.read_text().splitlines()
+        lines.insert(fn.line_start, "    /* changed */")
+        sut.write_text("\n".join(lines) + "\n")
+        orch.layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        self.assertEqual(orch._reuse_journal(state()), 0)
+
+    def test_a_decision_on_a_failure_is_reused_for_the_same_failure(self):            # CA-9
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w")),
+                                   router=ba.BrainRouter([DownBrain()], 0.0))
+        comp.run_caches = {"failure_analysis": uc.RunCache(self.d / "rc", "failure_analysis")}
+        layout = types.SimpleNamespace(sut_sha256="abc")
+        asked = []
+
+        async def ask():
+            asked.append(1)
+            return {"root_cause": {"choice": "test_generation_defect",
+                                   "probabilities": {"test_generation_defect": 0.9}}}
+        facts = lambda run_dir, address: uc.neutral_failure(json.dumps(
+            {"test_code": "UT_TEST(t) { f(); }", "actual": address, "evidence": [f"{run_dir}/repo/x.c:3"]}), run_dir)
+        first = run(comp._analysed("A3.root_cause", layout, facts("/w/20261025-171605-e0f3ef8a", "0x7ffd12345678"),
+                                   set(uc.ROUTES), ask, "root_cause"))
+        again = run(comp._analysed("A3.root_cause", layout, facts("/w/20261026-090000-aaaaaa11", "0x7ffe99999999"),
+                                   set(uc.ROUTES), ask, "root_cause"))
+        self.assertEqual(len(asked), 1)                                 # other run, other address: the same failure
+        self.assertEqual(again[0], first[0])
+        self.assertIn("[CA-9]", again[2])
+        run(comp._analysed("A3.root_cause", types.SimpleNamespace(sut_sha256="other"),
+                           facts("/w/x", "0x7ffd12345678"), set(uc.ROUTES), ask, "root_cause"))
+        self.assertEqual(len(asked), 2)                                 # another SUT version: asked
+        # Agent4: stored candidates pass the same fragment check before they are used
+        agent4 = a4.CorrectorAgent(router=ba.BrainRouter([DownBrain()], 0.0))
+        agent4.run_caches = {"failure_analysis": uc.RunCache(self.d / "rc", "failure_analysis")}
+        made = []
+
+        async def generate(task, context, model, **kw):
+            made.append(1)
+            return a4.PatchProposals(candidates=[a4.PatchProposal(original_fragment="return 2;",
+                                                                  corrected_fragment="return 1;", rationale="E2")])
+        agent4.generate = generate
+        context = [ba.ContextPart("failure", "test failed in /w/20261025-171605-e0f3ef8a/repo")]
+        need = ba.OutputNeed(items=1, tokens_per_item=100, overhead=10)
+        check = lambda p: None
+        one = run(agent4._generate_candidates("fix", context, check, need, "/p", "sha"))
+        two = run(agent4._generate_candidates("fix", context, check, need, "/p", "sha"))
+        self.assertEqual(len(made), 1)
+        self.assertEqual([p.corrected_fragment for p in two], [p.corrected_fragment for p in one])
+
+        def refuse(p):
+            raise ba.AgentFault("MODEL_OUTPUT_INVALID", "not in this source")
+        run(agent4._generate_candidates("fix", context, refuse, need, "/p", "sha"))
+        self.assertEqual(len(made), 2)                                  # a stored candidate is checked like a new one
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_a_parse_of_unchanged_files_is_reused_in_another_folder(self):            # CA-11
+        self.addCleanup(setattr, a1.FrontEnd, "cache", None)
+        a1.FrontEnd.cache = uc.RunCache(self.d / "rc", "code_analysis")
+        tools = uc.Tools.load(uc.DEFAULT_MANIFEST)
+
+        def project(name: str) -> Path:
+            repo = self.d / name
+            (repo / "src").mkdir(parents=True)
+            (repo / "src/a.h").write_text("int g(int x);\n")
+            (repo / "src/a.c").write_text('#include "a.h"\nint f(int x) { return g(x) + 1; }\n')
+            return repo
+
+        def parse(repo: Path):
+            fe = a1.FrontEnd(tools, repo, "src/a.c", ["-I{repo}/src"], "c")
+            self.assertTrue(fe.parse(), fe.errors)
+            return fe
+        first = parse(project("one"))
+        cache = a1.FrontEnd.cache
+        self.assertEqual((cache.hits, cache.misses), (0, 1))
+        second = parse(project("20261025-171605-e0f3ef8a"))           # another folder, the same files
+        self.assertEqual(cache.hits, 1)
+        self.assertEqual([q for _, q in second.definitions()], [q for _, q in first.definitions()])
+        self.assertEqual(second.headers, ["src/a.h"])                 # paths of this folder
+        repo = self.d / "20261025-171605-e0f3ef8a"
+        (repo / "src/a.h").write_text("int g(int x);\nint h(void);\n")      # a header changes: parsed anew
+        parse(repo)
+        self.assertEqual((cache.hits, cache.misses), (1, 2))
+
+    def test_an_identical_mutation_check_is_not_run_again(self):                      # CA-12
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w")))
+        comp.run_caches = {"mutations": uc.RunCache(self.d / "rc", "mutations")}
+        comp._mutation_context = lambda layout: "headers|compiler"
+        repo = copy_pilot("c_pilot", self.d)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        req = uc.OracleRequest(layout=layout, test="t", function="f", original_suite="A", changed_suite="B",
+                               bundle=uc.FileActionBundle(bundle_id="b1"))
+        runs = []
+
+        def work(r):
+            runs.append(1)
+            return uc.OracleResult(test=r.test, decision="accepted", mutants=4)
+        self.assertEqual(comp._mutations_cached("oracle", req, work, ("accepted",)).mutants, 4)
+        self.assertEqual(comp._mutations_cached("oracle", req.model_copy(update={"bundle": uc.FileActionBundle(
+            bundle_id="b1")}), work, ("accepted",)).decision, "accepted")
+        self.assertEqual(len(runs), 1)
+        comp._mutations_cached("oracle", req.model_copy(update={"changed_suite": "C"}), work, ("accepted",))
+        self.assertEqual(len(runs), 2)                                  # another text: run
+        cut = lambda r: (runs.append(1), uc.FaultCheckResult(suggestion_id=r.suggestion_id, decision="not_checked"))[1]
+        fault = uc.FaultCheckRequest(layout=layout, suggestion_id="S-1", original_source="a", suggested_source="b")
+        comp._mutations_cached("fault", fault, cut, ("kept",))
+        again = comp._mutations_cached("fault", fault.model_copy(update={"suggestion_id": "S-2"}), cut, ("kept",))
+        self.assertEqual(len(runs), 4)                                  # a check cut by its time limit is not kept
+        self.assertEqual(again.suggestion_id, "S-2")
+
+    def test_a_search_starts_from_the_inputs_an_earlier_search_kept(self):           # CA-13
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w"), max_fuzz_replays=4))
+        comp.run_caches = {"search_corpus": uc.RunCache(self.d / "rc", "search_corpus")}
+        key = comp._corpus_key("int target(void);", "ut_search", self.d)
+        corpus = self.d / "c1"
+        corpus.mkdir()
+        for name, data in (("seed_0", b"\0" * 8), ("s_1", b"one"), ("s_2", b"two"), ("s_3", b"three"),
+                           ("s_big", b"x" * (64 * 1024 + 1))):
+            (corpus / name).write_bytes(data)
+        comp._keep_corpus(corpus, key)
+        fresh = self.d / "c2"
+        fresh.mkdir()
+        self.assertEqual(comp._seed_corpus(fresh, key), 2)              # half of the replay limit
+        kept = {p.read_bytes() for p in fresh.iterdir()}
+        self.assertTrue(all(p.name.startswith("seed_c") for p in fresh.iterdir()))
+        self.assertTrue(kept <= {b"one", b"two", b"three"})
+        self.assertEqual(comp._seed_corpus(self.d, comp._corpus_key("int other(void);", "ut_search", self.d)), 0)
+
+    def test_a_large_suite_splits_only_when_its_parts_mean_the_same(self):           # CA-14
+        tests = "".join(f"/* evidence: E8 */\nUT_TEST(t{k})\n{{\n    UT_EXPECT_EQ_INT(f({k}), {k});\n}}\n\n" for k in range(5))
+        table = "UT_SUITE_BEGIN\n" + "".join(f"    UT_CASE(t{k})\n" for k in range(5)) + "UT_SUITE_END\n"
+        head = '#include "ut_harness.h"\n#include "x.h"\nint ut_static_f(int x);\nstatic int twice(int x) { return 2 * x; }\n' \
+               "typedef struct { int a; } pair_t;\nstruct s { int b; };\n\n"
+        split = a3.split_suite(head + tests + table, 3)
+        self.assertIsNotNone(split)
+        prologue, parts, text, line = split
+        self.assertEqual([p[0] for p in parts], [f"t{k}" for k in range(5)])
+        self.assertEqual(((head + tests + table).splitlines()[parts[1][1] - 1]), "UT_TEST(t1)")
+        self.assertTrue(text.startswith("UT_SUITE_BEGIN") and (head + tests + table).splitlines()[line - 1] == "UT_SUITE_BEGIN")
+        self.assertIsNone(a3.split_suite(head + tests + table, 5))                       # not more than the limit
+        for form in ("static int calls;\n", "int (*hook)(void);\n", "struct s g_s;\n",
+                     "static int counter(void) { static int n; return ++n; }\n"):
+            with self.subTest(form):
+                self.assertIsNone(a3.split_suite(head + form + tests + table, 3))       # state of its own per part
+        between = tests.replace("UT_TEST(t3)", "static int helper(void) { return 1; }\nUT_TEST(t3)")
+        self.assertIsNone(a3.split_suite(head + between + table, 3))                    # code between tests
+        braces = tests.replace("UT_EXPECT_EQ_INT(f(2), 2);", 'UT_EXPECT_EQ_STR(s("}{"), "}"); /* } */')
+        self.assertEqual(len(a3.split_suite(head + braces + table, 3)[1]), 5)            # braces in text and comments
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_a_suite_in_parts_runs_like_the_one_file(self):                         # CA-14
+        repo = copy_pilot("c_pilot", self.d)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=layout)))
+        bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
+            uc.GenerationRequest(plan=plan)))
+        suite = next(a for a in bundle.actions if a.role == "testsuite")
+        name = bundle.tests[1]
+        at = suite.content.index("{", suite.content.index(f"UT_TEST({name})"))
+        suite.content = suite.content[:at + 1] + "\n    UT_EXPECT_EQ_INT(1, 2);" + suite.content[at + 1:]   # one fails
+
+        def agent(split: int):
+            comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "w"), split_suite_tests=split),
+                                       router=ba.BrainRouter([DownBrain()], 0.0))
+            comp.run_caches = {"objects": uc.RunCache(self.d / "rc", "objects")}
+            return comp
+        req = uc.VerifyRequest(layout=layout, stage="observe", bundle=bundle, measure_tests=[])
+        one = agent(0).execute(req)
+        parts = agent(2).execute(req)
+        self.assertTrue(one.link_ok and parts.link_ok, parts.reason)
+        self.assertTrue((Path(parts.run_dir) / "suite_parts").is_dir())
+        self.assertFalse((Path(one.run_dir) / "suite_parts").exists())
+        view = lambda r: [(t.name, t.status, t.file.replace(r.run_dir, "<run>"), t.line, t.expected, t.actual)
+                          for t in r.tests]
+        self.assertEqual(view(parts), view(one))                            # the same results, files and lines
+        self.assertTrue(any(t.status == "failed" and t.line for t in parts.tests))
+        cover = lambda r: r.coverage.covered_items if r.coverage else None
+        self.assertEqual(cover(parts), cover(one))
+        again = agent(2)
+        again.execute(req)
+        self.assertGreater(again.run_caches["objects"].hits, 2)             # unchanged parts [CA-5]
+        broken = bundle.model_copy(deep=True)
+        bad = next(a for a in broken.actions if a.role == "testsuite")
+        bad.content = bad.content.replace("UT_EXPECT_EQ_INT(1, 2);", "UT_EXPECT_EQ_INT(undeclared_name, 2);", 1)
+        quarantined = agent(2).execute(req.model_copy(update={"bundle": broken}))
+        self.assertIn(name, {f.affected_test for f in quarantined.quarantined})   # messages of the one file [A3-CL12]
 
 
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
