@@ -558,11 +558,18 @@ reached [VIEW-9]. Every handoff and brain call is animated; the cards show line,
 file's ASIL targets and the tests passed; the end panel shows the final state and the action needed. At the end
 `viewer.html` is written next to the events: it replays the whole run offline on any computer.
 
-**Details [VIEW-13].** Until you click something, the Details panel shows an overview of the file on display. It
-lists the file's state and the time so far, what the run is doing now, and the targets not yet met with their
-values. It also shows the action needed once the file has ended, and the latest agent calls for this file with
-their input and output. The panel updates with every event. Click an agent, the orchestrator or a metric to see its
-own details. Click the heading **Details** to return to the overview.
+**Details [VIEW-13].** Until you click an agent or a metric, the Details panel gives an overview of the whole run.
+It shows how long the run has taken and how many files have finished: met every target, below target, or stopped on
+an error. It also shows how many files are running and how many folders are still to come. Below that, each file has
+a row, grouped by folder, with its LC, SC, BC, DC and MC/DC coverage as last measured:
+
+- a value below its target is red;
+- the file name turns green when the file met every target;
+- `–` means not measured yet, and `NA` means there is nothing to measure;
+- a running file says *running*, and a file that stopped says *stopped* with its error code (hover for the reason).
+
+Click a file to show its metric cards and its final panel. Click it again to follow the running file. Click the
+heading **Details** to return to the overview.
 
 **Test programs [VIEW-14].** A test program can run to its summary and report failed tests. The page then shows
 "k of n tests failed" in grey, not "exit 1". When each test runs alone to measure what it covers (A3-OBS5), all
@@ -576,11 +583,11 @@ folder in one command, so one page shows all of them: the chips read `folder: fi
 of every folder, and the page reads "finished" only after the last folder. Each folder keeps its own output folder,
 reports and summary.
 
-**Several files at once [VIEW-12].** With `max_parallel_suts` above 1, every event names its SUT file. A row of chips
-under the title lists the files with their state (running, verified, not verified). The cards, title and end panel
-show one file: the one you clicked (click it again to follow the run), else the file shown so far while it runs,
-else the running file that started first. A file that starts never clears another file's cards; the agent boxes show
-the latest call of any file, led by its name, and the page reads "finished" only after every file has ended.
+**Several files at once [VIEW-12].** With `max_parallel_suts` above 1, every event names its SUT file. The files are
+the rows of the Details overview. The cards, title and end panel show one file at a time: the file you clicked
+(click it again to follow the run); otherwise the file already shown, while it is still running; otherwise the
+running file that started first. A file that starts never clears another file's cards. The agent boxes show the
+latest call of any file, led by its name. The page says "finished" only after every file has ended.
 
 | Command | What it does |
 | --- | --- |

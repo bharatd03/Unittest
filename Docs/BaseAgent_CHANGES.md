@@ -1,17 +1,24 @@
 # BaseAgent changes
 
-## 2026-10-25 (evening): the Details panel is an overview, never empty
+## 2026-10-25 (evening): the Details panel is the overview of the whole run
 
-**Why.** Until you clicked an agent or a metric, the Details panel said only "Click an agent or a metric".
+**Why.** Until you clicked something, the Details panel said only "Click an agent or a metric". The row of file chips
+above the cards labelled every file "not verified", which said nothing about how far a file had got.
 
-* **Viewer (VIEW-13)**: the panel opens on an overview of the file on display: its state and time, the current
-  stage, the targets not met, the action needed, and its latest agent calls with input and output, newest first. The
-  overview updates with every event of that file, and clicking the heading **Details** brings it back. Every run
-  keeps its own list of calls (`calls`, the last 8), and `stage` events are recorded per run.
-* **Program events**: `data.runs` counts several runs as one entry. The outcome `tests_failed` is shown in grey
+* **Viewer (VIEW-13)**: the panel opens on an overview of the whole run:
+  * the time so far;
+  * how many files met every target, finished below target, stopped on an error or are still running;
+  * how many folders are still to come;
+  * one row per file, grouped by folder, with its percent metrics as last measured. A value below its target is red,
+    the file name turns green when every target is met, and a file that stopped shows its error code.
+
+  Clicking a row shows that file's cards; clicking the heading **Details** brings the overview back. The chip row is
+  gone. The final panel now reads "Every target met", "Finished below target" or "Stopped on an error".
+* **`MetricDeclaration.short`**: the column heading in the overview (for example `LC`, `MC/DC`).
+* **Program events**: `data.runs` counts several runs as one entry, and the outcome `tests_failed` is shown in grey
   (VIEW-14).
-* **Tests**: `ViewerTests.test_page_shows_input_output_orchestrator_and_idle_agents` now also reads the overview,
-  and reads it again after clicking the heading.
+* **Tests**: `ViewerTests.test_page_shows_input_output_orchestrator_and_idle_agents` reads the overview, then reads it
+  again after clicking the heading.
 
 ## 2026-10-25 (later): a remote brain behind a gateway; one page for several runs in a row
 

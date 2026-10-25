@@ -164,11 +164,11 @@ METRIC_NAMES = {"LC": "line", "SC": "statement", "BC": "branch", "DC": "decision
 VERIFIED_REASON = "every required metric has reached its ASIL target, measured by Agent3 [COV-1, COV-3]"
 # VIEW-5: what the unit-test application shows; ut_config.json "viewer.metrics" may replace it
 DEFAULT_VIEW_METRICS = [
-    {"id": "lc", "label": "Line coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function"},
-    {"id": "sc", "label": "Statement coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function"},
-    {"id": "bc", "label": "Branch coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function"},
-    {"id": "dc", "label": "Decision coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function"},
-    {"id": "mcdc", "label": "MC/DC", "kind": "percent", "unit": "%", "goal": 100, "per": "function"},
+    {"id": "lc", "label": "Line coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function", "short": "LC"},
+    {"id": "sc", "label": "Statement coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function", "short": "SC"},
+    {"id": "bc", "label": "Branch coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function", "short": "BC"},
+    {"id": "dc", "label": "Decision coverage", "kind": "percent", "unit": "%", "goal": 100, "per": "function", "short": "DC"},
+    {"id": "mcdc", "label": "MC/DC", "kind": "percent", "unit": "%", "goal": 100, "per": "function", "short": "MC/DC"},
     {"id": "tests_passed", "label": "Tests passed", "kind": "fraction", "better": "higher"},
 ]
 

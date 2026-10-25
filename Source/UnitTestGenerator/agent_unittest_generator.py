@@ -3173,6 +3173,13 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
     return out
 
 
+def void_functions(layout: uc.LayoutProfile) -> set[str]:
+    """A2-21ah (b): the names of the SUT's functions and methods that return void."""
+    return {f.qualified_name.split("::")[-1] for f in layout.functions
+            if re.sub(r"\b(static|inline|virtual|extern|constexpr)\b", "", f.return_type or "").strip() == "void"
+            and not f.qualified_name.split("::")[-1].startswith("~")}
+
+
 def build_agent(settings: ba.Settings, config_path: str | None = None) -> GeneratorAgent:
     section = {}
     if config_path:
@@ -3187,10 +3194,3 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Genera
 if __name__ == "__main__":
     _config = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--config"), None)
     raise SystemExit(ba.agent_main(lambda s: build_agent(s, _config), "agent_unittest_generator (Agent2)"))
-
-
-def void_functions(layout: uc.LayoutProfile) -> set[str]:
-    """A2-21ah (b): the names of the SUT's functions and methods that return void."""
-    return {f.qualified_name.split("::")[-1] for f in layout.functions
-            if re.sub(r"\b(static|inline|virtual|extern|constexpr)\b", "", f.return_type or "").strip() == "void"
-            and not f.qualified_name.split("::")[-1].startswith("~")}

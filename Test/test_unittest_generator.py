@@ -4879,6 +4879,19 @@ class SolvedScenarioTests(unittest.TestCase):
         self.assertEqual(seen[1]["data"]["outcome"], "exit 3")
 
 
+class AgentProgramTests(unittest.TestCase):
+    """An agent runs as its own program: everything it uses is defined before its __main__ block starts the server
+    (a definition after it never runs there, while an import in a test still sees it)."""
+    def test_nothing_is_defined_after_the_main_block(self):
+        import ast
+        for path in sorted(SRC.glob("*.py")) + [SRC.parent / "BaseAgent" / "baseagent.py"]:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            main = next((k for k, n in enumerate(tree.body) if isinstance(n, ast.If)
+                         and "__name__" in ast.unparse(n.test)), None)
+            with self.subTest(path.name):
+                self.assertEqual([ast.unparse(n)[:60] for n in tree.body[main + 1:]] if main is not None else [], [])
+
+
 class MeasuredRightTests(unittest.TestCase):
     """A3-OBS6, A2-21ah, VIEW-12a, LA-7 c: what a run measures and writes is checked against the tool itself."""
 

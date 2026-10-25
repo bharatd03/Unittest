@@ -4674,6 +4674,7 @@ class MetricDeclaration(StrictModel):
     categories: list[str] = Field(default_factory=list)
     per: str = ""
     note: str = Field(default="", max_length=160)
+    short: str = Field(default="", max_length=8)     # column heading in the Details overview (VIEW-13)
 
 
 class ViewHub:
@@ -4874,7 +4875,13 @@ h1{font-size:18px;font-weight:500;margin:0}.sub{color:var(--muted);font-size:13p
 .pill.live{background:var(--okbg);color:var(--ok)}.grow{flex:1}
 button{font:inherit;font-size:13px;background:transparent;border:.5px solid var(--line);color:var(--text);border-radius:8px;padding:4px 10px;cursor:pointer}
 button:hover{background:var(--card)}button.on{background:var(--card)}
-#runs{display:none;flex-wrap:wrap;gap:6px;padding:4px 24px 0}#runs.show{display:flex}
+#runs{display:none}
+#detail table.files{font-size:12px;table-layout:fixed}#detail table.files th,#detail table.files td{padding:2px 4px}
+#detail table.files th.n,#detail table.files td.n{text-align:right;font-variant-numeric:tabular-nums}
+#detail table.files td.f{padding-top:6px;overflow-wrap:anywhere}#detail table.files tr.v td{border-top:none;padding-bottom:6px}
+#detail tbody.frow{cursor:pointer}#detail tbody.frow:hover td{background:var(--card)}#detail tbody.frow.cur td.f{font-weight:500}
+#detail tr.grp td{color:var(--muted);padding-top:12px;font-size:11px;text-transform:none;letter-spacing:.02em}
+#detail .tag{font-size:11px;color:var(--muted);font-weight:400}#detail .tag.bad{color:var(--bad)}
 .chip{font-size:12px;padding:2px 10px;border-radius:999px;border:.5px solid var(--line);background:transparent;color:var(--muted);cursor:pointer}
 .chip.cur{background:var(--card);color:var(--text)}.chip.ok{color:var(--ok)}.chip.bad{color:var(--bad)}.chip.sel{border-color:var(--text)}
 #metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;padding:8px 24px}
@@ -5035,31 +5042,40 @@ function showOrch(){S.view="orchestrator";var o=S.orch,box=document.getElementBy
  if(o.description)box.appendChild(h("div",o.description,"sub"));
  [["Input of the run",o.input],["Output of the run",o.output||"running"]].forEach(function(p){var r=h("div",null,"row");r.appendChild(h("div",p[0],"k"));r.appendChild(h("div",p[1]||"–"));box.appendChild(r)});
  (o.details||[]).forEach(function(x){box.appendChild(h("div",x,"sub"))})}
-// VIEW-13: until an agent or a metric is clicked, Details is the overview of the file shown, kept up to date
-function overview(){S.view=null;var box=document.getElementById("detail"),r=S.runs[S.cur];box.innerHTML="";
- box.appendChild(h("h2",r&&many()?"Details · "+short(r.id):"Details"));
- if(!r){box.appendChild(h("div","Waiting for the first run.","sub"));return}
- function row(k,v,cls){var x=h("div",null,"row");x.appendChild(h("div",k,"k"));var y=h("div",v,cls);x.appendChild(y);box.appendChild(x);return y}
- var secs=Math.max(0,Math.round((r.state==="running"?(S.now||0):(r.end||S.now||0))-(r.start||0)));
- var took=Math.floor(secs/60)+" min "+(secs%60)+" s";
- row("State",r.state==="running"?"running for "+took:((r.final&&r.final.state)||r.state)+" after "+took+(r.final&&r.final.reason?" - "+r.final.reason:""),
-  r.state==="ok"?"state-ok":r.state==="bad"?"state-bad":"");
- if(r.stage)row("Now",r.stage);
- var open=[];(r.decl||[]).forEach(function(m){var v=r.values[m.id];if(!v||v.na||m.kind!=="percent")return;var g=v.goal!=null?v.goal:m.goal;if(g==null)return;
-  var met=m.better==="lower"?v.value<=g:(v.strict?v.value>g:v.value>=g);if(!met)open.push(m.label+" "+fmt(v.value)+" % (target "+fmt(g)+" %)")});
- row("Targets not met",open.length?open.join("; "):(Object.keys(r.values).length?"none":"not measured yet"));
- var acts=(r.final&&r.final.action_needed)||[];
- if(acts.length){var ul=h("ul");acts.slice(0,8).forEach(function(x){ul.appendChild(h("li",x))});row("Action needed","").appendChild(ul)}
- var hd=h("div",null,"row");hd.appendChild(h("div","Latest calls for this file, newest first","k"));box.appendChild(hd);
- var list=h("div",null,"calls");(r.calls||[]).slice().reverse().forEach(function(c){var d=h("div",null,"call"+(c.status!=="success"&&c.status!=="running"?" bad":""));
-  d.appendChild(h("b",clock(c.time)+"  "+c.label+" · "+c.tool+(c.status!=="success"?" · "+c.status:"")));
-  d.appendChild(h("div","in"+(c.from?" (from "+c.from+")":"")+": "+(c.input||"–"),"io"));d.appendChild(h("div","out: "+(c.output||"–"),"io"));list.appendChild(d)});
- if(!(r.calls||[]).length)list.appendChild(h("div","No call yet.","sub"));box.appendChild(list);
- box.appendChild(h("div","Click an agent or a metric for its details; click Details to come back here.","sub"))}
+// VIEW-13: until an agent or a metric is clicked, Details is the overview of the whole run: one row per file
+function colsOf(r){return (r&&r.decl||[]).filter(function(m){return m.kind==="percent"})}
+function below(m,v){if(!v||v.na||v.value==null)return false;var g=v.goal!=null?v.goal:m.goal;if(g==null)return false;
+ return m.better==="lower"?v.value>g:(v.strict?v.value<=g:v.value<g)}
+function dur(s){s=Math.max(0,Math.round(s));return s>=3600?Math.floor(s/3600)+" h "+Math.floor(s%3600/60)+" min":Math.floor(s/60)+" min "+(s%60)+" s"}
+function overview(){S.view=null;var box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2","Details"));
+ var ids=fileIds();if(!ids.length){box.appendChild(h("div","Waiting for the first run.","sub"));return}
+ function row(k,v){var x=h("div",null,"row");x.appendChild(h("div",k,"k"));x.appendChild(h("div",v));box.appendChild(x)}
+ var t0=Math.min.apply(null,ids.map(function(x){return S.runs[x].start||0})),live=running().length;
+ var tEnd=live||S.pending?(S.now||0):Math.max.apply(null,ids.map(function(x){return S.runs[x].end||0}));
+ row("State",(live||S.pending?"running for ":"finished after ")+dur(tEnd-t0));
+ var n={ok:0,low:0,err:0,run:0};ids.forEach(function(x){var r=S.runs[x];n[r.state==="running"?"run":r.state==="ok"?"ok":r.err?"err":"low"]+=1});
+ var parts=[n.ok+" met every target",n.low+" below target"];if(n.err)parts.push(n.err+" stopped on an error");if(n.run)parts.push(n.run+" running");
+ if(S.pending)parts.push(S.pending+(S.pending===1?" folder":" folders")+" to come");
+ row("Files",(n.ok+n.low+n.err)+" of "+ids.length+" finished: "+parts.join(" · "));
+ var cols=colsOf(S.runs[ids[0]]),tb=h("table",null,"files"),hd=h("tr"),span=Math.max(cols.length,1);
+ cols.forEach(function(m){var c=h("th",m.short||m.label.split(" ")[0].slice(0,6),"n");c.title=m.label+" %";hd.appendChild(c)});
+ var th=h("thead");th.appendChild(hd);tb.appendChild(th);var group=null;
+ ids.forEach(function(id){var r=S.runs[id],k=id.indexOf(": "),folder=k>0?id.slice(0,k):"",file=k>0?id.slice(k+2):id;
+  if(folder!==group&&folder){group=folder;var gb=h("tbody"),g=h("tr",null,"grp"),gc=h("td",folder);gc.colSpan=span;g.appendChild(gc);gb.appendChild(g);tb.appendChild(gb)}
+  var body=h("tbody",null,"frow"+(id===S.cur?" cur":"")),nr=h("tr"),f=h("td",null,"f");f.colSpan=span;f.title=id||r.subtitle||"";
+  var nm=h("span",id?file:(r.subtitle||r.title||"this run"));if(r.state==="ok")nm.className="state-ok";f.appendChild(nm);
+  if(r.state==="running")f.appendChild(h("span"," · running","tag"));
+  else if(r.err){var e=h("span"," · stopped: "+((r.final&&r.final.reason)||"").split(":")[0],"tag bad");e.title=(r.final&&r.final.reason)||"";f.appendChild(e)}
+  nr.appendChild(f);body.appendChild(nr);var vr=h("tr",null,"v");
+  cols.forEach(function(m){var v=r.values[m.id],c=h("td",!v||v.value==null&&!v.na?"–":v.na?"NA":fmt(v.value),"n"+(below(m,v)?" state-bad":""));
+   c.title=m.label+(v&&!v.na&&v.value!=null?": "+fmt(v.value)+" %":"");vr.appendChild(c)});
+  body.appendChild(vr);body.addEventListener("click",function(){S.sel=S.sel===id?null:id;show(true)});tb.appendChild(body)});
+ box.appendChild(tb);
+ box.appendChild(h("div","Click a file for its cards; an agent or a metric for its details; Details to come back here.","sub"))}
 var pend=null;function later(){if(S.view!=null||pend)return;pend=setTimeout(function(){pend=null;if(S.view==null)overview()},250)}
-function callOf(ev,a){var rc=runOf(ev);rc.calls=rc.calls||[];return rc.calls}
 function finalPanel(d){var f=document.getElementById("final");f.innerHTML="";f.classList.add("show");
- var ok=/^verified/.test(d.state||"");var t=h("h2",(ok?"Verified":"Not verified")+" · "+(d.state||""));t.className=ok?"state-ok":"state-bad";f.appendChild(t);
+ var ok=/^verified/.test(d.state||""),err=!ok&&/^[A-Z][A-Z_]{3,}:/.test(d.reason||"");
+ var t=h("h2",ok?"Every target met":err?"Stopped on an error":"Finished below target");t.className=ok?"state-ok":"state-bad";f.appendChild(t);
  if(d.reason)f.appendChild(h("div",d.reason));
  var s=[];if(d.seconds!=null)s.push("time "+Math.round(d.seconds)+" s");if(d.delivery)s.push(d.delivery);if(s.length)f.appendChild(h("div",s.join(" · "),"sub"));
  [["Action needed",d.action_needed],["Suggested source changes",d.suggestions]].forEach(function(p){if(p[1]&&p[1].length){f.appendChild(h("div",p[0],"sub"));var ul=h("ul");p[1].forEach(function(x){ul.appendChild(h("li",x))});f.appendChild(ul)}})}
@@ -5070,16 +5086,13 @@ function short(id){id=id||"";var k=id.indexOf(": "),pre=k>0?id.slice(0,k+2):"",f
  var s=f.split(/[\\/]/);return pre+(s[s.length-1]||f)}   // "folder: file" in a batch [VIEW-12a]
 function many(){return S.runOrder.filter(function(x){return x}).length>1}
 function tag(ev,text){return many()&&ev.run?"["+short(ev.run)+"] "+(text||""):(text||"")}
-function running(){return S.runOrder.filter(function(x){return S.runs[x].state==="running"})}
+function fileIds(){var ids=S.runOrder.filter(function(x){return x});return ids.length?ids:S.runOrder.slice()}
+function running(){return fileIds().filter(function(x){return S.runs[x].state==="running"})}
 function choose(){if(S.sel!=null&&S.runs[S.sel])return S.sel;var live=running();
  if(S.cur!=null&&S.runs[S.cur]&&S.runs[S.cur].state==="running")return S.cur;   // the file shown stays while it runs
  if(live.length)return live.reduce(function(a,b){return S.runs[b].start<S.runs[a].start?b:a});
- return S.runOrder.reduce(function(a,b){return S.runs[b].end>=S.runs[a].end?b:a},S.runOrder[0])}
-function chips(){var box=document.getElementById("runs");box.innerHTML="";var ids=S.runOrder.filter(function(x){return x});
- box.classList.toggle("show",ids.length>1);if(ids.length<2)return;
- ids.forEach(function(id){var r=S.runs[id],c=h("button",short(id)+(r.state==="running"?" · running":r.state==="ok"?" · verified":" · not verified"),
-  "chip"+(id===S.cur?" cur":"")+(id===S.sel?" sel":"")+(r.state==="ok"?" ok":r.state==="bad"?" bad":""));c.title=id;
-  c.addEventListener("click",function(){S.sel=S.sel===id?null:id;show(true)});box.appendChild(c)})}
+ var ids=fileIds();return ids.reduce(function(a,b){return S.runs[b].end>=S.runs[a].end?b:a},ids[0])}
+function chips(){}   // the files are rows of the Details overview [VIEW-13]
 function orchOf(r){if(!r||!r.orch)return;if(!S.orch){S.orch=r.orch;return}   // the drawn box shows the file shown
  ["label","description","input","output","details"].forEach(function(k){S.orch[k]=r.orch[k]});paintOrch()}
 function show(force){var id=choose();if(id==null)return;var r=S.runs[id];
@@ -5092,7 +5105,7 @@ function show(force){var id=choose();if(id==null)return;var r=S.runs[id];
  if(S.live||st.textContent!=="replay"){if(done&&S.runOrder.length){st.textContent="finished";st.className="pill"}else if(S.live){st.textContent="live";st.className="pill live"}}
  chips()}
 function pulse(k,on){var a=S.agents[k];if(!a||!a.rect)return;a.rect.setAttribute("stroke-width",on?2:.75)}
-function apply(ev){apply1(ev);if((ev.run||"")===(S.cur||""))later()}
+function apply(ev){apply1(ev);later()}
 function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="run_start"){var others=running().length;var rs=runOf(ev);rs.state="running";rs.final=null;rs.start=ev.time||0;rs.values={};
   rs.title=d.title||ev.app||"Pipeline";rs.subtitle=d.subtitle||"";rs.decl=d.metrics||[];(d.agents||[]).forEach(addAgent);
@@ -5102,12 +5115,9 @@ function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(ev.agent&&ev.agent!=="orchestrator"&&!S.agents[ev.agent]){addAgent({agent:ev.agent,label:ev.label,app:ev.app});layout()}
  if(k==="tool_start"){var a=S.agents[ev.agent];if(a){a.lastIn=tag(ev,ev.summary||ev.contract||"");a.counts[ev.tool]=(a.counts[ev.tool]||0)+1;a.runCalls+=1;a.lastOut="";a.lastFrom=a.from;
   a.history.push({time:ev.time||0,tool:ev.tool,input:a.lastIn,from:a.from,output:"",status:"running"});if(a.history.length>300)a.history.shift();
-  var rl=callOf(ev,a);rl.push({time:ev.time||0,agent:ev.agent,label:a.label,tool:ev.tool,input:plain(ev.summary||ev.contract||"",a),from:a.from,output:"",status:"running"});if(rl.length>8)rl.shift();
   var c=a.sat&&a.sat[ev.tool];if(c)c.setAttribute("fill",css("--"+fam(a)+"-s"));paint(a)}pulse(ev.agent,true);return}
  if(k==="tool_end"){var a2=S.agents[ev.agent];if(a2){a2.lastOut=tag(ev,ev.summary||ev.contract||"");var hc=a2.history[a2.history.length-1];
   if(hc&&hc.tool===ev.tool&&hc.status==="running"){hc.output=a2.lastOut;hc.status=ev.status||"success"}a2.from="";
-  var rl2=callOf(ev,a2);for(var j=rl2.length-1;j>=0;j--){if(rl2[j].agent===ev.agent&&rl2[j].tool===ev.tool&&rl2[j].status==="running"){
-   rl2[j].output=plain(ev.summary||ev.contract||"",a2);rl2[j].status=ev.status||"success";break}}
   var c2=a2.sat&&a2.sat[ev.tool];if(c2)c2.setAttribute("fill",css("--bg"));paint(a2)}pulse(ev.agent,false);
   if(ev.status&&ev.status!=="success")feed(ev,ev.summary||(labelOf(ev.agent)+" "+ev.tool+": "+ev.status),famOf(ev.agent));return}
  if(k==="handoff"){var tg=S.agents[ev.to];if(tg){tg.from=ev.agent==="orchestrator"?(S.orch&&S.orch.label||"orchestrator"):labelOf(ev.agent)}
@@ -5123,7 +5133,7 @@ function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="stage"){runOf(ev).stage=ev.summary||d.stage||"";feed(ev,tag(ev,ev.summary||d.stage||"stage"),"gray");return}
  if(k==="progress"){var pg=document.getElementById("progress");if(pg){pg.style.display="";pg.textContent=d.text||((d.percent||0)+" %")}
   if(d.pending!=null){S.pending=d.pending;show(false)}return}   // folders still to come keep the page live [VIEW-12a]
- if(k==="run_end"){var re=runOf(ev);re.state=/^verified/.test(d.state||"")?"ok":"bad";re.final=d;re.end=ev.time||0;
+ if(k==="run_end"){var re=runOf(ev);re.state=/^verified/.test(d.state||"")?"ok":"bad";re.err=re.state==="bad"&&/^[A-Z][A-Z_]{3,}:/.test(d.reason||"");re.final=d;re.end=ev.time||0;
   if(!running().length){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
    if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)})}
   if(re.orch){re.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"")}
