@@ -813,6 +813,25 @@ def setter_source(var: uc.StateVar, cpp: bool = False) -> str:
     return f"void {state_setter(var)}(long long v) {{ {var.name} = ({t})v; }}"
 
 
+def state_part(fn: uc.FunctionInfo, layout: uc.LayoutProfile, lines: list[str], limit: int = 40) -> str:
+    """A2-21aj: the setters and getters of the SUT state this function and the functions it calls use."""
+    listed, rest = uc.function_state(fn, layout, lines, limit)
+    if not listed:
+        return ""
+    rows = [f"void {uc.state_setter_name(v)}(long long v);  long long {uc.state_getter_name(v)}(void);  "
+            f"/* {v.type} {v.name.replace('(anonymous namespace)::', '')} */" for v in listed]
+    if rest:
+        rows.append("/* also used: " + ", ".join(v.name.replace("(anonymous namespace)::", "") for v in rest[:40])
+                    + " - the same two helpers exist for each */")
+    return ("SUT STATE (variables only the SUT file sees: set one before the call with its setter, read it after the "
+            "call with its getter; never name the variable itself) [A2-21z, A2-21aj]:\n" + "\n".join(rows))
+
+
+def getter_source(var: uc.StateVar, cpp: bool = False) -> str:
+    """A2-21z: the variable's value for a test that observes or asserts it."""
+    return f"long long {uc.state_getter_name(var)}({'' if cpp else 'void'}) {{ return (long long)({var.name}); }}"
+
+
 def repeat_count(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile, macros: dict[str, str]) -> int:
     """A2-21z: how often a stateful function is called in one test (1 for a function without state): one more
     than the largest small constant (2..8) it compares with, else 4."""
@@ -1091,8 +1110,9 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
     if uc.reset_state(layout):                                                               # A2-21s
         rows.append(uc.sut_reset_source(uc.reset_state(layout), layout.language == "cpp"))
     if setters:                                                       # A2-21z: SUT state set by the tests
-        rows += ["/* A2-21z: the tests set SUT state the functions read in their decisions. */",
-                 *[setter_source(v, layout.language == "cpp") for v in setters], ""]
+        rows += ["/* A2-21z: the tests set and read SUT state that only this file sees. */",
+                 *[setter_source(v, layout.language == "cpp") for v in setters],
+                 *[getter_source(v, layout.language == "cpp") for v in setters], ""]
     if layout.header_sut:                                                                    # A1-DA19
         rows += template_instances(plan)
     return f"{test_dir}/{access_name}", "\n".join(rows)
@@ -1166,6 +1186,7 @@ def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_head
     if render_sut_access(plan) is not None:                     # A2-21k
         prototypes += [wrapper_signature(f) + ";" for f in static_functions(layout) if not uses_private_type(f, layout)]
         prototypes += [f"void {state_setter(v)}(long long v);" for v in setter_vars(plan)]    # A2-21z
+        prototypes += [f"long long {uc.state_getter_name(v)}(void);" for v in setter_vars(plan)]
     lines += [f'#include "{h}"' for h in register_headers(plan) if h not in sut_headers]      # A2-21ab
     helpers = callback_helpers(layout)
     extra = ["#include <stddef.h>"] + (["#include <stdbool.h>"] if layout.language == "c" and any(
@@ -2445,6 +2466,10 @@ class GeneratorAgent(ba.AgentCore):
             if assembled:
                 notes.append(f"{assembled} tests assembled from checked scenarios - planned by the brain or solved by rule "
                              "[A2-21m, A1-PL15]")
+            if plan.rules_only and llm_scenarios:            # the rule round: measured first, then the brain [A1-PL1]
+                notes.append(f"{len(llm_scenarios)} scenario(s) of {len({sc.function for sc in llm_scenarios})} "
+                             "function(s) left to the brain's plan after this round's measurement [A1-PL1]")
+                llm_scenarios = []
             if self.cfg.mode in ("deterministic_then_llm", "llm") and (llm_scenarios or rewrite):
                 llm_tests, llm_notes, llm_linked, llm_trial, llm_made, llm_shared = await self._llm_tests(
                     plan, req, names, llm_scenarios, rewrite, existing, allowed)
@@ -2691,10 +2716,21 @@ class GeneratorAgent(ba.AgentCore):
         # ARCH-18: the functions' tests are asked for at the same time; every call sees the same names
         # and evidence it would see alone, and the answers are combined below in the order of the
         # functions, with names made unique there (A2-21q).
+        done = [0]
+
         def job(key: tuple[str, int], fn_scenarios: list[uc.Scenario]):
             fn_name = key[0]
 
             async def run():
+                try:
+                    return await write()
+                finally:                                                                       # VIEW-16
+                    done[0] += 1
+                    self.emit("stage", data={"stage": "A2.tests", "done": done[0], "of": len(work)},
+                              summary=f"UT-Generator: brain tests for {done[0]} of {len(work)} functions "
+                                      f"(last: {fn_name})")
+
+            async def write():
                 fn = uc.function_of(fn_name, layout, key[1])
                 if fn is None or (fn.is_static and not fn.from_frontend):
                     return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, [], {}, "", ""
@@ -2728,6 +2764,7 @@ class GeneratorAgent(ba.AgentCore):
                     scenario_rows.append(row)
                 fixes = [f"- {name}: {rewrite[name].issue}: {rewrite[name].diagnostic[:300]}\n{existing[name]['source']}"
                          for name in to_rewrite]
+                state_text = state_part(fn, layout, sut_lines) if setter_vars(plan) else ""         # A2-21aj
                 # ARCH-17: what the tests are built from stays whole; the headers keep at least their
                 # beginning; KB examples and the list of names give way first.
                 context = [
@@ -2748,9 +2785,7 @@ class GeneratorAgent(ba.AgentCore):
                             if "ut_stub_" in stub_header or "ut_fake_" in stub_header else
                             "STUB CONTROL: none. No function this code calls is replaced by a stub, so no ut_stub_ "
                             "name exists: do not use one. Call the function under test directly."),
-                    *([uc.part("state", "SUT STATE SETTERS (set a variable of the SUT before the call) [A2-21z]:\n" +
-                               "\n".join(f"void {state_setter(v)}(long long v);  /* {v.type} {v.name} */"
-                                         for v in setter_vars(plan)))] if setter_vars(plan) else []),
+                    *([uc.part("state", state_text)] if state_text else []),
                     *([uc.part("journal", "JOURNAL (why earlier tests of this function missed; remove the cause) "
                                "[LA-4]:\n" + (req.journal.get(fn.qualified_name) or req.journal.get(fn.name, "")))]
                       if req.journal.get(fn.qualified_name) or req.journal.get(fn.name) else []),
@@ -2785,7 +2820,7 @@ class GeneratorAgent(ba.AgentCore):
                     "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
                     "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
                     "UT_OBSERVE_DBL(\"id\", expr); for target code also UT_REG32(address) (a register in host "
-                    "memory), ut_state_set_<variable>(value) where listed, ut_asm_value = v (the result of replaced target "
+                    "memory), ut_state_set_<variable>(value) and ut_state_get_<variable>() where listed, ut_asm_value = v (the result of replaced target "
                     "assembly) and, in C++, UT_EXPECT_THROW(statement, type) and UT_OBSERVE_THROW(\"id\", statement). "
                     "When the EVIDENCE states the expected result, assert it, put the "
                     "EVIDENCE ids (as written there, in the form EV-<function>-<n>; never the classes E1-E8) into evidence_ids, write /* EV-... */ after the assertion and set evidence_class to that "
@@ -2853,6 +2888,9 @@ class GeneratorAgent(ba.AgentCore):
                 return produced, own_notes, fn, to_rewrite, tried, made_by, shared_text
             return run
         work = list(by_function.items())
+        if len(work) > 1:                                                                          # VIEW-16
+            self.emit("stage", data={"stage": "A2.tests", "done": 0, "of": len(work)},
+                      summary=f"UT-Generator: the brain writes tests for {len(work)} functions")
         results = await self.in_parallel([job(fn_name, fn_scenarios) for fn_name, fn_scenarios in work])
         trial_out: dict[str, str] = {}
         made_out: dict[str, str] = {}
@@ -2969,17 +3007,18 @@ class GeneratorAgent(ba.AgentCore):
         allowed |= {wrapper_name(f) for f in static_functions(plan.layout)}
         allowed |= set(re.findall(r"\b(ut_cb_\w+)\b", "\n".join(callback_helpers(plan.layout))))
         allowed |= {state_setter(v) for v in setter_vars(plan)}                                   # A2-21z
+        allowed |= {uc.state_getter_name(v) for v in setter_vars(plan)}
         allowed |= {uc.HIDDEN_MARK + n for n in uc.hidden_state(plan.layout, headers)}             # A2-21ai
         return allowed
 
     @staticmethod
-    def _body_problem(body: str, allowed: set[str]) -> str:
+    def _body_problem(body: str, allowed: set[str], function: str = "") -> str:
         """A2-20, A2-21: only symbols that exist here, no forbidden constructs, balanced."""
         if FORBIDDEN.search(body):
             return "forbidden construct in the body"
         calls = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", code_only(body))} - {
             "if", "for", "while", "switch", "return", "sizeof", "catch"}
-        named = uc.name_problem(code_only(body), calls, allowed)                     # a guard [A2-21ai, NC-6]
+        named = uc.name_problem(code_only(body), calls, allowed, function)           # a guard [A2-21ai, NC-6]
         if named:
             return named
         unknown = sorted(c for c in calls if c not in allowed)
@@ -3033,7 +3072,7 @@ class GeneratorAgent(ba.AgentCore):
                         fixed.append(f"{t.name}: form fixed: {', '.join(named[:3])} written with its namespace "
                                      "[ARCH-20, A2-21ai]")
                 helpers = set(re.findall(r"\b(ut_\w+)\s*\(", parsed.shared)) if shared_ok else set()
-                problem = cls._body_problem(t.body, allowed | setup_names([t.body]) | helpers)
+                problem = cls._body_problem(t.body, allowed | setup_names([t.body]) | helpers, function)
                 if problem and trial is not None and uc.check_kind(problem) == "prediction" and \
                         CHECKS.search(code_only(t.body)):                                    # NC-7
                     trial[t.name] = problem

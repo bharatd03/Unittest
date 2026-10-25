@@ -2665,6 +2665,7 @@ class BrainRouter:
         self.brains = brains
         self.cooldown = cooldown
         self.retry_after = {self.name_of(brain): 0.0 for brain in brains}
+        self.last_fault: dict[str, str] = {}      # the latest availability fault of each brain [ARCH-19]
         self.status: dict[str, str] = {}
         self.meter = TokenMeter()        # characters per token, learned per brain (ARCH-12)
 
@@ -2720,18 +2721,35 @@ class BrainRouter:
         if plan.input_chars and plan.used_input_tokens:
             self.meter.observe(plan.brain, plan.input_chars, plan.used_input_tokens)
 
+    def _out(self, name: str, faults: dict[str, str]) -> bool:
+        """ARCH-19: a brain counts as not available for the same model on another server only when it is out for
+        the run or failed to answer (ARCH-1c c) - never when it is busy (ARCH-1c d) or the call does not fit it."""
+        if self.retry_after.get(name, 0.0) == math.inf:
+            return True
+        code = faults.get(name) or (self.last_fault.get(name, "")
+                                    if time.monotonic() < self.retry_after.get(name, 0.0) else "")
+        return bool(code) and code not in ("MODEL_BUSY", "CONTEXT_BUDGET_EXCEEDED", "MODEL_OUTPUT_INVALID")
+
     async def _route(self, kind: str, candidates: list[Any], step: str, parts: list[ContextPart],
                      fixed_chars: int, need: int | None, plans: list[TokenPlan] | None,
                      call: Callable[[Any, str, TokenPlan], Any]) -> tuple[Any, Any, list[str]]:
-        skipped, budget_fault, output_fault = [], None, None
+        skipped, budget_fault, output_fault, busy_fault = [], None, None, None
         unusable: set[str] = set()                      # families whose answer stayed unusable [ARCH-19]
-        for brain in candidates:
+        faults: dict[str, str] = {}                     # what each brain of this call raised [ARCH-19]
+        for k, brain in enumerate(candidates):
             name = self.name_of(brain)
-            if self.family_of(name) in unusable:
+            family = self.family_of(name)
+            if family in unusable:
                 skipped.append(name)            # the same model on another server: same answer, only slower
                 continue
+            first = [self.name_of(b) for b in candidates[:k] if self.family_of(self.name_of(b)) == family]
+            if first and not all(self._out(f, faults) for f in first):
+                skipped.append(name)            # the same model is still there on its first server [ARCH-19]
+                continue
+            standby = any(self.family_of(self.name_of(b)) == family for b in candidates[k + 1:])
             wait = self.retry_after.get(name, 0.0)
-            if wait == math.inf or (time.monotonic() < wait and brain is not candidates[-1]):
+            waited_for = standby and self.last_fault.get(name) == "MODEL_BUSY"     # busy: waited for [ARCH-1c d]
+            if wait == math.inf or (time.monotonic() < wait and brain is not candidates[-1] and not waited_for):
                 skipped.append(name)
                 continue
             plan = TokenPlan(step=step, brain=name)
@@ -2742,6 +2760,7 @@ class BrainRouter:
                 result = await call(brain, text, plan)
             except AgentFault as exc:
                 plan.outcome = exc.code
+                faults[name] = exc.code
                 if exc.code == "CONTEXT_BUDGET_EXCEEDED" and brain is not candidates[-1]:
                     # Context windows differ between brains: a brain with more room may still
                     # answer. The brain itself is healthy: no cooldown.
@@ -2761,23 +2780,32 @@ class BrainRouter:
                 if exc.code not in AVAILABILITY_FAULTS:
                     raise
                 self._skip(name, exc.code)
-                LOG.warning("Brain %s failed (%s); using the next brain %s.", name, exc.code,
-                            "for this run" if exc.code == "BRAIN_NO_ACCESS" else f"for {self.cooldown:.0f} s")
+                if exc.code == "MODEL_BUSY" and standby:
+                    busy_fault = exc
+                    LOG.warning("Brain %s stayed busy (%s); the same model on another server is not asked - "
+                                "a busy server is waited for [ARCH-1c d, ARCH-19].", name, exc.message)
+                else:
+                    LOG.warning("Brain %s failed (%s); using the next brain %s.", name, exc.code,
+                                "for this run" if exc.code == "BRAIN_NO_ACCESS" else f"for {self.cooldown:.0f} s")
                 skipped.append(name)
                 continue
             plan.outcome = "answered"
             self._observe(plan, result)
             self.retry_after[name], self.status[name] = 0.0, "available"
+            self.last_fault.pop(name, None)
             return result, brain, skipped
         if output_fault is not None:
             raise output_fault
         if budget_fault is not None:
             raise budget_fault
+        if busy_fault is not None:                  # the same model elsewhere is not asked [ARCH-1c d, ARCH-19]
+            raise busy_fault
         raise AgentFault("NO_BRAIN_AVAILABLE", "No allowed brain is currently available.", True)
 
     def _skip(self, name: str, code: str) -> None:
         """No access: skipped for the run. Otherwise: skipped for the cooldown."""
         self.retry_after[name] = math.inf if code == "BRAIN_NO_ACCESS" else time.monotonic() + self.cooldown
+        self.last_fault[name] = code
         self.status[name] = code
 
     @property

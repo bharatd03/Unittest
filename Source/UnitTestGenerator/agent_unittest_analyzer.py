@@ -73,6 +73,8 @@ class AnalyzerConfig(BaseModel):
     max_brain_calls_per_function: int = 2    # re-ask included [A1-PL9, ORC-7]
     max_brain_scenarios: int = 4             # per call: shorter answers, faster on a small brain [ORC-7]
     rules_first: bool = True                 # no test measured yet: cheap tests first, then the brain [A1-PL1]
+    brain_functions_per_round: int = 30      # functions planned with the brain per round, at least [A1-PL16, ORC-7]
+    state_per_function: int = 40             # state variables listed per function [A2-21aj]
     long_function_lines: int = 150           # above: only the paths to the open items go to the brain [LA-10]
     max_lookups_per_function: int = 6        # A1-PL6, ORC-7
     # Expected answer per brain scenario, in tokens: sets the answer limit and window [ARCH-11]
@@ -3127,6 +3129,7 @@ class AnalyzerAgent(ba.AgentCore):
         for e in layout.enums:
             names |= {k.split("::")[-1] for k in e.values} | {e.name.split("::")[-1]}
         names |= {uc.state_setter_name(v) for v in uc.settable_state(layout)}                        # A2-21z
+        names |= {uc.state_getter_name(v) for v in uc.settable_state(layout)}
         return names
 
     @staticmethod
@@ -3511,8 +3514,12 @@ class AnalyzerAgent(ba.AgentCore):
         globals_ = sorted({m.group(2) for m in re.finditer(
             r"^\s*extern\s+(?!.*\bconst\b)([^;()]*?)\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;",
             "\n".join(self._dependency_headers_text(layout)), re.M)} - stubbed_vars)
-        setters = [f"{uc.state_setter_name(v)}(value) sets {v.name} ({v.type})"
-                   for v in uc.settable_state(layout)][:12]                                         # A2-21z
+        listed, rest = uc.function_state(fn, layout, sut_text.splitlines(), self.cfg.state_per_function)  # A2-21aj
+        setters = [f"{uc.state_setter_name(v)}(value) sets and {uc.state_getter_name(v)}() reads "
+                   f"{v.name.replace('(anonymous namespace)::', '')} ({v.type})" for v in listed]
+        if rest:
+            setters.append("also used (the same two helpers exist for each): " + ", ".join(
+                v.name.replace("(anonymous namespace)::", "") for v in rest[:40]))
         outside = sorted({g.line for g in gaps if g.line and not fn.line_start <= g.line <= fn.line_end})
         callees = [f for f in layout.functions if f is not fn and any(f.line_start <= n <= f.line_end for n in outside)]
         ev_rows = [f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
@@ -3559,7 +3566,8 @@ class AnalyzerAgent(ba.AgentCore):
             "REAL OR SYSTEM DEPENDENCIES (their real code runs; they have no ut_stub_ control - control them through "
             "what they read, such as the GLOBALS below): " + (", ".join(real[:20]) or "none"),
             "GLOBALS a test can set directly: " + (", ".join(globals_[:20]) or "none"),
-            "SUT STATE SETTERS:\n" + ("\n".join(f"- {x}" for x in setters) or "- none"),
+            "SUT STATE (only the SUT file sees these variables: never name one, use its setter and getter) "
+            "[A2-21z, A2-21aj]:\n" + ("\n".join(f"- {x}" for x in setters) or "- none"),
         ]
         # ARCH-17: facts stay whole; evidence, earlier tests and the style give way in that order
         # (reverse) when the call does not fit the brain's window.
@@ -4140,14 +4148,17 @@ class AnalyzerAgent(ba.AgentCore):
         planned = {sc.function for sc in scenarios}
         if last is not None and last.coverage is not None:
             scenarios += [sc for sc in self._evidence_scenarios(layout, req, disputed) if sc.function not in planned]
+        deferred: list[str] = []
         if brain_ok:                                                              # A1-PL1
             infeasible = {g.gap_id for g in gaps if "infeasible" in g.detail or "unreachable_code" in g.detail}
-            scenarios = await self._with_brain(scenarios, active_by_fn, infeasible, layout, req, stubs, disputed, notes)
+            scenarios = await self._with_brain(scenarios, active_by_fn, infeasible, layout, req, stubs, disputed, notes,
+                                               deferred)
         keep = [t.name for t in (last.tests if last else []) if t.status == "passed" and t.name not in drop]
         return uc.UTPlan(**base, stage="coverage", stubs=stubs, scenarios=scenarios, repairs=repairs, gaps=gaps,
                          keep_tests=keep, drop_tests=sorted(set(drop)), open_items=open_items,
                          reason=last.reason if last else "no measurement yet: estimated obligations [A1-18a]",
-                         disputed_evidence=sorted(new_disputes), **notes)
+                         disputed_evidence=sorted(new_disputes), rules_only=not brain_ok and last is not None,
+                         deferred=deferred, **notes)
 
     def _solved(self, fn: uc.FunctionInfo, active: list[uc.GapItem], lines: list[str], layout: uc.LayoutProfile,
                 last: uc.VerificationResult | None, solver: dict[str, Any]) -> list[uc.Scenario]:
@@ -4216,9 +4227,11 @@ class AnalyzerAgent(ba.AgentCore):
 
     async def _with_brain(self, scenarios: list[uc.Scenario], active_by_fn: dict[str, list[uc.GapItem]],
                           infeasible: set[str], layout: uc.LayoutProfile, req: uc.PlanRequest, stubs: list[uc.StubSpec],
-                          disputed: set[str], notes: dict[str, list[str]]) -> list[uc.Scenario]:
+                          disputed: set[str], notes: dict[str, list[str]], deferred: list[str] | None = None
+                          ) -> list[uc.Scenario]:
         """Per planned function: the brain's checked scenarios replace the rule scenarios; the coverage-guided search
-        inputs and the solved scenarios (A1-PL15) stay. Without a usable answer the planning fails (BRAIN_PLAN_FAILED) and the run stops [A1-PL8]."""
+        inputs and the solved scenarios (A1-PL15) stay. Without a usable answer the planning fails (BRAIN_PLAN_FAILED) and the run stops [A1-PL8].
+        More functions than one round takes: the others are left for later rounds, with no scenario now [A1-PL16]."""
         sut_text = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         out = list(scenarios)
         work = []
@@ -4238,6 +4251,18 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             evidence = [e for e in self.collect_evidence(layout, name).evidence if uc.evidence_key(e) not in disputed]
             work.append((name, fn, gaps, open_ids, evidence))
+        later = self._this_round(work, req)                                                         # A1-PL16
+        if later:
+            names = {w[0] for w in later}
+            work = [w for w in work if w[0] not in names]
+            out = [s for s in out if s.function not in names or s.inputs or s.scenario_id.startswith("S-solved-")]
+            if deferred is not None:
+                deferred.extend(sorted(names))
+            notes["planning"].append(f"{len(work)} function(s) planned with the brain in this round, {len(later)} left "
+                                     f"for later rounds: {', '.join(sorted(names)[:8])}"
+                                     f"{' ...' if len(names) > 8 else ''} [A1-PL16]")
+        done = [0]
+        total = len(work)
 
         # ARCH-18: the functions are planned at the same time, each with notes of its own; the
         # results are combined below in the order of the functions, never in the order they arrive.
@@ -4246,10 +4271,18 @@ class AnalyzerAgent(ba.AgentCore):
                 own = {key: [line for line in lines if key == "lookups" and line.startswith(fn.name + ":")]
                        for key, lines in notes.items()}
                 before = {key: len(lines) for key, lines in own.items()}
-                found = await self._brain_scenarios(fn, gaps, open_ids, infeasible, layout, req, sut_text, stubs,
-                                                    evidence, own)
+                try:
+                    found = await self._brain_scenarios(fn, gaps, open_ids, infeasible, layout, req, sut_text, stubs,
+                                                        evidence, own)
+                finally:                                                                       # VIEW-16
+                    done[0] += 1
+                    self.emit("stage", data={"stage": "A1.plan", "done": done[0], "of": total},
+                              summary=f"UT-Analyzer: brain plans for {done[0]} of {total} functions (last: {fn.name})")
                 return found, own, before
             return run
+        if total > 1:                                                                              # VIEW-16
+            self.emit("stage", data={"stage": "A1.plan", "done": 0, "of": total},
+                      summary=f"UT-Analyzer: the brain plans {total} functions")
         results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
         for (name, fn, *_), result in zip(work, results):
             if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
@@ -4268,6 +4301,24 @@ class AnalyzerAgent(ba.AgentCore):
             out = [s for s in out if not mine(s, fn) or s.inputs or s.scenario_id.startswith("S-solved-")   # A1-PL15
                    or (s.scenario_id.startswith("S-evidence-") and not behaviour)] + brain
         return out
+
+    def _this_round(self, work: list[tuple], req: uc.PlanRequest) -> list[tuple]:
+        """A1-PL16: the functions left for later rounds - this round takes the configured number, more when the
+        iterations left would not give every function its first brain round in their first half; never tried first,
+        then the most open items, then the order of the file."""
+        size = max(1, self.cfg.brain_functions_per_round)
+        if len(work) <= size:
+            return []
+        tried = set(req.attempts)
+        fresh = [w for w in work if not any(g.gap_id in tried for g in w[2])]
+        rounds = max(1, (max(req.iterations_left, 0) + 1) // 2)
+        size = max(size, -(-len(fresh) // rounds))
+        if len(work) <= size:
+            return []
+        ranked = sorted(range(len(work)), key=lambda k: (any(g.gap_id in tried for g in work[k][2]),
+                                                          -len(work[k][3]), work[k][1].line_start))
+        keep = set(ranked[:size])
+        return [w for k, w in enumerate(work) if k not in keep]
 
     @staticmethod
     def _linked_keys(f: uc.Failure, req: uc.PlanRequest, evidence: list[uc.EvidenceRef]) -> set[str]:

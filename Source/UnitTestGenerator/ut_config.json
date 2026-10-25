@@ -72,6 +72,7 @@
   },
   "analyzer": {"max_attempts_per_gap": 2, "long_function_lines": 150, "max_scenarios_per_function": 12, "real_dependency_depth": 2,
                "requirement_files": [], "max_brain_calls_per_function": 2,
+               "brain_functions_per_round": 30, "state_per_function": 40,
                "max_lookups_per_function": 6, "link_requirements": true, "propose_declarations": true,
                "rule_attempts": 2},
   "generator": {"mode": "deterministic_then_llm", "max_auto_tests_per_function": 24, "max_llm_tests_per_function": 8,

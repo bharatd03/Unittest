@@ -237,6 +237,11 @@ def state_setter_name(var: StateVar) -> str:
     return "ut_state_set_" + safe_name(var.name)
 
 
+def state_getter_name(var: StateVar) -> str:
+    """A2-21z: the getter of a SUT state variable, next to its setter."""
+    return "ut_state_get_" + safe_name(var.name)
+
+
 def settable_state(layout: "LayoutProfile") -> list[StateVar]:
     """A2-21z: the SUT state variables that get a setter - every scalar or enumeration variable, whatever its
     linkage. Agent1 offers exactly these to the brain and Agent2 writes exactly these."""
@@ -263,34 +268,141 @@ _STRING_LITERAL = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
 
 
 def hidden_state(layout: "LayoutProfile", headers: str) -> set[str]:
-    """A2-21ai: SUT state variables a test cannot name - static, in an unnamed namespace, or declared in no header."""
+    """A2-21ai: SUT state variables a test cannot name - static, in an unnamed namespace, or declared in no header.
+    Only a declaration as a variable (extern, or an inline variable in C++) makes one visible: the same name as a
+    field, a parameter or a variable of another namespace does not."""
     out = set()
     for v in layout.sut_state:
         short = v.name.split("::")[-1]
-        if not re.search(r"\b" + re.escape(short) + r"\b", headers):
+        declared = re.search(r"\b(?:extern|inline)\b[^;(){}]*?(?<![\w.>])" + re.escape(short) +
+                             r"\s*(?:\[[^\]]*\]\s*)*(?:=[^;]*)?;", headers)
+        if not declared:
             out.add(v.name)
     return out
 
 
-def name_problem(code: str, calls: set[str], allowed: set[str]) -> str:
+def _namespace_of(name: str) -> str:
+    return name.replace("(anonymous namespace)::", "").rpartition("::")[0]
+
+
+def _closest_first(names: list[str], function: str) -> list[str]:
+    """Variables of one name in several namespaces: those of the function's own namespace (or one enclosing it)
+    first, the deepest first [A2-21ai]."""
+    own = _namespace_of(function)
+
+    def rank(n: str) -> tuple[int, int]:
+        ns = _namespace_of(n)
+        inside = own == ns or own.startswith(ns + "::") or not ns
+        return (0 if inside else 1, -len(ns))
+    return sorted(names, key=rank)
+
+
+def name_problem(code: str, calls: set[str], allowed: set[str], function: str = "") -> str:
     """A2-21ai: a guard - helpers of the pipeline that are not written for this SUT, or a SUT variable that only the
     SUT file sees, used by its name. ``code`` without comments and strings; ``allowed`` may carry HIDDEN_MARK
-    entries."""
+    entries; ``function`` (the function under test) puts the variables of its namespace first."""
     setters = sorted(a for a in allowed if a.startswith("ut_state_set_"))
     missing = sorted(c for c in calls if c not in allowed and PIPELINE_HELPER.match(c))
     if missing:
         return (f"uses helpers the pipeline does not write for this SUT: {', '.join(missing[:4])}; the state setters "
                 f"that exist: {', '.join(setters[:8]) or 'none'} [A2-21ai]")
+    hidden: dict[str, list[str]] = {}
     for entry in sorted(a for a in allowed if a.startswith(HIDDEN_MARK)):
         name = entry[len(HIDDEN_MARK):]
-        short = name.split("::")[-1]
-        use = re.search(r"(?<![\w.>])(?:\w+::)*" + re.escape(short) + r"\b(?!\s*::)", code)
+        hidden.setdefault(name.split("::")[-1], []).append(name)
+    for short, names in sorted(hidden.items()):
+        use = re.search(r"(?<![\w.>])((?:\w+::)*)" + re.escape(short) + r"\b(?!\s*::)", code)
         declared = re.search(r"\b[A-Za-z_][\w:<>]*[\s*&]+" + re.escape(short) + r"\s*(?:[=;\[(,{)]|$)", code)
         if use and not declared:
-            setter = state_setter_name(StateVar(name=name))
-            how = f"set it with {setter}(value)" if setter in allowed else "observe it through the SUT's functions"
+            written = use.group(1).rstrip(":")
+            named = [n for n in names if written and (n.endswith("::" + written + "::" + short) or
+                                                     n.replace("(anonymous namespace)::", "") == written + "::" + short)]
+            ways = []
+            for n in _closest_first(named or names, function):
+                setter, getter = state_setter_name(StateVar(name=n)), state_getter_name(StateVar(name=n))
+                if setter in allowed:
+                    ways.append(f"{setter}(value) sets and {getter}() reads {n.replace('(anonymous namespace)::', '')}")
+            how = "; ".join(ways[:4]) if ways else "observe it through the SUT's functions"
             return f"uses {short}, which only the SUT file sees: {how} [A2-21ai]"
     return ""
+
+
+def _uses(text: str, short: str) -> bool:
+    return re.search(r"(?<![\w.>])(?:\w+::)*" + re.escape(short) + r"\b(?!\s*\()", text) is not None
+
+
+_DECISION = re.compile(r"\b(?:if|while|switch|case)\b|\?")
+
+
+def function_state(fn: "FunctionInfo", layout: "LayoutProfile", lines: list[str], limit: int = 40
+                   ) -> tuple[list[StateVar], list[StateVar]]:
+    """A2-21aj: the settable SUT state (A2-21z) the function and the SUT functions it calls (two levels) use - those
+    its own decisions read first - as (listed, the rest beyond ``limit``). A name that several namespaces use is
+    resolved by the namespace written in the code, else by the function's own namespace."""
+    by_short: dict[str, list[StateVar]] = {}
+    for v in settable_state(layout):
+        by_short.setdefault(v.name.split("::")[-1], []).append(v)
+    if not by_short:
+        return [], []
+
+    def body(f: "FunctionInfo") -> str:
+        return "\n".join(lines[f.line_start - 1: f.line_end]) if 0 < f.line_start <= len(lines) else ""
+    own_file = [g for g in layout.functions if g.file == fn.file]
+
+    def callees(f: "FunctionInfo") -> list["FunctionInfo"]:
+        """The SUT functions f calls, read from its text with the namespace written there; an unqualified name
+        several namespaces define is the one closest to f's own namespace."""
+        text = body(f).partition("{")[2]                                 # the body, not the function's own name
+        out = []
+        for short in sorted({c.split("::")[-1] for c in f.calls} | {g.name.split("::")[-1] for g in own_file}):
+            same = [g for g in own_file if g is not f and g.name.split("::")[-1] == short]
+            if not same:
+                continue
+            for m in re.finditer(r"(?<![\w:.>])((?:\w+::)*)" + re.escape(short) + r"\s*\(", text):
+                written = m.group(1).rstrip(":")
+                pick = [g for g in same if written and (g.qualified_name.replace("(anonymous namespace)::", "")
+                                                        .endswith(written + "::" + short)
+                                                        or g.qualified_name == written + "::" + short)]
+                if not pick and not written:
+                    first = _closest_first([g.qualified_name for g in same], f.qualified_name)[0]
+                    pick = [g for g in same if g.qualified_name == first]
+                out += [g for g in pick if g not in out]
+        return out
+    reach, frontier = [fn], [fn]
+    for _ in range(2):
+        nxt = []
+        for f in frontier:
+            for g in callees(f):
+                if g not in reach:
+                    reach.append(g)
+                    nxt.append(g)
+        frontier = nxt
+    own = body(fn)
+    decisions = "\n".join(line for line in own.splitlines() if _DECISION.search(line))
+    found: list[tuple[int, int, StateVar]] = []
+    for k, f in enumerate(reach):
+        text = own if f is fn else body(f)
+        for short, candidates in by_short.items():
+            if not _uses(text, short):
+                continue
+            written = {m.group(1).rstrip(":") for m in re.finditer(
+                r"(?<![\w.>])((?:\w+::)+)" + re.escape(short) + r"\b", text)}
+            chosen = [v for v in candidates if any(v.name.replace("(anonymous namespace)::", "").endswith(
+                w + "::" + short) for w in written)]
+            if not chosen:
+                ranked = _closest_first([v.name for v in candidates], f.qualified_name)
+                chosen = [v for v in candidates if v.name == ranked[0]] if len(candidates) > 1 and _namespace_of(
+                    f.qualified_name) else candidates
+            for v in chosen:
+                rank = 0 if f is fn and _uses(decisions, short) else 1 if f is fn else 2
+                found.append((rank, k, v))
+    seen: set[str] = set()
+    ordered = []
+    for _, _, v in sorted(found, key=lambda x: (x[0], x[1])):
+        if v.name not in seen:
+            seen.add(v.name)
+            ordered.append(v)
+    return ordered[:limit], ordered[limit:]
 
 
 def namespace_names(layout: "LayoutProfile", headers: str) -> dict[str, str]:
@@ -966,6 +1078,8 @@ class UTPlan(Contract):
     disputed_evidence: list[str] = Field(default_factory=list)   # evidence keys not to plan again [A1-PL13]
     proposed_dependencies: list[Dependency] = Field(default_factory=list)   # declarations proposed [A1-PL14]
     kinds_available: list[str] = Field(default_factory=list)   # answer kinds an available brain may give [BP-3, BP-9]
+    rules_only: bool = False          # the rule round: no brain writes a test; the scenarios are facts [A1-PL1]
+    deferred: list[str] = Field(default_factory=list)          # functions left for a later brain round [A1-PL16]
 
 
 class FuzzResult(Contract):
@@ -1056,6 +1170,7 @@ class PlanRequest(Contract):
     final_items: list[str] = Field(default_factory=list)         # items with a final status: not planned [LA-6]
     lessons: list[str] = Field(default_factory=list)             # verified lessons of the knowledge base [LA-8]
     item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
+    iterations_left: int = 0                                      # after this one: the brain's rounds [A1-PL16]
 
 
 class DependencyRequest(Contract):

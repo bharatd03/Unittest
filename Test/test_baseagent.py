@@ -2096,6 +2096,20 @@ class GenerateTests(unittest.IsolatedAsyncioTestCase):
             _, brain, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
         self.assertEqual(brain.brain_name, "qwen")                                  # remote down: the local one
         self.assertEqual(router.family_of("qwen_remote"), router.family_of("qwen"))
+        # a busy remote is waited for, a call too big for it is not passed on: the local one is never asked
+        for code in ("MODEL_BUSY", "CONTEXT_BUDGET_EXCEEDED"):
+            remote, local = qwen("qwen_remote", fail=code), qwen("qwen")
+            router = ba.BrainRouter([remote, local])
+            with self.subTest(code), self.assertLogs("baseagent", "WARNING") if code == "MODEL_BUSY" else \
+                    contextlib.nullcontext(), self.assertRaises(ba.AgentFault) as ctx:
+                await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+            self.assertEqual((ctx.exception.code, local.calls), (code, 0))
+        # while the busy remote cools down, the next call still goes to it, not to the local one
+        remote.fail, local.calls = None, 0
+        router = ba.BrainRouter([remote, local])
+        router._skip("qwen_remote", "MODEL_BUSY")
+        _, brain, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
+        self.assertEqual((brain.brain_name, local.calls), ("qwen_remote", 0))
         self.assertEqual(ba.QwenRemoteEngine(ba.QwenRemoteSettings()).family, ba.QwenEngine(ba.QwenSettings()).family)
 
     async def test_demo_cannot_generate(self):

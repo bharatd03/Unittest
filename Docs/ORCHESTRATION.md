@@ -74,7 +74,7 @@ flowchart TD
     end
 
     subgraph stageB ["Stage B: coverage"]
-        builds -- yes --> covPlan["Agent1 coverage plan<br/>iteration 1 with nothing measured: cheap tests first<br/>(rule-based tests + search, A1-PL1);<br/>then the brain plans every gap left, with what was tried,<br/>suggested values and earlier refusals as facts;<br/>format fixed, content checked (A1-PL, ARCH-20)"]
+        builds -- yes --> covPlan["Agent1 coverage plan<br/>iteration 1 with nothing measured: cheap tests first<br/>(rule-based tests + search, A1-PL1; no brain test either);<br/>then the brain plans every gap left, at most 30 functions<br/>a round on a large file (A1-PL16), with what was tried,<br/>suggested values and earlier refusals as facts;<br/>format fixed, content checked (A1-PL, ARCH-20)"]
         covPlan --> kb["KB guidance<br/>fetched by the orchestrator"]
         kb --> gen["Agent2 generate<br/>suites, test cases, stubs"]
         gen --> verify["Agent3 verify<br/>build, run all tests, measure"]

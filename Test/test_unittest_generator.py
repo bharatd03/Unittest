@@ -4990,6 +4990,40 @@ class PilotRunFixesTests(unittest.TestCase):
         self.assertEqual(len([s for s in seen if "mutants" in s.get("summary", "")]), 1)
 
 
+class LargeFileRoundTests(unittest.TestCase):
+    """A1-PL16, A1-PL1, LA-5: on a large file the brain's work is split into rounds, and the rule round is no attempt."""
+
+    def test_the_brain_plans_a_large_file_in_rounds(self):                                 # A1-PL16
+        agent = a1.AnalyzerAgent()
+        fn = lambda k: uc.FunctionInfo(name=f"f{k}", qualified_name=f"f{k}", signature="", file="a.c",
+                                       line_start=k * 10, line_end=k * 10 + 5)
+        gap = lambda k, j: uc.GapItem(gap_id=f"BC:{k}:{j}", function=f"f{k}", metric="BC", line=k * 10 + 1)
+        work = [(f"f{k}", fn(k), [gap(k, j) for j in range(1 + k % 3)], {f"BC:{k}:{j}" for j in range(1 + k % 3)}, [])
+                for k in range(100)]
+        later = agent._this_round(work, uc.PlanRequest(layout=uc.LayoutProfile(
+            repo_root=".", sut_file="a.c", language="c", component_root=".", writable_test_dir="t",
+            writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64), iterations_left=9,
+            attempts={"BC:0:0": 1}))
+        self.assertEqual(len(later), 70)                                    # 30 per round, 5 rounds for 100
+        names = {w[0] for w in later}
+        self.assertIn("f0", names)                                          # tried before: after the others
+        self.assertNotIn("f2", names)                                       # most open items first
+        req = uc.PlanRequest(layout=uc.LayoutProfile(
+            repo_root=".", sut_file="a.c", language="c", component_root=".", writable_test_dir="t",
+            writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64), iterations_left=1)
+        self.assertEqual(agent._this_round(work, req), [])                  # the last rounds take every function
+        self.assertEqual(agent._this_round(work[:30], req.model_copy(update={"iterations_left": 9})), [])
+
+    def test_the_rule_round_is_no_attempt(self):                                            # A1-PL1, LA-5
+        plan = uc.UTPlan(plan_id="p", stage="coverage", rules_only=True, layout=uc.LayoutProfile(
+            repo_root=".", sut_file="a.c", language="c", component_root=".", writable_test_dir="t",
+            writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64), scenarios=[uc.Scenario(
+                scenario_id="S-evidence-f", function="f", gap_ids=["EVIDENCE:f"], description="d")])
+        self.assertEqual(len(up.Journal.attempts_of(plan, 1)), 1)          # would count without the flag
+        source = (SRC / "ut_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("attempted = [] if plan.rules_only else Journal.attempts_of(plan, iteration)", source)
+
+
 @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
 class LargePilotFindingsTests(unittest.TestCase):
     """TP-25: what the large pilots found, on a small file of the same forms (A1-DA10, A1-DA15, A2-21k)."""
@@ -5017,6 +5051,79 @@ class LargePilotFindingsTests(unittest.TestCase):
         self.assertTrue(any(v.name == "pt::g_last" for v in layout.sut_state), layout.sut_state)
         pwm = next(d for d in layout.dependencies.entries if d.name == "pwm")
         self.assertEqual(pwm.decision, "stub", pwm.reason)                         # no definition is never "linked"
+
+    def test_several_namespaces_in_one_file(self):            # A2-21z, A2-21ai, A2-21aj, A2-21k, A1-PL1
+        """The same names in several namespaces (functions, statics, state, enums, stubs): the files build, the rule
+        round builds and runs without a brain, state is set and read by its own helpers, and the brain is told the
+        state of the function's own namespace."""
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "include").mkdir()
+        (root / "include/m.hpp").write_text(
+            "#pragma once\nnamespace a { enum class Mode { Off, On }; int step(int v); }\n"
+            "namespace b { enum class Mode { Idle, Run, Fault }; int step(int v); }\n"
+            "namespace b { namespace inner { int step(int v); } }\n"
+            "namespace hal { int init(int ch); }\nnamespace nvm { int init(int ch); }\n"
+            "struct Limits { int limit; int counter; };\nvoid configure(int limit);\n")
+        (root / "src/m.cpp").write_text(
+            '#include "m.hpp"\nnamespace a {\n'
+            "namespace {\nint counter = 0;\nMode g_mode = Mode::Off;\nint helper(int x) { return x + 1; }\n}\n"
+            "static int limit = 10;\n"
+            "int step(int v) { if (v > limit) { counter++; g_mode = Mode::On; } return helper(v) + counter + "
+            "hal::init(v) + nvm::init(v); }\n}\n"
+            "namespace b {\nnamespace {\nint counter = 0;\nMode g_mode = Mode::Idle;\nint helper(int x) { return x * 2; }\n}\n"
+            "static int limit = 20;\n"
+            "int step(int v) { if (v > limit && g_mode != Mode::Fault) { counter += 2; g_mode = Mode::Run; } "
+            "return helper(v) - counter; }\n"
+            "namespace inner { static int limit = 5; int step(int v) { return v < limit ? a::step(v) : b::step(v); } }\n}\n")
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file="src/m.cpp"))
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(tmp.name) / "w")))
+        layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
+            uc.CaptureRequest(layout=layout)))))
+        self.assertEqual(sorted(a2.wrapper_name(f) for f in a2.static_functions(layout)),
+                         ["ut_static_a__helper", "ut_static_b__helper"])
+        # a field or a parameter of the same name in a header does not make a variable of the SUT file visible
+        self.assertEqual(uc.hidden_state(layout, uc.headers_text(layout)), {v.name for v in layout.sut_state})
+        lines = (root / "src/m.cpp").read_text().splitlines()
+        b_step = next(f for f in layout.functions if f.qualified_name == "b::step")
+        listed, _ = uc.function_state(b_step, layout, lines)
+        self.assertEqual({v.name for v in listed}, {"b::limit", "b::g_mode", "b::counter"})   # its own namespace
+        self.assertNotIn("a::counter", [v.name for v in listed])
+        inner = next(f for f in layout.functions if f.qualified_name == "b::inner::step")
+        self.assertEqual([v.name for v in uc.function_state(inner, layout, lines)[0]][0], "b::inner::limit")
+        self.assertIn("a::counter", [v.name for v in uc.function_state(inner, layout, lines)[0]])   # through a::step
+        part = a2.state_part(b_step, layout, lines)
+        self.assertIn("ut_state_get_b_g_mode(void)", part)
+        allowed = {uc.HIDDEN_MARK + v.name for v in layout.sut_state} | {
+            uc.state_setter_name(v) for v in layout.sut_state}
+        problem = uc.name_problem("counter = 1;", set(), allowed, "b::step")
+        self.assertLess(problem.index("ut_state_set_b_counter"), problem.index("ut_state_set_a_counter"))
+        self.assertNotIn("ut_state_set_b_counter", uc.name_problem("a::counter = 1;", set(), allowed, "b::step"))
+        # the rule round: tests built, measured and run; no brain is asked for the scenarios left [A1-PL1]
+        plan = run(agent.plan(uc.PlanRequest(layout=layout, last=None, iteration=1)))
+        plan = plan.model_copy(update={"rules_only": True, "scenarios": plan.scenarios + [uc.Scenario(
+            scenario_id="S-x", function="b::step", function_line=b_step.line_start, gap_ids=["BC:x"],
+            description="d", characterization=False)]})
+        gen = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic_then_llm"))
+        with mock.patch.object(gen, "generate", side_effect=AssertionError("no brain test in the rule round")), \
+                mock.patch.object(gen, "_brain_values", return_value={}):
+            bundle = run(gen.generate_bundle(uc.GenerationRequest(plan=plan)))
+        self.assertTrue(any("[A1-PL1]" in n for n in bundle.notes), bundle.notes)
+        suite = next(a for a in bundle.actions if a.role == "testsuite")
+        extra = ("UT_TEST(test_b_state_helpers)\n{\n    ut_state_set_b_limit(1);\n    ut_state_set_b_g_mode(0);\n"
+                 "    UT_EXPECT_EQ_INT(b::step(3), 6 - 2);\n    UT_EXPECT_EQ_INT(ut_state_get_b_counter(), 2);\n"
+                 "    UT_EXPECT_EQ_INT(ut_state_get_b_g_mode(), 1);\n    UT_EXPECT_EQ_INT(ut_state_get_a_counter(), 0);\n}\n\n")
+        suite.content = suite.content.replace("UT_SUITE_BEGIN", extra + "UT_SUITE_BEGIN").replace(
+            "UT_SUITE_END", "    UT_CASE(test_b_state_helpers)\nUT_SUITE_END")
+        bundle.tests.append("test_b_state_helpers")
+        result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
+        self.assertTrue(result.link_ok, result.reason)
+        failed = [(t.name, t.message) for t in result.tests if t.status != "passed"]
+        self.assertEqual(failed, [])
+        self.assertIn("test_b_state_helpers", [t.name for t in result.tests])
 
 
 class AgentProgramTests(unittest.TestCase):

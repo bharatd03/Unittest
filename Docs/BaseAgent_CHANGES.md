@@ -1,5 +1,20 @@
 # BaseAgent changes
 
+## 2026-10-25 (late evening): the local Qwen only when the remote one is out
+
+**Why.** In the large pilot, the router passed calls from the remote Qwen to the local Qwen on the same GPU. That
+happened when the remote one was busy or cooling down after a busy answer, and when a call did not fit its window.
+The local one then refused at once (the call did not fit its window either) or was busy itself.
+
+* **`BrainRouter._route`** (ARCH-19, ARCH-1c d). A brain of the same model as an earlier brain in the order (the same
+  `family`) is asked only when every earlier one is out for the run or failed to answer in this call (a connection
+  fault, a timeout). It is never asked when the earlier one is busy, cooling down after `MODEL_BUSY`, or refused the
+  call as too big for its window. A remote brain cooling down after `MODEL_BUSY` is asked again rather than skipped.
+  When it stays busy, the call ends with `MODEL_BUSY`, not with the local brain's answer.
+* **`BrainRouter.last_fault`**: the latest availability fault of each brain, cleared by an answer.
+* **Tests.** `GenerateTests.test_unusable_answer_is_not_passed_to_the_same_model_on_another_server` covers a busy
+  remote, a call too big for it, and a remote cooling down after a busy answer.
+
 ## 2026-10-25 (afternoon): stop from the page; a busy remote server is waited for
 
 **Why.** A long run could be stopped only in the terminal. With two files in parallel, the remote Qwen's two request

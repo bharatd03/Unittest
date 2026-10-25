@@ -735,7 +735,7 @@ class Orchestrator:
                         crashed_calls=s.crashed_calls[-40:], journal=journal,                   # LA-4
                         tried_scenarios=sorted(s.tried_scenarios), other_model_items=sorted(s.other_model_items),
                         final_items=sorted(s.final_items), lessons=await self._lesson_texts(s),
-                        item_kinds=dict(s.item_kinds)), uc.UTPlan)
+                        item_kinds=dict(s.item_kinds), iterations_left=s.iter_limit - iteration), uc.UTPlan)
                     if pending is None:
                         plan = await planning
                     else:                       # the brain plans while the search runs on this computer [ORC-5a]
@@ -778,7 +778,8 @@ class Orchestrator:
                     if self._only_proven(plan, last):                                       # COV-4, COV-7
                         return await self._stop(s, "no test can reach the remaining items: each has a deterministic proof, "
                                                    "so only a change of the source can reach them [COV-4, COV-7]", last)
-                    attempted = Journal.attempts_of(plan, iteration)                          # LA-5
+                    # LA-5; the rule round writes no brain test: its scenarios are facts, not attempts [A1-PL1]
+                    attempted = [] if plan.rules_only else Journal.attempts_of(plan, iteration)
                     if not plan.scenarios and not plan.repairs and self._settled(s, last):     # LA-7 b
                         return await self._stop(s, "every open item has a final status: no further attempt can change "
                                                    "it [LA-6, LA-7]", last)
@@ -849,7 +850,7 @@ class Orchestrator:
                     for failure in [f for f in result.failures if f.route == "stop"]:
                         return s.finish("incomplete", "environment: " + failure.diagnostic, result)
                     progress = result.newly_covered > 0 or fixed or len(result.failures) < len(last.failures) \
-                        or new_cause                                    # a new root cause changes the next attempt [LA-7]
+                        or new_cause or bool(plan.deferred)   # a new root cause or untried functions [LA-7, A1-PL16]
                     stagnant = 0 if progress else stagnant + 1
                     if progress:
                         next_brain_asked = False
