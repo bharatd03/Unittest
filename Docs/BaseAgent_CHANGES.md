@@ -1,5 +1,53 @@
 # BaseAgent changes
 
+## 2026-10-25 (evening): the Details panel is an overview, never empty
+
+**Why.** Until you clicked an agent or a metric, the Details panel said only "Click an agent or a metric".
+
+* **Viewer (VIEW-13)**: the panel opens on an overview of the file on display: its state and time, the current
+  stage, the targets not met, the action needed, and its latest agent calls with input and output, newest first. The
+  overview updates with every event of that file, and clicking the heading **Details** brings it back. Every run
+  keeps its own list of calls (`calls`, the last 8), and `stage` events are recorded per run.
+* **Program events**: `data.runs` counts several runs as one entry. The outcome `tests_failed` is shown in grey
+  (VIEW-14).
+* **Tests**: `ViewerTests.test_page_shows_input_output_orchestrator_and_idle_agents` now also reads the overview,
+  and reads it again after clicking the heading.
+
+## 2026-10-25 (later): a remote brain behind a gateway; one page for several runs in a row
+
+**Why.** The remote Qwen sits behind Cloudflare, which ends a request that sends nothing for 100 s (HTTP 524). A long
+answer, or a request queued behind another file's request, was cut, the remote brain was marked unavailable and
+the local Ollama on the same GPU answered instead - for 15 minutes in one run.
+
+* **`QwenRemoteSettings`**: `stream` (default on), `stream_idle` (90 s), `shared_slots` (on), `gateway_retries` (3),
+  `gateway_pause` (15 s).
+* **Streamed answers** (`RemoteHTTP._stream`, `OllamaHTTP.call(..., idle=)`): server-sent events are put together
+  into the reply a non-streamed request gets; a server that does not stream is read as before, and one that refuses
+  the `stream` field is asked again without it.
+* **`SharedSlots`**: `max_concurrency` holds for every process of the computer together (slot files in the temporary
+  directory, refreshed by their holder, taken over after 120 s when a process ended without releasing them).
+* **`GATEWAY_BUSY`** (408, 425, 429, 502, 503, 504, 520-527) and a stream that stays silent: the same server is asked
+  again after `gateway_pause`, `gateway_retries` times, before the router's next brain is used.
+* **Viewer**: a `progress` event may carry `pending` (folders still to come); the page reads "finished" only when no
+  run is running and nothing is pending. A run id `folder: file` shows as such on its chip.
+* **Tests.** `QwenRemoteEngineTests.test_a_streamed_answer_and_a_slow_gateway`,
+  `test_requests_to_one_server_share_their_slots`; the request shape now has `stream: true`.
+
+## 2026-10-25: several runs on one viewer page
+
+**Why.** With two SUT files running in parallel on one page, each file's `run_start` cleared the metric cards and
+replaced the title, and one file's `run_end` marked the page finished while the other still ran. The events did not
+say which run they belonged to.
+
+* **`ViewHub.for_run(run)`** returns a `RunView`: the same hub whose `emit()` adds `"run": run` to every event.
+* **`VIEW_RUN_ENV` (`BASEAGENT_VIEW_RUN`)**: `emit_event` adds the run named there, so agent processes started for
+  one run tag their events too. Unset, nothing changes.
+* **The page** keeps title, metrics, final state and end panel per run, shows a row of chips (one per run, with its
+  state) when there is more than one, and shows one run: the one clicked, else the one shown while it runs, else the
+  running one that started first. A run that starts never clears another's cards; "finished" only when every run has
+  ended. Events without a run behave exactly as before.
+* **Tests.** `ViewerTests.test_several_runs_on_one_page_name_their_run`.
+
 ## 2026-10-24 (late night): answers of any brain are read the same way
 
 **Why.** A brain without JSON-schema enforcement may write "Here is the JSON:" before a fenced block, use another

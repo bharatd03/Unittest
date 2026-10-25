@@ -492,6 +492,274 @@ def mcdc_pairs(expr: str) -> tuple[list[str], dict[int, tuple[str, str]], list[i
     return leaves, pairs, infeasible
 
 
+# ============================================================================ solved scenarios [A1-PL15]
+LEAF_COMPARE = re.compile(r"^(?P<a>[^<>=!]+?)\s*(?P<op><=|>=|==|!=|<|>)\s*(?P<b>[^<>=!]+)$")
+SOLVE_CMP = {"<": lambda x, y: x < y, ">": lambda x, y: x > y, "<=": lambda x, y: x <= y, ">=": lambda x, y: x >= y,
+       "==": lambda x, y: x == y, "!=": lambda x, y: x != y}
+
+
+def _unwrap(text: str) -> str:
+    text = text.strip()
+    while text.startswith("(") and _close_paren(text) == len(text) - 1:
+        text = text[1:-1].strip()
+    return text
+
+
+def _constant(text: str, constants: dict[str, int]) -> float | int | None:
+    text = _unwrap(text)
+    if text in ("true", "TRUE"):
+        return 1
+    if text in ("false", "FALSE"):
+        return 0
+    m = re.fullmatch(r"([+-]?\d+\.\d*|[+-]?\d*\.\d+)(?:[eE][+-]?\d+)?[fFlL]?", text)
+    if m:
+        return float(text.rstrip("fFlL"))
+    return eval_int(text, constants)
+
+
+def param_constraint(leaf: str, params: set[str], constants: dict[str, int]) -> tuple[str, str, Any, bool] | None:
+    """A1-PL15: (parameter, comparison, constant, negated) of a condition, ("p", "bool", None, negated) for a boolean
+    parameter, or None when the condition has another form."""
+    text, neg = _unwrap(leaf), False
+    while text.startswith("!") and not text.startswith("!="):
+        neg, text = not neg, _unwrap(text[1:])
+    if text in params:
+        return text, "bool", None, neg
+    m = LEAF_COMPARE.match(text)
+    if not m:
+        return None
+    a, op, b = _unwrap(m.group("a")), m.group("op"), _unwrap(m.group("b"))
+    if a in params and b not in params:
+        value = _constant(b, constants)
+        return (a, op, value, neg) if value is not None else None
+    if b in params and a not in params:
+        value = _constant(a, constants)
+        return (b, FLIP[op], value, neg) if value is not None else None
+    return None
+
+
+def _holds(constraint: tuple[str, str, Any, bool], truth: bool, value: Any) -> bool:
+    _, op, constant, neg = constraint
+    result = bool(value) if op == "bool" else SOLVE_CMP[op](value, constant)
+    return (result != neg) == truth
+
+
+def solve_parameters(fn: uc.FunctionInfo, wanted: list[tuple[tuple[str, str, Any, bool], bool]]
+                     ) -> list[uc.NamedValue] | None:
+    """A1-PL15: values for every parameter of ``fn`` that make every (condition, truth) of ``wanted`` hold, from the
+    constants and their neighbours; None when a parameter cannot be given a value this way."""
+    out = []
+    for p in fn.params:
+        cs = [(c, truth) for c, truth in wanted if c[0] == p.name]
+        typ = (p.canonical or p.type).replace("const", "").strip()
+        if p.kind == "bool" or typ in ("bool", "_Bool"):
+            cands: list[Any] = [False, True]
+        elif p.kind in ("int", "enum") or INTEGRAL_T.match(typ):
+            lits = [int(c[2]) for c, _ in cs if c[2] is not None]
+            cands = sorted({0, *lits, *(v - 1 for v in lits), *(v + 1 for v in lits)}, key=lambda v: (abs(v), v))
+            if re.search(r"\bunsigned\b|\buint|\bsize_t\b", typ):
+                cands = [v for v in cands if v >= 0]
+        elif p.kind == "float" or FLOAT_T.match(typ):
+            lits = [float(c[2]) for c, _ in cs if c[2] is not None]
+            cands = sorted({0.0, *lits, *(v - 0.5 for v in lits), *(v + 0.5 for v in lits)}, key=lambda v: (abs(v), v))
+        else:
+            return None
+        value = next((v for v in cands if all(_holds(c, truth, v) for c, truth in cs)), None)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            text = "true" if value else "false"
+        elif p.kind == "enum":
+            text = f"({p.type}){int(value)}"
+        else:
+            text = repr(value) if isinstance(value, float) else str(int(value))
+        out.append(uc.NamedValue(name=p.name, value=text))
+    return out
+
+
+def mcdc_vectors(expr: str) -> tuple[list[str], Any, list[tuple[bool, ...]], dict[int, tuple[tuple, tuple]]]:
+    """A1-PL15: the leaves, the decision as a function of their values, the possible vectors and the unique-cause
+    pair (as vectors) of every condition - mcdc_pairs as values instead of text."""
+    leaves = split_conditions(expr)
+    if not 1 <= len(leaves) <= 10:
+        return leaves, None, [], {}
+    py = to_python(expr, leaves)
+    if not re.fullmatch(r"(?:\s|c\[\d+\]|\(|\)|\band\b|\bor\b|\bnot\b)*", py):
+        return leaves, None, [], {}
+    try:
+        decide = eval("lambda c: bool(" + py + ")", {"__builtins__": {}, "bool": bool})        # noqa: S307
+        decide(tuple(False for _ in leaves))
+    except (SyntaxError, TypeError, IndexError, NameError):
+        return leaves, None, [], {}
+    vectors = list(itertools.product([False, True], repeat=len(leaves)))
+    pairs = {}
+    for i in range(len(leaves)):
+        for v in vectors:
+            w = tuple(not x if k == i else x for k, x in enumerate(v))
+            if decide(v) != decide(w):
+                pairs[i] = (v, w)
+                break
+    return leaves, decide, vectors, pairs
+
+
+def _match_brace(text: str, start: int) -> int:
+    """Index of the brace closing the one at ``start`` (len(text) when it is not closed)."""
+    depth = 0
+    for k in range(start, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(text)
+
+
+def guard_conditions(lines: list[str], fn: uc.FunctionInfo, line: int) -> list[tuple[str, bool]] | None:
+    """A1-PL15: what must hold on the path to ``line``: the if/else chain around it (true or false, A1-37) and the
+    guard clauses of the function's body before it (``if (c) return ...;`` - c false, or the call would have left).
+    None when the path cannot be read this way (a loop, a switch or a goto before the line)."""
+    out: list[tuple[str, bool]] = []
+    for cond in enclosing_conditions("\n".join(lines), fn, line):
+        m = re.fullmatch(r"\((.*)\) is (true|false)", cond)
+        if m is None:
+            return None
+        out.append((m.group(1), m.group(2) == "true"))
+    first = max(fn.line_start - 1, 0)
+    body = "\n".join(strip_comments(x) for x in lines[first: min(line - 1, len(lines))])
+    if re.search(r"\b(for|while|do|switch|goto)\b", body):
+        return None                                   # the path depends on more than the conditions before it
+    open_at = body.find("{")
+    if open_at < 0:
+        return out
+    if body[open_at:].count("{") - body[open_at:].count("}") != 1 + len(out):
+        return None                                   # a block around the line that is not an if/else of the chain
+    for m in re.finditer(r"\bif\s*\(", body):
+        if m.start() < open_at or body[open_at: m.start()].count("{") - body[open_at: m.start()].count("}") != 1:
+            continue                                  # not a statement of the function's body itself
+        paren = m.end() - 1
+        close = paren + _close_paren(body[paren:])
+        if close <= paren:
+            return None
+        cond, rest = body[paren + 1: close], body[close + 1:]
+        lead = len(rest) - len(rest.lstrip())
+        if rest.lstrip().startswith("{"):
+            stop = close + 1 + lead + _match_brace(rest, lead)
+        else:
+            semi = rest.find(";")
+            stop = close + 1 + semi if semi >= 0 else len(body)
+        if stop >= len(body):
+            continue                                  # the statement encloses the line: enclosing_conditions has it
+        if re.match(r"\s*else\b", body[stop + 1:]):
+            continue                                  # an if/else: either way may lead on
+        if re.search(r"\b(return|throw|exit|abort)\b", body[close + 1: stop + 1]):
+            out.append((cond, False))
+    return out
+
+
+def _changed(name: str, text: str) -> bool:
+    """The parameter is assigned, incremented or has its address taken in ``text``."""
+    n = re.escape(name)
+    return bool(re.search(rf"(?<![\w.>])(?:\+\+|--)\s*{n}\b|(?<![\w.>]){n}\s*(?:\+\+|--|[-+*/%&|^]?=(?!=)|<<=|>>=)|"
+                          rf"&\s*{n}\b(?!\s*\()", text))
+
+
+def solver_params(fn: uc.FunctionInfo) -> list[uc.ParamInfo]:
+    """The parameters as the front end saw them, else read from the signature (scalar kinds only) [A1-DA14]."""
+    if fn.params or fn.from_frontend:
+        return fn.params
+    try:
+        _, params = parse_declaration(re.sub(r"^\s*(?:static|inline|extern)\s+", "", fn.signature.split("{")[0]))
+    except (ValueError, AttributeError):
+        return []
+    out = []
+    for typ, name in params:
+        bare = re.sub(r"\b(?:const|volatile|register)\b", "", typ).strip()
+        kind = "bool" if bare in ("bool", "_Bool") else "int" if INTEGRAL_T.match(bare) else \
+            "float" if FLOAT_T.match(bare) else "other"
+        out.append(uc.ParamInfo(name=name, type=typ, kind=kind))
+    return out
+
+
+def solve_gap(g: uc.GapItem, fn: uc.FunctionInfo, lines: list[str], constants: dict[str, int]
+              ) -> list[tuple[list[uc.NamedValue], str]]:
+    """A1-PL15: argument sets that take the open item (branch outcome, decision outcome, MC/DC pair) when the
+    decision and its path compare parameters with constants; [] otherwise. Every set is checked against every
+    condition; each comes with the condition vector it makes."""
+    fn = fn if fn.params else fn.model_copy(update={"params": solver_params(fn)})
+    if not fn.params or not 0 < g.line <= len(lines) or "infeasible" in g.detail:
+        return []
+    params = {p.name for p in fn.params if p.name}
+    expr = decision_text(lines[g.line - 1], g.column)
+    if not expr:
+        return []
+    before = "\n".join(strip_comments(x) for x in lines[max(fn.line_start - 1, 0): g.line - 1])
+    sig_end = before.find("{")
+    if any(_changed(p, before[sig_end + 1:] if sig_end >= 0 else before) for p in params):
+        return []                                     # a value set before the decision: not the argument any more
+    leaves, decide, vectors, pairs = mcdc_vectors(expr)
+    if decide is None:
+        return []
+    leaf_cs = [param_constraint(x, params, constants) for x in leaves]
+    path = guard_conditions(lines, fn, g.line)
+    if path is None or any(c is None for c in leaf_cs):
+        return []
+    # A path condition may itself combine conditions: every vector of it with the needed outcome is an alternative.
+    path_alts: list[list[list[tuple]]] = []
+    for cond, truth in path:
+        p_leaves, p_decide, p_vectors, _ = mcdc_vectors(cond)
+        cs = [param_constraint(x, params, constants) for x in p_leaves]
+        if p_decide is None or any(c is None for c in cs):
+            return []
+        path_alts.append([list(zip(cs, v)) for v in p_vectors if p_decide(v) == truth])
+    combos = [[]]
+    for alts in path_alts:
+        combos = [c + a for c in combos for a in alts][:64]
+        if not combos:
+            return []
+
+    def flip(v: tuple, k: int) -> tuple:
+        return tuple(not x if i == k else x for i, x in enumerate(v))
+
+    targets: list[list[tuple]] = []                  # alternatives: each a list of vectors that must all be made
+    if g.metric == "MCDC" and g.condition_index is not None and 0 <= g.condition_index < len(leaves):
+        k = g.condition_index
+        targets = [[v, flip(v, k)] for v in vectors if not v[k] and decide(v) != decide(flip(v, k))]
+    elif g.metric == "BC":
+        m = re.search(r":([TF])$", g.gap_id)
+        line_text = lines[g.line - 1]
+        at, cursor = None, line_text.find(expr)
+        for k, leaf in enumerate(leaves):
+            pos = line_text.find(leaf, max(cursor, 0))
+            if pos >= 0 and pos < g.column <= pos + len(leaf) + 1:
+                at = k
+            cursor = pos + len(leaf) if pos >= 0 else cursor
+        if m is None or at is None:
+            return []
+        truth = m.group(1) == "T"
+        targets = [[v] for v in vectors if v[at] == truth and decide(v) != decide(flip(v, at))]   # evaluated
+    elif g.metric == "DC":
+        seen = {o.rsplit("=", 1)[-1] for o in g.observed}
+        for want in (True, False):
+            if ("T" if want else "F") not in seen:
+                targets = [[v] for v in vectors if decide(v) == want]
+                break
+    targets = targets[:256]
+    for target in targets:
+        found = []
+        for vec in target:
+            for combo in combos:
+                args = solve_parameters(fn, list(zip(leaf_cs, vec)) + combo)
+                if args is not None:
+                    found.append((args, _vec_text(leaves, vec, decide(vec))))
+                    break
+            else:
+                break
+        if len(found) == len(target):
+            return found
+    return []
+
+
 def _vec_text(leaves: list[str], vec: tuple[bool, ...], result: bool) -> str:
     return ", ".join(f"({leaf}) is {'true' if v else 'false'}" for leaf, v in zip(leaves, vec)) + \
         f" -> decision {'true' if result else 'false'}"
@@ -3808,6 +4076,7 @@ class AnalyzerAgent(ba.AgentCore):
                 if caller is not None:
                     through[fn.qualified_name] = caller
         planned_fns = [f for f in layout.functions if f.qualified_name not in through]
+        solver: dict[str, Any] = {}                    # A1-PL15: the constants, read once and only when needed
         for fn in planned_fns:
             own = {fn.name, fn.qualified_name} | {q for q, c in through.items() if c is fn} | {
                 f.name for f in layout.functions if f.qualified_name in through and through[f.qualified_name] is fn}
@@ -3832,6 +4101,10 @@ class AnalyzerAgent(ba.AgentCore):
                 for name in [n for n in real if re.search(r"\b" + re.escape(n) + r"\s*\(", text)]:
                     if g.attempts >= self.cfg.max_attempts_per_gap:
                         open_items.append(f"{g.gap_id}: needs control of the real dependency {name} [A1-DA12]")
+            solved = self._solved(fn, active, lines, layout, last, solver)                # A1-PL15
+            scenarios += solved
+            given = {g for sc in solved for g in sc.gap_ids}
+            active = [g for g in active if g.gap_id not in given or g.attempts > 0]
             active_by_fn[uc.function_stem(fn, layout)] = active
             for group in self._group(active, sut_text)[: self.cfg.max_scenarios_per_function]:     # LA-10
                 lead = group[0]
@@ -3865,6 +4138,43 @@ class AnalyzerAgent(ba.AgentCore):
                          reason=last.reason if last else "no measurement yet: estimated obligations [A1-18a]",
                          disputed_evidence=sorted(new_disputes), **notes)
 
+    def _solved(self, fn: uc.FunctionInfo, active: list[uc.GapItem], lines: list[str], layout: uc.LayoutProfile,
+                last: uc.VerificationResult | None, solver: dict[str, Any]) -> list[uc.Scenario]:
+        """A1-PL15: the open items of ``fn`` whose decision and path compare parameters with constants, planned by
+        solving the condition vectors for argument values; one scenario per argument set, with every item it takes.
+        A set whose test already ran (and left the item open) is not planned again: the brain has the item."""
+        params = solver_params(fn)
+        if not params or any(not p.name for p in params) or uc.internal_member(fn, layout):
+            return []
+        if "constants" not in solver:
+            solver["constants"] = self._constants(layout)
+        stem = uc.function_stem(fn, layout)
+        ran = {t.name for t in (last.tests if last else [])}
+        by_args: dict[tuple, uc.Scenario] = {}
+        tried: set[tuple] = set()
+        for g in active:
+            if g.function not in (fn.name, fn.qualified_name):
+                continue
+            for k, (args, vector) in enumerate(solve_gap(g, fn, lines, solver["constants"]), 1):
+                key = tuple((a.name, a.value) for a in args)
+                if key in tried:
+                    continue
+                if key in by_args:
+                    by_args[key].gap_ids.append(g.gap_id)
+                    continue
+                where = re.sub(r"[^A-Za-z0-9]+", "_", g.gap_id.split(":", 2)[-1]).strip("_").lower()
+                name = f"test_{stem}_solved_{g.metric.lower()}_{where}_{k}"
+                if name in ran:
+                    tried.add(key)
+                    continue
+                by_args[key] = uc.Scenario(
+                    scenario_id=f"S-solved-{stem}-{g.line}-{where}-{k}", function=fn.name, function_line=fn.line_start,
+                    gap_ids=[g.gap_id], made_by="rule", checked=True, characterization=True, test_name=name,
+                    description=f"Arguments solved from the conditions on line {g.line}: {vector} [A1-PL15]",
+                    required_conditions=[vector], args=args, expected="observe it",
+                    purpose=f"takes {g.gap_id} with arguments solved from its conditions")
+        return list(by_args.values())
+
     @staticmethod
     def _input_scenarios(layout: uc.LayoutProfile, req: uc.PlanRequest) -> list[uc.Scenario]:
         """A1-18c: the inputs the coverage-guided search found, as characterization scenarios (no brain)."""
@@ -3897,7 +4207,7 @@ class AnalyzerAgent(ba.AgentCore):
                           infeasible: set[str], layout: uc.LayoutProfile, req: uc.PlanRequest, stubs: list[uc.StubSpec],
                           disputed: set[str], notes: dict[str, list[str]]) -> list[uc.Scenario]:
         """Per planned function: the brain's checked scenarios replace the rule scenarios; the coverage-guided search
-        inputs stay. Without a usable answer the planning fails (BRAIN_PLAN_FAILED) and the run stops [A1-PL8]."""
+        inputs and the solved scenarios (A1-PL15) stay. Without a usable answer the planning fails (BRAIN_PLAN_FAILED) and the run stops [A1-PL8]."""
         sut_text = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         out = list(scenarios)
         work = []
@@ -3934,7 +4244,7 @@ class AnalyzerAgent(ba.AgentCore):
             if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
                 # A1-PL8: this function gets no scenario in this plan - never a rule plan; the other functions go on
                 notes["planning"].append(f"{name}: no scenario this time - {result.message[:400]}")
-                out = [s for s in out if not mine(s, fn) or s.inputs]
+                out = [s for s in out if not mine(s, fn) or s.inputs or s.scenario_id.startswith("S-solved-")]
                 continue
             if isinstance(result, BaseException):
                 raise result
@@ -3944,7 +4254,7 @@ class AnalyzerAgent(ba.AgentCore):
             # The brain's plan replaces the rule scenarios of the function [A1-PL1]; a documented-behaviour check the
             # brain did not plan stays, and Agent2's brain writes its test (A1-25y, A2-21n).
             behaviour = any(f"EVIDENCE:{name}" in s.gap_ids and not s.characterization for s in brain)
-            out = [s for s in out if not mine(s, fn) or s.inputs
+            out = [s for s in out if not mine(s, fn) or s.inputs or s.scenario_id.startswith("S-solved-")   # A1-PL15
                    or (s.scenario_id.startswith("S-evidence-") and not behaviour)] + brain
         return out
 

@@ -4783,6 +4783,196 @@ class GenericFormTests(unittest.TestCase):
         self.assertEqual(os.environ.get("BASEAGENT_ANSWER_LOG"), before)
 
 
+class SolvedScenarioTests(unittest.TestCase):
+    """A1-PL15: items whose decision and path compare parameters with constants are planned without a brain."""
+    SOURCE = ("#include <stdbool.h>\n#define RPM_MIN 500\n\n"
+              "bool valid_request(int rpm, int request, bool gear_engaged, bool clutch_open)\n{\n"
+              "    if (rpm < 0)\n        return false;\n"
+              "    return rpm >= RPM_MIN && rpm <= 6000 && request >= 0 && request <= 400 && (gear_engaged || clutch_open);\n"
+              "}\n\nint scale(int raw, int *out)\n{\n    if (raw > 10) { *out = raw; }\n    return raw;\n}\n")
+
+    def setUp(self):
+        self.tmp = tmpdir()
+        root = Path(self.tmp.name) / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "torque.c").write_text(self.SOURCE, encoding="utf-8")
+        self.agent = a1.AnalyzerAgent()
+        self.layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file="src/torque.c"))
+        self.lines = self.SOURCE.splitlines()
+        self.col = self.lines[7].find("request >= 0") + 1
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def gaps(self):
+        return [uc.GapItem(gap_id=f"BC:valid_request:8:{self.col}:F", function="valid_request", metric="BC", line=8,
+                           column=self.col, detail="never false"),
+                uc.GapItem(gap_id="MCDC:valid_request:8:12:C3", function="valid_request", metric="MCDC", line=8,
+                           column=12, condition_index=2)]
+
+    def test_the_vector_an_item_needs_is_solved_for_arguments(self):
+        fn = next(f for f in self.layout.functions if f.name == "valid_request")
+        self.assertEqual(a1.guard_conditions(self.lines, fn, 8), [("rpm < 0", False)])     # the guard clause
+        bc, mcdc = self.gaps()
+        (args, vector), = a1.solve_gap(bc, fn, self.lines, {"RPM_MIN": 500})
+        self.assertEqual([a.value for a in args], ["500", "-1", "false", "true"])
+        self.assertIn("(request >= 0) is false", vector)
+        pair = a1.solve_gap(mcdc, fn, self.lines, {"RPM_MIN": 500})                        # both sides of C3
+        self.assertEqual([[a.value for a in args] for args, _ in pair],
+                         [["500", "-1", "false", "true"], ["500", "0", "false", "true"]])
+        # Not of this form: a pointer parameter, a macro the build may change, a parameter changed before
+        self.assertEqual(a1.solve_gap(bc, fn, self.lines, {}), [])
+        scale = next(f for f in self.layout.functions if f.name == "scale")
+        g = uc.GapItem(gap_id="BC:scale:14:9:T", function="scale", metric="BC", line=14, column=9)
+        self.assertEqual(a1.solve_gap(g, scale, self.lines, {}), [])
+        changed = self.lines[:6] + ["    rpm = rpm / 2;"] + self.lines[7:]
+        self.assertEqual(a1.solve_gap(bc, fn, changed, {"RPM_MIN": 500}), [])
+
+    def test_a_solved_item_becomes_a_test_without_a_brain(self):
+        b = UTBrain(plans={})
+        with brain(b):
+            plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps()),
+                                                      iteration=2)))
+        solved = [s for s in plan.scenarios if s.scenario_id.startswith("S-solved-")]
+        self.assertEqual(len(solved), 2, plan.scenarios)
+        self.assertEqual(sorted(solved[0].gap_ids), sorted(g.gap_id for g in self.gaps()))   # one test, two items
+        self.assertTrue(all(s.checked and s.made_by == "rule" for s in solved))
+        self.assertEqual(b.generate_calls, [])                                               # no brain asked
+        agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
+        uc.apply_profiles(agent, None)
+        agent.router = ba.BrainRouter([b], 0.0)
+        suite = uc.suite_of(run(agent.generate_bundle(uc.GenerationRequest(plan=plan))))
+        self.assertIn("valid_request(500, -1, false, true)", suite)
+        self.assertIn("valid_request(500, 0, false, true)", suite)
+        # A solved test that ran and left its item open is not planned again: the brain has the item
+        tests = [uc.TestResult(name=s.test_name, status="passed") for s in solved]
+        again = [g.model_copy(update={"attempts": 1}) for g in self.gaps()]
+        with brain(UTBrain(plans={})):
+            plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, iteration=3, attempts={
+                g.gap_id: 1 for g in again}, last=measured(self.layout, again, tests=tests))))
+        self.assertFalse([s for s in plan.scenarios if s.scenario_id.startswith("S-solved-")])
+
+
+    def test_a_no_change_answer_is_a_verdict_not_a_refusal(self):                         # COV-12a
+        bc, mcdc = self.gaps()
+        items = [uc.ItemEvidence(item_id=g.gap_id, metric=g.metric, function="valid_request", line=8) for g in (bc, mcdc)]
+        line = self.lines[7].strip()
+        same = {"item_ids": [bc.gap_id], "cause": "condition_defect", "original_fragment": line,
+                "corrected_fragment": line, "rationale": "the condition is right", "requirement_ids": [], "quotes": [],
+                "expected_effect": "valid_request(500, -1, false, true) reaches it"}
+        verdict = dict(same, item_ids=[mcdc.gap_id], cause="reachable_by_test", original_fragment="",
+                       corrected_fragment="")
+        with brain(UTBrain(suggestions=[same, verdict])):
+            result = run(a4.CorrectorAgent().suggest(uc.SuggestRequest(layout=self.layout, items=items)))
+        self.assertEqual(result.suggestions, [])
+        self.assertEqual(len(result.notes), 2, result.notes)
+        self.assertIn("no source change needed", result.notes[0])
+        self.assertIn("valid_request(500, -1, false, true)", result.notes[1])
+
+    def test_a_test_program_that_reports_failed_tests_is_no_error(self):                   # VIEW-14
+        seen = []
+        with mock.patch.object(a3.ba, "emit_event", lambda kind, **kw: seen.append(kw)):
+            a3._program_event(["/x/ut_runner.exe"], 1, 0.1, "UT_RESULT|t|FAIL\nUT_SUMMARY|9|7|2\n")
+            a3._program_event(["/x/ut_runner.exe"], 3, 0.1, "")
+        self.assertEqual(seen[0]["data"]["outcome"], "tests_failed")
+        self.assertIn("2 of 9 tests failed", seen[0]["summary"])
+        self.assertEqual(seen[1]["data"]["outcome"], "exit 3")
+
+
+class MeasuredRightTests(unittest.TestCase):
+    """A3-OBS6, A2-21ah, VIEW-12a, LA-7 c: what a run measures and writes is checked against the tool itself."""
+
+    def layout(self):
+        return uc.LayoutProfile(repo_root=".", sut_file="a.c", language="c", component_root=".", writable_test_dir="t",
+                                writable_stub_dir="t/s", suite_file="t/test_a.c", sut_sha256="0" * 64,
+                                functions=[uc.FunctionInfo(name="f", qualified_name="f", signature="int f(int x)",
+                                                           file="a.c", line_start=1, line_end=3, return_type="int"),
+                                           uc.FunctionInfo(name="g", qualified_name="g", signature="void g(void)",
+                                                           file="a.c", line_start=4, line_end=5, return_type="void")])
+
+    def test_a_per_test_measurement_is_never_used_unchecked(self):                           # A3-OBS6
+        comp = a3.CompilationAgent(config=a3.CompilationConfig())
+        sources = {"t1": "UT_TEST(t1) { UT_OBSERVE_INT(\"o\", f(1)); }", "t2": "UT_TEST(t2) { int k = 1; }"}
+        problem = comp._per_test_problem({"t1": [], "t2": []}, ["t1", "t2"], sources, False, None, {}, Path("."),
+                                         Path("."), self.layout())
+        self.assertIn("1 of 2 passed tests cover nothing when run alone (t1", problem)   # t2 calls no SUT code
+        self.assertEqual(comp._per_test_problem({"t1": ["LC:2"], "t2": []}, ["t1", "t2"], sources, False, None, {},
+                                                Path("."), Path("."), self.layout()), "")
+        # nothing is dropped as redundant without a checked measurement
+        self.assertEqual(a2.redundant_tests(["t1", "t2"], {}), [])
+
+    def test_tests_are_checked_against_the_harness_itself(self):                              # A2-21ah
+        api = uc.harness_api()
+        for name in ("UT_REG_SET_LATER", "UT_CALL_ANY", "UT_EXPECT_ANY_THROW", "ut_later", "ut_asm_value"):
+            self.assertIn(name, api)                                       # (c) known names, from the header
+        self.assertEqual(api["UT_EXPECT_EQ_INT"], 2)
+        problem = uc.macro_arity_problem("UT_EXPECT_EQ_INT(ut_obj.step(100000));")
+        self.assertIn("UT_EXPECT_EQ_INT takes 2 argument(s), this call has 1", problem)       # (a)
+        self.assertEqual(uc.check_kind(problem), "prediction")             # the brain's re-ask may correct it
+        self.assertEqual(uc.macro_arity_problem('UT_EXPECT_EQ_INT(f(a, b), g(1)); UT_OBSERVE_INT("x", h(1, 2));'), "")
+        body, changed = uc.void_values_as_statements('UT_OBSERVE_INT("t_1", (ut_obj.sync()));\n'
+                                                      'UT_EXPECT_EQ_INT(g(), 0);', {"sync", "g"})   # (b)
+        self.assertEqual(body, "ut_obj.sync();\ng();")
+        self.assertEqual(len(changed), 2)
+        self.assertEqual(a2.void_functions(self.layout()), {"g"})
+        allowed = a2.GeneratorAgent._allowed_symbols(uc.UTPlan(plan_id="p", layout=self.layout(), stage="coverage"),
+                                                     "", "")
+        self.assertIn("UT_REG_SET_LATER", allowed)
+
+    def test_the_ceiling_does_not_count_waiting_for_a_brain(self):                           # LA-7 c
+        with tmpdir() as d:
+            orch = up.Orchestrator(None)
+            orch.ledger, orch.hub, orch.layout, orch.suite = up.Ledger(Path(d) / "l.jsonl"), None, None, ""
+            orch.token_log, orch.escalation_log, orch._called, orch._last_agent = [], [], set(), ""
+            orch.brain_seconds = 0.0
+
+            class Client:
+                def __init__(self, calls):
+                    self.calls = calls
+
+                async def call(self, tool, payload, signatures=None):
+                    await asyncio.sleep(0.2)
+                    return ba.ContractResponse(request_id="r", status="success", contract="EchoOut", data={},
+                                               meta=ba.ContractMeta(llm_calls=self.calls))
+            orch.clients = {"analyzer": Client(0), "generator": Client(2)}
+            class Any_(up.BaseModel):
+                pass
+            run(orch.call("analyzer", "discover", uc.DiscoverRequest(repo_root=d, sut_file="a.c"), Any_))
+            self.assertEqual(orch.brain_seconds, 0.0)                          # no brain: the pipeline's own time
+            run(orch.call("generator", "generate", uc.DiscoverRequest(repo_root=d, sut_file="a.c"), Any_))
+            self.assertGreater(orch.brain_seconds, 0.15)                       # with the brain: not counted
+
+    def test_several_folders_run_on_one_page(self):                                          # VIEW-12a
+        with tmpdir() as d:
+            one, two = copy_pilot("c_pilot", Path(d)), copy_pilot("c_deps_pilot", Path(d))
+            runner = up.RepositoryRun(None)
+            runner.orchestrator.output_root = Path(d) / "out"
+            hub = ba.ViewHub(Path(d) / "page", app="UT")
+            runner._open_viewer = lambda out: (hub, None)
+            seen = []
+
+            class Fake:
+                def __init__(self, prefix):
+                    self.prefix = prefix
+
+                async def run(self, req):
+                    seen.append(self.prefix + req.sut_file)
+                    return uc.PipelineResult(final_state="verified_measured", reason="ok", sut_file=req.sut_file,
+                                             output_dir=str(Path(d) / "o"))
+            runner._orchestrator = lambda: Fake(runner.view_prefix)
+            results = run(runner.run_many(
+                [uc.RepositoryRequest(repository=str(one), sut_files=["src/thermostat.c"]),
+                 uc.RepositoryRequest(repository=str(two), sut_files=["src/ctrl.c", "src/brake_ctrl.c"])],
+                ["c_pilot", "c_deps_pilot"]))
+            self.assertEqual(seen, ["c_pilot: src/thermostat.c", "c_deps_pilot: src/ctrl.c",
+                                    "c_deps_pilot: src/brake_ctrl.c"])         # every file named with its folder
+            self.assertEqual(runner.progress.files, 3)                           # the progress counts all of them
+            self.assertEqual([len(r.results) for r in results], [1, 2])
+            self.assertTrue(all((Path(r.output_dir) / "summary.md").is_file() for r in results))
+            pending = [e["data"]["pending"] for e in hub.events() if e["kind"] == "progress"]
+            self.assertEqual(pending, [2, 1, 0])                                 # live until the last folder
+
+
 class ReadOnceTests(unittest.TestCase):
     """A1-31b: the working copy is read once per run; a changed file is read again."""
     def test_sources_are_read_again_only_when_changed(self):

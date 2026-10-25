@@ -341,7 +341,10 @@ class Orchestrator:
             what = (uc.view_summary(to, payload) or f"{to}: {type(payload).__name__}").split(": ", 1)[-1]
             self.hub.emit("handoff", agent=source, label=frm, to=agent, to_label=to,
                           contract=type(payload).__name__, summary=f"{frm} to {to}: {what}")
+        began = time.monotonic()
         response = await self.clients[role].call(tool, payload, signatures=self.signatures())
+        if response.meta.llm_calls:                                   # LA-7 c: time spent with the brain
+            self.brain_seconds = getattr(self, "brain_seconds", 0.0) + (time.monotonic() - began)
         if response.status == "success" and role != "kb":
             self._last_agent = agent
         plans = uc.plans_of(response)                              # windows, tokens, packs [ARCH-15, KP-7]
@@ -407,6 +410,7 @@ class Orchestrator:
         self.ledger = Ledger(out / "ledger.jsonl")
         self.token_log = []
         self.escalation_log = []
+        self.brain_seconds = 0.0                                                             # LA-7 c
         state = RunState(req=req, repo=repo, out=out, workspace=workspace)
         state.asil, state.asil_source, state.targets, state.iter_limit = uc.coverage_policy(       # COV-1, COV-2, COV-9
             req.sut_file, self.raw.get("coverage"))
@@ -421,16 +425,19 @@ class Orchestrator:
             server = self._serve_viewer(self.hub)
         if self.hub is not None:
             self.hub.activate()
+            # several files on one page: events name their file - and the folder, in a batch [VIEW-12, VIEW-12a]
+            self.hub = self.hub.for_run(getattr(self, "view_prefix", "") + req.sut_file)
         state.mode, state.origin = mode, dict(origin or {})
         if state.origin.get("commit"):                                    # ORC-19: bound to the tested commit
             self.ledger.append(agent="ut_pipeline", tool="tested_commit", repository=state.origin.get("repository", ""),
                                branch=state.origin.get("branch", ""), commit=state.origin["commit"])
-        self.run_env = {"BASEAGENT_ANSWER_LOG": str(out / "brain_answers.jsonl")}  # every brain answer [ARCH-20]
+        self.run_env = {"BASEAGENT_ANSWER_LOG": str(out / "brain_answers.jsonl"),  # every brain answer [ARCH-20]
+                        ba.VIEW_RUN_ENV: getattr(self, "view_prefix", "") + req.sut_file}   # its events' file [VIEW-12]
         # an agent in this process reads the process environment: only then is it set there [ORC-23 (c)]
         in_process = self.in_process()
-        answer_log = os.environ.get("BASEAGENT_ANSWER_LOG")
+        before = {name: os.environ.get(name) for name in self.run_env}
         if in_process:
-            os.environ["BASEAGENT_ANSWER_LOG"] = self.run_env["BASEAGENT_ANSWER_LOG"]
+            os.environ.update(self.run_env)
         try:
             async with contextlib.AsyncExitStack() as stack:
                 await self.connect(stack, out / "logs")
@@ -463,12 +470,11 @@ class Orchestrator:
             else:
                 LOG.exception("pipeline run failed")
                 result = state.stopped(f"ended by an error ({type(exc).__name__}: {exc})"[:400])
-        if not in_process:
-            pass
-        elif answer_log is None:
-            os.environ.pop("BASEAGENT_ANSWER_LOG", None)
-        else:
-            os.environ["BASEAGENT_ANSWER_LOG"] = answer_log
+        for name, value in (before.items() if in_process else ()):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         brains = set()
@@ -704,9 +710,13 @@ class Orchestrator:
                         " - targets met: checking the documented behaviour [A1-25y, ORC-32]" if s.targets_met_at else ""))
                     if self._needs_revision(last, s):                                  # A1-DA12
                         await self._dependencies(s, last)
-                    if s.deadline is not None and time.monotonic() > s.deadline:                  # LA-7 c
+                    # LA-7 c: the pipeline's own time - agent calls that waited for a brain are not counted
+                    brain_time = getattr(self, "brain_seconds", 0.0)
+                    if s.deadline is not None and time.monotonic() - brain_time > s.deadline:
+                        waited = f"; {brain_time / 60:.0f} min waiting for brain answers not counted" \
+                            if brain_time >= 60 else ""
                         return await self._stop(s, f"safety ceiling of the file reached: "
-                                                   f"{(s.deadline - s.started) / 60:.0f} min [LA-7]", last)
+                                                   f"{(s.deadline - s.started) / 60:.0f} min{waited} [LA-7]", last)
                     s.quarantine = {}
                     asked_third = set(s.other_model_items)
                     s.open_now = {g.gap_id for fc in (last.coverage.functions if last.coverage else []) for g in fc.gaps}
@@ -1047,6 +1057,12 @@ class Orchestrator:
                         "pipeline_limitation", construct, entry.result if entry else status.reason, item=g.gap_id,
                         kinds=s.kinds_tried.get(g.gap_id, []), brains=sorted(s.item_brains.get(g.gap_id, set()))))
 
+    def _observe_findings(self, s: "RunState", obs: uc.VerificationResult) -> None:
+        """A3-OBS6, NC-5: what an observation run could not measure is a finding of the pipeline, not of the SUT."""
+        for line in obs.unknown_outcomes:
+            if hasattr(s, "findings") and not any(f.message == line[:600] for f in s.findings):
+                s.findings.append(self._finding("pipeline_limitation", line.split(" -> ")[0][:80], line))
+
     def _finding(self, kind: str, subject: str, message: str, item: str = "", kinds: list[str] | None = None,
                  brains: list[str] | None = None) -> uc.PipelineFinding:
         """NC-5: one finding of this run; its signature counts it across runs and files."""
@@ -1088,6 +1104,7 @@ class Orchestrator:
                 obs = await self.call("compilation", "observe", uc.VerifyRequest(
                     layout=self.layout, stage="observe", bundle=only, measure_tests=tried), uc.VerificationResult)
                 self.check_result(obs, self.layout.sut_sha256)
+                self._observe_findings(s, obs)                                                   # A3-OBS6
             except (Rejected, ba.AgentFault) as exc:
                 obs = None
                 decided.update({n: f"no trial build: {exc}"[:300] for n in tried})
@@ -1095,8 +1112,10 @@ class Orchestrator:
                 compiled = {f.affected_test: f.diagnostic for f in obs.quarantined if f.affected_test}
                 status = {t.name: t for t in obs.tests}
                 open_now = getattr(s, "open_now", set()) or set()
+                whole = set(obs.coverage.covered_items) if obs.coverage and not obs.test_items else set()
                 for name in tried:
-                    reached = set(obs.test_items.get(name, []))
+                    # A3-OBS6: without a checked per-test measurement, the build of the tests on trial is judged whole
+                    reached = set(obs.test_items.get(name, [])) or whole
                     targets = set(bundle.trial_targets.get(name) or []) or open_now
                     result = status.get(name)
                     if name in compiled or not obs.link_ok:
@@ -1407,6 +1426,7 @@ class Orchestrator:
                 layout=self.layout, stage="observe", bundle=bundle,
                 measure_tests=[t for t in bundle.tests if t not in s.test_items]), uc.VerificationResult)   # A3-OBS5
             self.check_result(obs, self.layout.sut_sha256)
+            self._observe_findings(s, obs)                                                       # A3-OBS6
             bundle = await self._drop_quarantined(s, bundle, obs)                       # A3-CL12
             s.test_items.update(obs.test_items)                            # what each test reached [A1-PL7]
             if bundle.observations:          # the probes may all have been in tests that did not compile [A3-CL12]
@@ -2856,10 +2876,63 @@ class RepositoryRun:
         finally:
             await self._close_viewer(server)
 
+    async def run_many(self, reqs: list[uc.RepositoryRequest], labels: list[str]) -> list[uc.RepositoryResult]:
+        """VIEW-12a: several repositories or folders one after another, on one viewer page. Each keeps its own
+        output folder, reports and summary; the progress counts the files of all of them."""
+        run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+        top = self.orchestrator.output_root / run_id
+        top.mkdir(parents=True, exist_ok=True)
+        for req in reqs:
+            for sut in req.sut_files:
+                if not uc.safe_relpath(sut):
+                    raise ba.AgentFault("INVALID_REQUEST", "SUT files must be relative to the repository.")
+        self.hub, server = self._open_viewer(top)
+        results: list[uc.RepositoryResult] = []
+        try:
+            selections: list[uc.FileSelection | None] = []
+            ready: list[uc.RepositoryRequest] = []
+            for req, label in zip(reqs, labels):                      # every folder's files first [ORC-35]
+                selection = None
+                if not req.sut_files and not is_link(req.repository):
+                    selection = await self.orchestrator.select_files(Path(req.repository).resolve(),
+                                                                     top / label / "select", req.compile_commands)
+                    req = req.model_copy(update={"sut_files": selection.selected})
+                selections.append(selection)
+                ready.append(req)
+            self.batch = True
+            self.progress = Progress(sum(max(1, len(r.sut_files)) for r in ready))
+            for index, (req, label, selection) in enumerate(zip(ready, labels, selections)):
+                if self.hub is not None:                              # the page stays live until the last folder
+                    self.hub.emit("progress", summary=f"{label}: folder {index + 1} of {len(ready)}",
+                                  data={"text": f"folder {index + 1} of {len(ready)}: {label}",
+                                        "pending": len(ready) - index})
+                self.view_prefix = f"{label}: "
+                out = top / label
+                out.mkdir(parents=True, exist_ok=True)
+                try:
+                    result = await (self._folder(req, out) if not is_link(req.repository) else self._repository(req, out))
+                except (ba.AgentFault, OSError) as exc:              # this folder only; the others go on
+                    message = exc.message if isinstance(exc, ba.AgentFault) else str(exc)
+                    result = uc.RepositoryResult(repository=req.repository, output_dir=str(out),
+                                                 reason=f"not run: {message}"[:600])
+                    self._summary(result, out)
+                if selection is not None and result.selection is None:
+                    result.selection = selection
+                    self._summary(result, out)
+                results.append(result)
+            if self.hub is not None:
+                self.hub.emit("progress", summary="every folder done", data={"text": "100 % - every folder done",
+                                                                          "percent": 100, "pending": 0})
+        finally:
+            self.batch, self.view_prefix = False, ""
+            await self._close_viewer(server)
+        return results
+
     def _orchestrator(self) -> Orchestrator:
         orch = Orchestrator(self.config_path)
         orch.hub = self.hub
         orch.progress = getattr(self, "progress", None)                                       # VIEW-11
+        orch.view_prefix = getattr(self, "view_prefix", "")                                   # VIEW-12a
         return orch
 
     def _open_viewer(self, out: Path) -> tuple[ba.ViewHub | None, ba.ViewerServer | None]:
@@ -2921,7 +2994,8 @@ class RepositoryRun:
         previous = cache.load_state()
         runs = [SutRun(sut, out / f"{i + 1:02d}-{slug(sut)}", out / "worktrees" / f"{i + 1:02d}")
                 for i, sut in enumerate(req.sut_files)]
-        self.progress = Progress(len(runs))                                                   # VIEW-11
+        if not getattr(self, "batch", False):                     # a batch counts every folder's files [VIEW-12a]
+            self.progress = Progress(len(runs))                                               # VIEW-11
         semaphore = asyncio.Semaphore(1 if self.cfg.interactive or self.orchestrator.in_process()       # ORC-23, LA-9
                                       else self.cfg.max_parallel_suts)
         key = hashlib.sha256(f"{req.repository}|{commit}|{req.build_command}|{req.compile_commands}".encode()).hexdigest()[:20]
@@ -2981,7 +3055,8 @@ class RepositoryRun:
                 result.reason = "no production file was found to test [ORC-35]"
                 self._summary(result, out)
                 return result
-        self.progress = Progress(len(req.sut_files))                                          # VIEW-11
+        if not getattr(self, "batch", False):                     # a batch counts every folder's files [VIEW-12a]
+            self.progress = Progress(len(req.sut_files))                                      # VIEW-11
         parallel = 1 if self.orchestrator.cfg.interactive or self.orchestrator.in_process() else self.cfg.max_parallel_suts
         semaphore = asyncio.Semaphore(parallel)
         results: dict[str, uc.PipelineResult] = {}
@@ -3592,6 +3667,37 @@ def keep_awake() -> bool:
         return False
 
 
+def run_batch(args: argparse.Namespace) -> int:
+    """VIEW-12a: the folders of the command one after another on one viewer page; 0 when every file of every folder
+    was verified, else 3."""
+    labels = [Path(r.rstrip("/\\")).name if not is_link(r) else r.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+              for r in args.repo]
+    named: dict[str, list[str]] = {}
+    for item in args.sut:
+        name, _, sut = item.partition("=")
+        if not sut:
+            raise ba.AgentFault("INVALID_REQUEST", f"--sut {item}: write NAME=FILE [VIEW-12a]")
+        named.setdefault(name.strip(), []).append(sut.strip().replace("\\", "/"))
+    reqs = [uc.RepositoryRequest(repository=r if is_link(r) else str(Path(r).resolve()), sut_files=named.get(label, []))
+            for r, label in zip(args.repo, labels)]
+    results = asyncio.run(RepositoryRun(args.config).run_many(reqs, labels))
+    lines, code = [f"Every folder, every production file - {time.strftime('%Y-%m-%d %H:%M:%S')}"], 0
+    for label, result in zip(labels, results):
+        print(f"\n==== {label}")
+        summary = Path(result.output_dir) / "summary.md"
+        if summary.is_file():
+            print(summary.read_text(encoding="utf-8"))
+        verified = bool(result.results) and all(r.final_state != "incomplete" for r in result.results)
+        lines.append(f"  {label}: every file verified" if verified else
+                     f"  {label}: not every file verified (exit code 3) - see its report above")
+        code = code if verified else 3
+    if args.summary:
+        args.summary.parent.mkdir(parents=True, exist_ok=True)
+        args.summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    return code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ut_pipeline: the unit-test orchestrator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3612,6 +3718,16 @@ def main() -> int:
     run.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
     run.add_argument("--interactive", action="store_true", default=None,
                      help="ask at a decision point (source change or requirement needed) [LA-9]")
+    batch = sub.add_parser("batch", help="Several folders or repositories one after another, on one viewer page "
+                                         "[VIEW-12a].")
+    batch.add_argument("--repo", action="append", required=True, help="a folder or repository link; repeatable")
+    batch.add_argument("--sut", action="append", default=[],
+                       help="NAME=FILE: a SUT file of the folder or repository named NAME (its last path part); "
+                            "repeatable; a folder without one: every production file [ORC-35]")
+    batch.add_argument("--summary", type=Path, help="a text file listing every folder's outcome")
+    batch.add_argument("--config", type=Path, default=HERE / "ut_config.json")
+    batch.add_argument("--view", dest="view", action="store_true", default=None, help="live viewer on [VIEW-3]")
+    batch.add_argument("--no-view", dest="view", action="store_false", help="no live viewer")
     bench = sub.add_parser("benchmark", help="Seeded-defect benchmark on the pilots [ORC-16].")
     bench.add_argument("--config", type=Path, default=HERE / "ut_config.json")
     bench.add_argument("--case", action="append", help="run only these case ids")
@@ -3654,8 +3770,10 @@ def main() -> int:
             return 0 if ok else 1
         if args.command == "check":
             return asyncio.run(check_setup(args.config))
-        if args.command in ("run", "benchmark", "calibrate"):
+        if args.command in ("run", "batch", "benchmark", "calibrate"):
             keep_awake()                                                                     # ORC-36
+        if args.command == "batch":
+            return run_batch(args)
         if args.command == "calibrate":
             return asyncio.run(calibrate(args.config, args.brain, args.case))
         if args.command == "benchmark":

@@ -165,17 +165,18 @@ case "$ACTION" in
   pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
   pilot-realrepo) pilot c_realrepo_pilot kernel/src/klist.c kernel/src/kqueue.c codec/ring.c drivers/crc_drv.c "$@" && pilot cpp_realrepo_pilot src/dispatcher.cpp "$@" ;;
   pilot-all)
-    # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named
+    # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named;
+    # one command for all of them, so one viewer page from the first file to the last [VIEW-12a]
     SUMMARY="$HERE/ut_output/pilots/pilot_all_summary.txt"; mkdir -p "$HERE/ut_output/pilots"
-    echo "Every pilot, every production file - $(date)" > "$SUMMARY"; ALL=0
+    repos=()
     for dir in "$PILOTS"/*/; do
-      name="$(basename "$dir")"; suts=()
-      [ "$name" = cpp_embedded_pilot ] && suts=(src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp)
-      echo; echo "==== $name: every production file ..."
-      if pilot "$name" ${suts[@]+"${suts[@]}"} "$@"; then echo "  $name: every file verified" >> "$SUMMARY"
-      else echo "  $name: not every file verified (exit code $?) - see its report above" >> "$SUMMARY"; ALL=3; fi
+      name="$(basename "$dir")"; repo="$HERE/ut_output/pilots/$name"
+      rm -rf "$repo"; cp -r "$PILOTS/$name" "$repo"; repos+=(--repo "$repo")
     done
-    echo; echo "---- every pilot ----"; cat "$SUMMARY"; exit $ALL ;;
+    "$PY" ut_pipeline.py batch "${repos[@]}" --sut cpp_embedded_pilot=src/motor_ctrl.cpp \
+      --sut cpp_embedded_pilot=src/counter.cpp --sut cpp_embedded_pilot=src/app_main.cpp \
+      --sut cpp_embedded_pilot=include/ring_buffer.hpp --summary "$SUMMARY" --config ut_config.json "$@"
+    exit $? ;;
   benchmark) "$PY" ut_pipeline.py benchmark --config ut_config.json --knowledge "${1:-on}" ;;
   calibrate)                                    # BP-8: one real brain on the construct corpus
     if [ $# -lt 1 ]; then echo "Usage: $0 calibrate BRAIN, for example sonnet or qwen_remote [BP-8]"; exit 2; fi

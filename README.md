@@ -98,7 +98,7 @@ measurement. Items the pipeline itself could not handle - with every answer kind
 listed first in the report and collected across runs in `ut_output/pipeline_findings.jsonl`; send that file with a
 report when a new kind of code ends incomplete.
 
-Two SUT files run at the same time (`pipeline.max_parallel_suts` in `ut_config.json`, default 2; 1 runs them one after another). For a local Qwen, start Ollama with `OLLAMA_NUM_PARALLEL=2` so both files get answers at once. Each file gets its own test, stub and access files (`test_<file>.c`, `ut_stubs_<file>.c/.h`, `ut_sut_access_<file>.c`).
+Two SUT files run at the same time (`pipeline.max_parallel_suts` in `ut_config.json`, default 2; 1 runs them one after another). Set `brain.qwen_remote.max_concurrency` (and `brain.qwen.max_concurrency`) to the number of requests your Qwen server answers at once - `OLLAMA_NUM_PARALLEL` on an Ollama server; it holds for all files of the run together. Answers of the remote server are streamed, so a tunnel such as Cloudflare does not cut a long answer, and a gateway timeout is asked again on the same server before the local Ollama is used (`stream`, `gateway_retries`, `gateway_pause`). `pilot-all` shows every pilot on one viewer page. Each file gets its own test, stub and access files (`test_<file>.c`, `ut_stubs_<file>.c/.h`, `ut_sut_access_<file>.c`).
 
 With a Claude model, the brain is asked about several functions at the same time (`brain.anthropic.parallel_calls` in `ut_config.json`, default 4; match it to your API quota); with Qwen one at a time. The results are combined in a fixed order, so the same input gives the same tests.
 

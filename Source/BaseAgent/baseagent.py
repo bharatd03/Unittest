@@ -1067,6 +1067,12 @@ class QwenRemoteSettings(QwenSettings):
     preload: bool = False
     startup_timeout: float = Field(default=20.0, gt=0.0, le=120.0)
     windows: list[int] = Field(default_factory=lambda: [16_384], min_length=1, max_length=8)
+    # ARCH-1c: a server behind a gateway (a tunnel that ends a request after a silence, e.g. Cloudflare at 100 s)
+    stream: bool = True                    # the answer is streamed: a long answer keeps the connection alive
+    stream_idle: float = Field(default=90.0, gt=5.0, le=600.0)   # longest silence between two pieces
+    shared_slots: bool = True              # max_concurrency holds for every process of this computer together
+    gateway_retries: int = Field(default=3, ge=0, le=10)         # a gateway timeout: the same server again
+    gateway_pause: float = Field(default=15.0, ge=0.0, le=300.0)
 
     @field_validator("base_url")
     @classmethod
@@ -1940,8 +1946,11 @@ class OllamaHTTP:
         except OSError as exc:
             raise AgentFault("MODEL_UNAVAILABLE", f"{self.LABEL} is unreachable.", True) from exc
 
-    async def call(self, method: str, path: str, body: Any, timeout: float) -> tuple[int, Any]:
-        """Returns (status, parsed JSON) for 200, else (status, {"error": short text})."""
+    async def call(self, method: str, path: str, body: Any, timeout: float,
+                   idle: float | None = None) -> tuple[int, Any]:
+        """Returns (status, parsed JSON) for 200, else (status, {"error": short text}). ``idle``: the answer is
+        streamed and may pause at most that long between two pieces (ARCH-1c); the whole call stays within
+        ``timeout``."""
         data = None
         if body is not None:
             try:
@@ -1949,8 +1958,9 @@ class OllamaHTTP:
             except AgentFault as exc:
                 raise AgentFault("CONTEXT_BUDGET_EXCEEDED", "Request is too large for the local model.") from exc
         try:
-            status, raw = await asyncio.wait_for(
-                asyncio.to_thread(self._http, method, path, data, timeout), timeout + 1.0)
+            reader = (lambda: self._stream(path, data, timeout, idle)) if idle else \
+                (lambda: self._http(method, path, data, timeout))
+            status, raw = await asyncio.wait_for(asyncio.to_thread(reader), timeout + 1.0)
         except TimeoutError as exc:
             raise AgentFault("MODEL_TIMEOUT", f"{self.LABEL}: the request exceeded its deadline.", True) from exc
         if len(raw) > self.MAX_RESPONSE_BYTES:
@@ -2344,8 +2354,124 @@ class RemoteHTTP(OllamaHTTP):
     def headers(self) -> dict[str, str]:
         return {**super().headers(), "Authorization": "Bearer " + self.key(), "User-Agent": self.user_agent}
 
+    def _stream(self, path: str, data: bytes | None, timeout: float, idle: float) -> tuple[int, bytes]:
+        """ARCH-1c: an OpenAI-compatible streamed answer (server-sent events), put together into the reply a
+        non-streamed request gets. A server that answers without streaming is read as it is."""
+        headers = {**self.headers(), "Accept": "text/event-stream"}
+        request = urllib.request.Request(self.base_url + path, data=data, method="POST", headers=headers)
+        deadline = time.monotonic() + timeout
+        try:
+            with self.opener.open(request, timeout=idle) as reply:
+                if "event-stream" not in (reply.headers.get("Content-Type") or ""):
+                    return reply.status, reply.read(self.MAX_RESPONSE_BYTES + 1)
+                parts: list[str] = []
+                finish, usage, size = None, {}, 0
+                for raw in reply:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("error"):
+                        return 500, json.dumps({"error": event["error"]}).encode()
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {} if isinstance(choice, dict) else {}
+                        if isinstance(delta.get("content"), str):
+                            parts.append(delta["content"])
+                            size += len(delta["content"])
+                        if isinstance(choice, dict) and choice.get("finish_reason"):
+                            finish = choice["finish_reason"]
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    if size > self.MAX_RESPONSE_BYTES:
+                        break
+                body = {"choices": [{"message": {"content": "".join(parts)}, "finish_reason": finish or "stop"}],
+                        "usage": usage}
+                return 200, json.dumps(body).encode()
+        except urllib.error.HTTPError as exc:
+            with contextlib.closing(exc):
+                return exc.code, exc.read(8192)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise AgentFault("MODEL_TIMEOUT", f"{self.LABEL}: no answer within {idle:.0f} s.", True) from exc
+            raise AgentFault("MODEL_UNAVAILABLE", f"{self.LABEL} is unreachable.", True) from exc
+        except TimeoutError as exc:
+            raise AgentFault("MODEL_TIMEOUT", f"{self.LABEL}: the request exceeded its deadline.", True) from exc
+        except OSError as exc:
+            raise AgentFault("MODEL_UNAVAILABLE", f"{self.LABEL} is unreachable.", True) from exc
+
+
+class SharedSlots:
+    """ARCH-1c: at most ``count`` requests at once to one server from every process of this computer (each SUT file
+    of a run has its own agent processes). A slot is a file created exclusively in a folder of the temporary
+    directory; its holder refreshes it, so the slot of a process that ended without releasing it is free again
+    after ``stale`` seconds."""
+
+    def __init__(self, key: str, count: int, stale: float = 120.0):
+        import tempfile
+        self.folder = Path(tempfile.gettempdir()) / "baseagent-slots" / hashlib.sha256(key.encode()).hexdigest()[:16]
+        self.count, self.stale = max(1, count), stale
+
+    def _try(self) -> Path | None:
+        self.folder.mkdir(parents=True, exist_ok=True)
+        for k in range(self.count):
+            path = self.folder / f"slot-{k}"
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()}\n".encode())
+                os.close(fd)
+                return path
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if time.time() - path.stat().st_mtime > self.stale:
+                        path.unlink()
+            except OSError:
+                return None                                    # no folder to share: this process alone
+        return None
+
+    @contextlib.asynccontextmanager
+    async def hold(self, wait: float):
+        deadline = time.monotonic() + wait
+        path = self._try()
+        while path is None and self.folder.is_dir() and any(self.folder.iterdir()):
+            if time.monotonic() > deadline:
+                raise AgentFault("MODEL_BUSY", "Every request slot of the remote server stayed taken.", True)
+            await asyncio.sleep(0.5)
+            path = self._try()
+        stop = asyncio.Event()
+
+        async def beat() -> None:
+            while not stop.is_set():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), self.stale / 4)
+                if path is not None:
+                    with contextlib.suppress(OSError):
+                        os.utime(path)
+        task = asyncio.create_task(beat()) if path is not None else None
+        try:
+            yield
+        finally:
+            stop.set()
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await task
+            if path is not None:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
 
 REMOTE_FORMATS = ("json_schema", "json_object", "none")
+# ARCH-1c: answers of a gateway or a busy server that mean "slow", not "down"
+GATEWAY_BUSY = frozenset({408, 425, 429, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527})
 
 
 class QwenRemoteEngine(QwenEngine):
@@ -2363,11 +2489,39 @@ class QwenRemoteEngine(QwenEngine):
         self.model_id = "openai:" + settings.model
         self.http = RemoteHTTP(settings.base_url, settings.api_key_env, opener, settings.user_agent)
         self.format_mode = "json_schema" if settings.json_schema else "json_object"
+        self.streaming = settings.stream                                                   # ARCH-1c
+        self.slots = SharedSlots(f"{settings.base_url}|{settings.model}", settings.max_concurrency) \
+            if settings.shared_slots else None
 
     @staticmethod
     def _log_reply(status: int, reply: Any) -> None:
         detail = reply.get("error") if isinstance(reply, dict) else None
         LOG.warning("The remote Qwen server answered HTTP %s: %s", status, detail or "no detail")
+
+    async def _send(self, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        """ARCH-1c: one request through the shared slots; a gateway timeout or a busy answer is asked again on the
+        same server after a pause - it is slow, not down - before the router's next brain is used."""
+        settings = self.settings
+        idle = settings.stream_idle if body.get("stream") else None
+        status, reply = 0, {}
+        for attempt in range(settings.gateway_retries + 1):
+            try:
+                if self.slots is not None:                             # ARCH-1c (b)
+                    async with self.slots.hold(settings.queue_timeout):
+                        status, reply = await self.http.call("POST", "/chat/completions", body, timeout, idle=idle)
+                else:
+                    status, reply = await self.http.call("POST", "/chat/completions", body, timeout, idle=idle)
+            except AgentFault as exc:
+                if exc.code != "MODEL_TIMEOUT" or attempt >= settings.gateway_retries:
+                    raise
+                status, reply = 504, {"error": exc.message}
+            if status not in GATEWAY_BUSY or attempt >= settings.gateway_retries:
+                return status, reply
+            self._log_reply(status, reply)
+            LOG.warning("The remote Qwen server is slow (HTTP %s); asking it again in %.0f s (%d of %d) [ARCH-1c].",
+                        status, settings.gateway_pause * (attempt + 1), attempt + 1, settings.gateway_retries)
+            await asyncio.sleep(settings.gateway_pause * (attempt + 1))
+        return status, reply
 
     def _refused(self, status: int, reply: Any) -> None:
         if status in (401, 403):
@@ -2439,8 +2593,14 @@ class QwenRemoteEngine(QwenEngine):
                                            "json_schema": {"name": "answer", "schema": fmt, "strict": True}}
             elif self.format_mode == "json_object":
                 body["response_format"] = {"type": "json_object"}
-            status, reply = await self.http.call("POST", "/chat/completions", body, timeout)
+            if self.streaming:                                         # ARCH-1c (a)
+                body.update(stream=True, stream_options={"include_usage": True})
+            status, reply = await self._send(body, timeout)
             detail = str(reply.get("error", "")) if isinstance(reply, dict) else ""
+            if status == 400 and self.streaming and re.search(r"stream", detail, re.I):
+                self.streaming = False
+                LOG.warning("The remote Qwen server does not stream; asking without streaming.")
+                continue
             if status == 400 and self.format_mode != "none" and re.search(
                     r"response_format|json_schema|json_object|grammar|schema", detail, re.I):
                 self.format_mode = REMOTE_FORMATS[REMOTE_FORMATS.index(self.format_mode) + 1]
@@ -4445,6 +4605,9 @@ class AgentClient:
 # events file (one JSON object per line). Agents, in this process or in subprocesses, append to
 # the file named by BASEAGENT_EVENTS; the hub serves it to the page.
 VIEW_ENV = "BASEAGENT_EVENTS"
+# Several runs on one page (VIEW-12): the run an event belongs to, set by the application for the agent processes
+# of that run; its events carry it as "run".
+VIEW_RUN_ENV = "BASEAGENT_VIEW_RUN"
 VIEW_KINDS = ("run_start", "stage", "run_end", "tool_start", "tool_end", "handoff", "brain_call", "brain_answer",
               "program", "metric", "escalation", "progress")
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
@@ -4471,6 +4634,8 @@ def emit_event(kind: str, **fields: Any) -> None:
     path = os.environ.get(VIEW_ENV)
     if not path or kind not in VIEW_KINDS:
         return
+    if os.environ.get(VIEW_RUN_ENV) and "run" not in fields:
+        fields["run"] = os.environ[VIEW_RUN_ENV]
     try:
         # LF on every operating system: the live page reads the file by bytes [VIEW-10]
         with open(path, "a", encoding="utf-8", newline="\n") as handle:
@@ -4552,6 +4717,23 @@ class ViewHub:
 
     def events(self) -> list[dict[str, Any]]:
         return read_events(self.path)
+
+    def for_run(self, run: str) -> "RunView":
+        """The same hub for one of several runs shown on one page: every event it emits carries ``run``."""
+        return RunView(self, run)
+
+
+class RunView:
+    """VIEW-12: a ViewHub seen by one run - emit() adds the run; everything else is the hub's."""
+    def __init__(self, hub: "ViewHub", run: str):
+        self._hub, self.run = hub, run
+
+    def emit(self, kind: str, **fields: Any) -> None:
+        fields.setdefault("run", self.run)
+        self._hub.emit(kind, **fields)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._hub, name)
 
 
 def has_desktop() -> bool:
@@ -4692,6 +4874,9 @@ h1{font-size:18px;font-weight:500;margin:0}.sub{color:var(--muted);font-size:13p
 .pill.live{background:var(--okbg);color:var(--ok)}.grow{flex:1}
 button{font:inherit;font-size:13px;background:transparent;border:.5px solid var(--line);color:var(--text);border-radius:8px;padding:4px 10px;cursor:pointer}
 button:hover{background:var(--card)}button.on{background:var(--card)}
+#runs{display:none;flex-wrap:wrap;gap:6px;padding:4px 24px 0}#runs.show{display:flex}
+.chip{font-size:12px;padding:2px 10px;border-radius:999px;border:.5px solid var(--line);background:transparent;color:var(--muted);cursor:pointer}
+.chip.cur{background:var(--card);color:var(--text)}.chip.ok{color:var(--ok)}.chip.bad{color:var(--bad)}.chip.sel{border-color:var(--text)}
 #metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;padding:8px 24px}
 .m{background:var(--card);border-radius:8px;padding:10px 12px;cursor:default}.m.click{cursor:pointer}
 .m .l{font-size:12px;color:var(--muted)}.m .v{font-size:20px;font-weight:500}.m .g{font-size:11px;color:var(--faint)}
@@ -4712,7 +4897,7 @@ svg text{font-family:inherit}
 #detail .row{font-size:12.5px;padding:3px 0}#detail .k{color:var(--muted)}
 #detail .calls{max-height:420px;overflow-y:auto;margin-top:6px}
 #detail .call{border-top:.5px solid var(--line);padding:6px 0;font-size:12px}
-#detail .call b{font-weight:500}#detail .call .io{color:var(--muted)}#detail .call.bad b{color:var(--bad)}
+#detail h2{cursor:pointer}#detail .call b{font-weight:500}#detail .call .io{color:var(--muted)}#detail .call.bad b{color:var(--bad)}
 table{border-collapse:collapse;width:100%;font-size:12px}td,th{text-align:left;padding:3px 4px;border-top:.5px solid var(--line);font-weight:400}
 th{color:var(--muted)}
 #final{display:none;margin:0 24px 24px;border:.5px solid var(--line);border-radius:12px;padding:14px 16px}
@@ -4726,9 +4911,10 @@ body.present header h1{font-size:24px}body.present #canvas{min-height:600px}body
 <span class="pill" id="progress" style="display:none" title="share of the run's work done, and the time left"></span><span class="pill" id="status">waiting</span><span class="grow"></span>
 <span id="replay" style="display:none;gap:6px;align-items:center"><button id="play">Pause</button><button id="speed">Speed 1x</button><button id="end">Show end</button></span>
 <button id="present">Present</button></header>
+<div id="runs" title="files of this run: click one to show its metrics; click it again to follow the running file"></div>
 <section id="metrics"></section>
 <main><svg id="canvas" viewBox="0 0 960 640" role="img" aria-label="Agents around the brain"></svg>
-<div class="side"><div class="panel" id="detail"><h2>Details</h2><div class="sub">Click an agent or a metric.</div></div>
+<div class="side"><div class="panel" id="detail"><h2>Details</h2><div class="sub">Waiting for the first run.</div></div>
 <div class="panel"><h2>Activity</h2><div id="feed"></div></div></div></main>
 <section id="final"></section>
 <script id="embedded" type="application/json">__EVENTS__</script>
@@ -4737,7 +4923,8 @@ body.present header h1{font-size:24px}body.present #canvas{min-height:600px}body
 "use strict";
 var NS="http://www.w3.org/2000/svg",svg=document.getElementById("canvas");
 var FAM=["teal","coral","blue","pink","amber","green"];
-var S={agents:{},order:[],metrics:{},decl:[],calls:0,tokens:0,model:"",feed:[],t0:null,pos:{},last:null,orch:null};
+var S={agents:{},order:[],metrics:{},decl:[],calls:0,tokens:0,model:"",feed:[],t0:null,pos:{},last:null,orch:null,
+ runs:{},runOrder:[],sel:null,cur:null};
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
 function el(tag,attrs,parent){var e=document.createElementNS(NS,tag);for(var k in attrs)e.setAttribute(k,attrs[k]);if(parent)parent.appendChild(e);return e}
 function h(tag,text,cls){var e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e}
@@ -4749,7 +4936,8 @@ function addAgent(d){if(!d||!d.agent)return;var a=S.agents[d.agent];
  (d.tools||[]).forEach(function(t){if(a.tools.indexOf(t)<0)a.tools.push(t)});
  if(d.support)a.support=true;return a}
 function cut(s,n){s=s||"";return s.length>n?s.slice(0,n-1)+"…":s}
-function plain(s,a){s=s||"";var p=(a&&a.label?a.label:"")+": ";return s.indexOf(p)===0?s.slice(p.length):s}
+function plain(s,a){s=s||"";var p=(a&&a.label?a.label:"")+": ",m=s.match(/^(\[[^\]]*\] )([\s\S]*)$/);
+ if(m&&m[2].indexOf(p)===0)return m[1]+m[2].slice(p.length);return s.indexOf(p)===0?s.slice(p.length):s}
 function setLine(node,text,full){if(!node)return;node.textContent=text;var t=node.querySelector("title");if(!t){t=el("title",{});node.appendChild(t)}t.textContent=full||text}
 function paint(a){if(!a||!a.inLine)return;
  if(a.idle){setLine(a.inLine,"not called in this run",a.idle);setLine(a.outLine,cut(a.idle,38),a.idle);a.g.setAttribute("opacity",".55");return}
@@ -4829,11 +5017,11 @@ function setMetric(id,data){var M=S.metrics[id];if(!M)return;M.value=data;var m=
  if(goal!=null){var met=(m.better==="lower")?data.value<=goal:(data.strict?data.value>goal:data.value>=goal);
   c.classList.toggle("met",met);c.classList.toggle("fail",!met&&!!data.failed);
   var g=c.querySelector(".g");g.textContent="target "+(data.strict?"> ":(m.better==="lower"?"≤ ":""))+fmt(goal)+(m.kind==="percent"?" %":"")+(met?" · met":"")}}
-function showTable(id){var M=S.metrics[id],box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",M.decl.label+(M.decl.per?" per "+M.decl.per:"")));
+function showTable(id){S.view="metric";var M=S.metrics[id],box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",M.decl.label+(M.decl.per?" per "+M.decl.per:"")));
  var rows=(M.value&&M.value.per)||[];if(!rows.length){box.appendChild(h("div","No values yet.","sub"));return}
  var t=h("table"),hd=h("tr");var cols=Object.keys(rows[0]);cols.forEach(function(k){hd.appendChild(h("th",k))});t.appendChild(hd);
  rows.forEach(function(r){var tr=h("tr");cols.forEach(function(k){tr.appendChild(h("td",typeof r[k]==="number"?fmt(r[k]):String(r[k])))});t.appendChild(tr)});box.appendChild(t)}
-function showAgent(k){var a=S.agents[k],box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",a.label));
+function showAgent(k){S.view="agent";var a=S.agents[k],box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",a.label));
  if(a.role)box.appendChild(h("div",a.role,"sub"));
  if(a.idle){var ri=h("div",null,"row");ri.appendChild(h("div","Not called in this run","k"));ri.appendChild(h("div",a.idle));box.appendChild(ri)}
  if(a.programs){var rp=h("div",null,"row");rp.appendChild(h("div","Programs run","k"));rp.appendChild(h("div",Object.keys(a.programs).map(function(p){return p+" ×"+a.programs[p]}).join(", ")));box.appendChild(rp)}
@@ -4843,30 +5031,83 @@ function showAgent(k){var a=S.agents[k],box=document.getElementById("detail");bo
   d.appendChild(h("b",clock(c.time)+"  "+c.tool+(c.status&&c.status!=="success"?" · "+c.status:"")));
   d.appendChild(h("div","in"+(c.from?" (from "+c.from+")":"")+": "+plain(c.input,a),"io"));d.appendChild(h("div","out: "+(plain(c.output,a)||"–"),"io"));list.appendChild(d)});
  if(!a.history.length)list.appendChild(h("div","No call yet.","sub"));box.appendChild(list)}
-function showOrch(){var o=S.orch,box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",o.label||"Orchestrator"));
+function showOrch(){S.view="orchestrator";var o=S.orch,box=document.getElementById("detail");box.innerHTML="";box.appendChild(h("h2",o.label||"Orchestrator"));
  if(o.description)box.appendChild(h("div",o.description,"sub"));
  [["Input of the run",o.input],["Output of the run",o.output||"running"]].forEach(function(p){var r=h("div",null,"row");r.appendChild(h("div",p[0],"k"));r.appendChild(h("div",p[1]||"–"));box.appendChild(r)});
  (o.details||[]).forEach(function(x){box.appendChild(h("div",x,"sub"))})}
+// VIEW-13: until an agent or a metric is clicked, Details is the overview of the file shown, kept up to date
+function overview(){S.view=null;var box=document.getElementById("detail"),r=S.runs[S.cur];box.innerHTML="";
+ box.appendChild(h("h2",r&&many()?"Details · "+short(r.id):"Details"));
+ if(!r){box.appendChild(h("div","Waiting for the first run.","sub"));return}
+ function row(k,v,cls){var x=h("div",null,"row");x.appendChild(h("div",k,"k"));var y=h("div",v,cls);x.appendChild(y);box.appendChild(x);return y}
+ var secs=Math.max(0,Math.round((r.state==="running"?(S.now||0):(r.end||S.now||0))-(r.start||0)));
+ var took=Math.floor(secs/60)+" min "+(secs%60)+" s";
+ row("State",r.state==="running"?"running for "+took:((r.final&&r.final.state)||r.state)+" after "+took+(r.final&&r.final.reason?" - "+r.final.reason:""),
+  r.state==="ok"?"state-ok":r.state==="bad"?"state-bad":"");
+ if(r.stage)row("Now",r.stage);
+ var open=[];(r.decl||[]).forEach(function(m){var v=r.values[m.id];if(!v||v.na||m.kind!=="percent")return;var g=v.goal!=null?v.goal:m.goal;if(g==null)return;
+  var met=m.better==="lower"?v.value<=g:(v.strict?v.value>g:v.value>=g);if(!met)open.push(m.label+" "+fmt(v.value)+" % (target "+fmt(g)+" %)")});
+ row("Targets not met",open.length?open.join("; "):(Object.keys(r.values).length?"none":"not measured yet"));
+ var acts=(r.final&&r.final.action_needed)||[];
+ if(acts.length){var ul=h("ul");acts.slice(0,8).forEach(function(x){ul.appendChild(h("li",x))});row("Action needed","").appendChild(ul)}
+ var hd=h("div",null,"row");hd.appendChild(h("div","Latest calls for this file, newest first","k"));box.appendChild(hd);
+ var list=h("div",null,"calls");(r.calls||[]).slice().reverse().forEach(function(c){var d=h("div",null,"call"+(c.status!=="success"&&c.status!=="running"?" bad":""));
+  d.appendChild(h("b",clock(c.time)+"  "+c.label+" · "+c.tool+(c.status!=="success"?" · "+c.status:"")));
+  d.appendChild(h("div","in"+(c.from?" (from "+c.from+")":"")+": "+(c.input||"–"),"io"));d.appendChild(h("div","out: "+(c.output||"–"),"io"));list.appendChild(d)});
+ if(!(r.calls||[]).length)list.appendChild(h("div","No call yet.","sub"));box.appendChild(list);
+ box.appendChild(h("div","Click an agent or a metric for its details; click Details to come back here.","sub"))}
+var pend=null;function later(){if(S.view!=null||pend)return;pend=setTimeout(function(){pend=null;if(S.view==null)overview()},250)}
+function callOf(ev,a){var rc=runOf(ev);rc.calls=rc.calls||[];return rc.calls}
 function finalPanel(d){var f=document.getElementById("final");f.innerHTML="";f.classList.add("show");
  var ok=/^verified/.test(d.state||"");var t=h("h2",(ok?"Verified":"Not verified")+" · "+(d.state||""));t.className=ok?"state-ok":"state-bad";f.appendChild(t);
  if(d.reason)f.appendChild(h("div",d.reason));
  var s=[];if(d.seconds!=null)s.push("time "+Math.round(d.seconds)+" s");if(d.delivery)s.push(d.delivery);if(s.length)f.appendChild(h("div",s.join(" · "),"sub"));
  [["Action needed",d.action_needed],["Suggested source changes",d.suggestions]].forEach(function(p){if(p[1]&&p[1].length){f.appendChild(h("div",p[0],"sub"));var ul=h("ul");p[1].forEach(function(x){ul.appendChild(h("li",x))});f.appendChild(ul)}})}
+// VIEW-12: several runs (SUT files) on one page - each keeps its title, metrics and final state
+function runOf(ev){var id=ev.run||"";var r=S.runs[id];
+ if(!r){r=S.runs[id]={id:id,title:"",subtitle:"",decl:[],values:{},state:"running",final:null,start:ev.time||0,end:0,orch:null};S.runOrder.push(id)}return r}
+function short(id){id=id||"";var k=id.indexOf(": "),pre=k>0?id.slice(0,k+2):"",f=k>0?id.slice(k+2):id;
+ var s=f.split(/[\\/]/);return pre+(s[s.length-1]||f)}   // "folder: file" in a batch [VIEW-12a]
+function many(){return S.runOrder.filter(function(x){return x}).length>1}
+function tag(ev,text){return many()&&ev.run?"["+short(ev.run)+"] "+(text||""):(text||"")}
+function running(){return S.runOrder.filter(function(x){return S.runs[x].state==="running"})}
+function choose(){if(S.sel!=null&&S.runs[S.sel])return S.sel;var live=running();
+ if(S.cur!=null&&S.runs[S.cur]&&S.runs[S.cur].state==="running")return S.cur;   // the file shown stays while it runs
+ if(live.length)return live.reduce(function(a,b){return S.runs[b].start<S.runs[a].start?b:a});
+ return S.runOrder.reduce(function(a,b){return S.runs[b].end>=S.runs[a].end?b:a},S.runOrder[0])}
+function chips(){var box=document.getElementById("runs");box.innerHTML="";var ids=S.runOrder.filter(function(x){return x});
+ box.classList.toggle("show",ids.length>1);if(ids.length<2)return;
+ ids.forEach(function(id){var r=S.runs[id],c=h("button",short(id)+(r.state==="running"?" · running":r.state==="ok"?" · verified":" · not verified"),
+  "chip"+(id===S.cur?" cur":"")+(id===S.sel?" sel":"")+(r.state==="ok"?" ok":r.state==="bad"?" bad":""));c.title=id;
+  c.addEventListener("click",function(){S.sel=S.sel===id?null:id;show(true)});box.appendChild(c)})}
+function orchOf(r){if(!r||!r.orch)return;if(!S.orch){S.orch=r.orch;return}   // the drawn box shows the file shown
+ ["label","description","input","output","details"].forEach(function(k){S.orch[k]=r.orch[k]});paintOrch()}
+function show(force){var id=choose();if(id==null)return;var r=S.runs[id];
+ if(force||id!==S.cur){S.cur=id;document.getElementById("title").textContent=r.title||"Pipeline";document.title=r.title||"Pipeline";
+  document.getElementById("subtitle").textContent=r.subtitle||"";metricsInit(r.decl);
+  Object.keys(r.values).forEach(function(m){setMetric(m,r.values[m])});setMetric("__calls",{value:S.calls});setMetric("__tokens",{value:S.tokens});
+  orchOf(r)
+  var f=document.getElementById("final");if(r.final)finalPanel(r.final);else f.classList.remove("show");if(S.view==null)overview()}
+ var st=document.getElementById("status"),done=!running().length&&!S.pending;
+ if(S.live||st.textContent!=="replay"){if(done&&S.runOrder.length){st.textContent="finished";st.className="pill"}else if(S.live){st.textContent="live";st.className="pill live"}}
+ chips()}
 function pulse(k,on){var a=S.agents[k];if(!a||!a.rect)return;a.rect.setAttribute("stroke-width",on?2:.75)}
-function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
- if(k==="run_start"){document.getElementById("title").textContent=d.title||ev.app||"Pipeline";document.title=d.title||"Pipeline";
-  document.getElementById("subtitle").textContent=d.subtitle||"";(d.agents||[]).forEach(addAgent);
-  Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];ag.runCalls=0;ag.idle=""});
-  S.orch=d.orchestrator?{label:d.orchestrator.label,description:d.orchestrator.description,input:d.orchestrator.input,details:d.orchestrator.details||[]}:null;
-  layout();metricsInit(d.metrics);feed(ev,ev.summary||"Run started","gray");
-  if(S.live){var sr=document.getElementById("status");sr.textContent="live";sr.className="pill live";
-   document.getElementById("final").classList.remove("show")}return}
+function apply(ev){apply1(ev);if((ev.run||"")===(S.cur||""))later()}
+function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
+ if(k==="run_start"){var others=running().length;var rs=runOf(ev);rs.state="running";rs.final=null;rs.start=ev.time||0;rs.values={};
+  rs.title=d.title||ev.app||"Pipeline";rs.subtitle=d.subtitle||"";rs.decl=d.metrics||[];(d.agents||[]).forEach(addAgent);
+  if(!others)Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];ag.runCalls=0;ag.idle=""});   // a new page of work
+  rs.orch=d.orchestrator?{label:d.orchestrator.label,description:d.orchestrator.description,input:d.orchestrator.input,details:d.orchestrator.details||[]}:null;
+  if(!S.orch)S.orch={label:"",description:"",input:"",details:[]};if(!others||rs.id===S.cur)orchOf(rs);layout();show(rs.id===S.cur||!others);feed(ev,tag(ev,ev.summary||"Run started"),"gray");return}
  if(ev.agent&&ev.agent!=="orchestrator"&&!S.agents[ev.agent]){addAgent({agent:ev.agent,label:ev.label,app:ev.app});layout()}
- if(k==="tool_start"){var a=S.agents[ev.agent];if(a){a.lastIn=ev.summary||ev.contract||"";a.counts[ev.tool]=(a.counts[ev.tool]||0)+1;a.runCalls+=1;a.lastOut="";a.lastFrom=a.from;
+ if(k==="tool_start"){var a=S.agents[ev.agent];if(a){a.lastIn=tag(ev,ev.summary||ev.contract||"");a.counts[ev.tool]=(a.counts[ev.tool]||0)+1;a.runCalls+=1;a.lastOut="";a.lastFrom=a.from;
   a.history.push({time:ev.time||0,tool:ev.tool,input:a.lastIn,from:a.from,output:"",status:"running"});if(a.history.length>300)a.history.shift();
+  var rl=callOf(ev,a);rl.push({time:ev.time||0,agent:ev.agent,label:a.label,tool:ev.tool,input:plain(ev.summary||ev.contract||"",a),from:a.from,output:"",status:"running"});if(rl.length>8)rl.shift();
   var c=a.sat&&a.sat[ev.tool];if(c)c.setAttribute("fill",css("--"+fam(a)+"-s"));paint(a)}pulse(ev.agent,true);return}
- if(k==="tool_end"){var a2=S.agents[ev.agent];if(a2){a2.lastOut=ev.summary||ev.contract||"";var hc=a2.history[a2.history.length-1];
+ if(k==="tool_end"){var a2=S.agents[ev.agent];if(a2){a2.lastOut=tag(ev,ev.summary||ev.contract||"");var hc=a2.history[a2.history.length-1];
   if(hc&&hc.tool===ev.tool&&hc.status==="running"){hc.output=a2.lastOut;hc.status=ev.status||"success"}a2.from="";
+  var rl2=callOf(ev,a2);for(var j=rl2.length-1;j>=0;j--){if(rl2[j].agent===ev.agent&&rl2[j].tool===ev.tool&&rl2[j].status==="running"){
+   rl2[j].output=plain(ev.summary||ev.contract||"",a2);rl2[j].status=ev.status||"success";break}}
   var c2=a2.sat&&a2.sat[ev.tool];if(c2)c2.setAttribute("fill",css("--bg"));paint(a2)}pulse(ev.agent,false);
   if(ev.status&&ev.status!=="success")feed(ev,ev.summary||(labelOf(ev.agent)+" "+ev.tool+": "+ev.status),famOf(ev.agent));return}
  if(k==="handoff"){var tg=S.agents[ev.to];if(tg){tg.from=ev.agent==="orchestrator"?(S.orch&&S.orch.label||"orchestrator"):labelOf(ev.agent)}
@@ -4875,16 +5116,20 @@ function apply(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
  if(k==="brain_answer"){if(d.model){S.model=d.model;if(S.brainText)S.brainText.textContent=d.model}
   if(d.outcome==="answered"){S.calls+=1;S.tokens+=(d.tokens||0);setMetric("__calls",{value:S.calls});setMetric("__tokens",{value:S.tokens});fly("brain",ev.agent,"purple",false,800)}
   feed(ev,ev.summary||(labelOf(ev.agent)+": brain "+(d.outcome||"")),"purple");return}
- if(k==="program"){var ap=S.agents[ev.agent];if(ap){ap.programs=ap.programs||{};ap.programs[d.program]=(ap.programs[d.program]||0)+1}
-  if(d.outcome&&d.outcome!=="ok")feed(ev,ev.summary||(labelOf(ev.agent)+" ran "+(d.program||"")),famOf(ev.agent));return}
- if(k==="metric"){setMetric(d.id,d);return}
+ if(k==="program"){var ap=S.agents[ev.agent];if(ap){ap.programs=ap.programs||{};ap.programs[d.program]=(ap.programs[d.program]||0)+(d.runs||1)}
+  if(d.outcome&&d.outcome!=="ok")feed(ev,tag(ev,ev.summary||(labelOf(ev.agent)+" ran "+(d.program||""))),d.outcome==="tests_failed"?"gray":famOf(ev.agent));return}
+ if(k==="metric"){var rm=runOf(ev);rm.values[d.id]=d;if((ev.run||"")===S.cur)setMetric(d.id,d);return}
  if(k==="escalation"){feed(ev,ev.summary||(labelOf(ev.agent)+": a rule needed the brain"),d.outcome==="resolved"?"purple":"gray");return}
- if(k==="stage"){feed(ev,ev.summary||d.stage||"stage","gray");return}
- if(k==="progress"){var pg=document.getElementById("progress");if(pg){pg.style.display="";pg.textContent=d.text||((d.percent||0)+" %")}return}
- if(k==="run_end"){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
-   if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)});
-  if(S.orch){S.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"");paintOrch()}
-  finalPanel(d);feed(ev,ev.summary||"Run finished","gray");var st=document.getElementById("status");st.textContent="finished";st.className="pill";return}}
+ if(k==="stage"){runOf(ev).stage=ev.summary||d.stage||"";feed(ev,tag(ev,ev.summary||d.stage||"stage"),"gray");return}
+ if(k==="progress"){var pg=document.getElementById("progress");if(pg){pg.style.display="";pg.textContent=d.text||((d.percent||0)+" %")}
+  if(d.pending!=null){S.pending=d.pending;show(false)}return}   // folders still to come keep the page live [VIEW-12a]
+ if(k==="run_end"){var re=runOf(ev);re.state=/^verified/.test(d.state||"")?"ok":"bad";re.final=d;re.end=ev.time||0;
+  if(!running().length){var idle=d.idle||{};Object.keys(S.agents).forEach(function(x){var ag=S.agents[x];
+   if(!ag.runCalls){ag.idle=idle[x]||"no work for this agent in this run"}paint(ag)})}
+  if(re.orch){re.orch.output=[d.state,d.delivery].filter(Boolean).join(" · ")+((d.action_needed||[]).length?" · action needed":"")}
+  if((ev.run||"")===S.cur){orchOf(re);finalPanel(d)}
+  feed(ev,tag(ev,ev.summary||"Run finished"),"gray");show(false);return}}
+document.getElementById("detail").addEventListener("click",function(e){if(e.target.tagName==="H2"&&S.view!=null)overview()});
 document.getElementById("present").addEventListener("click",function(){document.body.classList.toggle("present");this.classList.toggle("on")});
 var embedded=JSON.parse(document.getElementById("embedded").textContent||"null");
 S.animate=!matchMedia("(prefers-reduced-motion: reduce)").matches;

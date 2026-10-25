@@ -444,6 +444,18 @@ A repeated attempt with the same information gives the same answer, so every att
 6. **Stop (LA-7).** The loop continues while an iteration covers something or finds a new root cause. It stops when every item has a final status, at the safety ceiling that grows with the file, or after two iterations with nothing new. A verified, complete result is never lost by a later round: if a later round breaks the build or covers less, the best result is delivered and the later round is reported as left out (ORC-33).
 7. **Lessons (LA-8).** A cause that a verified test removed is stored in the knowledge base with the construct it occurred in. It goes to the next attempts, files and runs; a recurring one is proposed as a rule.
 8. **Decision point (LA-9).** Only in an interactive run (from the menu, or `--interactive`). When items need a source change or a requirement, the user keeps the suggestions, gives requirement documents (the file is run again with them), or leaves the items open.
+9. **Solved scenarios (A1-PL15).** Before the brain plans an item, Agent1 tries to solve it. This works when the item's
+   decision, and every condition on the path to it, compares a parameter with a constant (a literal, a macro or an
+   enumerator) or tests a boolean parameter. The path includes the if/else chain and the guard clauses
+   (`if (c) return ...;`) before the decision. Agent1 picks the condition vector the item needs: the condition's
+   outcome for a branch, an outcome for a decision, or both sides of the unique-cause pair for MC/DC. It then looks
+   for parameter values among the constants and their neighbours and checks the values against every condition. A
+   test is assembled from those values without a brain. Any other form of condition is left to the brain, which
+   gets the vector as before. A solved test that ran and still left its item open is not planned again: the brain
+   gets the item.
+10. **A "no change" verdict (COV-12a).** The suggestion brain may answer `reachable_by_test` and name the input
+    values. The report then says that no source change is needed for the item. This is a note, not a suggestion,
+    and it does not change the item's status.
 
 ## 7a2. Brain profiles and new code without pipeline changes [BP, NC]
 
@@ -511,6 +523,20 @@ header SUT (class and function) are instantiated with arguments the repository u
 -fno-exceptions and -fno-rtti; brain tasks show forms, never pilot names; and the answer of any brain is read the
 same way (any reasoning tag, fences and prose around the JSON).
 
+**Measured right (A3-OBS6, A2-21ah, LA-7 c, ARCH-1c).**
+- Agent3 checks its per-test measurement before Agent2 may drop a test as redundant: a passed test that calls the
+  SUT but covers nothing when run alone, or an item of the whole run that no single run covers, means the per-test
+  items are not used for that run (nothing is dropped; a trial is judged by the whole run) and a finding names the
+  platform and how the single runs ended.
+- Agent2 reads the harness API from the harness header itself (`uc.HARNESS_H`): every `UT_` macro is a known name,
+  a macro called with the wrong number of arguments is refused with its parameters (the brain's re-ask corrects
+  it), and a `void` call inside `UT_OBSERVE_`/`UT_EXPECT_` becomes a statement.
+- The safety ceiling counts the pipeline's own time: agent calls that waited for a brain answer are not counted, as
+  the brain is shared by every file of the run; the number of iterations still bounds the brain's work.
+- A brain server behind a gateway (Cloudflare ends a silent request after 100 s): answers are streamed, every agent
+  process of the computer shares the server's `max_concurrency`, and a gateway timeout (524, 504, 502 ...) is asked
+  again on the same server after a pause before the next brain answers.
+
 **Findings across runs (NC-5).** Pipeline limitations, false refusals and unknown outcomes go to
 `ut_output/pipeline_findings.jsonl`, counted by signature; the report lists them first.
 
@@ -531,6 +557,30 @@ was not called is greyed and says why, for example UT-Source Code Corrector when
 reached [VIEW-9]. Every handoff and brain call is animated; the cards show line, statement, branch, decision and MC/DC coverage against the
 file's ASIL targets and the tests passed; the end panel shows the final state and the action needed. At the end
 `viewer.html` is written next to the events: it replays the whole run offline on any computer.
+
+**Details [VIEW-13].** Until you click something, the Details panel shows an overview of the file on display. It
+lists the file's state and the time so far, what the run is doing now, and the targets not yet met with their
+values. It also shows the action needed once the file has ended, and the latest agent calls for this file with
+their input and output. The panel updates with every event. Click an agent, the orchestrator or a metric to see its
+own details. Click the heading **Details** to return to the overview.
+
+**Test programs [VIEW-14].** A test program can run to its summary and report failed tests. The page then shows
+"k of n tests failed" in grey, not "exit 1". When each test runs alone to measure what it covers (A3-OBS5), all
+those runs appear as a single entry.
+
+The small circles around an agent box are its tools (MCP contract tools), one circle per tool; a circle is filled in
+the agent's colour while that tool runs, and hovering over it shows the tool's name.
+
+**One page for a whole batch [VIEW-12a].** `pilot-all` (and `ut_pipeline.py batch --repo A --repo B ...`) runs every
+folder in one command, so one page shows all of them: the chips read `folder: file`, the progress counts every file
+of every folder, and the page reads "finished" only after the last folder. Each folder keeps its own output folder,
+reports and summary.
+
+**Several files at once [VIEW-12].** With `max_parallel_suts` above 1, every event names its SUT file. A row of chips
+under the title lists the files with their state (running, verified, not verified). The cards, title and end panel
+show one file: the one you clicked (click it again to follow the run), else the file shown so far while it runs,
+else the running file that started first. A file that starts never clears another file's cards; the agent boxes show
+the latest call of any file, led by its name, and the page reads "finished" only after every file has ended.
 
 | Command | What it does |
 | --- | --- |

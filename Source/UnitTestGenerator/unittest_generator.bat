@@ -332,29 +332,20 @@ rem  pilot is named, because a header is never selected on its own. Each pilot r
 set "UT_HOME=%~dp0"
 set "ALL_SUMMARY=%~dp0ut_output\pilots\pilot_all_summary.txt"
 if not exist "%~dp0ut_output\pilots" mkdir "%~dp0ut_output\pilots"
-> "%ALL_SUMMARY%" echo Every pilot, every production file - %DATE% %TIME%
-set "ALL_EXIT=0"
-for /d %%P in ("%PILOTS%\*") do call :pilot_one "%%~nxP"
+rem  One command for every pilot: one viewer page from the first file to the last [VIEW-12a].
+set "REPOS="
+for /d %%P in ("%PILOTS%\*") do call :pilot_copy "%%~nxP"
 echo.
-echo ---- every pilot ----
-type "%ALL_SUMMARY%"
-echo Each pilot's report and summary: %~dp0ut_output\pilots\PILOT\ut_output
-set "UT_EXIT=%ALL_EXIT%"
+echo Running the pipeline on every pilot, one viewer page for all of them - this takes a while ...
+"%PY%" ut_pipeline.py batch %REPOS% --sut cpp_embedded_pilot=src/motor_ctrl.cpp --sut cpp_embedded_pilot=src/counter.cpp --sut cpp_embedded_pilot=src/app_main.cpp --sut cpp_embedded_pilot=include/ring_buffer.hpp --summary "%ALL_SUMMARY%" --config ut_config.json %EXTRA%
+set "UT_EXIT=%errorlevel%"
+echo Each pilot's report and summary: %~dp0ut_output\RUN\PILOT\summary.md
 goto end
-:pilot_one
-set "PILOT=%~1"
-set "SUTS="
-if /i "%PILOT%"=="cpp_embedded_pilot" set "SUTS=--sut src\motor_ctrl.cpp --sut src\counter.cpp --sut src\app_main.cpp --sut include\ring_buffer.hpp"
-set "REPO=%UT_HOME%ut_output\pilots\%PILOT%"
+:pilot_copy
+set "REPO=%UT_HOME%ut_output\pilots\%~1"
 if exist "%REPO%" rmdir /s /q "%REPO%"
-xcopy "%PILOTS%\%PILOT%" "%REPO%\" /E /I /Q /Y >nul
-echo.
-echo ==== %PILOT%: every production file - this can take several minutes ...
-"%PY%" ut_pipeline.py run --repo "%REPO%" %SUTS% --config ut_config.json %EXTRA%
-set "ONE=%errorlevel%"
-if "%ONE%"=="0" >> "%ALL_SUMMARY%" echo   %PILOT%: every file verified
-if not "%ONE%"=="0" >> "%ALL_SUMMARY%" echo   %PILOT%: not every file verified (exit code %ONE%) - see its report above
-if not "%ONE%"=="0" set "ALL_EXIT=3"
+xcopy "%PILOTS%\%~1" "%REPO%\" /E /I /Q /Y >nul
+set REPOS=%REPOS% --repo "%REPO%"
 exit /b 0
 
 :view_run

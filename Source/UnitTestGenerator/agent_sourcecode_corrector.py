@@ -97,12 +97,15 @@ class SuggestionQuote(BaseModel):
 class SuggestionProposal(BaseModel):
     """What the brain returns per suggestion (COV-12). No cause lets an item be excluded (COV-5)."""
     item_ids: list[str] = Field(description="ids from ITEMS NOT REACHED that the change makes reachable")
-    cause: Literal["condition_defect", "dead_code", "required_defensive_code", "not_controllable"] = Field(
+    cause: Literal["condition_defect", "dead_code", "required_defensive_code", "not_controllable",
+                   "reachable_by_test"] = Field(
         description="condition_defect: the condition is wrong; dead_code: the code can never run and is not required; "
                     "required_defensive_code: a requirement demands it, so make it controllable from a test; "
-                    "not_controllable: the input it depends on cannot be set from a test")
-    original_fragment: str = Field(description="exact text copied from the SOURCE (without line numbers)")
-    corrected_fragment: str = Field(description="the replacement text")
+                    "not_controllable: the input it depends on cannot be set from a test; reachable_by_test: the "
+                    "source needs no change, a test with the right inputs reaches the items")
+    original_fragment: str = Field(description="exact text copied from the SOURCE (without line numbers); empty for "
+                                               "reachable_by_test")
+    corrected_fragment: str = Field(description="the replacement text; empty for reachable_by_test")
     rationale: str = Field(description="step by step: why the items are not reached and why the change fixes it")
     requirement_ids: list[str] = Field(description="evidence ids of the requirements the change relies on")
     quotes: list[SuggestionQuote]
@@ -120,7 +123,10 @@ SUGGEST_TASK = (
     "run and that no requirement demands (dead_code), code a requirement demands that a test cannot trigger "
     "(required_defensive_code: make it controllable, for example through a parameter or a stubbed function), or "
     "an input a test cannot set (not_controllable: make it settable). Then propose the smallest change of the "
-    "SOURCE that lets a test reach the items and keeps every behaviour the REQUIREMENTS state. Copy "
+    "SOURCE that lets a test reach the items and keeps every behaviour the REQUIREMENTS state. When the source "
+    "needs no change because inputs a test can set meet every path condition and missing vector, say so: cause "
+    "reachable_by_test, empty original_fragment and corrected_fragment, and the input values in expected_effect. "
+    "Copy "
     "original_fragment exactly from the SOURCE (without line numbers); it must occur once. Cite the requirements "
     "you rely on with evidence ids and quotes copied word for word. Return JSON {{\"suggestions\": [...]}} with "
     "at most {limit} suggestions, the smallest first.")
@@ -369,6 +375,10 @@ class CorrectorAgent(ba.AgentCore):
 
         def rule(s: SuggestionProposal) -> str:
             original = s.original_fragment.replace("\r\n", "\n")
+            if s.cause == "reachable_by_test" or (original.strip() and original ==
+                                                   s.corrected_fragment.replace("\r\n", "\n")):
+                return "" if s.item_ids and s.expected_effect.strip() else \
+                    "reachable_by_test needs the items and the input values that reach them in expected_effect"
             if not original.strip() or source.count(original) != 1:
                 return "original_fragment must occur exactly once in the SOURCE"
             if original == s.corrected_fragment.replace("\r\n", "\n"):
@@ -388,9 +398,16 @@ class CorrectorAgent(ba.AgentCore):
         except ba.AgentFault as exc:
             return uc.SuggestionSet(notes=[f"no suggestion: brain not available or no usable answer ({exc.code}) [COV-12]"])
         author = self.last_brain.get("brain", "")
-        out = []
+        out, notes = [], []
         for s in answer.suggestions:
             original = s.original_fragment.replace("\r\n", "\n")
+            if s.cause == "reachable_by_test" or (original.strip() and original ==
+                                                   s.corrected_fragment.replace("\r\n", "\n")):
+                # A verdict, not a change: the brain sees no source defect - the items are a matter of the tests
+                # (COV-12a); never a suggestion, never a status of its own
+                notes.append(f"{', '.join(s.item_ids[:6])}: no source change needed according to {author or 'the brain'}"
+                             f" - {s.expected_effect.strip()[:300]} [COV-12a]")
+                continue
             patched = source.replace(original, s.corrected_fragment.replace("\r\n", "\n"), 1)
             line = source[:source.index(original)].count("\n") + 1
             fn = next((f.name for f in layout.functions if f.line_start <= line <= f.line_end), "")
@@ -402,7 +419,7 @@ class CorrectorAgent(ba.AgentCore):
                 patched_content=patched.replace("\n", "\r\n") if crlf else patched,
                 rationale=(s.rationale + " Expected effect: " + s.expected_effect)[:2000],
                 requirement_ids=s.requirement_ids, with_requirements=bool(cited), author=author))
-        return uc.SuggestionSet(suggestions=out)
+        return uc.SuggestionSet(suggestions=out, notes=notes)
 
     def evidence_problem(self, evidence: list[uc.EvidenceRef]) -> str:
         """A4-23f: at least two independent expected-behaviour evidence items (different places,

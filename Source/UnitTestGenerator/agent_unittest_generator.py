@@ -2782,9 +2782,11 @@ class GeneratorAgent(ba.AgentCore):
                              "shared (every name starting with ut_); a test calls them [BP-2].")
                 dropped: list[str] = []
                 tried: dict[str, str] = {}
+                forms: list[str] = []
                 check = self._grounding(allowed, names - set(to_rewrite),
                                         set(to_rewrite), fn.name, dropped, {n: existing[n]["source"] for n in to_rewrite},
-                                        trial=tried, shared_ok=bool(part_brains))
+                                        trial=tried, shared_ok=bool(part_brains), void_names=void_functions(layout),
+                                        fixed=forms)
                 try:
                     result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
                                                  project=layout.repo_root, check=check,
@@ -2802,7 +2804,7 @@ class GeneratorAgent(ba.AgentCore):
                     else:
                         shared_text = (SHARED_BEGIN.format(function=_ident(fn.qualified_name)) + "\n"
                                        + result.shared.strip() + "\n" + SHARED_END)
-                own_notes = [f"{fn.qualified_name}: {d}" for d in dropped] + \
+                own_notes = [f"{fn.qualified_name}: {x}" for x in forms] + [f"{fn.qualified_name}: {d}" for d in dropped] + \
                     [f"{fn.qualified_name}: {n} refused only by predictions ({w[:120]}); built in a trial [NC-7]"
                      for n, w in tried.items()]
                 produced = []
@@ -2940,7 +2942,7 @@ class GeneratorAgent(ba.AgentCore):
 
     @staticmethod
     def _allowed_symbols(plan: uc.UTPlan, headers: str, stub_header: str) -> set[str]:
-        allowed = set(HARNESS_MACROS) | SAFE_CALLS
+        allowed = set(HARNESS_MACROS) | SAFE_CALLS | set(uc.harness_api())                   # A2-21ah (c)
         for f in plan.layout.functions:
             allowed.add(f.name.split("::")[-1])
             allowed |= set(f.qualified_name.split("::"))
@@ -2961,6 +2963,9 @@ class GeneratorAgent(ba.AgentCore):
         unknown = sorted(c for c in calls if c not in allowed)
         if unknown:
             return f"calls functions that do not exist here: {', '.join(unknown[:5])} [A2-20]"
+        arity = uc.macro_arity_problem(code_only(body))                                           # A2-21ah (a)
+        if arity:
+            return arity
         code = code_only(body)
         if code.count("{") != code.count("}") or code.count("(") != code.count(")"):
             return "unbalanced braces or parentheses"
@@ -2975,7 +2980,8 @@ class GeneratorAgent(ba.AgentCore):
     @classmethod
     def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None,
                    function: str = "", dropped: list[str] | None = None, old_sources: dict[str, str] | None = None,
-                   trial: dict[str, str] | None = None, shared_ok: bool = False):
+                   trial: dict[str, str] | None = None, shared_ok: bool = False,
+                   void_names: set[str] | None = None, fixed: list[str] | None = None):
         """The check of one LLM answer, test by test [A2-21t]: names are repaired (A2-21q), a test whose body
         fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left. With
         ``trial``, a test refused only by a prediction is kept and named there: the tool decides (NC-6, NC-7).
@@ -2991,6 +2997,12 @@ class GeneratorAgent(ba.AgentCore):
                     name = readable_test_name(t.name, function, existing_names | seen | rewritten)
                     if name != t.name:
                         t = t.model_copy(update={"name": name})
+                body, changed = uc.void_values_as_statements(t.body, void_names or set())        # A2-21ah (b)
+                if changed:
+                    t = t.model_copy(update={"body": body})
+                    if fixed is not None:
+                        fixed.append(f"{t.name}: form fixed: {', '.join(changed[:3])} returns nothing, so it is "
+                                     "called as a statement [ARCH-20, A2-21ah]")
                 helpers = set(re.findall(r"\b(ut_\w+)\s*\(", parsed.shared)) if shared_ok else set()
                 problem = cls._body_problem(t.body, allowed | setup_names([t.body]) | helpers)
                 if problem and trial is not None and uc.check_kind(problem) == "prediction" and \
@@ -3175,3 +3187,10 @@ def build_agent(settings: ba.Settings, config_path: str | None = None) -> Genera
 if __name__ == "__main__":
     _config = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--config"), None)
     raise SystemExit(ba.agent_main(lambda s: build_agent(s, _config), "agent_unittest_generator (Agent2)"))
+
+
+def void_functions(layout: uc.LayoutProfile) -> set[str]:
+    """A2-21ah (b): the names of the SUT's functions and methods that return void."""
+    return {f.qualified_name.split("::")[-1] for f in layout.functions
+            if re.sub(r"\b(static|inline|virtual|extern|constexpr)\b", "", f.return_type or "").strip() == "void"
+            and not f.qualified_name.split("::")[-1].startswith("~")}

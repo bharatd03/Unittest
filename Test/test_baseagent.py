@@ -244,7 +244,7 @@ def start_fake_ollama():
 class FakeOpenAI(http.server.BaseHTTPRequestHandler):
     """An OpenAI-compatible server (/v1/models, /v1/chat/completions) for QwenRemoteEngine; key "test-key"."""
     defaults = dict(models=["qwen3-8b"], status=200, replies=None, finish_reason="stop", reject_schema=False,
-                    max_model_len=32768)
+                    max_model_len=32768, stream=False, statuses=None)
     calls: list = []
     agents: list = []
 
@@ -289,11 +289,23 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
             return self._send(404, {"error": {"message": "unknown path"}})
         if cls.reject_schema and body.get("response_format", {}).get("type") == "json_schema":
             return self._send(400, {"error": {"message": "response_format type json_schema is not supported"}})
-        if cls.status != 200:
-            return self._send(cls.status, {"error": {"message": "server overloaded"}})
         chats = sum(1 for path, _, _ in cls.calls if path == "/v1/chat/completions")
+        status = cls.statuses[min(chats, len(cls.statuses)) - 1] if cls.statuses else cls.status
+        if status != 200:
+            return self._send(status, {"error": {"message": "server overloaded"}})
         replies = cls.replies or [json.dumps(QWEN_REPLY)]
         content = replies[min(chats, len(replies)) - 1]
+        if cls.stream and body.get("stream"):                    # server-sent events, in small pieces [ARCH-1c]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for k in range(0, len(content), 7):
+                chunk = {"choices": [{"index": 0, "delta": {"content": content[k:k + 7]}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            last = {"choices": [{"index": 0, "delta": {}, "finish_reason": cls.finish_reason}],
+                    "usage": {"prompt_tokens": 150, "completion_tokens": 30}}
+            self.wfile.write(f"data: {json.dumps(last)}\n\ndata: [DONE]\n\n".encode())
+            return
         self._send(200, {"id": "c1", "object": "chat.completion", "model": body["model"],
                          "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
                                       "finish_reason": cls.finish_reason}],
@@ -895,7 +907,8 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patcher.stop)
 
     def engine(self, **changes):
-        settings = ba.QwenRemoteSettings(**{"base_url": self.url, "api_key_env": "BASEAGENT_TEST_REMOTE_KEY", **changes})
+        settings = ba.QwenRemoteSettings(**{"base_url": self.url, "api_key_env": "BASEAGENT_TEST_REMOTE_KEY",
+                                            "gateway_pause": 0.0, **changes})
         return ba.QwenRemoteEngine(settings, opener=urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
     def test_settings_and_order(self):
@@ -922,7 +935,8 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         path, body, auth = FakeOpenAI.calls[-1]
         self.assertEqual((path, auth), ("/v1/chat/completions", "Bearer test-key"))
         self.assertEqual(body["model"], "qwen3-8b")
-        self.assertIs(body["stream"], False)
+        self.assertIs(body["stream"], True)                                          # ARCH-1c: streamed
+        self.assertEqual(body["stream_options"], {"include_usage": True})
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertTrue(body["messages"][-1]["content"].endswith("/no_think"))
         self.assertEqual(body["response_format"]["type"], "json_schema")
@@ -940,6 +954,33 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
             await self.engine().start()
         self.assertEqual(ctx.exception.code, "BRAIN_NO_ACCESS")
         self.assertNotIn("wrong-key", ctx.exception.message)
+
+    async def test_a_streamed_answer_and_a_slow_gateway(self):                          # ARCH-1c
+        FakeOpenAI.stream = True
+        engine = self.engine()
+        raw = await engine.predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")   # put together
+        FakeOpenAI.reset()
+        FakeOpenAI.statuses = [524, 502, 200]                    # the gateway gave up twice: the same server again
+        raw = await self.engine().predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")
+        self.assertEqual(len(FakeOpenAI.chat_bodies()), 3)
+        FakeOpenAI.reset()
+        FakeOpenAI.statuses = [524]
+        with self.assertRaises(ba.AgentFault) as ctx:            # still slow after the retries: the next brain
+            await self.engine(gateway_retries=1).predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ctx.exception.code, "MODEL_UNAVAILABLE")
+        self.assertEqual(len(FakeOpenAI.chat_bodies()), 2)
+
+    async def test_requests_to_one_server_share_their_slots(self):                     # ARCH-1c (b)
+        slots = ba.SharedSlots(f"test-{uuid.uuid4().hex}", 1, stale=60)
+        async with slots.hold(5):
+            with self.assertRaises(ba.AgentFault) as ctx:
+                async with slots.hold(0.6):                        # another holder of the same server waits
+                    pass
+            self.assertEqual(ctx.exception.code, "MODEL_BUSY")
+        async with slots.hold(1):                                  # released: free again
+            pass
 
     async def test_a_varied_reask_samples_differently(self):
         engine = self.engine()
@@ -2858,6 +2899,21 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             handle.write("{broken\n")
         self.assertEqual(len(ba.read_events(self.dir / "events.jsonl")), 2)  # a damaged line is skipped
 
+    def test_several_runs_on_one_page_name_their_run(self):                              # VIEW-12
+        hub = ba.ViewHub(self.dir, app="UT").activate()
+        one, two = hub.for_run("src/a.c"), hub.for_run("src/b.c")
+        one.emit("run_start", summary="a")
+        two.emit("metric", data={"id": "line", "value": 5})
+        with mock.patch.dict(os.environ, {ba.VIEW_RUN_ENV: "src/b.c"}):
+            ba.emit_event("tool_start", agent="x", tool="t")               # an agent process of that run
+        hub.emit("progress", data={"text": "50 %"})                          # an event of the whole page
+        self.assertEqual(one.run_dir, hub.run_dir)
+        hub.deactivate()
+        self.assertEqual([e.get("run") for e in hub.events()], ["src/a.c", "src/b.c", "src/b.c", None])
+        page = ba.view_page(hub.events())
+        for piece in ("function runOf(", "function choose(", 'id="runs"'):    # the page keeps the runs apart
+            self.assertIn(piece, page)
+
     async def test_agent_tools_and_brain_calls_become_events(self):
         hub = ba.ViewHub(self.dir, app="UT").activate()
         agent = ViewAgent(router=ba.BrainRouter([PlanBrain("qwen", windows=[8192])]))
@@ -2923,10 +2979,18 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             page.get_by_text("Show end").click()
             page.wait_for_timeout(300)
             text = page.locator("#canvas").text_content()
+            overview = page.locator("#detail").inner_text()                   # VIEW-13: never empty
             page.get_by_text("UT-Analyzer", exact=True).first.click()
             detail = page.locator("#detail").inner_text()
             metrics = page.locator("#metrics").inner_text()
+            page.locator("#detail h2").click()
+            back = page.locator("#detail").inner_text()
             browser.close()
+        self.assertIn("Latest calls for this file", overview)
+        self.assertIn("UT-Analyzer · plan", overview)
+        self.assertIn("in (from UT-Orchestrator): plan request, iteration 1", overview)
+        self.assertIn("verified_measured", overview)
+        self.assertIn("Latest calls for this file", back)
         self.assertIn("in (from UT-Orchestrator): plan request, iteration 1", text)
         self.assertIn("out: plan with 3 scenarios", text)
         self.assertIn("not called in this run", text)
