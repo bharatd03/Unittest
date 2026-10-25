@@ -2462,6 +2462,87 @@ class SeqBrain(GenBrain):
         return {"model": self.model_id, "output": validate(self.replies.pop(0)), "usage": {}}
 
 
+class AskingWellTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-21a, ARCH-14a: offered repairs first, the rejected answer shown, no question asked twice, thinking per step."""
+    FAILURE = ba.RuleFailure(rule="R-2 generated file", failure="the build fails", subject="stub.h",
+                             message="stub.h:24:28: error: no member named 'x' in namespace 'hal'")
+
+    class ChoiceBrain(SeqBrain):
+        def __init__(self, replies, favourite="", name="sonnet"):
+            super().__init__(replies, name)
+            self.favourite, self.decisions = favourite, 0
+
+        async def predict(self, state, questions):
+            self.decisions += 1
+            key = next(iter(questions))
+            labels = list(questions[key]["criteria"])
+            probs = {k: (0.8 if k == self.favourite else round(0.2 / (len(labels) - 1), 6)) for k in labels}
+            return {"model": self.model_id, "answers": ba.answers_from_probabilities({key: probs}, questions),
+                    "usage": {}}
+
+    async def test_offered_repairs_are_ranked_by_the_brain_and_decided_by_the_tool(self):
+        brain = self.ChoiceBrain([], favourite="r2")
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        tried = []
+
+        def apply(option):
+            tried.append(option)
+            return "" if option == "r2" else "still fails"
+        answer = await agent.resolve(self.FAILURE, task="Repair it.", context="facts", output_model=GenPlan,
+                                     verify=lambda a: "no", options={"r1": "remove the line", "r2": "drop hal::"},
+                                     apply_option=apply, step="S.repair")
+        self.assertEqual((answer, tried, brain.calls), (ba.ChosenOption(option="r2"), ["r2"], 0))
+        # none accepted and no brain may write a free edit (BP-11): no free answer is asked
+        brain = self.ChoiceBrain([PLAN_REPLY], favourite="r1")
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        answer = await agent.resolve(self.FAILURE, task="Repair it.", context="facts", output_model=GenPlan,
+                                     verify=lambda a: "no", options={"r1": "a", "r2": "b"},
+                                     apply_option=lambda o: "fails", free_brains=[], step="S.repair")
+        self.assertEqual((answer, brain.calls), (None, 0))
+        self.assertTrue(any("option r1" in a for a in agent.escalations[0]["attempts"]))
+
+    async def test_a_re_ask_shows_the_rejected_answer_and_a_failed_question_is_not_asked_again(self):
+        brain = SeqBrain([dict(PLAN_REPLY, name="wrong"), dict(PLAN_REPLY, name="wrong too")])
+        agent = EchoAgent(router=ba.BrainRouter([brain]))
+        verify = lambda a: f"'{a.name}' does not compile"
+        self.assertIsNone(await agent.resolve(self.FAILURE, task="Repair it.", context="the same facts",
+                                              output_model=GenPlan, verify=verify, step="S.repair"))
+        self.assertIn("YOUR PREVIOUS ANSWER, REJECTED", brain.tasks[1])
+        self.assertIn('"wrong"', brain.tasks[1])
+        again = ba.RuleFailure(rule=self.FAILURE.rule, failure="the build fails", subject="stub.h",
+                               message="other/stub.h:31:2: error: no member named 'x' in namespace 'hal'")
+        self.assertIsNone(await agent.resolve(again, task="Repair it.", context="the same facts", output_model=GenPlan,
+                                              verify=verify, step="S.repair"))
+        self.assertEqual(brain.calls, 2)                          # the same model is not asked the same question
+        self.assertIn("not asked again", agent.escalations[1]["attempts"][0])
+        brain.replies = [dict(PLAN_REPLY, name="fine")]           # new facts: a new question
+        answer = await agent.resolve(again, task="Repair it.", context="other facts", output_model=GenPlan,
+                                     verify=lambda a: "", step="S.repair")
+        self.assertEqual(answer.name, "fine")
+
+    async def test_a_brain_thinks_only_on_its_listed_steps(self):
+        seen = []
+
+        class ThinkBrain(GenBrain):
+            settings = types.SimpleNamespace(think_steps=["A3.repair"])
+
+            async def generate(self, task, context, schema, validate):
+                seen.append(ba._THINK_STEP.get())
+                return await GenBrain.generate(self, task, context, schema, validate)
+        router = ba.BrainRouter([ThinkBrain("qwen_remote")])
+        for step in ("A3.repair", "A2.tests"):
+            await router.generate("t", "c", {}, ba.model_validator_for(GenPlan), step=step)
+        self.assertEqual(seen, [True, False])
+        engine = ba.QwenEngine(ba.QwenSettings(think_steps=["A3.repair"]))
+        token = ba._THINK_STEP.set(True)
+        try:
+            self.assertTrue(engine.thinking())
+            self.assertGreaterEqual(engine.call_limits("generate", 100)[1], 4096)   # room for the reasoning
+        finally:
+            ba._THINK_STEP.reset(token)
+        self.assertFalse(engine.thinking())
+
+
 class AnswerHandlingTests(unittest.IsolatedAsyncioTestCase):
     """ARCH-20: a re-ask after a refused answer is sampled differently; every answer goes to the run's log."""
     async def test_vary_reaches_brains_that_take_it_and_the_answer_log_is_written(self):

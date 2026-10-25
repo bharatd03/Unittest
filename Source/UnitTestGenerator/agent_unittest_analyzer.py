@@ -3963,7 +3963,8 @@ class AnalyzerAgent(ba.AgentCore):
         self._link_cache[key] = links
         return links
 
-    async def _missing_declarations(self, layout: uc.LayoutProfile, symbols: list[str]) -> tuple[
+    async def _missing_declarations(self, layout: uc.LayoutProfile, symbols: list[str],
+                                    no_brain: set[str] | frozenset = frozenset()) -> tuple[
             list[uc.Dependency], list[str]]:
         """A1-PL14: a declaration from the dependency plan or the headers; the brain only when none exists."""
         root = Path(layout.repo_root)
@@ -3999,6 +4000,10 @@ class AnalyzerAgent(ba.AgentCore):
                      if re.search(r"\b" + re.escape(sym) + r"\b", line)][:12]
             if not self.cfg.propose_declarations or not usage:
                 open_items.append(f"no declaration found for {sym}; cannot stub it")
+                continue
+            if sym in no_brain or short in no_brain:                                 # ARCH-21a: not asked again
+                open_items.append(f"no declaration found for {sym}; the brain's proposal did not build - a declaration "
+                                  "in the repository is needed [A1-PL14]")
                 continue
             try:
                 answer = await self.generate(DECLARATION_TASK.format(name=sym),
@@ -4089,7 +4094,8 @@ class AnalyzerAgent(ba.AgentCore):
             missing_decls = [s for s in last.undefined_symbols if s not in stubbed and
                              s not in {f.name for f in layout.functions} and
                              s not in {f.qualified_name for f in layout.functions}]
-            proposed, decl_items = await self._missing_declarations(layout, missing_decls) if missing_decls else ([], [])
+            proposed, decl_items = await self._missing_declarations(
+                layout, missing_decls, set(req.no_brain_declarations)) if missing_decls else ([], [])
             for dep in proposed:                                                # A1-PL14
                 spec = stub_spec(dep)
                 if spec is not None and spec.function not in stubbed:

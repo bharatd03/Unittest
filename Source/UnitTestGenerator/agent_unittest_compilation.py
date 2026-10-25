@@ -641,6 +641,10 @@ class FileEdit(BaseModel):
     new: str = Field(description="its replacement")
 
 
+# A3-CL14b: what the harness calls in the generated files - never removed by a rule's repair
+HARNESS_HOOKS = r"\b(?:ut_before_each|ut_after_each|ut_sut_reset|ut_stub_call|main)\s*\("
+
+
 class BuildRepair(BaseModel):
     edits: list[FileEdit] = Field(description="edits of the generated files only", max_length=12)
     reason: str = Field(description="one sentence: what was wrong and what the edits change")
@@ -2945,14 +2949,20 @@ class CompilationAgent(ba.AgentCore):
             result.reason = "builds, links and runs"
             return result
         # Measure [A3-50..60]
+        self._measure_notes = []
         try:
             result.coverage = self._coverage(chain, build, run_dir, repo, layout)
         except ba.AgentFault as exc:
-            result.decision, result.reason = "environment_error", exc.message
-            result.failures.append(uc.Failure(failure_id="env-coverage", kind="environment",
-                                              classification="environment_defect", route="stop",
+            # A3-60b: with the tools in place a failed measurement is this run's, not the environment's: the
+            # orchestrator goes on once; a missing tool stops the run
+            missing = [t for t in (chain.profdata, chain.cov) if not Path(t).is_file()]
+            result.decision, result.reason = "environment_error", exc.message + (
+                f" (missing: {', '.join(missing)})" if missing else " - not measured")
+            result.failures.append(uc.Failure(failure_id="env-coverage-tool" if missing else "env-coverage",
+                                              kind="environment", classification="environment_defect", route="stop",
                                               diagnostic=exc.message))
             return result
+        result.measurement_notes = list(self._measure_notes)
         test_failures = self._classify_tests(layout, tests, repo, req)
         result.failures.extend(test_failures)
         self._regressions(result, req.previous)
@@ -3614,10 +3624,16 @@ class CompilationAgent(ba.AgentCore):
         # relative to the run folder (the working directory): a comma in a path would read as a weight
         listing.write_text("\n".join(os.path.relpath(r, run_dir).replace("\\", "/") for r in raws) + "\n",
                            encoding="utf-8")
-        code, text = _run([chain.profdata, "merge", "-sparse", f"--input-files={listing}", "-o", str(merged)], run_dir,
-                          max(120.0, 0.05 * len(raws)), env)
+        # A3-60a: a profile a crashed or killed test left damaged is skipped and named; the merge fails only when
+        # no profile can be read
+        code, text = _run([chain.profdata, "merge", "-sparse", "--failure-mode=all", f"--input-files={listing}",
+                           "-o", str(merged)], run_dir, max(120.0, 0.05 * len(raws)), env)
         if code != 0:
             raise ba.AgentFault("MEASUREMENT_FAILED", "llvm-profdata failed: " + text.strip()[-200:])
+        skipped = sorted({Path(m.group(1)).stem for m in re.finditer(r"warning:\s*([^:\n]+\.profraw)", text)})
+        if skipped:
+            self.__dict__.setdefault("_measure_notes", []).append(f"{len(skipped)} coverage profile(s) could not be read and were left out - "
+                                       f"their tests count as not measured: {', '.join(skipped[:6])} [A3-60a]")
         # No source filter on export: with a sut_access file the SUT is reached through #include,
         # so its path differs; the SUT's records are selected by path suffix [A2-21k].
         args = [str(build["binary"]), f"-instr-profile={merged}"]
@@ -3814,6 +3830,13 @@ class CompilationAgent(ba.AgentCore):
                              if d.severity in ("error", "fatal"))[:6000]
         parts = [uc.part("compiler errors", messages), uc.part("SUT include lines (the order it compiles with)",
                                                                "\n".join(prologue) or "(none)")]
+        origins = self._line_origins(req, result)                                          # A3-CL14a
+        if origins:
+            parts.append(uc.part("where the failing lines come from", "WHERE THE FAILING LINES COME FROM:\n" + origins))
+        declared = self._project_declarations(req, result)
+        if declared:
+            parts.append(uc.part("project declarations", "THE PROJECT'S OWN DECLARATIONS OF THE NAMES IN THE ERRORS:\n"
+                                 + declared))
         for action in req.bundle.actions:
             text = action.content
             if action.role == "testsuite":                 # its includes and declarations, then a few tests
@@ -3823,6 +3846,177 @@ class CompilationAgent(ba.AgentCore):
             parts.append(uc.part(f"GENERATED FILE {action.path}", text[:12_000],
                                  priority=uc.P_FACTS if action.role != "testsuite" else uc.P_EVIDENCE))
         return parts
+
+    # ---------------------------------------------------------------- A3-CL14a: facts and rule-built repairs
+    def _action_of(self, bundle: uc.FileActionBundle, path: str) -> uc.FileAction | None:
+        facts = self._toolchain.facts if getattr(self, "_toolchain", None) is not None else None
+        return next((a for a in bundle.actions if uc.same_file(a.path, path, facts)), None)
+
+    def _line_origins(self, req: uc.VerifyRequest, result: uc.VerificationResult) -> str:
+        """A3-CL14a: each failing line of a generated file with what wrote it - the stub of which dependency, from
+        which declaration (a header's, or one the brain proposed)."""
+        deps = req.layout.dependencies.entries if req.layout.dependencies else []
+        rows = []
+        for d in [d for d in result.diagnostics if d.severity in ("error", "fatal")][:12]:
+            action = self._action_of(req.bundle, d.file) if req.bundle else None
+            if action is None:
+                continue
+            lines = action.content.splitlines()
+            text = lines[d.line - 1].strip() if 0 < d.line <= len(lines) else ""
+            origin = {"stub": "the stub file", "helper": "the stub header", "sut_access": "the SUT access file",
+                      "testsuite": "the test suite's includes and declarations"}.get(action.role, action.role)
+            name = re.search(r"\b([A-Za-z_][\w:]*)\s*\(", text)
+            found = []
+            for dep in deps:
+                base = (dep.qualified_name or dep.name).replace("::", "_")
+                if re.search(r"\but_stub_" + re.escape(base) + r"(?:_|\b)", text) or (
+                        name and name.group(1) in (dep.qualified_name, dep.name) and action.role == "stub"):
+                    source = f"declared in {dep.header}" if dep.header and "brain" not in dep.decided_by else \
+                        f"PROPOSED BY THE BRAIN ({dep.decided_by}), not found in the repository"
+                    found.append(f"the stub of {dep.qualified_name or dep.name}: {dep.declaration or dep.name} - {source}")
+            if found:                      # two stubs of one name: both are named, the conflict is the fact
+                origin = " AND ".join(found) + (" (two stubs of the same function)" if len(found) > 1 else "")
+            rows.append(f"- {Path(action.path).name}:{d.line}: `{text[:160]}` - written for {origin}")
+        return "\n".join(dict.fromkeys(rows))
+
+    def _project_declarations(self, req: uc.VerifyRequest, result: uc.VerificationResult) -> str:
+        """A3-CL14a: where the repository's headers declare the names the errors quote, with the namespace."""
+        names = []
+        for d in result.diagnostics:
+            if d.severity in ("error", "fatal"):
+                names += [n.split("::")[-1] for n in re.findall(r"'([A-Za-z_][\w:]*)'", d.message)]
+        names = [n for n in dict.fromkeys(names) if not n.startswith("ut_") and len(n) > 1][:8]
+        root = Path(req.layout.repo_root)
+        rows = []
+        for rel in list(dict.fromkeys(req.layout.headers))[:60]:
+            try:
+                text = (root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for name in names:
+                for m in re.finditer(r"^[^\n]*\b" + re.escape(name) + r"\b[^\n]*$", text, re.M):
+                    line = m.group(0).strip()
+                    if line.startswith(("//", "/*", "*", "#include")) or not re.search(
+                            r"\(|\b(?:typedef|using|struct|class|enum|extern|namespace)\b|;", line):
+                        continue
+                    space = "::".join(re.findall(r"\bnamespace\s+([\w:]+)\s*\{", text[: m.start()])[-1:])
+                    rows.append(f"- {rel}:{text[: m.start()].count(chr(10)) + 1}: {line[:200]}"
+                                + (f"  (inside namespace {space})" if space else ""))
+        return "\n".join(list(dict.fromkeys(rows))[:16])
+
+    def _repair_options(self, req: uc.VerifyRequest, errors: list[uc.Diagnostic]) -> dict[str, tuple[str, "BuildRepair"]]:
+        """A3-CL14b: repairs the rules build from the compiler's messages - removing the failing lines a stub wrote,
+        dropping or adding a namespace, including the header that declares a name. The brain chooses, the compiler
+        decides; none of them touches a test, the SUT or a project file."""
+        options: dict[str, tuple[str, BuildRepair]] = {}
+        bundle = req.bundle
+        root = Path(req.layout.repo_root)
+
+        def removal(content: str, numbers: list[int]) -> list[FileEdit]:
+            """Edits that remove these lines (a definition they open with its whole block), each fragment made unique
+            by the lines around it, which stay."""
+            lines = content.splitlines(keepends=True)
+            gone: set[int] = set()
+            for n in numbers:
+                i = n - 1
+                if not 0 <= i < len(lines):
+                    continue
+                j, depth, opened = i, 0, False
+                if "{" in lines[i] or (i + 1 < len(lines) and lines[i + 1].strip().startswith("{")) or \
+                        (lines[i].rstrip().endswith(")") and "(" in lines[i]):
+                    while j < len(lines):
+                        depth += lines[j].count("{") - lines[j].count("}")
+                        opened = opened or "{" in lines[j]
+                        if opened and depth <= 0:
+                            break
+                        j += 1
+                    j = min(j, len(lines) - 1)
+                gone |= set(range(i, j + 1))
+            edits = []
+            for a in sorted(gone):
+                if a - 1 in gone:
+                    continue
+                b = a
+                while b + 1 in gone:
+                    b += 1
+                lo, hi = a, b
+                while "".join(lines[lo:hi + 1]).strip() and content.count("".join(lines[lo:hi + 1])) != 1 and \
+                        (lo > 0 or hi < len(lines) - 1):
+                    lo, hi = max(0, lo - 1), min(len(lines) - 1, hi + 1)
+                old = "".join(lines[lo:hi + 1])
+                if content.count(old) != 1:
+                    return []
+                edits.append(FileEdit(path=path_of[content], old=old,
+                                      new="".join(lines[lo:a]) + "".join(lines[b + 1:hi + 1])))
+            return edits
+        path_of: dict[str, str] = {a.content: a.path for a in (bundle.actions if bundle else [])}
+
+        def add(text: str, edits: list[FileEdit]) -> None:
+            if edits and len(options) < 11 and all(e.old for e in edits):
+                key = f"r{len(options) + 1}"
+                if not any(o[1].edits == edits for o in options.values()):
+                    options[key] = (text[:480], BuildRepair(edits=edits, reason=text[:300]))
+        failing: dict[str, list[int]] = {}
+        for d in errors:
+            action = self._action_of(bundle, d.file) if bundle else None
+            if action is None or action.role == "testsuite":
+                continue
+            failing.setdefault(action.path, []).append(d.line)
+        for path, numbers in failing.items():                    # the failing lines of one generated file
+            text = next(a.content for a in bundle.actions if a.path == path)
+            lines = text.splitlines(keepends=True)
+            chosen = [lines[n - 1] for n in sorted(set(numbers)) if 0 < n <= len(lines)]
+            if chosen and not any(re.search(r"\bUT_(EXPECT|OBSERVE|TEST)\b|^\s*[{}]\s*$|" + HARNESS_HOOKS, x) for x in chosen):
+                add(f"remove the {len(chosen)} failing line(s) of {Path(path).name} (a definition with its body): "
+                    + " | ".join(x.strip()[:80] for x in chosen[:4]), removal(text, sorted(set(numbers))))
+        for d in errors:
+            action = self._action_of(bundle, d.file) if bundle else None
+            if action is None:
+                continue
+            lines = action.content.splitlines(keepends=True)
+            line = lines[d.line - 1] if 0 < d.line <= len(lines) else ""
+            if not line or re.search(r"\bUT_(EXPECT|OBSERVE)|" + HARNESS_HOOKS, line):
+                continue
+            if action.content.count(line) != 1:              # a duplicated line: only its removal is offered
+                if re.search(r"conflicts with|redefinition of|redeclar", d.message) and action.role != "testsuite":
+                    add(f"{Path(action.path).name}:{d.line}: remove the duplicated line `{line.strip()[:100]}`",
+                        removal(action.content, [d.line]))
+                continue
+            m = re.search(r"no (?:member|type) named '(\w+)' in namespace '([\w:]+)'", d.message)
+            if m:
+                fixed = re.sub(r"\b" + re.escape(m.group(2)) + r"::\s*(?=" + re.escape(m.group(1)) + r"\b)", "", line)
+                if fixed != line:
+                    add(f"{Path(action.path).name}:{d.line}: drop the namespace {m.group(2)}:: before {m.group(1)}",
+                        [FileEdit(path=action.path, old=line, new=fixed)])
+            m = re.search(r"(?:unknown type name|use of undeclared identifier) '(\w+)'", d.message)
+            if m:
+                name = m.group(1)
+                for rel in req.layout.headers[:60]:
+                    try:
+                        htext = (root / rel).read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    decl = re.search(r"\b(?:typedef\b[^;]*\b" + re.escape(name) + r"\s*;|using\s+" + re.escape(name) +
+                                     r"\s*=|(?:struct|class|enum(?:\s+class)?|union)\s+" + re.escape(name) +
+                                     r"\b|[\w:<>*&\s]+\b" + re.escape(name) + r"\s*\()", htext)
+                    if not decl:
+                        continue
+                    spaces = re.findall(r"\bnamespace\s+([\w:]+)\s*\{", htext[: decl.start()])
+                    if spaces:
+                        fixed = re.sub(r"(?<![\w:])" + re.escape(name) + r"\b", f"{spaces[-1]}::{name}", line, count=1)
+                        add(f"{Path(action.path).name}:{d.line}: write {name} as {spaces[-1]}::{name} ({rel})",
+                            [FileEdit(path=action.path, old=line, new=fixed)])
+                    first = re.search(r'^#include [<"][^>"]+[>"][^\n]*\n', action.content, re.M)
+                    include = f'#include "{Path(rel).name}"\n'
+                    if first and include not in action.content:
+                        add(f"{Path(action.path).name}: include {Path(rel).name}, which declares {name}",
+                            [FileEdit(path=action.path, old=first.group(0), new=first.group(0) + include)])
+                    break
+            if re.search(r"conflicts with|redefinition of|conflicting types|redeclar|a type specifier is required",
+                         d.message) and action.role != "testsuite":
+                add(f"{Path(action.path).name}:{d.line}: remove the line `{line.strip()[:100]}`",
+                    removal(action.content, [d.line]))
+        return options
 
     async def _repair_generated(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> uc.VerificationResult:
         """A3-CL14: the rules (A3-CL12, A3-CL13, A3-HW2, A3-HW3) left the build failing in generated files: the
@@ -3852,10 +4046,19 @@ class CompilationAgent(ba.AgentCore):
                 return "with these edits the build still fails:\n" + "\n".join(
                     f"{Path(d.file).name}:{d.line}: {d.message}" for d in left[:8])
 
-            answer = await self.resolve(failure, task=REPAIR_TASK, context=self._context_of_repair(req.model_copy(
-                update={"bundle": bundle}), current), output_model=BuildRepair, verify=build_with, step="A3.repair",
-                attempts=self.cfg.rule_attempts, project=req.layout.repo_root,
-                need=ba.OutputNeed(items=4, tokens_per_item=300, overhead=300))
+            now = req.model_copy(update={"bundle": bundle})
+            offered = self._repair_options(now, errors)                                     # A3-CL14b
+
+            async def apply_option(key: str) -> str:
+                return await build_with(offered[key][1])
+            # BP-10: after the offered repairs, a free edit only from a brain whose profile allows file_edit
+            free = await uc.brains_for(self, "file_edit", "A3.repair") if offered else None
+            answer = await self.resolve(failure, task=REPAIR_TASK, context=self._context_of_repair(now, current),
+                                        output_model=BuildRepair, verify=build_with, step="A3.repair",
+                                        attempts=self.cfg.rule_attempts, project=req.layout.repo_root,
+                                        need=ba.OutputNeed(items=4, tokens_per_item=300, overhead=300),
+                                        options={k: v[0] for k, v in offered.items()}, apply_option=apply_option,
+                                        free_brains=free)
             if answer is None or "result" not in trial:
                 break
             bundle, current, errors = trial["bundle"], trial["result"], trial["errors"]

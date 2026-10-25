@@ -1,5 +1,29 @@
 # BaseAgent changes
 
+## 2026-10-25 (last): asking so that an answer can be right, for every brain
+
+**Why.** In Stage A the remote Qwen was asked twice, with the same facts and the same seed, to repair a stub header
+that was wrong because of a declaration it had invented itself. It gave the same unusable answer both times. The
+SKILL.md files never reach the brain, and Qwen's thinking was off on every step.
+
+* **`AgentCore.resolve`** (ARCH-21a):
+  * `options` / `apply_option`: repairs the agent's rules built are offered first as a typed choice (2-12 labels plus
+    `none`). The tool tries them in the order of the brain's probabilities, or in the rules' order without a brain.
+    An accepted option comes back as `ChosenOption`.
+  * `free_brains`: the brains that may write a free answer after the options failed (`[]`: none).
+  * A re-ask shows the rejected answer ("YOUR PREVIOUS ANSWER, REJECTED") and is sampled differently (`vary`).
+  * A question that failed before with the same facts (rule, failure signature, normalized context) is not asked of
+    the same model again. Only a brain of another model may answer it, else it is not asked and the escalation says
+    so (`_failed_questions`).
+  * Answers the tool accepted for the same rule (`ResolutionMemory.recent`) are shown as examples of the form.
+* **`AgentCore.decide(..., allowed=)`**: narrows the brains, like `generate`.
+* **`RuleFailure.normalized()`**: the message without paths, numbers and generated names. `signature()` uses it.
+* **Thinking per step** (ARCH-14a): `QwenSettings.think_steps` (also for the remote engine). The router sets
+  `_THINK_STEP` around each call. `QwenEngine.thinking()` is true with `think`, or on a listed step when the model
+  can think. The answer limit then leaves at least 4,096 tokens.
+* **Tests.** `AskingWellTests`: offered repairs ranked and decided by the tool, no free answer when the profile
+  allows none, the rejected answer in the re-ask, no repeated question, thinking only on listed steps.
+
 ## 2026-10-25 (late evening): the local Qwen only when the remote one is out
 
 **Why.** In the large pilot, the router passed calls from the remote Qwen to the local Qwen on the same GPU. That

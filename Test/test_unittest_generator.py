@@ -3231,6 +3231,11 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertEqual([(d.name, d.qualified_name, d.decided_by, d.return_type) for d in deps],
                          [("pwm", "hal::pwm", "rule", "void")])
         self.assertTrue(any("hal::led" in i and "hal::led_t" in i for i in items), items)
+        asked = UTBrain(declarations={"hal::led": "void hal::led(int);"})
+        with brain(asked):                                       # a declaration that did not build: not asked again
+            deps, items = run(self.agent._missing_declarations(layout, ["hal::led"], {"hal::led"}))
+        self.assertEqual((deps, asked.generate_calls), ([], []))
+        self.assertTrue(any("a declaration in the repository is needed" in i for i in items), items)
 
 
 class BrainGenerationTests(unittest.TestCase):
@@ -5070,6 +5075,34 @@ class LargeFileRoundTests(unittest.TestCase):
         self.assertEqual(code, -126)
         self.assertIn("command line is too long", text)                   # never "tool not found"
 
+    def test_a_round_that_was_not_measured_is_not_the_end(self):                           # A3-60b
+        stop = lambda fid: uc.VerificationResult(run_id="r", stage="verify", sut_sha256="", suite_sha256="",
+                                                 decision="environment_error", failures=[uc.Failure(
+                                                     failure_id=fid, kind="environment", route="stop",
+                                                     classification="environment_defect", diagnostic="x")])
+        self.assertTrue(up.Orchestrator._not_measured(stop("env-coverage")))
+        self.assertFalse(up.Orchestrator._not_measured(stop("env-coverage-tool")))   # a missing tool stops
+        self.assertFalse(up.Orchestrator._not_measured(stop("env-toolchain")))
+        source = (SRC / "ut_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("if self._not_measured(result) and s.unmeasured == 0:", source)
+
+    def test_a_setup_round_without_the_brains_declarations(self):                       # A1-PL14, ARCH-21a
+        rule = uc.Dependency(name="pwm", qualified_name="hal::pwm", declaration="void pwm(int);", decision="stub",
+                             decided_by="rule", header="include/hal.hpp")
+        invented = rule.model_copy(update={"declaration": "int hal::pwm(hal::x);", "decided_by": "brain declaration (q)"})
+        other = uc.Dependency(name="adc", decision="stub", decided_by="brain declaration (q)")
+        layout = uc.LayoutProfile(repo_root=".", sut_file="a.cpp", language="cpp", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t", suite_file="t/x.cpp", sut_sha256="0" * 64,
+                                  dependencies=uc.DependencyPlan(entries=[invented, other]))
+        orch = up.Orchestrator.__new__(up.Orchestrator)
+        orch.layout, orch.hub = layout, None
+        s = types.SimpleNamespace(layout=layout, notes=[], declarations_dropped=[], replaced_dependencies={"pwm": rule})
+        with mock.patch.object(up.Orchestrator, "_stage", lambda self, text: None):
+            self.assertTrue(orch._drop_brain_declarations(s))
+            self.assertFalse(orch._drop_brain_declarations(s))   # once
+        self.assertEqual(s.declarations_dropped, ["adc", "hal::pwm"])
+        self.assertEqual([(d.name, d.decided_by) for d in orch.layout.dependencies.entries], [("pwm", "rule")])
+
     def test_two_pilot_folders_are_one_command(self):                                       # VIEW-12a
         bat = (SRC / "unittest_generator.bat").read_text(encoding="utf-8")
         sh = (SRC / "unittest_generator.sh").read_text(encoding="utf-8")
@@ -5157,6 +5190,78 @@ class LargePilotFindingsTests(unittest.TestCase):
                 self.assertTrue(result.link_ok, result.reason)
                 self.assertGreater(len(result.tests), 3)
                 self.assertEqual([(t.name, t.message[:200]) for t in result.tests if t.status != "passed"], [])
+
+    def test_a_damaged_profile_is_left_out_of_the_merge(self):                       # A3-60a
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "src/a.c").write_text("int twice(int x)\n{\n    return x > 3 ? 2 * x : x;\n}\n")
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file="src/a.c"))
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(tmp.name) / "w")))
+        layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
+            uc.CaptureRequest(layout=layout)))))
+        plan = run(agent.plan(uc.PlanRequest(layout=layout, last=comp.execute(uc.VerifyRequest(layout=layout,
+                                                                                               stage="probe")),
+                                             iteration=1)))
+        bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
+            uc.GenerationRequest(plan=plan)))
+        result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
+        run_dir = Path(result.run_dir)
+        (run_dir / "prof" / "crashed_test.profraw").write_bytes(b"\x81rforpl\xff truncated")
+        binary = next(p for p in run_dir.rglob("*") if p.is_file() and p.name.startswith("ut_runner")
+                      and p.suffix in ("", ".exe"))
+        report = comp._coverage(comp.toolchain(), {"binary": binary}, run_dir, Path(result.run_dir) / "repo", layout)
+        self.assertTrue(report.measured)
+        self.assertTrue(any("crashed_test" in n for n in comp._measure_notes), comp._measure_notes)
+
+    def test_a_failing_stub_gets_its_origin_and_rule_repairs(self):            # A3-CL14a, A3-CL14b, ARCH-21a
+        """Two stubs of hal::pwm - the header's and one the brain invented: the repair's facts name both origins, and
+        the rules' own repairs, tried without a brain, take the build forward; the brain is never needed for them."""
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "include").mkdir()
+        (root / "include/hal.hpp").write_text("#pragma once\n#include <cstdint>\nnamespace hal {\n"
+                                              "void pwm(std::uint8_t channel, std::uint16_t duty);\n}\n")
+        (root / "src/fan.cpp").write_text('#include "hal.hpp"\nint fan(int d)\n{\n    hal::pwm(1, '
+                                          'static_cast<std::uint16_t>(d));\n    return d > 10 ? 1 : 0;\n}\n')
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file="src/fan.cpp"))
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(tmp.name) / "w")),
+                                   router=ba.BrainRouter([DownBrain()], 0.0))           # TP-21: no real brain
+        layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
+            uc.CaptureRequest(layout=layout)))))
+        rule = next(d for d in layout.dependencies.entries if d.name == "pwm")
+        decl = "std::uint16_t hal::pwm(hal::pwm_channel_t, std::uint16_t);"
+        rt, params = a1.parse_declaration(decl)
+        invented = uc.Dependency(name="pwm", qualified_name="hal::pwm", declaration=decl, decision="stub",
+                                 decided_by="brain declaration (qwen_remote)", return_type=rt, params=params)
+        layout = layout.model_copy(update={"dependencies": layout.dependencies.model_copy(
+            update={"entries": layout.dependencies.entries + [invented]})})
+        plan = uc.UTPlan(plan_id="p", stage="setup", layout=layout,
+                         stubs=[s for s in (a1.stub_spec(rule), a1.stub_spec(invented)) if s])
+        bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
+            uc.GenerationRequest(plan=plan)))
+        req = uc.VerifyRequest(layout=layout, stage="build_check", bundle=bundle)
+        result = comp.execute(req)
+        self.assertFalse(result.link_ok)
+        origins = comp._line_origins(req, result)
+        self.assertIn("PROPOSED BY THE BRAIN", origins)
+        self.assertIn("declared in include/hal.hpp", origins)
+        self.assertIn("two stubs of the same function", origins)
+        self.assertIn("include/hal.hpp", comp._project_declarations(req, result))
+        options = comp._repair_options(req, comp._repairable(result, req))
+        self.assertTrue(any(text.startswith("remove the") for text, _ in options.values()), options)
+        for _, repair in options.values():                       # a test, the SUT or a project file: never
+            self.assertTrue(all(e.path.startswith("tests/") for e in repair.edits))
+        before = len([d for d in result.diagnostics if d.severity == "error"])
+        repaired = run(comp._repair_generated(result, req))      # no brain here: the rules' order, the tool decides
+        after = len([d for d in repaired.diagnostics if d.severity == "error"])
+        self.assertLess(after, before)
+        self.assertTrue(any("option" in a for e in comp.escalations for a in e["attempts"]), comp.escalations)
 
     def test_several_namespaces_in_one_file(self):            # A2-21z, A2-21ai, A2-21aj, A2-21k, A1-PL1
         """The same names in several namespaces (functions, statics, state, enums, stubs): the files build, the rule

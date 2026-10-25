@@ -945,6 +945,7 @@ class VerificationResult(Contract):
     host_notes: list[str] = Field(default_factory=list)       # target keywords, target asm, data model [A3-HW2..HW4]
     repaired_files: dict[str, str] = Field(default_factory=dict)   # generated files repaired by the brain [A3-CL14]
     unknown_outcomes: list[str] = Field(default_factory=list)      # ends the platform facts do not describe [NC-12]
+    measurement_notes: list[str] = Field(default_factory=list)     # profiles left out of the merge [A3-60a]
 
 
 # ============================================================================ planning (Agent1)
@@ -1171,6 +1172,7 @@ class PlanRequest(Contract):
     lessons: list[str] = Field(default_factory=list)             # verified lessons of the knowledge base [LA-8]
     item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
     iterations_left: int = 0                                      # after this one: the brain's rounds [A1-PL16]
+    no_brain_declarations: list[str] = Field(default_factory=list)   # the brain's declaration did not build [A1-PL14]
 
 
 class DependencyRequest(Contract):
@@ -2540,15 +2542,16 @@ def patterns_of(fn: "FunctionInfo", layout: "LayoutProfile") -> list[str]:
 
 # ============================================================================ brain profiles [BP-1 .. BP-10]
 # BP-2: the kinds of answer a brain may give, from narrow to wide (repair and decision are not on the ladder)
-ANSWER_KINDS = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision")
+ANSWER_KINDS = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision",
+                "file_edit")     # file_edit: a free edit of generated files after the offered repairs failed [BP-11]
 KIND_LADDER = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part")
-MINIMUM_KINDS = ("values", "scenario", "test", "repair", "decision")      # what Qwen3 8B was given before BP
+MINIMUM_KINDS = ("values", "scenario", "test", "repair", "decision", "file_edit")   # Qwen3 8B's before BP; BP-11
 # BP-3: a cause on the test-building side, and the narrowest kind that contains the missing piece
 CAUSE_KIND = {"needs_call_sequence": "call_sequence", "test_setup": "setup", "needs_dependency_control": "stub",
               "pipeline_limitation": "test"}
 KIND_STEP = {"values": "A2.value", "scenario": "A1.plan", "call_sequence": "A1.plan", "setup": "A2.setup",
              "stub": "A2.stub", "test": "A2.tests", "suite_part": "A2.tests", "repair": "A3.repair",
-             "decision": ""}
+             "decision": "", "file_edit": "A3.repair"}
 
 
 class BrainProfile(Contract):

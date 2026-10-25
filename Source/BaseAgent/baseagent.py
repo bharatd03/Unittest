@@ -966,6 +966,9 @@ class QwenSettings(StrictModel):
     # Qwen3 can reason before it answers ("thinking"). Off by default: the typed answers are
     # short, and on a CPU thinking multiplies the time per answer.
     think: bool = False
+    # ARCH-14a: the steps (A3.repair, A1.declaration ...) on which the brain thinks before it answers, with think off
+    # for the others: the few small questions where a wrong answer costs a build, at the time of a longer answer.
+    think_steps: list[str] = Field(default_factory=list)
     # Without thinking, the JSON format makes Qwen write probabilities as its very first tokens,
     # with no room to look at the evidence first, so an 8B model judges by surface patterns
     # (it called a parameterized query SQL injection with probability 1.0). With "analysis",
@@ -1242,6 +1245,8 @@ AVAILABILITY_FAULTS = {"BRAIN_UNAVAILABLE", "MODEL_UNAVAILABLE", "MODEL_TIMEOUT"
 # The API key cannot use this model (or there is no key): skipped for the rest of the run.
 NO_ACCESS_ERRORS = {"AuthenticationError", "PermissionDeniedError", "NotFoundError"}
 # The brain of the latest call in the current task (ARCH-18: calls of one agent at the same time).
+# ARCH-14a: this call's step is one the answering brain thinks on (set by the router around the call).
+_THINK_STEP: contextvars.ContextVar[bool] = contextvars.ContextVar("baseagent_think_step", default=False)
 _CALL_BRAIN: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("baseagent_call_brain",
                                                                                     default=None)
 # Rate limited (429) or overloaded (529): asked again after a wait, never another brain (ARCH-18).
@@ -2074,6 +2079,7 @@ class QwenEngine:
             if settings.think and "thinking" not in capabilities:
                 raise AgentFault("CONFIGURATION_ERROR",
                                  f"{settings.model} does not support thinking; set qwen.think to false.")
+            self.can_think = "thinking" in capabilities
         details = info.get("details") if isinstance(info.get("details"), dict) else {}
         self.details = {key: str(details[key]) for key in ("family", "parameter_size", "quantization_level")
                         if details.get(key)}
@@ -2124,9 +2130,13 @@ class QwenEngine:
         if not settings.adaptive:
             return [fixed_ctx], fixed_out
         out = fixed_out if need is None else min(settings.max_num_predict, max(256, math.ceil(need * 1.3)))
-        if settings.think:
+        if self.thinking():
             out = max(out, 4096)
         return list(settings.windows), out
+
+    def thinking(self) -> bool:
+        """ARCH-14a: this call thinks - always with think on, else on the configured steps when the model can."""
+        return self.settings.think or (_THINK_STEP.get() and getattr(self, "can_think", True))
 
     def _window(self, messages: list[dict[str, str]], windows: list[int], out: int, ratio: float,
                 at_least: int = 0) -> int:
@@ -2154,7 +2164,7 @@ class QwenEngine:
                    "num_predict": num_predict}
         if vary:              # after a repetition loop: other sampling, still a fixed seed [ARCH-19]
             options.update(temperature=max(settings.temperature, 0.4), seed=settings.seed + 1, repeat_penalty=1.2)
-        body = {"model": settings.model, "messages": messages, "stream": False, "think": settings.think,
+        body = {"model": settings.model, "messages": messages, "stream": False, "think": self.thinking(),
                 "format": fmt, "keep_alive": settings.keep_alive, "options": options}
         status, reply = await self.http.call("POST", "/api/chat", body, timeout)
         if status == 404:
@@ -2579,7 +2589,7 @@ class QwenRemoteEngine(QwenEngine):
         super()._check_budget(messages, min(num_ctx or window, window), num_predict)
 
     def _messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        if self.settings.think or not self.settings.no_think_tag or not messages:
+        if self.thinking() or not self.settings.no_think_tag or not messages:
             return messages
         out = [dict(m) for m in messages]
         last = next((m for m in reversed(out) if m.get("role") == "user"), None)
@@ -2594,7 +2604,7 @@ class QwenRemoteEngine(QwenEngine):
             body: dict[str, Any] = {"model": settings.model, "messages": self._messages(messages), "stream": False,
                                     "temperature": settings.temperature, "seed": settings.seed,
                                     "max_tokens": num_predict,
-                                    "chat_template_kwargs": {"enable_thinking": settings.think}}
+                                    "chat_template_kwargs": {"enable_thinking": self.thinking()}}
             if vary:          # after a repetition loop: other sampling, still a fixed seed [ARCH-19]
                 body.update(temperature=max(settings.temperature, 0.4), seed=settings.seed + 1, frequency_penalty=0.3)
             if self.format_mode == "json_schema":
@@ -2755,6 +2765,8 @@ class BrainRouter:
             plan = TokenPlan(step=step, brain=name)
             if plans is not None:
                 plans.append(plan)
+            listed = getattr(getattr(brain, "settings", None), "think_steps", None)
+            thinks = _THINK_STEP.set(bool(step) and isinstance(listed, (list, tuple, set)) and step in listed)  # ARCH-14a
             try:
                 text = self._plan(brain, kind, step, parts, fixed_chars, need, plan)
                 result = await call(brain, text, plan)
@@ -2789,6 +2801,8 @@ class BrainRouter:
                                 "for this run" if exc.code == "BRAIN_NO_ACCESS" else f"for {self.cooldown:.0f} s")
                 skipped.append(name)
                 continue
+            finally:
+                _THINK_STEP.reset(thinks)
             plan.outcome = "answered"
             self._observe(plan, result)
             self.retry_after[name], self.status[name] = 0.0, "available"
@@ -3900,14 +3914,22 @@ class RuleFailure:
     subject: str = ""
     message: str = ""
 
-    def signature(self) -> str:
-        """The same failure in another run: paths, numbers and generated names removed (ARCH-23)."""
+    def normalized(self, limit: int = 600) -> str:
+        """The message without paths, numbers and generated names: the same in another run (ARCH-23)."""
         text = re.sub(r"(?:[A-Za-z]:)?(?:[\w.~-]*[/\\])+[\w.-]+|\b[\w-]+(?:\.[\w-]+)*\.(?:[ch]|cc|cpp|cxx|c\+\+|hh|hpp|hxx|"
                       r"inc|ipp|tpp|s|asm|o|obj)\b", "<path>", self.message)
         text = re.sub(r"\but_\w+", "<gen>", text)
         text = re.sub(r"\b0x[0-9a-fA-F]+\b|\b\d+\b", "<n>", text)
-        text = " ".join(text.split())[:600]
-        return hashlib.sha256(f"{self.rule}|{self.subject}|{text}".encode()).hexdigest()[:32]
+        return " ".join(text.split())[:limit]
+
+    def signature(self) -> str:
+        """The same failure in another run: paths, numbers and generated names removed (ARCH-23)."""
+        return hashlib.sha256(f"{self.rule}|{self.subject}|{self.normalized()}".encode()).hexdigest()[:32]
+
+
+class ChosenOption(StrictModel):
+    """ARCH-21a: a repair the agent's rules offered, chosen and accepted by the tool."""
+    option: str
 
 
 class Escalation(StrictModel):
@@ -3968,6 +3990,18 @@ class ResolutionMemory:
                 con.commit()
             finally:
                 con.close()
+
+    def recent(self, agent: str, rule: str, limit: int = 3) -> list[str]:
+        """ARCH-23: the latest accepted answers to failures of this rule - examples of what the tool accepted."""
+        with self._lock, contextlib.suppress(Exception):
+            con = self._db()
+            try:
+                return [r[0] for r in con.execute(
+                    "SELECT answer FROM resolutions WHERE project=? AND agent=? AND rule=? ORDER BY uses DESC, created "
+                    "DESC LIMIT ?", (self.project, agent, rule, limit))]
+            finally:
+                con.close()
+        return []
 
     def forget(self, agent: str, rule: str, signature: str) -> None:
         with self._lock, contextlib.suppress(Exception):
@@ -4033,6 +4067,7 @@ class AgentCore:
         self.packs: KnowledgePacks | None = None
         # Rule failures handed to the brain (ARCH-21 .. ARCH-23): the application sets the memory.
         self.resolutions: ResolutionMemory | None = None
+        self._failed_questions: dict[str, set[str]] = {}       # question -> models that failed it [ARCH-21a]
         self.escalations: list[dict[str, Any]] = []
         # The application may narrow the brains per step, for example by what each brain may write (its profile):
         # brains_for_step(step, available brain names) -> the names allowed, or None for no restriction. A step no
@@ -4129,13 +4164,16 @@ class AgentCore:
         return [n for n in order if n in router.names] if order else None
 
     async def decide(self, state: str | list[ContextPart], questions: dict[str, Question], *, step: str = "",
-                     project: str | Path | None = None, need: OutputNeed | None = None) -> dict[str, Any]:
+                     project: str | Path | None = None, need: OutputNeed | None = None,
+                     allowed: list[str] | None = None) -> dict[str, Any]:
         """Typed questions (choice/score/noul) answered with probabilities, as BaseAgent does.
-        ``state`` may be prioritized parts; ``step`` adds that step's knowledge packs."""
+        ``state`` may be prioritized parts; ``step`` adds that step's knowledge packs; ``allowed`` narrows the brains
+        for this call (another model after one failed, ARCH-21a)."""
         if need is not None and need.items <= 0:
             raise AgentFault("NO_WORK", "Nothing to ask a brain for in this step (ARCH-16).")
         router = await self._brains()
-        allowed = self._step_brains(router, step, list(self.allowed_brains))
+        allowed = self._step_brains(router, step, [b for b in (allowed or self.allowed_brains) if b in self.allowed_brains]
+                                    or list(self.allowed_brains))
         prefer = self._step_order(router, step)
         profile = UseCase(domain=self.name, questions=questions)
         plans: list[TokenPlan] = []
@@ -4234,14 +4272,22 @@ class AgentCore:
     async def resolve(self, failure: RuleFailure, *, task: str, context: str | list[ContextPart],
                       output_model: type[BaseModel], verify: Callable[[BaseModel], Any], step: str = "",
                       attempts: int = 2, need: OutputNeed | None = None, project: str | Path | None = None,
-                      check: Callable[[BaseModel], Any] | None = None, remember: bool = True) -> BaseModel | None:
+                      check: Callable[[BaseModel], Any] | None = None, remember: bool = True,
+                      options: dict[str, str] | None = None, apply_option: Callable[[str], Any] | None = None,
+                      free_brains: list[str] | None = None, option_tries: int = 3) -> BaseModel | None:
         """A rule failed: stored resolution first, then the brain, each judged by ``verify`` (ARCH-21, ARCH-22).
 
         ``verify(answer)`` runs the tool that rejected the rule's result (sync or async) and returns "" when it
         accepts the answer, else the tool's message, which the brain gets with the next attempt. Returns the
         accepted answer or None; the case is recorded in ``self.escalations`` (meta.escalations) either way.
         A brain is never a reason to fail: without one the case is recorded as needing a brain. ``remember=False``
-        when ``verify`` is not yet the final tool: the agent stores the answer itself once that tool accepted it."""
+        when ``verify`` is not yet the final tool: the agent stores the answer itself once that tool accepted it.
+
+        ARCH-21a: ``options`` - repairs the agent's rules built (id -> what it does) - are offered first as a typed
+        choice; the tool tries them in the order of the brain's probabilities (``apply_option(id)`` returns "" when
+        the tool accepts one, which comes back as a ChosenOption). Only when none is accepted is a free answer
+        asked, of ``free_brains`` (None: any; [] none - the profile of BP-10). A re-ask shows the rejected answer;
+        a question that failed before with the same facts is never asked of the same model again."""
         signature = failure.signature()
         record = Escalation(agent=self.name, step=step, rule=failure.rule, failure=failure.failure[:300],
                             subject=failure.subject[:200])
@@ -4255,13 +4301,29 @@ class AgentCore:
                 verdict = exc.message
             return str(verdict or "")
 
+        async def tried(option: str) -> str:
+            try:
+                verdict = apply_option(option)
+                if inspect.isawaitable(verdict):
+                    verdict = await verdict
+            except AgentFault as exc:
+                verdict = exc.message
+            return str(verdict or "")
+
         def done(answer: BaseModel | None) -> BaseModel | None:
             self.escalations.append(record.model_dump())
             self.emit("escalation", data=record.model_dump(), summary=f"{self.view_label}: {record.text()}"[:200])
             return answer
 
         memory = self.resolutions
+        options = {k: v for k, v in (options or {}).items() if apply_option is not None}
         if memory is not None:                                                          # ARCH-23
+            for stored in memory.get(self.name, failure.rule + "#option", signature) if options else []:
+                with contextlib.suppress(ValidationError):
+                    chosen = ChosenOption.model_validate_json(stored)
+                    if chosen.option in options and not await tried(chosen.option):
+                        record.source, record.outcome = "memory", "resolved"
+                        return done(chosen)
             for stored in memory.get(self.name, failure.rule, signature):
                 try:
                     answer = output_model.model_validate_json(stored)
@@ -4275,15 +4337,80 @@ class AgentCore:
                     return done(answer)
                 record.attempts.append(f"stored resolution rejected: {verdict}"[:600])
                 memory.forget(self.name, failure.rule, signature)
+        parts = [ContextPart("context", context)] if isinstance(context, str) else list(context)
+        question = hashlib.sha256("\x1f".join([step, failure.rule, signature, *sorted(options)] + [
+            f"{p.name}={RuleFailure(failure.rule, '', message=p.text).normalized(10 ** 7)}" for p in parts]).encode()).hexdigest()
+        failed_models = self._failed_questions.setdefault(question, set())
+        allowed: list[str] | None = None
+        if failed_models:                       # the same question with the same facts failed before [ARCH-21a]
+            try:
+                router = await self._brains()
+                allowed = [b for b in router.available if b in self.allowed_brains
+                           and router.family_of(b) not in failed_models]
+            except AgentFault:
+                allowed = []
+            if not allowed:
+                record.outcome = "rejected"
+                record.attempts.append("not asked again: the same question with the same facts was answered without "
+                                       "success before, and no brain of another model is available [ARCH-21a]")
+                return done(None)
+        used_models: set[str] = set()
+
+        def note_model() -> None:
+            name = self.brain_of_call().get("brain", "")
+            with contextlib.suppress(Exception):
+                used_models.add(self.router.family_of(name) if self.router is not None else name)
         messages = [failure.message] if failure.message else []
-        for _ in range(max(1, attempts)):
+        if options:                                                                      # ARCH-21a: a choice first
+            order = list(options)
+            choice_parts = parts + [ContextPart("repairs", "REPAIRS THE RULES OFFER:\n" + "\n".join(
+                f"- {k}: {v}" for k, v in options.items()))]
+            criteria = {**{k: v[:500] for k, v in list(options.items())[:11]},
+                        "none": "None of these repairs addresses the errors."}
+            try:
+                answer = await self.decide(choice_parts, {"repair": Question(type="choice", instructions=(
+                    f"{task[:400]} Which of the REPAIRS THE RULES OFFER resolves the errors? Decide from the facts "
+                    f"given: the compiler's messages and where each failing line comes from.")[:1000],
+                    criteria=criteria)}, step=step, project=project, allowed=allowed)
+                probabilities = answer["repair"]["probabilities"]
+                order = sorted(order, key=lambda k: -float(probabilities.get(k, 0.0)))
+                record.source, record.brain = "brain", self.brain_of_call().get("brain", "")
+                note_model()
+            except AgentFault as exc:                         # no brain: the rules' order, the tool still decides
+                record.attempts.append(f"no brain choice ({exc.code}); the options are tried in the rules' order")
+            for option in order[:max(1, option_tries)]:
+                verdict = await tried(option)
+                if not verdict:
+                    if memory is not None and remember:
+                        memory.put(self.name, failure.rule + "#option", signature,
+                                   ChosenOption(option=option).model_dump_json())
+                    record.outcome = "resolved"
+                    record.attempts.append(f"option {option} accepted by the tool")
+                    return done(ChosenOption(option=option))
+                record.attempts.append(f"option {option}: {verdict}"[:600])
+                messages.append(f"the offered repair {option} ({options[option][:160]}) was tried: {verdict}")
+            if free_brains is not None:
+                allowed = [b for b in free_brains if allowed is None or b in allowed]
+                if not allowed:
+                    failed_models |= used_models
+                    record.outcome = "rejected"
+                    return done(None)
+        if self.resolutions is not None:
+            examples = [x[:800] for x in self.resolutions.recent(self.name, failure.rule, 2)]
+            if examples:                                                                  # ARCH-23 as examples
+                parts = parts + [ContextPart("examples", "ANSWERS THE TOOL ACCEPTED FOR EARLIER FAILURES OF THIS "
+                                             "KIND (their form, not their content):\n" + "\n".join(examples), 4)]
+        previous = ""
+        for k in range(max(1, attempts)):
             prompt = (f"{task}\n\nA deterministic rule could not do this ({failure.rule}): {failure.failure}"
                       + (f"\nConcerned: {failure.subject}" if failure.subject else "")
-                      + "".join(f"\nTool message{' (after your previous answer)' if k else ''}:\n{m[:4000]}"
-                                for k, m in enumerate(messages)))
+                      + "".join(f"\nTool message{' (after an earlier answer)' if n else ''}:\n{m[:4000]}"
+                                for n, m in enumerate(messages))
+                      + (f"\nYOUR PREVIOUS ANSWER, REJECTED - do not give it again; change what the tool message "
+                         f"shows:\n{previous}" if previous else ""))
             try:
-                answer = await self.generate(prompt, context, output_model, need=need, step=step, project=project,
-                                             check=check)
+                answer = await self.generate(prompt, parts, output_model, need=need, step=step, project=project,
+                                             check=check, allowed=allowed, vary=k > 0)
             except AgentFault as exc:
                 if exc.code in NO_BRAIN_CODES or exc.code == "NO_WORK":
                     if record.source != "brain":
@@ -4294,6 +4421,7 @@ class AgentCore:
                 record.attempts.append(f"brain answer not usable: {exc.code}: {exc.message}"[:600])
                 continue
             record.source, record.brain = "brain", self.brain_of_call().get("brain", "")
+            note_model()
             verdict = await judge(answer)
             if not verdict:
                 if memory is not None and remember:
@@ -4302,6 +4430,8 @@ class AgentCore:
                 return done(answer)
             record.attempts.append(verdict[:600])
             messages.append(verdict)
+            previous = answer.model_dump_json()[:2000]
+        failed_models |= used_models
         record.outcome = "rejected"
         return done(None)
 

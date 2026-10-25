@@ -691,6 +691,8 @@ class Orchestrator:
             if last.decision == "environment_error":
                 return s.finish("incomplete", "environment: " + last.reason)
             if (not last.link_ok or last.decision == "setup_blocked") and self._problems(last) == before:
+                if self._drop_brain_declarations(s):            # rules first: once without them [A1-PL14, ARCH-21a]
+                    continue
                 return s.finish("incomplete", f"Stage A round {rounds} changed nothing; the same setup or build "
                                 "issues remain: " + last.reason)
         # 3. Stage B: coverage loop [ORC-5], up to the iteration limit of the file's ASIL level [COV-9]
@@ -831,7 +833,17 @@ class Orchestrator:
                     await self._lessons(s, generated_suite, result)                                        # LA-8
                     await self._learn(s, result, bundle)
                     if result.decision == "environment_error":
+                        # A3-60b: a measurement that failed with the tools in place: the round is not measured, its
+                        # tests are kept, the next round goes on with the last measurement; twice in a row stops
+                        if self._not_measured(result) and s.unmeasured == 0:
+                            s.unmeasured += 1
+                            s.notes.append(f"iteration {iteration} was not measured ({result.reason[:200]}); its "
+                                           "tests are kept and the next iteration goes on [A3-60b]")
+                            self._stage(f"iteration {iteration} not measured; the next iteration goes on [A3-60b]")
+                            continue
                         return s.finish("incomplete", "environment: " + result.reason, result)
+                    s.unmeasured = 0
+                    s.notes.extend(n for n in result.measurement_notes if n not in s.notes)          # A3-60a
                     fixed = False
                     for failure in [f for f in result.failures if f.route == "agent4"]:
                         if failure.failure_id in s.no_source_fix or (          # Agent4 is not asked again [A4-23j]
@@ -900,6 +912,31 @@ class Orchestrator:
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
+
+    def _drop_brain_declarations(self, s: "RunState") -> bool:
+        """A1-PL14, ARCH-21a: a Stage A round changed nothing while declarations the brain proposed are in the plan:
+        once more without them - the rules' own stubs, and the dependencies they had replaced - before the run
+        stops; the brain is not asked for the same declarations again."""
+        deps = self.layout.dependencies
+        proposed = [d for d in (deps.entries if deps else []) if "brain" in d.decided_by]
+        if not proposed or s.declarations_dropped:
+            return False
+        s.declarations_dropped = sorted({d.qualified_name or d.name for d in proposed})
+        names = {d.name for d in proposed}
+        entries = [d for d in deps.entries if d.name not in names] + [
+            s.replaced_dependencies[n] for n in sorted(names) if n in s.replaced_dependencies]
+        self.layout = s.layout = self.layout.model_copy(update={"dependencies": deps.model_copy(
+            update={"entries": entries})})
+        s.notes.append(f"Stage A changed nothing with the declarations the brain proposed for "
+                       f"{', '.join(s.declarations_dropped[:6])}; one more round without them [A1-PL14, ARCH-21a]")
+        self._stage("Stage A: once more without the brain's declarations [A1-PL14]")
+        return True
+
+    @staticmethod
+    def _not_measured(result: uc.VerificationResult) -> bool:
+        """A3-60b: the only stop is a failed measurement with the tools in place."""
+        stops = [f for f in result.failures if f.route == "stop"]
+        return bool(stops) and all(f.failure_id == "env-coverage" for f in stops)
 
     @staticmethod
     def _open(result: uc.VerificationResult) -> bool:
@@ -1402,13 +1439,16 @@ class Orchestrator:
         if self._needs_revision(last, s):                    # a real dependency that does not build here [A1-DA12]
             await self._dependencies(s, last)
         plan = await self.call("analyzer", "plan", uc.PlanRequest(
-            layout=self.layout, last=last, iteration=0, attempts=s.attempts, existing_suite=self.suite), uc.UTPlan)
+            layout=self.layout, last=last, iteration=0, attempts=s.attempts, existing_suite=self.suite,
+            no_brain_declarations=list(s.declarations_dropped)), uc.UTPlan)
         s.take_plan(plan)
         if plan.stage == "blocked":
             raise ba.AgentFault("SETUP_BLOCKED", "Agent1 blocked: " + plan.reason)
         if plan.proposed_dependencies:                    # declarations for symbols without one [A1-PL14]
             deps = self.layout.dependencies or uc.DependencyPlan()
             names = {d.name for d in plan.proposed_dependencies}
+            s.replaced_dependencies.update({d.name: d for d in deps.entries if d.name in names
+                                            and d.name not in s.replaced_dependencies})
             deps = deps.model_copy(update={"entries": [d for d in deps.entries if d.name not in names] +
                                            list(plan.proposed_dependencies)})
             self.layout = s.layout = self.layout.model_copy(update={"dependencies": deps})
@@ -2123,6 +2163,9 @@ class RunState:
         self.no_fix_functions: set[str] = set()               # functions Agent4 found no change for [A4-23j]
         self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
         self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
+        self.unmeasured = 0                                   # iterations in a row not measured [A3-60b]
+        self.declarations_dropped: list[str] = []             # the brain's declarations that did not build [A1-PL14]
+        self.replaced_dependencies: dict[str, uc.Dependency] = {}   # what a proposed declaration replaced
         self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
         self.journal = Journal(req.sut_file, out / "journal")                          # LA-2
         self.quarantine: dict[str, tuple[str, str]] = {}      # test -> (compiler message, source) of this iteration
