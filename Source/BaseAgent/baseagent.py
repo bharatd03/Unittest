@@ -1073,6 +1073,8 @@ class QwenRemoteSettings(QwenSettings):
     shared_slots: bool = True              # max_concurrency holds for every process of this computer together
     gateway_retries: int = Field(default=3, ge=0, le=10)         # a gateway timeout: the same server again
     gateway_pause: float = Field(default=15.0, ge=0.0, le=300.0)
+    # ARCH-1c (d): a request waits this long for a free slot - a busy server is not a reason for the next brain
+    slot_wait: float = Field(default=1800.0, gt=0.0, le=7200.0)
 
     @field_validator("base_url")
     @classmethod
@@ -2037,6 +2039,9 @@ class QwenEngine:
         self.last_analysis = ""          # local diagnostics only (see QwenSettings.analysis)
         self.loaded_window = 0           # num_ctx of the last answered call (sticky_window)
 
+    def _gate_wait(self) -> float:
+        return self.settings.queue_timeout
+
     @staticmethod
     def _log_reply(status: int, reply: Any) -> None:
         detail = reply.get("error") if isinstance(reply, dict) else None
@@ -2223,9 +2228,9 @@ class QwenEngine:
         else:
             window = self._window(messages, windows, out, ratio)
         try:
-            await asyncio.wait_for(self.gate.acquire(), timeout=settings.queue_timeout)
+            await asyncio.wait_for(self.gate.acquire(), timeout=self._gate_wait())
         except TimeoutError as exc:
-            raise AgentFault("MODEL_BUSY", "The local model is busy with other requests.", True) from exc
+            raise AgentFault("MODEL_BUSY", "The model is busy with other requests.", True) from exc
         try:
             usage = {"input_tokens": 0, "output_tokens": 0}
             attempt, varied = 0, vary
@@ -2498,6 +2503,10 @@ class QwenRemoteEngine(QwenEngine):
         detail = reply.get("error") if isinstance(reply, dict) else None
         LOG.warning("The remote Qwen server answered HTTP %s: %s", status, detail or "no detail")
 
+    def _gate_wait(self) -> float:
+        """ARCH-1c (d): calls of this process wait for the server as long as for a shared slot."""
+        return self.settings.slot_wait
+
     async def _send(self, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
         """ARCH-1c: one request through the shared slots; a gateway timeout or a busy answer is asked again on the
         same server after a pause - it is slow, not down - before the router's next brain is used."""
@@ -2507,7 +2516,7 @@ class QwenRemoteEngine(QwenEngine):
         for attempt in range(settings.gateway_retries + 1):
             try:
                 if self.slots is not None:                             # ARCH-1c (b)
-                    async with self.slots.hold(settings.queue_timeout):
+                    async with self.slots.hold(settings.slot_wait):                    # ARCH-1c (d)
                         status, reply = await self.http.call("POST", "/chat/completions", body, timeout, idle=idle)
                 else:
                     status, reply = await self.http.call("POST", "/chat/completions", body, timeout, idle=idle)
@@ -4719,6 +4728,19 @@ class ViewHub:
     def events(self) -> list[dict[str, Any]]:
         return read_events(self.path)
 
+    # VIEW-15: a stop asked for from the page (or by a file named "stop" in the run folder); the application
+    # decides where it can stop safely and asks stop_requested() there.
+    def request_stop(self, by: str = "the viewer") -> None:
+        if self.stop_requested():
+            return
+        with contextlib.suppress(OSError):
+            (self.run_dir / "stop").write_text(f"stop requested by {by}\n", encoding="utf-8")
+        self.emit("stage", data={"stage": "stop", "stop": True}, summary=f"Stop requested from {by}: the run ends at "
+                  "its next safe point")
+
+    def stop_requested(self) -> bool:
+        return (self.run_dir / "stop").is_file()
+
     def for_run(self, run: str) -> "RunView":
         """The same hub for one of several runs shown on one page: every event it emits carries ``run``."""
         return RunView(self, run)
@@ -4836,7 +4858,15 @@ def serve_viewer(hub: ViewHub, *, host: str = "127.0.0.1", port: int = 0, open_b
         return StreamingResponse(lines(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    app = Starlette(routes=[Route("/", page), Route("/events", stream), Route("/events.json", all_events)])
+    async def stop(request):
+        """VIEW-15: only from the page - it sets a header a plain form or link cannot - and with the token."""
+        if not allowed(request) or request.headers.get("x-baseagent-viewer") != "stop":
+            return PlainTextResponse("refused", status_code=403)
+        hub.request_stop()
+        return JSONResponse({"stopping": True})
+
+    app = Starlette(routes=[Route("/", page), Route("/events", stream), Route("/events.json", all_events),
+                            Route("/stop", stop, methods=["POST"])])
     sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
@@ -4876,6 +4906,7 @@ h1{font-size:18px;font-weight:500;margin:0}.sub{color:var(--muted);font-size:13p
 button{font:inherit;font-size:13px;background:transparent;border:.5px solid var(--line);color:var(--text);border-radius:8px;padding:4px 10px;cursor:pointer}
 button:hover{background:var(--card)}button.on{background:var(--card)}
 #runs{display:none}
+#stop{color:var(--bad);border-color:var(--bad)}#stop.ask{background:var(--badbg)}#stop:disabled{opacity:.6;cursor:default}
 #detail table.files{font-size:12px;table-layout:fixed}#detail table.files th,#detail table.files td{padding:2px 4px}
 #detail table.files th.n,#detail table.files td.n{text-align:right;font-variant-numeric:tabular-nums}
 #detail table.files td.f{padding-top:6px;overflow-wrap:anywhere}#detail table.files tr.v td{border-top:none;padding-bottom:6px}
@@ -4917,7 +4948,7 @@ body.present header h1{font-size:24px}body.present #canvas{min-height:600px}body
 <header><div><h1 id="title">__TITLE__</h1><div class="sub" id="subtitle"></div></div>
 <span class="pill" id="progress" style="display:none" title="share of the run's work done, and the time left"></span><span class="pill" id="status">waiting</span><span class="grow"></span>
 <span id="replay" style="display:none;gap:6px;align-items:center"><button id="play">Pause</button><button id="speed">Speed 1x</button><button id="end">Show end</button></span>
-<button id="present">Present</button></header>
+<button id="stop" style="display:none" title="end the run at its next safe point">Stop</button><button id="present">Present</button></header>
 <div id="runs" title="files of this run: click one to show its metrics; click it again to follow the running file"></div>
 <section id="metrics"></section>
 <main><svg id="canvas" viewBox="0 0 960 640" role="img" aria-label="Agents around the brain"></svg>
@@ -5102,7 +5133,8 @@ function show(force){var id=choose();if(id==null)return;var r=S.runs[id];
   orchOf(r)
   var f=document.getElementById("final");if(r.final)finalPanel(r.final);else f.classList.remove("show");if(S.view==null)overview()}
  var st=document.getElementById("status"),done=!running().length&&!S.pending;
- if(S.live||st.textContent!=="replay"){if(done&&S.runOrder.length){st.textContent="finished";st.className="pill"}else if(S.live){st.textContent="live";st.className="pill live"}}
+ if(S.live||st.textContent!=="replay"){if(done&&S.runOrder.length){st.textContent="finished";st.className="pill"}else if(S.live){st.textContent=S.stopping?"stopping":"live";st.className="pill live"}}
+ var sb=document.getElementById("stop");if(sb)sb.style.display=S.live&&!(done&&S.runOrder.length)?"":"none";   // VIEW-15
  chips()}
 function pulse(k,on){var a=S.agents[k];if(!a||!a.rect)return;a.rect.setAttribute("stroke-width",on?2:.75)}
 function apply(ev){apply1(ev);later()}
@@ -5130,6 +5162,8 @@ function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
   if(d.outcome&&d.outcome!=="ok")feed(ev,tag(ev,ev.summary||(labelOf(ev.agent)+" ran "+(d.program||""))),d.outcome==="tests_failed"?"gray":famOf(ev.agent));return}
  if(k==="metric"){var rm=runOf(ev);rm.values[d.id]=d;if((ev.run||"")===S.cur)setMetric(d.id,d);return}
  if(k==="escalation"){feed(ev,ev.summary||(labelOf(ev.agent)+": a rule needed the brain"),d.outcome==="resolved"?"purple":"gray");return}
+ if(k==="stage"&&d.stop){S.stopping=true;var sb2=document.getElementById("stop");if(sb2){sb2.disabled=true;sb2.textContent="Stopping…"}
+  if(S.live){var st3=document.getElementById("status");st3.textContent="stopping";st3.className="pill live"}}
  if(k==="stage"){runOf(ev).stage=ev.summary||d.stage||"";feed(ev,tag(ev,ev.summary||d.stage||"stage"),"gray");return}
  if(k==="progress"){var pg=document.getElementById("progress");if(pg){pg.style.display="";pg.textContent=d.text||((d.percent||0)+" %")}
   if(d.pending!=null){S.pending=d.pending;show(false)}return}   // folders still to come keep the page live [VIEW-12a]
@@ -5140,6 +5174,13 @@ function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
   if((ev.run||"")===S.cur){orchOf(re);finalPanel(d)}
   feed(ev,tag(ev,ev.summary||"Run finished"),"gray");show(false);return}}
 document.getElementById("detail").addEventListener("click",function(e){if(e.target.tagName==="H2"&&S.view!=null)overview()});
+(function(){var b=document.getElementById("stop"),timer=null;   // VIEW-15: two clicks, no dialog
+ b.addEventListener("click",function(){if(b.disabled)return;
+  if(!b.classList.contains("ask")){b.classList.add("ask");b.textContent="Confirm stop";clearTimeout(timer);
+   timer=setTimeout(function(){b.classList.remove("ask");b.textContent="Stop"},5000);return}
+  clearTimeout(timer);b.classList.remove("ask");b.disabled=true;b.textContent="Stopping…";S.stopping=true;
+  fetch("stop"+(location.search||""),{method:"POST",headers:{"X-BaseAgent-Viewer":"stop"}}).then(function(r){
+   if(!r.ok){b.disabled=false;b.textContent="Stop";S.stopping=false}}).catch(function(){b.disabled=false;b.textContent="Stop";S.stopping=false})})})();
 document.getElementById("present").addEventListener("click",function(){document.body.classList.toggle("present");this.classList.toggle("on")});
 var embedded=JSON.parse(document.getElementById("embedded").textContent||"null");
 S.animate=!matchMedia("(prefers-reduced-motion: reduce)").matches;

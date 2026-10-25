@@ -674,7 +674,7 @@ def solver_params(fn: uc.FunctionInfo) -> list[uc.ParamInfo]:
         return []
     out = []
     for typ, name in params:
-        bare = re.sub(r"\b(?:const|volatile|register)\b", "", typ).strip()
+        bare = re.sub(r"\bstd::", "", re.sub(r"\b(?:const|volatile|register)\b", "", typ)).strip()
         kind = "bool" if bare in ("bool", "_Bool") else "int" if INTEGRAL_T.match(bare) else \
             "float" if FLOAT_T.match(bare) else "other"
         out.append(uc.ParamInfo(name=name, type=typ, kind=kind))
@@ -885,6 +885,7 @@ class AstIndex:
         self.nodes: dict[str, dict] = {}            # id -> node, for parsed chunks
         self.qualified: dict[str, str] = {}         # id -> qualified name
         self.parent: dict[str, str] = {}            # id -> enclosing record/namespace id
+        self.internal: set[str] = set()             # ids declared inside an unnamed namespace (internal linkage)
         self.parsed: set[int] = set()
 
     def _resolve(self, path: str) -> str:
@@ -947,8 +948,11 @@ class AstIndex:
             inner_scope, inner_parent = qualified, nid
         elif kind == "EnumDecl" and node.get("scopedEnumTag") and name:
             inner_scope = qualified
+        unnamed = kind == "NamespaceDecl" and not name          # internal linkage, also inside a named namespace
         for child in node.get("inner", []) or []:
             if isinstance(child, dict):
+                if (unnamed or nid in self.internal) and child.get("id"):
+                    self.internal.add(child["id"])
                 self._index(child, inner_scope, inner_parent)
 
     def qualified_name(self, node: dict) -> str:
@@ -2771,8 +2775,8 @@ class AnalyzerAgent(ba.AgentCore):
                 dep.decision, dep.decided_by, dep.reason = "stub", "revision", revision
                 dep.attempts += 1
             decided[key] = dep
-            if dep.decision == "real" and not dep.definition.lower().endswith(HEADER_EXT):
-                if dep.definition not in real_units:
+            if dep.decision == "real" and dep.definition and not dep.definition.lower().endswith(HEADER_EXT):
+                if dep.definition not in real_units:                # a unit, never "no definition" [A1-DA10]
                     real_units[dep.definition] = key
                     unit = units.get(dep.definition)
                     for node, _ in (unit.definitions() if unit else []):
@@ -2780,7 +2784,7 @@ class AnalyzerAgent(ba.AgentCore):
                             queue += [(r, depth + 1, dep.definition) for r in unit.references(node)]
         # A real translation unit brings every definition in it: those dependencies are real too.
         for dep in decided.values():
-            if dep.decision == "stub" and dep.definition in real_units and dep.decided_by != "revision":
+            if dep.decision == "stub" and dep.definition and dep.definition in real_units and dep.decided_by != "revision":
                 dep.decision, dep.decided_by = "real", "rule"
                 dep.reason = f"defined in {dep.definition}, which is linked for {real_units[dep.definition]} [A1-DA10]"
         plan.entries = sorted(decided.values(), key=lambda d: (d.depth, d.name))
@@ -2823,7 +2827,8 @@ class AnalyzerAgent(ba.AgentCore):
             out.append(uc.FunctionInfo(
                 name=name, qualified_name=qualified, signature=header, file=layout.sut_file,
                 line_start=src.count(b"\n", 0, begin) + 1, line_end=src.count(b"\n", 0, end) + 1,
-                is_static=node.get("storageClass") == "static" or "(anonymous namespace)" in qualified,
+                is_static=node.get("storageClass") == "static" or "(anonymous namespace)" in qualified or
+                (node.get("kind") == "FunctionDecl" and node.get("id") in fe.ast.internal),   # unnamed namespace [A2-21k]
                 calls=calls, return_type=ret, params=params, from_frontend=True,
                 member=node["kind"] in ("CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl")))
         out.sort(key=lambda f: f.line_start)
@@ -3121,7 +3126,7 @@ class AnalyzerAgent(ba.AgentCore):
                     names.add(f"ut_cb_{re.sub(r'[^A-Za-z0-9_]', '_', f.name.replace('(anonymous namespace)::', ''))}_{i}")
         for e in layout.enums:
             names |= {k.split("::")[-1] for k in e.values} | {e.name.split("::")[-1]}
-        names |= {"ut_state_set_" + re.sub(r"\W", "_", v.name) for v in layout.sut_state}          # A2-21z
+        names |= {uc.state_setter_name(v) for v in uc.settable_state(layout)}                        # A2-21z
         return names
 
     @staticmethod
@@ -3186,7 +3191,7 @@ class AnalyzerAgent(ba.AgentCore):
         """ARCH-20, A1-PL4: format noise removed from values and gap ids; returns "field: 'before' -> 'after'"."""
         fixes: list[str] = []
         if layout is not None:                       # a setter for a visible variable, an assignment of a hidden one
-            state = {re.sub(r"\W", "_", v.name): v.name for v in layout.sut_state}
+            state = {uc.state_setter_name(v)[len("ut_state_set_"):]: v.name for v in uc.settable_state(layout)}
             visible = uc.headers_text(layout)
             setup = []
             for stmt in planned.setup:
@@ -3270,7 +3275,10 @@ class AnalyzerAgent(ba.AgentCore):
                 reasons.append(f"an earlier call is not a call of the SUT: {stmt[:60]} [BP-2]")
             else:
                 missing = self._calls_known(stmt, known | local)
-                if missing:
+                named = uc.name_problem("", set(missing), known)                         # a guard [A2-21ai]
+                if named:
+                    reasons.append(f"setup {named}")
+                elif missing:
                     reasons.append(f"setup calls functions that do not exist here: {', '.join(missing[:4])}")
         if len(planned.calls_before) > 12:
             reasons.append("more than 12 earlier calls")
@@ -3281,7 +3289,10 @@ class AnalyzerAgent(ba.AgentCore):
                 reasons.append(f"setup statement unbalanced: {stmt[:60]}")
             else:
                 missing = self._calls_known(stmt, known | local)
-                if missing:
+                named = uc.name_problem("", set(missing), known)                         # a guard [A2-21ai]
+                if named:
+                    reasons.append(f"setup {named}")
+                elif missing:
                     reasons.append(f"setup calls functions that do not exist here: {', '.join(missing[:4])}")
         by_name = {p.name: p for p in text_params(fn)}
         given = {a.name: a.value for a in planned.args}
@@ -3500,8 +3511,8 @@ class AnalyzerAgent(ba.AgentCore):
         globals_ = sorted({m.group(2) for m in re.finditer(
             r"^\s*extern\s+(?!.*\bconst\b)([^;()]*?)\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;",
             "\n".join(self._dependency_headers_text(layout)), re.M)} - stubbed_vars)
-        setters = [f"ut_state_set_{re.sub(chr(92) + 'W', '_', v.name)}(value) sets {v.name} ({v.type})"
-                   for v in layout.sut_state][:12]
+        setters = [f"{uc.state_setter_name(v)}(value) sets {v.name} ({v.type})"
+                   for v in uc.settable_state(layout)][:12]                                         # A2-21z
         outside = sorted({g.line for g in gaps if g.line and not fn.line_start <= g.line <= fn.line_end})
         callees = [f for f in layout.functions if f is not fn and any(f.line_start <= n <= f.line_end for n in outside)]
         ev_rows = [f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "

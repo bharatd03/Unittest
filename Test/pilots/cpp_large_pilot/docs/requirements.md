@@ -1,0 +1,116 @@
+# Powertrain controller requirements
+
+- GEN-1: tables interpolate linearly between their points and hold their end values outside them
+- GEN-2: a PID controller does not integrate further into a saturated output (anti-windup)
+- GEN-3: a monitor fails after its fail time of continuous failure and heals after its heal time; a latching monitor stays failed until reset
+- SPD-1: engine speed comes from a 60-2 wheel; a gap at the wrong tooth count loses sync and counts a sync error; a period above 50000 us is a stall
+- PED-1 (ASIL B): the second pedal track must read half the first within 120 counts and the first lie in 400..3600, else the pedal monitor fails after 100 ms and latches: limp home with 0 %
+- PED-2: the brake overrides a pedal above 10 %
+- TRQ-1 (ASIL C): the torque target is the driver request, raised by cruise, lowered by the speed limiter, the gear and temperature limit and stability control, halved during a shift, never below the minimum
+- TRQ-2: a stability or shift reduction acts at once; other changes are rate limited to +15/-40 Nm per step
+- IDL-1: idle control runs with the engine running, the pedal at most 2 % and below 5 km/h; it raises the target by 50 rpm with A/C and 100 rpm below 12000 mV
+- BST-1: the boost target follows engine speed, 80 % above 60 degrees C intake air and 150 hPa less while knock control acts; 500 ms more than 200 hPa above target is an overboost fault that ends boost control
+- INJ-1 (ASIL B): fuel is cut above 6500 rpm, in overrun above 1400 rpm with a warm engine, and after a crash
+- INJ-2: the pulse is 3.5 us per mg air, enriched when cold, corrected by lambda within +-25 %, and capped at 20000 us
+- KNK-1: knock retards the cylinder by 3 degrees up to 15; it recovers 1 degree after a speed-dependent number of quiet events
+- IGN-1: ignition advance is limited to -10.0 .. 45.0 degrees
+- SHF-1: upshift and downshift points depend on the mode and the pedal; kickdown drops two gears; manual mode shifts one gear per request
+- LCK-1: the converter locks from 3rd gear above 50 km/h with less than 80 rpm slip and oil at 30 degrees C, not while shifting or at full pedal below 80 km/h
+- CRS-1: cruise control engages from 30 to 180 km/h; the brake, the clutch or stability control end it to standby; stability cancels are counted
+- CRS-2: the pedal above 20 % overrides cruise control until it is released; accel/decel change the set speed by 2 km/h
+- COL-1: the fan follows the coolant temperature, at least 30 % with A/C; after a hot shutdown above 100 degrees C it runs 60000 ms at 60 %
+- FPM-1: the fuel pump primes for 2000 ms before the engine runs; a crash stops it
+- MON-1: a coolant sensor reading outside 50..4000 counts fails the monitor after 500 ms
+- MON-2: air mass above 1200 below 1000 rpm is implausible after 300 ms
+- MON-3 (ASIL B): a throttle position more than 8 % from its target for 200 ms fails and latches
+- MON-4: no vehicle speed above 3000 rpm in gear for 2000 ms fails the speed sensor
+- MON-5: the two brake switches disagreeing for 1000 ms fail the brake switch monitor
+- MON-6: oil pressure below 0.8 bar above 1500 rpm for 1000 ms fails and latches
+- MIS-1: a cylinder whose crank acceleration drops 400 below the mean misfires; over 200 revolutions more than 10 % misfires is catalyst damaging and more than 2 % emission relevant
+- CAN-1: the engine status frame carries speed, coolant, torque, gear, pedal, cruise speed, MIL and an alive counter; a value out of range is not packed
+- CAN-2: an alive counter that repeats or jumps by more than 2 is an error; 3 errors make the message invalid
+- LOG-1: the event log keeps the latest 16 events and counts overflows
+- THR-1 (ASIL B): a failed throttle monitor puts the throttle into limp home (0) until reset
+- SST-1: the engine stops after 1000 ms at standstill with the brake held, after having moved above 8 km/h, when every condition holds; releasing the brake, steering or a weak battery restarts it
+- LHT-1: the lambda heater waits 20000 ms after start unless the exhaust is above 100 degrees C; above 850 degrees C it is off
+- SNS-1: a sensor channel not read 3 times in a row is stale
+- CAM-1: a cam phaser stays locked below 1.5 bar oil pressure, 20 degrees C oil or 900 rpm
+- CAM-2: intake cams advance 0..50 degrees and exhaust cams retard -40..0 degrees by load and speed; bank 2 is offset by 1 degree
+- CAM-3: 50 deviations above 15 degrees more than recoveries are a phaser fault
+- INJ-3: an injector drawing less than 300 mA when commanded is open, more than 9000 mA (or 100 mA when not commanded) short, each after 5 counts net
+- INJ-4: an injector whose crank acceleration balance exceeds 400 is imbalanced
+- TCS-1: wheel slip is computed above 3 km/h in tenths of a percent; undriven wheels count only braking slip
+- TCS-2: slip above 12 % for 50 ms is active; traction control cuts 2 Nm per tenth of a percent of excess slip unless switched off
+- EGR-1: exhaust gas recirculation runs only with a warm engine (60 degrees C), up to 80 % load and 4000 rpm
+- DPF-1: soot loads from the engine model and burns above 550 degrees C; above 28 g a regeneration starts above 60 km/h, else it is requested
+- DPF-2: a regeneration ends below 4 g, is interrupted below 30 km/h or after 1200000 ms; a pressure drop above 400 hPa is a blocked filter
+- SCR-1: urea dosing follows NOx and exhaust flow above 200 degrees C, 80 % above 450 degrees C, 90 % with a tank below 10 %, none when frozen or empty
+- EVP-1: canister purge runs in closed loop with a warm engine 60000 ms after start; strong negative fuel trims halve or stop it
+- ADP-1: long-term fuel trims learn an eighth of the short-term trim per update in rpm and load cells, in closed loop above 70 degrees C, within +-25 %; reaching the limit is reported
+- ADP-2: knock adaptation learns the retard per cell within 6 degrees
+- HYB-1: the state of charge counts the current and, after 1800000 ms at rest, moves a quarter of the way to the open-circuit value
+- HYB-2: regenerative braking is off with ABS, below 8 km/h and above 95 % charge; it tapers from 80 %; a cold battery halves it, a hot one takes three quarters
+- ALT-1: the alternator targets 14.2 V less 10 mV per degree above 25 degrees C, 14.8 V when decelerating and 12.8 V with a charged battery and low load
+- STR-1: the starter cranks with the clutch pressed or in park, the immobilizer released and the engine stopped; after 10000 ms it rests 30000 ms
+- LNC-1: launch control limits the engine to 4000 rpm when armed, standing, with traction control on, full pedal and the clutch open
+- HLD-1: hill hold keeps the vehicle on a slope of 3 % or more for 2000 ms after the brake is released, or until the engine torque holds it
+- SPL-1: the speed limiter reduces torque within 5 km/h of the limit and removes it at the limit; a kickdown above 95 % overrides it
+- SRV-1: service is due at 30000 km, 730 days or 10 % oil quality, and soon 1500 km, 30 days or 25 % before
+- OIL-1: the oil level is valid only after a stop on a slope of at most 5 %
+- DRV-1: eco, sport and manual set pedal gain, shift mode and stop/start; a trailer limits the gain to 100 % and disables stop/start
+- DCT-1: the launch clutch targets 100 rpm slip plus 4 rpm per pedal percent, 50 rpm when overheated above 250 degrees C; it closes below 30 rpm slip above 1000 rpm
+- GAR-1: a gear actuator reaches its position within 600 ms or reports a fault; it pushes softly while synchronizing
+- PAR-1: a calibration value outside its limits is refused
+- PAR-2: a parameter set whose checksum does not match is restored to its defaults
+- OBD-1: a readiness monitor is complete when it ran in the cycle; the vehicle is ready when every required monitor completed without failing; any failure lights the MIL
+- CAN-3: every message packs only values within its signals' ranges and unpacks what it packed
+- IGC-1: the coil dwell is 2.5 ms, longer at low and shorter at high supply voltage and above 5000 rpm, within 1.2..4.0 ms
+- IGC-2: a primary current peak below 4000 mA counts; 8 net counts are a coil fault
+- MON-7: an intake air temperature sensor outside 30..4050 counts fails after 1000 ms
+- MON-8 (ASIL B): rail pressure more than 10 bar below or 15 bar above its target for 500 ms fails and latches
+- MON-9: cam and crank disagreeing by more than 6 degrees for 300 ms fail the correlation monitor
+- MON-10: a supply outside 9.0..16.0 V for 2000 ms fails the supply monitor
+- MON-11: a catalyst above 950 degrees C for 3000 ms fails and latches
+- MON-12: a clutch switch never pressed while the pedal moves for 5000 ms fails
+- MON-13: a boost pressure sensor outside 100..3500 hPa fails after 400 ms
+- MON-14: a gear position that differs from the commanded gear for 800 ms fails
+- THM-1: below 70 degrees C the coolant pump stands (20 % for cabin heat) and split cooling is used at part load; above 112 degrees C the pump runs at 100 % and torque is derated
+- THM-2: the grille opens above 95 degrees C, with A/C or above 130 km/h; a hot turbo (300 degrees C) keeps the pump running after shutdown
+- AIR-1: air mass by speed density is checked against the air-mass meter within 25 %; an implausible meter is replaced by speed density
+- TQM-1: indicated torque falls with the square of the distance from the optimum advance; friction grows with speed, cold oil, A/C and alternator load
+- SEQ-1: a dual-clutch shift preselects (300 ms), hands the torque over (400 ms) and completes the inertia phase (150 ms); a phase that takes too long aborts and is counted
+- EVM-1: electric driving needs more than 30 % charge, below 60 km/h and not cold; it ends on high demand after 3000 ms; below 15 % the engine charges until 25 %
+- CDA-1: cylinders 2 and 3 are deactivated after 2000 ms of 1200..3500 rpm, below 35 % load, from 3rd gear, warm and without knock
+- TUR-1: torque is reduced above 950 degrees C exhaust, above 200000 turbo rpm and above 2000 m altitude
+- VSP-1: vehicle speed is the mean of the undriven wheels, or of the two middle wheels when those differ by more than 5 km/h
+- GRP-1: the engine speed must match output speed times the gear ratio within 8 %
+- DIA-1: a freeze frame is stored once per DTC; the newest 8 are kept
+- DIA-2: the programming session is refused while moving; three wrong keys lock security access; writing needs security access
+- DIA-3: clearing diagnostic information is possible in the default and extended sessions
+- BRT-1: brake temperatures rise with brake torque times wheel speed and cool towards ambient, faster at speed and at the front; above 600 degrees C brakes fade
+- KNW-1: the knock window opens 10 degrees after top dead centre for 40 degrees, 8 for 50 above 4000 rpm; the threshold is 1.5 times the learned noise plus 50; injection noise blanks the window
+- CTL-1: the oil pump targets 1.0..5.0 bar, the coolant valve 80..105 degrees C, the grille 0..100 %, the throttle bypass -20..20; a disabled loop outputs its lowest value
+- RUN-1: the engine cranks with the key on and a start request, runs above 500 rpm, stalls below 500 rpm and ends in after-run for 5000 ms; a crank above 8000 ms fails
+- HV-1 (ASIL C): a crash or an open interlock discharges the high-voltage link at once; an isolation below 100 kOhm is a fault that clears above 500 kOhm
+- HV-2: pre-charge closes the contactors at 95 % of the battery voltage within 2000 ms; discharge must reach 60 V within 5000 ms, else fault
+- CHG-1: charging needs a locked plug, a pilot of 10..85 % (0.6 A per percent, at most 32 A) and a charge below 90 %; outside -10..45 degrees C it pauses; the current halves in the last 10 %
+- DCD-1: the DC/DC converter supplies 14.0 V with high voltage on, less 8 mV per degree above 25 degrees C, 0.4 V more for a low battery or high load
+- BTH-1: the battery cools above 40 degrees C (35 when charging), uses the chiller above 45, heats below 0 (10 when charging), and limits power at extreme or uneven temperatures
+- SHR-1: in manual mode an upshift is recommended above 3000 rpm at part pedal and a downshift below 1200 rpm
+- TRL-1: a trailer is detected by a socket with lamp current above 300 mA or a mass 900 kg above the curb mass
+- MON-15: a fuel level sender outside 5..250 ohm fails after 3000 ms
+- MON-16: exhaust above 1050 degrees C for 500 ms fails and latches
+- MON-17: transmission oil above 140 degrees C in gear for 2000 ms fails
+- MON-18 (ASIL C): an isolation resistance below 100 kOhm for 100 ms fails and latches
+- MON-19 (ASIL C): a cell outside 2.80..4.25 V for 200 ms fails and latches
+- MON-20: a pilot duty outside 8..97 % fails after 300 ms
+- MON-21: a lambda sensor outside 50..950 mV in closed loop fails after 1500 ms
+- MON-22: no knock sensor noise above 2000 rpm for 2000 ms fails the sensor
+- MON-23: a wheel more than 10 km/h from the vehicle speed for 1000 ms fails
+- MON-24 (ASIL B): an unpowered throttle above 12 % for 300 ms fails and latches
+- MON-25: an ambient pressure outside 500..1100 hPa fails after 5000 ms
+- MON-26 (ASIL C): a contactor feedback that differs from its command for 100 ms fails and latches
+- ACC-1: following distance control keeps a time gap of 1.0, 1.5 or 2.2 s (at least 5 m); without a target it regulates to the set speed; below a third of the gap it brakes at -3.5 m/s2 and warns
+- IMO-1: the immobilizer releases on the answer to its challenge; three wrong answers block it until reset
+- DRC-1: a warm-up counts when the coolant rises by 22 degrees C to at least 70; a drive cycle when driving above 40 km/h after 600000 ms
+- RNG-1: the range uses the mean of the last 8 consumption samples; without consumption it is unknown

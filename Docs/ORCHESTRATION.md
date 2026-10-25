@@ -456,6 +456,19 @@ A repeated attempt with the same information gives the same answer, so every att
 10. **A "no change" verdict (COV-12a).** The suggestion brain may answer `reachable_by_test` and name the input
     values. The report then says that no source change is needed for the item. This is a note, not a suggestion,
     and it does not change the item's status.
+11. **Fewer wasted rounds (A2-21z, A2-21ai, A3-156a, A4-23j).**
+    - **One list of setters.** The brain is offered exactly the state setters the generator writes: one for every
+      scalar or enumeration SUT variable, under one name.
+    - **Names checked before compiling.** A test that calls a pipeline helper that doesn't exist, or uses a variable
+      only the SUT file sees, is refused before the build and the brain is asked again. A C++ name used without its
+      namespace is written with it.
+    - **State in the root-cause facts.** The root-cause brain is told which state the tested function reads and
+      whether the test set it.
+    - **Agent4 once per function.** Agent4 is asked at most once per function while the source is unchanged.
+12. **Speed (A3-OBS5, A3-85k, ARCH-1c d).**
+    - Tests measured one by one run four at a time (`parallel_runs`).
+    - The mutants of an oracle-strength check run in parallel too, without per-test measurement.
+    - A busy remote brain is waited for (`slot_wait`) instead of being replaced by the slower local Qwen.
 
 ## 7a2. Brain profiles and new code without pipeline changes [BP, NC]
 
@@ -570,6 +583,13 @@ a row, grouped by folder, with its LC, SC, BC, DC and MC/DC coverage as last mea
 
 Click a file to show its metric cards and its final panel. Click it again to follow the running file. Click the
 heading **Details** to return to the overview.
+
+**Stop [VIEW-15].** While a run is live, the page shows a **Stop** button. The first click asks on the button itself
+("Confirm stop"); the second asks the run to stop. Only the page can do this: the server accepts the request only with
+a header that the page sends, plus the token if one is configured. The orchestrator then ends at its next safe point:
+before the next iteration of a file, before a file starts, or before a folder starts. It delivers what was verified
+and gives the reason "stopped by the user". Files not yet started are reported as not run. Creating a file named
+`stop` in the run folder does the same.
 
 **Test programs [VIEW-14].** A test program can run to its summary and report failed tests. The page then shows
 "k of n tests failed" in grey, not "exit 1". When each test runs alone to measure what it covers (A3-OBS5), all

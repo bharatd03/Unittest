@@ -13,7 +13,8 @@ rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot
 rem    unittest_generator.bat pilot-embedded    full pipeline on the embedded C pilot (registers, superloop, asm; four files)
 rem    unittest_generator.bat pilot-embedded-cpp  full pipeline on the embedded C++ pilot (fakes, exceptions, template; four files)
 rem    unittest_generator.bat pilot-realrepo    full pipeline on patterns of real repositories (include order, T * const, namespaces; five files)
-rem    unittest_generator.bat pilot-all         full pipeline on every pilot, every production file (23 files), one summary
+rem    unittest_generator.bat pilot-large       full pipeline on the two large pilots (about 5000 lines each, C and C++ with templates)
+rem    unittest_generator.bat pilot-all         full pipeline on every pilot, every production file (25 files), one summary
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
@@ -169,6 +170,7 @@ if /i "%ACTION%"=="run" if defined REPO set "SETUP_ARGS=ensure --repo "%REPO%""
 if /i "%ACTION%"=="run" if defined REPO if defined BRANCH set "SETUP_ARGS=ensure --repo "%REPO%" --branch "%BRANCH%""
 if /i "%ACTION%"=="pilot-deps" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
 if /i "%ACTION%"=="pilot-all" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
+if /i "%ACTION%"=="pilot-large" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_large_pilot""
 "%PY%" ut_setup.py %SETUP_ARGS%
 set "UT_EXIT=%errorlevel%"
 if "%UT_EXIT%"=="0" goto tools_ready
@@ -210,11 +212,12 @@ if /i "%ACTION%"=="pilot-deps" goto pilot_deps
 if /i "%ACTION%"=="pilot-embedded" goto pilot_embedded
 if /i "%ACTION%"=="pilot-embedded-cpp" goto pilot_embedded_cpp
 if /i "%ACTION%"=="pilot-realrepo" goto pilot_realrepo
+if /i "%ACTION%"=="pilot-large" goto pilot_large
 if /i "%ACTION%"=="pilot-all" goto pilot_all
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="calibrate" goto calibrate
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-all, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-large, pilot-all, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -311,6 +314,15 @@ rem  The C pilot, then the C++ pilot of the same patterns (NEXT_PILOT).
 set "PILOT=c_realrepo_pilot"
 set "SUTS=--sut kernel\src\klist.c --sut kernel\src\kqueue.c --sut codec\ring.c --sut drivers\crc_drv.c"
 set "NEXT_PILOT=cpp_realrepo_pilot"
+set "NEXT_SUTS=--sut src\dispatcher.cpp"
+goto pilot
+
+:pilot_large
+rem  TP-25: one C file and one C++ file of about 5000 lines each, one after the other (NEXT_PILOT).
+set "PILOT=c_large_pilot"
+set "SUTS=--sut src\body_ctrl.c"
+set "NEXT_PILOT=cpp_large_pilot"
+set "NEXT_SUTS=--sut src\powertrain.cpp"
 :pilot
 rem  The pipeline writes the generated tests into the repository, so it runs on a fresh copy.
 set "REPO=%~dp0ut_output\pilots\%PILOT%"
@@ -323,7 +335,7 @@ set "UT_EXIT=%errorlevel%"
 if not defined NEXT_PILOT goto end
 set "PILOT=%NEXT_PILOT%"
 set "NEXT_PILOT="
-set "SUTS=--sut src\dispatcher.cpp"
+set "SUTS=%NEXT_SUTS%"
 goto pilot
 
 :pilot_all

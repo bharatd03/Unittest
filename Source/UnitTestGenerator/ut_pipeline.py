@@ -161,6 +161,7 @@ class ViewerConfig(BaseModel):
 
 METRIC_IDS = {"LC": "lc", "SC": "sc", "BC": "bc", "DC": "dc", "MCDC": "mcdc"}
 METRIC_NAMES = {"LC": "line", "SC": "statement", "BC": "branch", "DC": "decision", "MCDC": "MC/DC"}
+USER_STOP = "stopped by the user from the viewer [VIEW-15]"
 VERIFIED_REASON = "every required metric has reached its ASIL target, measured by Agent3 [COV-1, COV-3]"
 # VIEW-5: what the unit-test application shows; ut_config.json "viewer.metrics" may replace it
 DEFAULT_VIEW_METRICS = [
@@ -674,6 +675,8 @@ class Orchestrator:
         # 2. Stage A: make it build [ORC-4]
         rounds = 0
         while not last.link_ok or last.decision == "setup_blocked":
+            if self._stop_asked():                                                            # VIEW-15
+                return s.finish("incomplete", USER_STOP, last)
             if rounds >= self.cfg.stage_a_rounds:
                 return s.finish("incomplete", "setup or build issues remain after the Stage A budget: " + last.reason)
             twice = [f for f in last.failures if any("[A3-CL13]" in e for e in f.evidence)]
@@ -705,6 +708,8 @@ class Orchestrator:
         try:
             async with budget:
                 for iteration in range(1, s.iter_limit + 1):
+                    if self._stop_asked():                                                    # VIEW-15
+                        return self._user_stop(s, last)
                     s.current = f"Stage B iteration {iteration}"
                     self._stage(f"Stage B: iteration {iteration} of {s.iter_limit}" + (
                         " - targets met: checking the documented behaviour [A1-25y, ORC-32]" if s.targets_met_at else ""))
@@ -828,14 +833,18 @@ class Orchestrator:
                         return s.finish("incomplete", "environment: " + result.reason, result)
                     fixed = False
                     for failure in [f for f in result.failures if f.route == "agent4"]:
-                        if failure.failure_id in s.no_source_fix:             # Agent4 is not asked again [A4-23j]
+                        if failure.failure_id in s.no_source_fix or (          # Agent4 is not asked again [A4-23j]
+                                failure.affected_function and failure.affected_function in s.no_fix_functions):
                             self._back_to_the_test(s, failure)
                     for failure in [f for f in result.failures if f.route == "agent4"][:1]:      # A3-177
                         verified = await self._correct_source(s, failure, result, last_good)
                         if verified is not None:
                             result, fixed = verified, True
+                            s.no_fix_functions.clear()            # a new source: Agent4 may be asked again
                         else:
                             s.no_source_fix.add(failure.failure_id)
+                            if failure.affected_function:                 # the same function: not again [A4-23j]
+                                s.no_fix_functions.add(failure.affected_function)
                             self._back_to_the_test(s, failure)
                     for failure in [f for f in result.failures if f.route == "stop"]:
                         return s.finish("incomplete", "environment: " + failure.diagnostic, result)
@@ -894,6 +903,26 @@ class Orchestrator:
     @staticmethod
     def _open(result: uc.VerificationResult) -> bool:
         return result.coverage is not None and any(f.gaps for f in result.coverage.functions)
+
+    def _stop_asked(self) -> bool:
+        """VIEW-15: the user asked from the viewer page (or by a file named stop in its run folder) to stop."""
+        return self.hub is not None and self.hub.stop_requested()
+
+    def _user_stop(self, s: "RunState", last: uc.VerificationResult) -> uc.PipelineResult:
+        """VIEW-15: stopped by the user - what Agent3 verified is delivered (ORC-33); the evidence of the open items
+        is collected deterministically, without asking a brain for suggestions."""
+        if last.verified and last.decision == "complete":
+            return s.finish("verified_measured", VERIFIED_REASON, last)
+        best = s.best_result
+        if best is not None and best.verified and best.decision == "complete":
+            return s.finish("verified_measured", f"{VERIFIED_REASON}; then {USER_STOP}", best)
+        if best is not None and (last.coverage is None or not last.link_ok):
+            last = best
+        self._metrics(s, last, final=True)
+        s.not_reached = s.evidence(last)
+        self._final_statuses(s, last)
+        s.action_needed = s.actions(last)
+        return s.finish("incomplete", USER_STOP, last)
 
     async def _stop(self, s: "RunState", reason: str, last: uc.VerificationResult) -> uc.PipelineResult:
         """COV-9: the run stops. Verified only when every metric has reached its target by measurement;
@@ -2088,6 +2117,7 @@ class RunState:
         self.fix_details: dict[str, dict[str, Any]] = {}      # per published fix, for the pull request [ORC-25]
         self.requirement_docs: list[uc.RequirementDocument] = []    # given for the run [A1-RQ1, A1-RQ3]
         self.no_source_fix: set[str] = set()                  # failures Agent4 found no change for [A4-23j]
+        self.no_fix_functions: set[str] = set()               # functions Agent4 found no change for [A4-23j]
         self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
         self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
         self.fuzz_spent = 0                                   # seconds of search granted in this run [ORC-5a]
@@ -2909,6 +2939,12 @@ class RepositoryRun:
                 self.view_prefix = f"{label}: "
                 out = top / label
                 out.mkdir(parents=True, exist_ok=True)
+                if self.hub is not None and self.hub.stop_requested():                        # VIEW-15
+                    result = uc.RepositoryResult(repository=req.repository, output_dir=str(out),
+                                                 reason=f"not run: {USER_STOP}")
+                    self._summary(result, out)
+                    results.append(result)
+                    continue
                 try:
                     result = await (self._folder(req, out) if not is_link(req.repository) else self._repository(req, out))
                 except (ba.AgentFault, OSError) as exc:              # this folder only; the others go on
@@ -3068,6 +3104,11 @@ class RepositoryRun:
 
         async def one(sut: str) -> None:
             async with semaphore:
+                if self.hub is not None and self.hub.stop_requested():                        # VIEW-15
+                    self.progress.done += 1
+                    results[sut] = uc.PipelineResult(final_state="incomplete", reason=f"not run: {USER_STOP}",
+                                                     sut_file=sut)
+                    return
                 try:
                     r = await self._orchestrator().run(request(sut, list(req.requirements)))
                     again = [d.split(": ", 1)[1].split(" - ", 1)[0] for d in r.decisions

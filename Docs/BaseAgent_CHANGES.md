@@ -1,5 +1,20 @@
 # BaseAgent changes
 
+## 2026-10-25 (afternoon): stop from the page; a busy remote server is waited for
+
+**Why.** A long run could be stopped only in the terminal. With two files in parallel, the remote Qwen's two request
+slots were often both taken. After 120 s of waiting, a request went to the local Ollama on the same GPU, which only
+added minutes.
+
+* **`ViewHub.request_stop()` / `stop_requested()`** (VIEW-15). A stop is recorded as a file named `stop` in the run
+  folder, so every process of the run and every file of the page sees it. The page's **Stop** button asks on the
+  button first, then posts `/stop`. The server accepts the post only with the page's header
+  `X-BaseAgent-Viewer: stop` (and the token of VIEW-3). An event with `data.stop` turns the page to "stopping".
+* **`QwenRemoteSettings.slot_wait`** (default 30 min, ARCH-1c d). A request waits this long for a shared slot and for
+  this process's own gate (`QwenEngine._gate_wait()`). The local engine keeps `queue_timeout`.
+* **Tests.** `ViewerTests.test_the_page_stops_a_run`, `test_a_stop_by_file`, and
+  `QwenRemoteEngineTests.test_a_busy_remote_server_is_waited_for`.
+
 ## 2026-10-25 (evening): the Details panel is the overview of the whole run
 
 **Why.** Until you clicked something, the Details panel said only "Click an agent or a metric". The row of file chips

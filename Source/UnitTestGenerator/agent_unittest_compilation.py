@@ -38,7 +38,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -610,6 +612,7 @@ class CompilationConfig(BaseModel):
     keep_active_s: float = 7200.0      # a run folder younger than this is never deleted (parallel files) [ORC-23]
     quarantine_rounds: int = 2         # rebuilds without generated tests that do not compile [A3-CL12]
     max_minimize_tests: int = 300
+    parallel_runs: int = 4             # programs at once: per-test measurement, oracle mutants [A3-OBS5, A3-85k, ORC-7]
     fuzz_seconds: int = 60             # per function [A3-FZ3]
     max_fuzz_replays: int = 200        # corpus inputs measured one by one [A3-FZ4]
     search_executions: int = 200_000   # ut_search without libFuzzer: executions per function [A3-FZ10]
@@ -718,6 +721,26 @@ def _program_event(cmd: list[str], code: int, seconds: float, text: str = "") ->
                   data={"program": name, "outcome": outcome, "seconds": round(seconds, 2)}, summary=summary)
 
 
+# VIEW-14: the many runs of one measurement or check are reported as one entry by their caller, not one each
+_QUIET = threading.local()
+_HOST_LOCK = threading.Lock()
+
+
+def _in_parallel(work: list[Any], count: int) -> list[Any]:
+    """A3-OBS5, A3-85k: ``work`` (functions without arguments) run up to ``count`` at a time, results in order;
+    their programs are not single entries of the viewer."""
+    def quiet(job):
+        _QUIET.on = True
+        try:
+            return job()
+        finally:
+            _QUIET.on = False
+    if count <= 1 or len(work) <= 1:
+        return [quiet(job) for job in work]
+    with ThreadPoolExecutor(max_workers=min(count, len(work)), thread_name_prefix="ut-run") as pool:
+        return list(pool.map(quiet, work))
+
+
 # Windows has no fork: with function-local statics every test runs in a run of its own [A3-45c]
 ONE_BY_ONE = os.name == "nt"
 
@@ -731,7 +754,7 @@ def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None =
         # stdin is never inherited: in an MCP stdio server it is the JSON-RPC channel.
         proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
                               stdin=subprocess.DEVNULL, env={**os.environ, **(env or {})}, errors="replace")
-        if not quiet:
+        if not quiet and not getattr(_QUIET, "on", False):
             _program_event(cmd, proc.returncode, time.monotonic() - started, proc.stdout or "")
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except subprocess.TimeoutExpired as exc:
@@ -1270,11 +1293,39 @@ OUTCOME_QUESTION = {
         "timeout": "The program was ended because it ran too long.",
         "undetermined": "The output and the exit status do not show how it ended."})}
 
+def state_facts(layout: uc.LayoutProfile, source: str, function: str, test_code: str) -> tuple[list[str], str]:
+    """A3-156a: the state the tested function reads (SUT state and its function-local statics) and how the test
+    sets it - by a setter, by earlier calls of SUT functions, or not at all (the initial state of A2-21s)."""
+    fn = next((f for f in layout.functions if function and function in (f.name, f.qualified_name)), None)
+    if fn is None or not source:
+        return [], ""
+    body = "\n".join(source.splitlines()[fn.line_start - 1: fn.line_end])
+    reads = [v.name for v in layout.sut_state
+             if re.search(r"(?<![\w.>])" + re.escape(v.name.split("::")[-1]) + r"\b", body)]
+    reads += [v.name for v in layout.local_statics if v.name.startswith(fn.qualified_name + "::")]
+    if not reads:
+        return [], ""
+    setters = sorted(set(re.findall(r"\b(ut_state_set_\w+)\s*\(", test_code)))
+    names = sorted({f.name.split("::")[-1] for f in layout.functions})
+    calls = re.findall(r"\b(" + "|".join(map(re.escape, names)) + r")\s*\(", test_code) if names else []
+    short = fn.name.split("::")[-1]
+    earlier = [c for c in calls if c != short] + [short] * max(0, calls.count(short) - 1)
+    how = []
+    if setters:
+        how.append("set by " + ", ".join(setters))
+    if earlier:
+        how.append(f"built up by {len(earlier)} earlier call(s) of SUT functions in the test")
+    return reads, "; ".join(how) or ("not set: the test calls the function once from the initial state, so the "
+                                     "result also depends on that state")
+
+
 CLASSIFY_QUESTION = {
     "root_cause": ba.Question(type="choice", instructions=(
         "A generated unit test failed. Decide the most likely root cause from the evidence only."), criteria={
         "test_generation_defect": "The test's inputs, call or expected value are wrong - for example the values "
-                                  "test_code sets do not create the condition the test's purpose names.",
+                                  "test_code sets do not create the condition the test's purpose names, or the "
+                                  "expected value ignores state_the_function_reads (state that earlier calls "
+                                  "build up) - see how_the_test_sets_that_state.",
         "stub_defect": "A stub returns or records the wrong thing for this scenario.",
         "source_behavior_defect": "The test is valid and supported by the evidence; the SUT behaves incorrectly.",
         "undetermined": "The evidence is insufficient or conflicting."})}
@@ -3024,9 +3075,10 @@ class CompilationAgent(ba.AgentCore):
         """A3-HW2, A3-HW3: compile the SUT once; host definitions for the target keywords its errors name,
         and the target asm statements the host assembler rejects replaced in the staged copy only."""
         state: dict[str, list[str]] = {"defines": [], "notes": []}
-        self._host[str(repo)] = state
-        while len(self._host) > 64:
-            self._host.pop(next(iter(self._host)))
+        with _HOST_LOCK:                                      # mutants are staged in parallel [A3-85k]
+            self._host[str(repo)] = state
+            while len(self._host) > 64:
+                self._host.pop(next(iter(self._host)))
         sut = repo / layout.sut_file
         try:
             chain = self.toolchain()
@@ -3501,20 +3553,27 @@ class CompilationAgent(ba.AgentCore):
         base.mkdir(exist_ok=True)
         out = {}
         self._per_test_runs: dict[str, str] = {}
-        started, failed = time.monotonic(), 0
-        for index, name in enumerate(names):
+        started = time.monotonic()
+
+        def one(index: int, name: str):
             raw = base / f"t{index}.profraw"
             code, text = _run([str(binary), "--only", name], run_dir, self.cfg.run_timeout,
                               chain.env(LLVM_PROFILE_FILE=str(raw.resolve())), quiet=True)   # one entry [VIEW-14]
-            failed += code != 0
             lines = [x for x in text.replace("\r", "").splitlines() if x.strip()]
-            self._per_test_runs[name] = f"exit {code}, profile {'written' if raw.is_file() else 'missing'}, " + \
+            how = f"exit {code}, profile {'written' if raw.is_file() else 'missing'}, " + \
                 (lines[-1][:120] if lines else "no output")                                      # A3-OBS6
             if not raw.is_file():
-                continue
+                return code, how, None
             report, show = self._items_of(binary, raw, run_dir, repo, layout, chain)
             vectors = [f"VEC:{d['line']}:{d['column']}:{vec}={res}" for d in parse_mcdc_show(show) for vec, res in d["vectors"]]
-            out[name] = sorted(set(report.covered_items) | set(vectors))
+            return code, how, sorted(set(report.covered_items) | set(vectors))
+        done = _in_parallel([lambda k=k, n=n: one(k, n) for k, n in enumerate(names)], self.cfg.parallel_runs)
+        failed = 0
+        for name, (code, how, items) in zip(names, done):                # in the order of the tests
+            failed += code != 0
+            self._per_test_runs[name] = how
+            if items is not None:
+                out[name] = items
         if names:
             ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
                           data={"program": binary.name, "outcome": "tests_failed" if failed else "ok",
@@ -3835,10 +3894,13 @@ class CompilationAgent(ba.AgentCore):
         for failure in pending:
             failure.evidence.remove(NEEDS_BRAIN)
             test = next((t for t in result.tests if t.name == failure.affected_test), None)
+            reads, sets = state_facts(req.layout, uc.read_source(sut) if sut.is_file() else "",
+                                      failure.affected_function, codes.get(failure.affected_test, ""))
             state = json.dumps({"failing_test": failure.affected_test,                     # A3-156: its own code
                                 "test_code": codes.get(failure.affected_test, "")[:3000], "assertion": failure.diagnostic,
                                 "expected": test.expected if test else "", "actual": test.actual if test else "",
-                                "evidence": failure.evidence, "sut_source": excerpt})
+                                "evidence": failure.evidence, "sut_source": excerpt,
+                                "state_the_function_reads": reads, "how_the_test_sets_that_state": sets})   # A3-156a
             try:
                 answer = (await self.decide([uc.part("failure", state)], CLASSIFY_QUESTION, step="A3.root_cause",
                                             project=req.layout.repo_root,
@@ -4177,18 +4239,31 @@ class CompilationAgent(ba.AgentCore):
         # Reference form [A3-85b]: the original test with expected values replaced by observed ones.
         observed = self._observe_failures(req, req.original_suite)
         reference = rewrite_expectations(req.original_suite, observed)
-        killed_ref, killed_new, total = set(), set(), 0
+        killed_ref, killed_new = set(), set()
         suite_path = req.layout.suite_file
-        for mutant_id, mutant_source in self.mutants(sut_source, fn):
-            total += 1
-            for which, suite in (("ref", reference), ("new", req.changed_suite)):
-                bundle = _replace_suite(req.bundle, suite_path, suite)
-                res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle,
-                                                    source_overrides={req.layout.sut_file: mutant_source}))
-                shutil.rmtree(res.run_dir, ignore_errors=True)           # mutant builds are not kept
-                outcome = next((t.status for t in res.tests if t.name == req.test), "crashed")
-                if outcome != "passed" or not res.link_ok:
-                    (killed_ref if which == "ref" else killed_new).add(mutant_id)
+        mutants = self.mutants(sut_source, fn)
+        total, started = len(mutants), time.monotonic()
+
+        def run(mutant_source: str, suite: str) -> bool:
+            """True when the mutant is detected. Only the tests run: no per-test measurement [A3-85k]."""
+            bundle = _replace_suite(req.bundle, suite_path, suite)
+            res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle, measure_tests=[],
+                                                source_overrides={req.layout.sut_file: mutant_source}))
+            shutil.rmtree(res.run_dir, ignore_errors=True)               # mutant builds are not kept
+            outcome = next((t.status for t in res.tests if t.name == req.test), "crashed")
+            return outcome != "passed" or not res.link_ok
+        jobs = [(mutant_id, which, lambda m=mutant_source, s=suite: run(m, s))
+                for mutant_id, mutant_source in mutants
+                for which, suite in (("ref", reference), ("new", req.changed_suite))]
+        for (mutant_id, which, _), detected in zip(jobs, _in_parallel([j[2] for j in jobs], self.cfg.parallel_runs)):
+            if detected:
+                (killed_ref if which == "ref" else killed_new).add(mutant_id)
+        if total:                                                                                  # VIEW-14
+            ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
+                          data={"program": "mutation check", "outcome": "ok", "runs": 2 * total,
+                                "seconds": round(time.monotonic() - started, 2)},
+                          summary=f"UT-Compilation checked {req.test} against {total} mutants of {fn.name} "
+                                  f"({round(time.monotonic() - started)} s)")
         if not total:
             return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", reason="no mutants")
         weaker = killed_ref - killed_new
@@ -4200,7 +4275,7 @@ class CompilationAgent(ba.AgentCore):
 
     def _observe_failures(self, req: uc.OracleRequest, suite: str) -> dict[int, str]:
         bundle = _replace_suite(req.bundle, req.layout.suite_file, suite)
-        res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle))
+        res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle, measure_tests=[]))
         shutil.rmtree(res.run_dir, ignore_errors=True)
         return {t.line: t.actual for t in res.tests if t.name == req.test and t.status == "failed" and t.line}
 

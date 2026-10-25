@@ -972,6 +972,14 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, "MODEL_UNAVAILABLE")
         self.assertEqual(len(FakeOpenAI.chat_bodies()), 2)
 
+    async def test_a_busy_remote_server_is_waited_for(self):                           # ARCH-1c (d)
+        """A request waits for a free slot of the remote server (slot_wait), not the 2 min of a local queue, so a busy
+        server never hands the call to the local model on the same GPU."""
+        remote = self.engine()
+        self.assertEqual(remote.settings.slot_wait, 1800.0)
+        self.assertEqual(remote._gate_wait(), remote.settings.slot_wait)
+        self.assertEqual(ba.QwenEngine(ba.QwenSettings())._gate_wait(), ba.QwenSettings().queue_timeout)
+
     async def test_requests_to_one_server_share_their_slots(self):                     # ARCH-1c (b)
         slots = ba.SharedSlots(f"test-{uuid.uuid4().hex}", 1, stale=60)
         async with slots.hold(5):
@@ -3031,6 +3039,48 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             server.stop()
         self.assertEqual(status, "live")
+
+    @unittest.skipUnless(importlib.util.find_spec("uvicorn") and importlib.util.find_spec("starlette")
+                         and importlib.util.find_spec("playwright"), "uvicorn, starlette and playwright are required")
+    def test_the_page_stops_a_run(self):                                                    # VIEW-15
+        """The Stop button asks on the button itself, then posts with the page's header; the hub records the stop
+        for the application; a plain POST without that header is refused."""
+        hub = ba.ViewHub(self.dir, app="UT")
+        hub.emit("run_start", summary="Run started", data={"title": "UT", "agents": []})
+        server = ba.serve_viewer(hub, open_browser=False, title="UT live")
+        try:
+            request = urllib.request.Request(server.url + "stop", data=b"", method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(refused.exception.code, 403)
+            self.assertFalse(hub.stop_requested())
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto(server.url)
+                page.wait_for_function("document.getElementById('stop').style.display !== 'none'", timeout=10000)
+                page.locator("#stop").click()
+                asked = page.locator("#stop").inner_text()
+                self.assertFalse(hub.stop_requested())                            # one click only asks
+                page.locator("#stop").click()
+                page.wait_for_function("document.getElementById('stop').disabled", timeout=10000)
+                deadline = time.time() + 10
+                while not hub.stop_requested() and time.time() < deadline:
+                    time.sleep(0.1)
+                page.wait_for_function("document.getElementById('status').textContent === 'stopping'", timeout=10000)
+                browser.close()
+        finally:
+            server.stop()
+        self.assertEqual(asked, "Confirm stop")
+        self.assertTrue(hub.stop_requested())
+        self.assertTrue(any(e.get("data", {}).get("stop") for e in hub.events()))
+
+    def test_a_stop_by_file(self):                                                           # VIEW-15
+        hub = ba.ViewHub(self.dir, app="UT")
+        self.assertFalse(hub.for_run("src/a.c").stop_requested())
+        (Path(self.dir) / "stop").write_text("stop\n")
+        self.assertTrue(hub.for_run("src/a.c").stop_requested())                  # every file of the page sees it
 
     @unittest.skipUnless(importlib.util.find_spec("uvicorn") and importlib.util.find_spec("starlette"),
                          "uvicorn and starlette are required")

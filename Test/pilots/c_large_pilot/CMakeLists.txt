@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(c_large_pilot C)
+set(CMAKE_C_STANDARD 11)
+add_library(bcm STATIC src/body_ctrl.c)
+target_include_directories(bcm PUBLIC include)
+target_compile_options(bcm PRIVATE -Wall -Wextra)

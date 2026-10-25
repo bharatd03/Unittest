@@ -4879,6 +4879,146 @@ class SolvedScenarioTests(unittest.TestCase):
         self.assertEqual(seen[1]["data"]["outcome"], "exit 3")
 
 
+class PilotRunFixesTests(unittest.TestCase):
+    """From the pilot-all run of 2026-10-25: A2-21z, A2-21ai, A2-21s, A2-21k, A3-156a, A3-85k, A3-OBS5, VIEW-15."""
+
+    def layout(self, language="cpp", **kw):
+        base = dict(repo_root=".", sut_file="src/counter.cpp", language=language, component_root=".",
+                    writable_test_dir="tests", writable_stub_dir="tests", suite_file="tests/test_counter.cpp",
+                    sut_sha256="0" * 64)
+        base.update(kw)
+        return uc.LayoutProfile(**base)
+
+    def test_one_list_of_state_setters_for_both_agents(self):                       # A2-21z
+        layout = self.layout(sut_state=[uc.StateVar(name="counter::total", type="volatile std::uint32_t"),
+                                        uc.StateVar(name="g_buf", type="int[4]"),
+                                        uc.StateVar(name="g_obj", type="Foo"),
+                                        uc.StateVar(name="g_mode", type="Mode")],
+                             enums=[uc.EnumInfo(name="Mode")])
+        self.assertEqual([v.name for v in uc.settable_state(layout)], ["counter::total", "g_mode"])
+        self.assertEqual(uc.state_setter_name(layout.sut_state[0]), "ut_state_set_counter_total")
+        plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="")
+        with mock.patch.object(Path, "is_file", return_value=True):
+            self.assertEqual([v.name for v in a2.setter_vars(plan)], ["counter::total", "g_mode"])
+        offered = a1.AnalyzerAgent()._known_names(layout, [])
+        self.assertIn("ut_state_set_counter_total", offered)                     # what the brain is told of exists
+        self.assertNotIn("ut_state_set_g_buf", offered)
+        self.assertEqual(a2.setter_source(layout.sut_state[0], True),
+                         "void ut_state_set_counter_total(long long v) { counter::total = (decltype(counter::total))v; }")
+        self.assertTrue(uc.state_resettable(layout.sut_state[0], True))           # std:: integers too [A2-21s]
+
+    def test_names_are_checked_before_the_build(self):                              # A2-21ai
+        layout = self.layout(sut_state=[uc.StateVar(name="counter::total", type="volatile std::uint32_t")],
+                             functions=[uc.FunctionInfo(name="dispatch", qualified_name="fw::dispatch", signature="",
+                                                        file="a.cpp", line_start=1, line_end=2)])
+        allowed = {"UT_EXPECT_EQ_INT", "add", "ut_state_set_counter_total", uc.HIDDEN_MARK + "counter::total"}
+        problem = a2.GeneratorAgent._body_problem("UT_EXPECT_EQ_INT(ut_state_get_counter_total(), 0);", allowed)
+        self.assertIn("helpers the pipeline does not write", problem)
+        self.assertEqual(uc.check_kind(problem), "guard")                        # refused, never a trial build
+        problem = a2.GeneratorAgent._body_problem("total = 3; UT_EXPECT_EQ_INT(add(1), 4);", allowed)
+        self.assertIn("ut_state_set_counter_total(value)", problem)
+        self.assertEqual(uc.check_kind(problem), "guard")
+        self.assertEqual(a2.GeneratorAgent._body_problem(
+            "ut_state_set_counter_total(3); UT_EXPECT_EQ_INT(add(1), 4);", allowed), "")
+        self.assertEqual(uc.hidden_state(layout, "namespace counter { std::uint32_t add(std::uint32_t n); }"),
+                         {"counter::total"})
+        names = uc.namespace_names(layout, "namespace fw { struct Evt { int sig; }; }")
+        self.assertEqual(names, {"dispatch": "fw::dispatch", "Evt": "fw::Evt"})
+        body, fixed = uc.qualify_names('Evt e{1}; dispatch(&e); fw::dispatch(&e); UT_OBSERVE_INT("Evt", e.sig);', names)
+        self.assertEqual(body, 'fw::Evt e{1}; fw::dispatch(&e); fw::dispatch(&e); UT_OBSERVE_INT("Evt", e.sig);')
+        self.assertEqual(fixed, ["Evt", "dispatch"])
+        self.assertEqual(uc.qualify_names("using namespace fw; Evt e{1};", names)[1], [])
+
+    def test_only_free_internal_functions_get_a_wrapper(self):                      # A2-21k
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "src").mkdir()
+        (root / "src/a.cpp").write_text("namespace {\nint helper(int x) { return x; }\ntemplate <typename T>\n"
+                                        "T twice(T x) { return x + x; }\n}\n")
+        fns = [uc.FunctionInfo(name="helper", qualified_name="(anonymous namespace)::helper", signature="int helper(int x)",
+                               file="src/a.cpp", line_start=2, line_end=2, is_static=True, from_frontend=True),
+               uc.FunctionInfo(name="twice", qualified_name="(anonymous namespace)::twice", signature="T twice(T x)",
+                               file="src/a.cpp", line_start=4, line_end=4, is_static=True, from_frontend=True),
+               uc.FunctionInfo(name="Fixed::from_raw", qualified_name="pt::Fixed::from_raw", signature="",
+                               file="src/a.cpp", line_start=1, line_end=1, is_static=True, from_frontend=True, member=True)]
+        layout = self.layout(repo_root=str(root), sut_file="src/a.cpp", functions=fns)
+        self.assertEqual([f.name for f in a2.static_functions(layout)], ["helper"])
+
+    def test_the_root_cause_sees_the_state_the_function_reads(self):                 # A3-156a
+        src = "static int g_last;\nint step(int t)\n{\n    int out = t - g_last > 5 ? g_last + 5 : t;\n    g_last = out;\n    return out;\n}\n"
+        layout = self.layout(language="c", sut_file="src/a.c", sut_state=[uc.StateVar(name="g_last", type="int")],
+                             functions=[uc.FunctionInfo(name="step", qualified_name="step", signature="int step(int t)",
+                                                        file="src/a.c", line_start=2, line_end=7)])
+        reads, how = a3.state_facts(layout, src, "step", "UT_EXPECT_EQ_INT(step(100), 100);")
+        self.assertEqual(reads, ["g_last"])
+        self.assertIn("not set", how)
+        _, how = a3.state_facts(layout, src, "step", "ut_state_set_g_last(95); UT_EXPECT_EQ_INT(step(100), 100);")
+        self.assertIn("ut_state_set_g_last", how)
+        _, how = a3.state_facts(layout, src, "step", "step(50); UT_EXPECT_EQ_INT(step(100), 55);")
+        self.assertIn("1 earlier call", how)
+
+    def test_mutants_run_in_parallel_without_per_test_measurement(self):           # A3-85k, A3-OBS5, VIEW-14
+        order, seen = [], []
+        jobs = [lambda k=k: (time.sleep(0.02 * (3 - k)), order.append(k), k)[2] for k in range(3)]
+        self.assertEqual(a3._in_parallel(jobs, 3), [0, 1, 2])                     # results in order
+        self.assertNotEqual(order, [0, 1, 2])                                      # ran at the same time
+        with mock.patch.object(a3.ba, "emit_event", lambda kind, **kw: seen.append(kw)):
+            a3._in_parallel([lambda: a3._run([sys.executable, "-c", "pass"], Path("."), 10)] * 2, 2)
+        self.assertEqual(seen, [])                                                 # one entry by the caller instead
+        comp = a3.CompilationAgent(config=a3.CompilationConfig())
+        asked = []
+
+        def execute(req):
+            asked.append(req.measure_tests)
+            return uc.VerificationResult(run_id="r", stage="observe", sut_sha256="", suite_sha256="", build_ok=True,
+                                         link_ok=True, run_ok=True, decision="complete", run_dir=str(Path(tmpdir().name)),
+                                         tests=[uc.TestResult(name="t", status="passed")])
+        fn = uc.FunctionInfo(name="f", qualified_name="f", signature="int f(int x)", file="a.c", line_start=1, line_end=1)
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / "a.c").write_text("int f(int x) { return x <= 3 ? x + 1 : 0; }\n")
+        layout = self.layout(language="c", repo_root=tmp.name, sut_file="a.c", suite_file="t.c", functions=[fn])
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(path="t.c", action="create",
+                                                                                         role="testsuite", content="")])
+        with mock.patch.object(comp, "execute", execute), \
+                mock.patch.object(a3.ba, "emit_event", lambda kind, **kw: seen.append(kw)):
+            result = comp.oracle_check(uc.OracleRequest(layout=layout, function="f", test="t", original_suite="",
+                                                        changed_suite="", bundle=bundle))
+        self.assertTrue(result.mutants)
+        self.assertTrue(asked and all(m == [] for m in asked))                     # no per-test measurement
+        self.assertEqual(len([s for s in seen if "mutants" in s.get("summary", "")]), 1)
+
+
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+class LargePilotFindingsTests(unittest.TestCase):
+    """TP-25: what the large pilots found, on a small file of the same forms (A1-DA10, A1-DA15, A2-21k)."""
+    def test_unnamed_namespaces_and_dependencies_without_a_definition(self):
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        (root / "src").mkdir(parents=True)
+        (root / "include").mkdir()
+        (root / "include/x.hpp").write_text(
+            "namespace hal { void pwm(int duty); }\nnamespace pt {\nclass IBus {\npublic:\n    virtual ~IBus() = default;\n"
+            "    virtual bool read(int channel) = 0;\n};\nint use(IBus& bus, int v);\n}\n")
+        (root / "src/x.cpp").write_text(
+            '#include "x.hpp"\nnamespace pt {\nnamespace {\nint g_last = 0;\nint key_of(int s)\n{\n    return s * 3;\n}\n}\n'
+            "int use(IBus& bus, int v)\n{\n    hal::pwm(v);\n    g_last = v;\n    return bus.read(v) ? key_of(v) : 0;\n}\n}\n")
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file="src/x.cpp"))
+        build = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(tmp.name) / "w"))).capture(
+            uc.CaptureRequest(layout=layout))
+        layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=build)))
+        key_of = next(f for f in layout.functions if f.name.endswith("key_of"))
+        self.assertEqual(key_of.qualified_name, "pt::key_of")                     # the name a test reads
+        self.assertTrue(key_of.is_static)
+        self.assertEqual([f.name for f in a2.static_functions(layout)], [key_of.name])
+        self.assertTrue(any(v.name == "pt::g_last" for v in layout.sut_state), layout.sut_state)
+        pwm = next(d for d in layout.dependencies.entries if d.name == "pwm")
+        self.assertEqual(pwm.decision, "stub", pwm.reason)                         # no definition is never "linked"
+
+
 class AgentProgramTests(unittest.TestCase):
     """An agent runs as its own program: everything it uses is defined before its __main__ block starts the server
     (a definition after it never runs there, while an import in a test still sees it)."""

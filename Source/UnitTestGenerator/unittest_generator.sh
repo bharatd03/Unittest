@@ -8,7 +8,8 @@
 #    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
 #    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp | pilot-realrepo
 #                                              every SUT file of a pilot, one live viewer page for all
-#    ./unittest_generator.sh pilot-all         every pilot, every production file (23 files), one summary
+#    ./unittest_generator.sh pilot-large       the two large pilots (about 5000 lines each, C and C++ with templates)
+#    ./unittest_generator.sh pilot-all         every pilot, every production file (25 files), one summary
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 #    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 #    ./unittest_generator.sh benchmark [on|off|both]
@@ -48,7 +49,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-all|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-large|pilot-all|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -112,6 +113,7 @@ case "$ACTION" in
       done
     fi ;;
   pilot-deps|pilot-all) SETUP=(ensure --repo "$PILOTS/c_deps_pilot") ;;
+  pilot-large) SETUP=(ensure --repo "$PILOTS/c_large_pilot") ;;
 esac
 "$PY" ut_setup.py "${SETUP[@]}"
 RC=$?
@@ -163,6 +165,7 @@ case "$ACTION" in
   pilot-deps) pilot c_deps_pilot src/ctrl.c src/brake_ctrl.c src/steer_assist.c "$@" ;;
   pilot-embedded) pilot c_embedded_pilot src/gpio_driver.c src/scheduler.c src/critical.c src/main_loop.c "$@" ;;
   pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
+  pilot-large) pilot c_large_pilot src/body_ctrl.c "$@" && pilot cpp_large_pilot src/powertrain.cpp "$@" ;;
   pilot-realrepo) pilot c_realrepo_pilot kernel/src/klist.c kernel/src/kqueue.c codec/ring.c drivers/crc_drv.c "$@" && pilot cpp_realrepo_pilot src/dispatcher.cpp "$@" ;;
   pilot-all)
     # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named;

@@ -228,12 +228,148 @@ class StateVar(Contract):
     type: str = ""
 
 
+_SETTABLE = re.compile(r"(?:(?:unsigned|signed)\s+)?(?:char|short|int|long|long long|long int|short int)|unsigned|signed|"
+                       r"bool|_Bool|size_t|ptrdiff_t|u?intptr_t|u?int(?:_least|_fast)?\d+_t")
+
+
+def state_setter_name(var: StateVar) -> str:
+    """A2-21z: the setter of a SUT state variable - one name for Agent1's offer, Agent2's file and its checks."""
+    return "ut_state_set_" + safe_name(var.name)
+
+
+def settable_state(layout: "LayoutProfile") -> list[StateVar]:
+    """A2-21z: the SUT state variables that get a setter - every scalar or enumeration variable, whatever its
+    linkage. Agent1 offers exactly these to the brain and Agent2 writes exactly these."""
+    enums = {e.name.split("::")[-1] for e in layout.enums}
+    out = []
+    for v in layout.sut_state:
+        t = re.sub(r"\b(volatile|const|static|struct|enum)\b", " ", v.type)
+        t = re.sub(r"\bstd::", "", re.sub(r"\s+", " ", t)).strip()
+        if not t or any(c in t for c in "[*(&<"):
+            continue
+        base = t.split("::")[-1]
+        resolved = layout.typedefs.get(base, "") or layout.typedefs.get(t, "")
+        if resolved and (re.search(r"\b(struct|union|class)\b", resolved) or any(c in resolved for c in "[*(")):
+            continue
+        if _SETTABLE.fullmatch(t) or base in enums or (re.fullmatch(r"[A-Za-z_]\w*_t", base) and not
+                                                        re.search(r"\b(struct|union)\b", v.type)):
+            out.append(v)
+    return out
+
+
+HIDDEN_MARK = "\0hidden:"          # an entry of a set of allowed names: a SUT variable only the SUT file sees
+PIPELINE_HELPER = re.compile(r"^ut_(?:state_set|state_get|stub|fake)_\w+$")
+_STRING_LITERAL = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+
+
+def hidden_state(layout: "LayoutProfile", headers: str) -> set[str]:
+    """A2-21ai: SUT state variables a test cannot name - static, in an unnamed namespace, or declared in no header."""
+    out = set()
+    for v in layout.sut_state:
+        short = v.name.split("::")[-1]
+        if not re.search(r"\b" + re.escape(short) + r"\b", headers):
+            out.add(v.name)
+    return out
+
+
+def name_problem(code: str, calls: set[str], allowed: set[str]) -> str:
+    """A2-21ai: a guard - helpers of the pipeline that are not written for this SUT, or a SUT variable that only the
+    SUT file sees, used by its name. ``code`` without comments and strings; ``allowed`` may carry HIDDEN_MARK
+    entries."""
+    setters = sorted(a for a in allowed if a.startswith("ut_state_set_"))
+    missing = sorted(c for c in calls if c not in allowed and PIPELINE_HELPER.match(c))
+    if missing:
+        return (f"uses helpers the pipeline does not write for this SUT: {', '.join(missing[:4])}; the state setters "
+                f"that exist: {', '.join(setters[:8]) or 'none'} [A2-21ai]")
+    for entry in sorted(a for a in allowed if a.startswith(HIDDEN_MARK)):
+        name = entry[len(HIDDEN_MARK):]
+        short = name.split("::")[-1]
+        use = re.search(r"(?<![\w.>])(?:\w+::)*" + re.escape(short) + r"\b(?!\s*::)", code)
+        declared = re.search(r"\b[A-Za-z_][\w:<>]*[\s*&]+" + re.escape(short) + r"\s*(?:[=;\[(,{)]|$)", code)
+        if use and not declared:
+            setter = state_setter_name(StateVar(name=name))
+            how = f"set it with {setter}(value)" if setter in allowed else "observe it through the SUT's functions"
+            return f"uses {short}, which only the SUT file sees: {how} [A2-21ai]"
+    return ""
+
+
+def namespace_names(layout: "LayoutProfile", headers: str) -> dict[str, str]:
+    """A2-21ai: C++ functions and types of the SUT declared in a namespace, by their name without it - only names
+    with exactly one such candidate and no global one of the same name."""
+    if layout.language != "cpp":
+        return {}
+    found: dict[str, set[str]] = {}
+    plain: set[str] = set()
+
+    def add(qualified: str) -> None:
+        qualified = qualified.replace("(anonymous namespace)::", "").strip(":")
+        if "::" in qualified:
+            found.setdefault(qualified.rsplit("::", 1)[1], set()).add(qualified)
+        elif qualified:
+            plain.add(qualified)
+    for f in layout.functions:
+        if f.member:
+            add(f.qualified_name.rsplit("::", 1)[0])           # the class
+        elif not f.qualified_name.startswith("operator"):
+            add(f.qualified_name)
+    for d in (layout.dependencies.entries if layout.dependencies else []):
+        if d.kind == "function" and d.qualified_name:
+            add(d.qualified_name)
+    for e in layout.enums:
+        add(e.name)
+    for i in layout.interfaces:
+        add(i.name)
+    stack: list[str | None] = []
+    for m in re.finditer(r"\bnamespace\s+([\w:]+)?\s*\{|\b(?:struct|class|union|enum(?:\s+class|\s+struct)?)\s+"
+                         r"([A-Za-z_]\w*)\s*(?=[{:;])|\{|\}", headers):
+        if m.group(0).startswith("namespace"):
+            stack.append(m.group(1) or "")
+        elif m.group(2):
+            spaces = [s for s in stack if s]
+            if len(spaces) == len([s for s in stack if s is not None]):            # not inside a class body
+                add("::".join(spaces + [m.group(2)]))
+        elif m.group(0) == "{":
+            stack.append(None)
+        elif stack:
+            stack.pop()
+    return {short: next(iter(q)) for short, q in found.items() if len(q) == 1 and short not in plain}
+
+
+def qualify_names(body: str, names: dict[str, str]) -> tuple[str, list[str]]:
+    """A2-21ai: writes C++ SUT names that are used without their namespace with it (a form fix, ARCH-20). Never
+    inside strings, after ::, . or ->, or when the body opens the namespace with a using-directive or declares
+    the name itself. Returns the body and the names fixed."""
+    if not names or re.search(r"\busing\s+namespace\b", body):
+        return body, []
+    fixed: list[str] = []
+    parts, last = [], 0
+    for m in _STRING_LITERAL.finditer(body):
+        parts.append((body[last:m.start()], True))
+        parts.append((m.group(0), False))
+        last = m.end()
+    parts.append((body[last:], True))
+    code = "".join(p for p, is_code in parts if is_code)
+    wanted = {s: q for s, q in names.items() if re.search(r"(?<![\w:.>])" + re.escape(s) + r"\b(?!\s*::)", code)
+              and not re.search(r"\b[A-Za-z_][\w:<>]*[\s*&]+" + re.escape(s) + r"\s*[=;\[,)]", code)}
+    if not wanted:
+        return body, []
+    pattern = re.compile(r"(?<![\w:.>])(" + "|".join(map(re.escape, sorted(wanted, key=len, reverse=True))) +
+                         r")\b(?!\s*::)")
+    out = []
+    for text, is_code in parts:
+        if is_code:
+            text = pattern.sub(lambda m: wanted[m.group(1)], text)
+        out.append(text)
+    fixed = sorted(wanted)
+    return "".join(out), fixed
+
+
 def state_resettable(var: StateVar, cpp: bool) -> bool:
     """A2-21s: C state is restored byte for byte; in C++ only scalars, enumerations, pointers and arrays of them."""
     if not cpp:
         return True
     t = re.sub(r"\b(volatile|const|unsigned|signed|struct|enum)\b", " ", var.type)
-    t = re.sub(r"\[[^\]]*\]", "", t).strip()
+    t = re.sub(r"\bstd::", "", re.sub(r"\[[^\]]*\]", "", t)).strip()      # std::uint32_t is a scalar too
     return t.endswith("*") or bool(re.fullmatch(r"(bool|char|short|int|long|long long|float|double|long double|"
                                                  r"u?int\d+_t|size_t|[A-Za-z_]\w*_t|[A-Z]\w*)\s*", t))
 

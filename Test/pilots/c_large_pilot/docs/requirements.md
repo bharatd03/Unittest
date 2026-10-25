@@ -1,0 +1,108 @@
+# Body control module requirements
+
+- WIP-4: the intermittent wiper interval falls from 4000 ms at standstill to 800 ms at 140 km/h, linearly between the points
+- LGT-6: the headlamp leveling position follows the body pitch from -20 to +20 tenths of a degree, 0 to 100 %
+- SHT-2: the seat heater targets 0, 30.0, 38.0 and 45.0 degrees C for level 0 to 3
+- CLM-1: the fan duty follows the temperature error from 0 to 50.0 degrees C, 0 to 100 %
+- LGT-9: the interior light dims along a perceptual curve
+- LGT-11: the expected bulb current depends on the supply voltage
+- INP-1: a switch input changes its debounced state only after the raw level was stable for the switch's debounce time (10 to 50 ms); a change of the raw level restarts the time
+- PWR-1: the key moves the power mode OFF -> ACC -> RUN; START with the brake pressed cranks the engine
+- PWR-2: cranking ends in RUN when the engine runs, when START is released or after 4000 ms; the time-out sets DTC CRANK_TIMEOUT
+- PWR-3: from RUN, ACC is accepted only with the engine stopped
+- LGT-1: automatic headlamps switch on after 2000 ms below 1000 lux and off after 5000 ms above 3000 lux, only in RUN
+- LGT-2: fast wiping switches the automatic headlamps on at once
+- LGT-3: follow-me-home keeps the low beam on for 30000 ms after RUN ends in AUTO, while the driver door is closed
+- LGT-4: a commanded bulb drawing less than 60 % of its expected current is open, more than 150 % short; an uncommanded bulb drawing more than 50 mA is short
+- TRN-1: hazard or a crash flashes both sides and overrides the lever
+- TRN-2: a tap of the lever flashes three times (comfort flashing)
+- TRN-3: the flash period is 660 ms, 330 ms with a failed bulb
+- WIP-1: the washer runs the wiper at low speed in every mode
+- WIP-2: high speed below 5 km/h runs at low speed
+- WIP-3: an idle wiper away from its park position is driven to it at the park duty
+- WIP-5: in AUTO, heavy rain wipes fast, light rain slowly, a trace of rain at twice the interval
+- LCK-1: a crash unlocks every door at once
+- LCK-2: the doors lock automatically once at 15 km/h with every door closed
+- LCK-3: more than 10 lock or unlock commands within 30 s are refused and set DTC LOCK_OVERUSE
+- LCK-4: the child lock changes only with the rear door open; it keeps the rear inner handle from opening
+- WIN-1 (ASIL B): a closing window reverses when the motor current exceeds 9000 mA (front) or 8000 mA (rear) above the pinch zone of 40 tenths of a percent
+- WIN-2: a reversing window opens for 300 ms or until fully open
+- WIN-3: three pinches set DTC WINDOW_PINCH
+- WIN-4: express mode keeps a window moving after the switch is released
+- SHT-1: a seat heater runs only in RUN with the seat occupied; a request above level 3 switches it off
+- SHT-3: level 3 falls back to level 2 after 600000 ms; any level ends after 3600000 ms
+- SHT-4: above 60.0 degrees C the heater is off and DTC SEAT_OVERTEMP is set
+- BAT-1: with the engine off, the shed level rises to 1, 2 and 3 below 12200, 11800 and 11400 mV
+- BAT-2: a level falls only 300 mV above its threshold; a running engine clears it
+- BAT-3: comfort loads need level 0, heating at most 1, lighting at most 2; safety loads always run
+- INT-1: an open door or the switch lights the interior; it stays on 20000 ms after the last door closed, until locked
+- INT-2: the light fades up by 10 % and down by 5 % per step
+- HRN-1: locking chirps the horn once for 50 ms; the alarm pattern sounds 500 ms on, 500 ms off
+- MIR-1: mirrors unfold above 50 km/h; auto fold folds them when locked and unfolds them when driving off unlocked
+- MIR-2: mirror heating runs at least 600000 ms with the rear defrost, longer while it is 3.0 degrees C or colder outside
+- CAN-1: CRC-8 SAE J1850 (polynomial 0x1D, start 0xFF, final XOR 0xFF) protects every safety message
+- CAN-2: a signal outside its physical range is not encoded
+- CAN-3: bits are numbered LSB first within each byte; a field of 1 to 32 bits must lie within the 8 data bytes
+- CAN-4: a message is valid after a frame with a correct CRC; a wrong CRC or alive counter counts an error, a good frame removes one
+- CAN-5: a message not received for three periods is invalid and sets DTC CAN_TIMEOUT
+- DTC-1: a fault is confirmed after 3 failed reports in a row and healed after 3 passed reports
+- DTC-2: a confirmed DTC that does not fail for 40 operation cycles is no longer confirmed
+- DTC-3: while DTC recording is frozen (diagnostic session), reports are ignored
+- PAR-1: parameters with a wrong version, CRC or a value out of range are replaced by the defaults and written back
+- PAR-2: parameters are written to NVM only in power mode OFF and only when changed
+- PAR-3: the auto-lock speed lies in 5..40 km/h; the follow-me time in whole seconds up to 120 s
+- EVQ-1: an event queue keeps the order of its events; a push to a full queue is refused and counted
+- FOB-1: a key fob frame counts only with a correct CRC, the paired fob ID and a rolling counter ahead of the last by 1..256
+- FOB-2: after 5 rejected counters the receiver ignores frames for 10000 ms
+- DIA-1: the programming session is refused while the vehicle moves
+- DIA-2: a non-default session falls back after 5000 ms without tester present
+- DIA-3: writing a DID needs the extended session and security access; three wrong keys lock security access
+- DIA-4: DID F190 reads 'BCM' and the parameter version; 0101 the auto-lock speed; 0102 the number of confirmed DTCs
+- SCH-1: the scheduler runs the 10 ms tasks for every 10 ms elapsed and the 100 ms tasks on every whole 100 ms
+- SCH-2: a gap above 1000 ms or a clock that went back restarts the schedule; a gap counts an overrun and sets DTC SCHEDULER
+- CLM-2: the compressor stops below 2.0 degrees C outside; a freezing evaporator or a pressure outside 200..3000 kPa stops it for 30000 ms
+- CLM-3: defrost forces fresh air; polluted air (quality above 70) recirculates; recirculation ends after 900000 ms
+- TPM-1: tire pressure is compensated to 20 degrees C; below 180 kPa it is low, below 150 kPa severe; a low warning clears 20 kPa above the limit
+- TPM-2: a wheel sensor not received for 60000 ms is reported lost
+- ALM-1: locking by fob with every door closed arms the alarm after 20000 ms; unlocking disarms it in every state
+- ALM-2: an armed alarm sounds 30000 ms on an open door, intrusion or tilt, at most 10 times per arming
+- ALM-3: the panic button sounds the alarm until pressed again, unlocked or 30000 ms passed
+- GAT-1: the tailgate moves only below 3 km/h; an obstacle or a further request stops it
+- GAT-2: a kick opens the tailgate only with the key nearby; a locked tailgate does not open
+- ROF-1 (ASIL B): a closing sunroof reverses for 400 ms when the motor draws more than 6000 mA above the pinch zone
+- ROF-2: rain or locking closes an open sunroof
+- IMM-1: the engine is released only by the response to the last challenge; each challenge answers once
+- IMM-2: after 3 wrong responses no response is accepted until reset
+- PDC-1: an echo time converts to cm at 343 m/s; distances are capped at 150 cm; 3 invalid echoes report a fault
+- PDC-2: in reverse below 15 km/h the beep interval grows from continuous at 30 cm to 1000 ms at 150 cm
+- SIG-1: daytime running lights are on in RUN with the engine running, the low beam off and the parking brake released
+- SIG-2: emergency braking (above 600 cm/s2 from 50 km/h) flashes the brake lamps at 5 Hz
+- SIG-3: front fog lamps need the low beam and less than 120 km/h; the rear fog lamp needs the low beam
+- ODO-1: the odometer counts whole metres and carries the remaining millimetres; it stops at 999999999 m
+- ODO-2: a pulse length of 0 or above 5000 mm is ignored
+- COL-1 (ASIL B): the steering column never locks while the vehicle moves
+- COL-2: the column unlocks only with the immobilizer released; 3 retries are allowed when the bolt is stuck
+- LIN-1: the rain/light sensor frame (ID 0x23) carries the rain level, the light in units of 4 lux and the enhanced checksum
+- LIN-2: three bad frames in a row clear the rain and light values
+- AMB-1: the ambient light shows one of six colours at 0..100 % brightness, half at night; an alarm shows full red
+- FUL-1: the fuel level follows the sender (10 ohm full, 180 ohm empty, 600 dl); a sender outside 10..230 ohm sets DTC NVM
+- FUL-2: the level is filtered, frozen while sloshing above 300 cm/s2, and taken at once after refuelling at standstill
+- FUL-3: the low-fuel warning comes below 80 dl and goes 20 dl above
+- SMM-1: three seat positions are stored per seat, except in power mode OFF
+- SMM-2: a stored position is recalled only below 3 km/h; a manual switch or an obstacle stops the movement
+- SMM-3: each axis moves at most 8 steps per cycle towards the stored position
+- HBA-1: flashing always lights the high beam; without the assist the lever decides
+- HBA-2: the assist lights the high beam above 40 km/h in the dark after 2000 ms without oncoming or preceding traffic
+- GW-1: the gateway forwards only the frames of its routing table, at most once per minimum gap; diagnostic frames 0x700..0x7FF pass in a diagnostic session
+- GW-2: a frame from an unknown bus is dropped
+- NM-1: a local wake-up or bus activity wakes the module; it prepares to sleep 2000 ms after the last reason to stay awake
+- NM-2: bus activity while preparing to sleep wakes it again; after 1500 ms more it sleeps and stores the parameters
+- SUP-1: three supervision cycles in a row without every expected checkpoint set DTC SCHEDULER and report a failure
+- WSH-1: the washer fluid warning comes after 10000 ms of a low level without sloshing
+- RSR-1: a rear door opened in RUN gives a rear-seat reminder once when the driver door opens in OFF
+- SLD-1 (ASIL B): a moving sliding door stops at a motor current above 7000 mA; a closing door then reopens
+- SLD-2: sliding doors move only at standstill and unlocked; the left door does not open past a quarter with the fuel lid open
+- SLD-3: the child lock disables the inner request of a sliding door
+- WHL-1: the steering wheel heater runs in RUN when heating loads are allowed, for at most 1800000 ms and up to 35.0 degrees C
+- LGT-7: headlamp leveling moves 10 % per step at standstill or in static mode, else 1 %
+- LGT-8: cornering lights work with the low beam below 40 km/h: steering beyond 30 degrees or the indicator; both in reverse

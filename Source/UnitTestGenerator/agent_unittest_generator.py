@@ -772,7 +772,10 @@ def decision_state(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile, mac
     """A2-21z: scalar SUT state the function reads in a decision, with 0, 1 and the constants it is compared with."""
     out = []
     conds = _conditions(body)
+    settable = {v.name for v in uc.settable_state(layout)}             # only variables that get a setter [A2-21z]
     for var in layout.sut_state:
+        if var.name not in settable:
+            continue
         short = var.name.split("::")[-1]
         t = re.sub(r"\b(volatile|const|static)\b", "", var.type).strip()
         if "[" in t or "*" in t or not (INTEGRAL.match(t) or re.fullmatch(r"[A-Za-z_][\w:]*_t", t) or
@@ -792,31 +795,21 @@ def decision_state(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile, mac
 
 
 def state_setter(var: uc.StateVar) -> str:
-    return "ut_state_set_" + _ident(var.name)
+    return uc.state_setter_name(var)
 
 
 def setter_vars(plan: uc.UTPlan) -> list[uc.StateVar]:
-    """State variables that get a setter in the sut_access file [A2-21z]."""
+    """A2-21z: every scalar or enumeration SUT state variable gets a setter in the sut_access file - the list Agent1
+    offers the brain, so a setter the brain was told of always exists."""
     layout = plan.layout
-    root = Path(layout.repo_root)
-    sut = root / layout.sut_file
-    if not layout.sut_state or not sut.is_file():
+    if not layout.sut_state or not (Path(layout.repo_root) / layout.sut_file).is_file():
         return []
-    lines = sut.read_text(encoding="utf-8", errors="replace").splitlines()
-    macros = header_macros(layout)
-    seen: dict[str, uc.StateVar] = {}
-    for fn in layout.functions:
-        for var, _ in decision_state(fn, "\n".join(lines[fn.line_start - 1: fn.line_end]), layout, macros):
-            seen.setdefault(var.name, var)
-    asked = " ".join(x for sc in plan.scenarios for x in sc.setup)     # a setter a checked scenario uses [A1-PL4]
-    for var in layout.sut_state:
-        if var.name not in seen and re.search(r"\b" + re.escape(state_setter(var)) + r"\s*\(", asked):
-            seen[var.name] = var
-    return list(seen.values())
+    return uc.settable_state(layout)
 
 
-def setter_source(var: uc.StateVar) -> str:
-    t = re.sub(r"\b(volatile|const)\b", "", var.type).strip()
+def setter_source(var: uc.StateVar, cpp: bool = False) -> str:
+    """A2-21z: in C++ the variable's own type (decltype): a type its namespace declares need not be visible here."""
+    t = f"decltype({var.name})" if cpp else re.sub(r"\s+", " ", re.sub(r"\b(volatile|const|static)\b", "", var.type)).strip()
     return f"void {state_setter(var)}(long long v) {{ {var.name} = ({t})v; }}"
 
 
@@ -1042,7 +1035,28 @@ def _instantiate_param(p: uc.ParamInfo, mapping: dict[str, str]) -> uc.ParamInfo
 
 
 def static_functions(layout: uc.LayoutProfile) -> list[uc.FunctionInfo]:
-    return [f for f in layout.functions if f.is_static and f.from_frontend]
+    """A2-21k: functions outside any class with internal linkage that are not templates - the ones a wrapper reaches."""
+    lines = _sut_lines(layout)
+    return [f for f in layout.functions if f.is_static and f.from_frontend and not f.member
+            and not _is_template(f, lines)]
+
+
+def _sut_lines(layout: uc.LayoutProfile) -> list[str]:
+    try:
+        return uc.read_source(Path(layout.repo_root) / layout.sut_file).splitlines()
+    except OSError:
+        return []
+
+
+def _is_template(fn: uc.FunctionInfo, lines: list[str]) -> bool:
+    """A2-21k: the function is a template (its declaration, or the line before it, starts with template <...>)."""
+    if re.match(r"\s*template\s*<", fn.signature):
+        return True
+    for k in (fn.line_start - 2, fn.line_start - 1):
+        if 0 <= k < len(lines) and re.match(r"\s*template\s*<", lines[k]) and not lines[k].rstrip().endswith(";"):
+            if k == fn.line_start - 2 or not re.search(r"\(", lines[k].split(">", 1)[-1]):
+                return True
+    return False
 
 
 def wrapper_name(fn: uc.FunctionInfo) -> str:
@@ -1078,7 +1092,7 @@ def render_sut_access(plan: uc.UTPlan) -> tuple[str, str] | None:
         rows.append(uc.sut_reset_source(uc.reset_state(layout), layout.language == "cpp"))
     if setters:                                                       # A2-21z: SUT state set by the tests
         rows += ["/* A2-21z: the tests set SUT state the functions read in their decisions. */",
-                 *[setter_source(v) for v in setters], ""]
+                 *[setter_source(v, layout.language == "cpp") for v in setters], ""]
     if layout.header_sut:                                                                    # A1-DA19
         rows += template_instances(plan)
     return f"{test_dir}/{access_name}", "\n".join(rows)
@@ -1521,13 +1535,16 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
         dims = [sorted(set(small) | set(own[f.name])) if f.kind in ("int", "enum") else [0, 1] if f.kind == "bool"
                 else [float(v) for v in small] if f.kind == "float" else
                 [targets[k][1]] + (["0"] if uc.null_checked(f.name, body) else []) if f.kind == "pointer"
-                else [0] if f.kind == "callback" else ["{0}"] for k, f in enumerate(p.fields)]
-        # C++ forbids narrowing in a brace initializer: integer fields get their own type [A2-21ad]
-        casts = [f"({f.type})" if cpp and f.kind == "int" and f.type else "" for f in p.fields]
+                else [0] if f.kind == "callback" else ["{}" if cpp else "{0}"] for k, f in enumerate(p.fields)]
+        # C++: any other field is value-initialized with {} - a scoped enumeration or a class takes no {0} [A2-21ad]
+        base = p.base or t.rstrip("*& ").strip()
+        # C++ forbids narrowing in a brace initializer: integer fields get their own type, and an enumeration field
+        # (a scoped one takes no integer at all) the type of the field itself, whatever namespace declared it [A2-21ad]
+        casts = [f"({f.type})" if cpp and f.kind == "int" and f.type else
+                 f"static_cast<decltype({base}::{f.name})>" if cpp and f.kind == "enum" else "" for f in p.fields]
         inits = ["{" + ", ".join(casts[k] + (f"({_c_literal(v)})" if casts[k] else _c_literal(v))
                                  for k, v in enumerate(combo)) + "}"
                  for combo in combine(dims, max(6, max(len(d) for d in dims)))]
-        base = p.base or t.rstrip("*& ").strip()
         ref = p.kind == "struct" or p.by_ref
         pre = [x[0] for x in targets if x is not None]
         opts = [([*pre, f"{base} ut_v{i} = {init};"], f"ut_v{i}" if ref else f"&ut_v{i}", []) for init in inits]
@@ -2426,7 +2443,8 @@ class GeneratorAgent(ba.AgentCore):
                 elif self.cfg.mode == "llm" or not _has_auto(sc.function, [n for n, _, _ in auto], layout):
                     llm_scenarios.append(sc)                                          # A2-21o
             if assembled:
-                notes.append(f"{assembled} tests assembled from scenarios the brain planned and Agent1 checked [A2-21m]")
+                notes.append(f"{assembled} tests assembled from checked scenarios - planned by the brain or solved by rule "
+                             "[A2-21m, A1-PL15]")
             if self.cfg.mode in ("deterministic_then_llm", "llm") and (llm_scenarios or rewrite):
                 llm_tests, llm_notes, llm_linked, llm_trial, llm_made, llm_shared = await self._llm_tests(
                     plan, req, names, llm_scenarios, rewrite, existing, allowed)
@@ -2786,7 +2804,7 @@ class GeneratorAgent(ba.AgentCore):
                 check = self._grounding(allowed, names - set(to_rewrite),
                                         set(to_rewrite), fn.name, dropped, {n: existing[n]["source"] for n in to_rewrite},
                                         trial=tried, shared_ok=bool(part_brains), void_names=void_functions(layout),
-                                        fixed=forms)
+                                        fixed=forms, qualify=uc.namespace_names(layout, self._headers_text(layout)))
                 try:
                     result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
                                                  project=layout.repo_root, check=check,
@@ -2951,6 +2969,7 @@ class GeneratorAgent(ba.AgentCore):
         allowed |= {wrapper_name(f) for f in static_functions(plan.layout)}
         allowed |= set(re.findall(r"\b(ut_cb_\w+)\b", "\n".join(callback_helpers(plan.layout))))
         allowed |= {state_setter(v) for v in setter_vars(plan)}                                   # A2-21z
+        allowed |= {uc.HIDDEN_MARK + n for n in uc.hidden_state(plan.layout, headers)}             # A2-21ai
         return allowed
 
     @staticmethod
@@ -2960,6 +2979,9 @@ class GeneratorAgent(ba.AgentCore):
             return "forbidden construct in the body"
         calls = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", code_only(body))} - {
             "if", "for", "while", "switch", "return", "sizeof", "catch"}
+        named = uc.name_problem(code_only(body), calls, allowed)                     # a guard [A2-21ai, NC-6]
+        if named:
+            return named
         unknown = sorted(c for c in calls if c not in allowed)
         if unknown:
             return f"calls functions that do not exist here: {', '.join(unknown[:5])} [A2-20]"
@@ -2981,7 +3003,8 @@ class GeneratorAgent(ba.AgentCore):
     def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None,
                    function: str = "", dropped: list[str] | None = None, old_sources: dict[str, str] | None = None,
                    trial: dict[str, str] | None = None, shared_ok: bool = False,
-                   void_names: set[str] | None = None, fixed: list[str] | None = None):
+                   void_names: set[str] | None = None, fixed: list[str] | None = None,
+                   qualify: dict[str, str] | None = None):
         """The check of one LLM answer, test by test [A2-21t]: names are repaired (A2-21q), a test whose body
         fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left. With
         ``trial``, a test refused only by a prediction is kept and named there: the tool decides (NC-6, NC-7).
@@ -3003,6 +3026,12 @@ class GeneratorAgent(ba.AgentCore):
                     if fixed is not None:
                         fixed.append(f"{t.name}: form fixed: {', '.join(changed[:3])} returns nothing, so it is "
                                      "called as a statement [ARCH-20, A2-21ah]")
+                body, named = uc.qualify_names(t.body, qualify or {})                           # A2-21ai
+                if named:
+                    t = t.model_copy(update={"body": body})
+                    if fixed is not None:
+                        fixed.append(f"{t.name}: form fixed: {', '.join(named[:3])} written with its namespace "
+                                     "[ARCH-20, A2-21ai]")
                 helpers = set(re.findall(r"\b(ut_\w+)\s*\(", parsed.shared)) if shared_ok else set()
                 problem = cls._body_problem(t.body, allowed | setup_names([t.body]) | helpers)
                 if problem and trial is not None and uc.check_kind(problem) == "prediction" and \

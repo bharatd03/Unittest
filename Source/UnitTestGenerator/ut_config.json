@@ -3,7 +3,7 @@
     "engine": {"mode": "auto", "brain_order": ["opus", "fable", "sonnet", "haiku", "qwen_remote", "qwen"]},
     "qwen_remote": {"base_url": "https://llm.openroute-ai.com/v1", "model": "qwen3-8b", "api_key_env": "QWEN_REMOTE_API_KEY",
                     "max_concurrency": 2, "stream": true, "stream_idle": 90, "shared_slots": true,
-                    "gateway_retries": 3, "gateway_pause": 15},
+                    "gateway_retries": 3, "gateway_pause": 15, "slot_wait": 1800},
     "qwen": {"model": "qwen3:8b", "adaptive": true, "windows": [4096, 8192, 12288, 16384], "max_num_predict": 8192,
              "generate_num_ctx": 16384, "generate_num_predict": 4096, "generate_timeout": 900, "max_concurrency": 1},
     "anthropic": {"models": {"opus": "claude-opus-5-5", "fable": "claude-fable-5-1", "sonnet": "claude-sonnet-5-5",
@@ -78,6 +78,7 @@
                 "rule_attempts": 2, "max_brain_values": 12},
   "compilation": {
     "tools_manifest": "tools/toolchain.json",
+    "parallel_runs": 4,
     "required_metrics": ["LC", "SC", "BC", "DC", "MCDC"],
     "work_dir": "ut_work",
     "max_mutants": 50,
