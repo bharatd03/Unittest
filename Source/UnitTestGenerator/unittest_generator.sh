@@ -165,8 +165,24 @@ case "$ACTION" in
   pilot-deps) pilot c_deps_pilot src/ctrl.c src/brake_ctrl.c src/steer_assist.c "$@" ;;
   pilot-embedded) pilot c_embedded_pilot src/gpio_driver.c src/scheduler.c src/critical.c src/main_loop.c "$@" ;;
   pilot-embedded-cpp) pilot cpp_embedded_pilot src/motor_ctrl.cpp src/counter.cpp src/app_main.cpp include/ring_buffer.hpp "$@" ;;
-  pilot-large) pilot c_large_pilot src/body_ctrl.c "$@" && pilot cpp_large_pilot src/powertrain.cpp "$@" ;;
-  pilot-realrepo) pilot c_realrepo_pilot kernel/src/klist.c kernel/src/kqueue.c codec/ring.c drivers/crc_drv.c "$@" && pilot cpp_realrepo_pilot src/dispatcher.cpp "$@" ;;
+  pilot-large|pilot-realrepo)
+    # two pilot folders in one command, so one viewer page from the first file to the last [VIEW-12a]
+    mkdir -p "$HERE/ut_output/pilots"
+    if [ "$ACTION" = pilot-large ]; then
+      names=(c_large_pilot cpp_large_pilot)
+      suts=(--sut c_large_pilot=src/body_ctrl.c --sut cpp_large_pilot=src/powertrain.cpp)
+    else
+      names=(c_realrepo_pilot cpp_realrepo_pilot)
+      suts=(--sut c_realrepo_pilot=kernel/src/klist.c --sut c_realrepo_pilot=kernel/src/kqueue.c
+            --sut c_realrepo_pilot=codec/ring.c --sut c_realrepo_pilot=drivers/crc_drv.c
+            --sut cpp_realrepo_pilot=src/dispatcher.cpp)
+    fi
+    repos=()
+    for name in "${names[@]}"; do
+      repo="$HERE/ut_output/pilots/$name"; rm -rf "$repo"; cp -r "$PILOTS/$name" "$repo"; repos+=(--repo "$repo")
+    done
+    "$PY" ut_pipeline.py batch "${repos[@]}" "${suts[@]}" --config ut_config.json "$@"
+    exit $? ;;
   pilot-all)
     # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named;
     # one command for all of them, so one viewer page from the first file to the last [VIEW-12a]

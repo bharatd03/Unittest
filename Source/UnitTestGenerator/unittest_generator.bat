@@ -310,19 +310,26 @@ set "PILOT=cpp_embedded_pilot"
 set "SUTS=--sut src\motor_ctrl.cpp --sut src\counter.cpp --sut src\app_main.cpp --sut include\ring_buffer.hpp"
 goto pilot
 :pilot_realrepo
-rem  The C pilot, then the C++ pilot of the same patterns (NEXT_PILOT).
-set "PILOT=c_realrepo_pilot"
-set "SUTS=--sut kernel\src\klist.c --sut kernel\src\kqueue.c --sut codec\ring.c --sut drivers\crc_drv.c"
-set "NEXT_PILOT=cpp_realrepo_pilot"
-set "NEXT_SUTS=--sut src\dispatcher.cpp"
-goto pilot
+rem  The C pilot, then the C++ pilot of the same patterns: one command, one viewer page [VIEW-12a].
+set "PAIR=c_realrepo_pilot cpp_realrepo_pilot"
+set "PAIR_SUTS=--sut c_realrepo_pilot=kernel/src/klist.c --sut c_realrepo_pilot=kernel/src/kqueue.c --sut c_realrepo_pilot=codec/ring.c --sut c_realrepo_pilot=drivers/crc_drv.c --sut cpp_realrepo_pilot=src/dispatcher.cpp"
+goto pilot_pair
 
 :pilot_large
-rem  TP-25: one C file and one C++ file of about 5000 lines each, one after the other (NEXT_PILOT).
-set "PILOT=c_large_pilot"
-set "SUTS=--sut src\body_ctrl.c"
-set "NEXT_PILOT=cpp_large_pilot"
-set "NEXT_SUTS=--sut src\powertrain.cpp"
+rem  TP-25: one C file and one C++ file of about 5000 lines each: one command, one viewer page [VIEW-12a].
+set "PAIR=c_large_pilot cpp_large_pilot"
+set "PAIR_SUTS=--sut c_large_pilot=src/body_ctrl.c --sut cpp_large_pilot=src/powertrain.cpp"
+:pilot_pair
+set "UT_HOME=%~dp0"
+if not exist "%~dp0ut_output\pilots" mkdir "%~dp0ut_output\pilots"
+set "REPOS="
+for %%P in (%PAIR%) do call :pilot_copy "%%P"
+echo.
+echo Running the pipeline on %PAIR%, one viewer page for both - this can take a while ...
+"%PY%" ut_pipeline.py batch %REPOS% %PAIR_SUTS% --config ut_config.json %EXTRA%
+set "UT_EXIT=%errorlevel%"
+goto end
+
 :pilot
 rem  The pipeline writes the generated tests into the repository, so it runs on a fresh copy.
 set "REPO=%~dp0ut_output\pilots\%PILOT%"
@@ -332,11 +339,7 @@ echo.
 echo Running the pipeline on %REPO% - this can take several minutes ...
 "%PY%" ut_pipeline.py run --repo "%REPO%" %SUTS% --config ut_config.json %EXTRA%
 set "UT_EXIT=%errorlevel%"
-if not defined NEXT_PILOT goto end
-set "PILOT=%NEXT_PILOT%"
-set "NEXT_PILOT="
-set "SUTS=%NEXT_SUTS%"
-goto pilot
+goto end
 
 :pilot_all
 rem  Every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT of the embedded C++

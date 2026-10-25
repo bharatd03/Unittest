@@ -286,6 +286,44 @@ def function_name(header: str) -> str:
     return name
 
 
+def _declared_in(short: str, namespace: str, rel: str, root: Path) -> bool:
+    """A1-PL14: the header declares ``short`` inside ``namespace`` (hal::pwm in namespace hal { ... })."""
+    try:
+        text = strip_comments((root / rel).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return False
+    for m in re.finditer(r"\bnamespace\s+" + re.escape(namespace.split("::")[-1]) + r"\s*\{", text):
+        depth, k = 1, m.end()
+        while k < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[k], 0)
+            k += 1
+        if re.search(r"\b" + re.escape(short) + r"\s*\(", text[m.end():k]):
+            return True
+    return False
+
+
+STD_TYPES = {"size_t", "ptrdiff_t", "intptr_t", "uintptr_t", "nullptr_t", "FILE", "va_list", "string", "string_view",
+             "vector", "array", "map", "unordered_map", "function", "unique_ptr", "shared_ptr", "optional", "pair"}
+
+
+def unknown_types(types: list[str], texts: list[str]) -> list[str]:
+    """A1-PL14: the type names of a proposed declaration that neither the language, the standard library nor the
+    repository declares - a guard against an invented type (hal::pwm_channel_t)."""
+    code = "\n".join(texts)
+    out = []
+    for t in types:
+        for m in re.finditer(r"((?:[A-Za-z_]\w*::)*)([A-Za-z_]\w*)", re.sub(r"\s*::\s*", "::", t)):
+            ns, name = m.group(1), m.group(2)
+            if ns.startswith("std::") or name in TYPE_WORDS or name in TYPE_QUALIFIERS or name in STD_TYPES or \
+                    re.fullmatch(r"u?int(?:_least|_fast)?\d+_t|u?intmax_t", name) or name in out:
+                continue
+            if not re.search(r"\b(?:typedef\b[^;]*\b" + re.escape(name) + r"\s*;|using\s+" + re.escape(name) +
+                             r"\s*=|(?:struct|class|union|enum(?:\s+class|\s+struct)?)\s+" + re.escape(name) +
+                             r"\b|#\s*define\s+" + re.escape(name) + r"\b)", code):
+                out.append(ns + name)
+    return out
+
+
 def find_declarations(text: str) -> dict[str, str]:
     """Function declarations (prototypes) in a header: name -> declaration text."""
     return dict(_declarations(text))
@@ -317,8 +355,9 @@ def parse_declaration(decl: str) -> tuple[str, list[list[str]]]:
     decl = re.sub(r"^extern\s+", "", decl.strip().rstrip(";"))
     decl = re.sub(r"\s*(?:noexcept|__attribute__\s*\(\(.*\)\))\s*$", "", decl)           # trailing attributes
     head, params = decl[: decl.index("(")], decl[decl.index("(") + 1: decl.rindex(")")]
-    name = re.search(r"([A-Za-z_]\w*)\s*$", head).group(1)
-    return_type = head[: head.rindex(name)].strip()
+    # the name with its namespaces (hal::pwm): the qualifier is not part of the return type [A1-PL14]
+    qualified = re.search(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$", head)
+    return_type = head[: qualified.start()].strip()
     out = []
     if params.strip() not in ("", "void"):
         for index, p in enumerate(_split_top(params)):
@@ -333,7 +372,7 @@ def parse_declaration(decl: str) -> tuple[str, list[list[str]]]:
             m = re.search(r"([A-Za-z_]\w*)\s*(\[[^\]]*\])?$", p)
             before = p[: m.start(1)] if m else ""
             # a name follows a complete type: a type word that is not only a qualifier, or * or &
-            named = m is not None and m.group(1) not in TYPE_WORDS and (
+            named = m is not None and m.group(1) not in TYPE_WORDS and not before.rstrip().endswith("::") and (
                 re.search(r"[*&]", before) or set(re.findall(r"[A-Za-z_]\w*", before)) - TYPE_QUALIFIERS)
             if named:
                 ptype = (before + (m.group(2) and "*" or "")).strip()
@@ -3928,24 +3967,31 @@ class AnalyzerAgent(ba.AgentCore):
             list[uc.Dependency], list[str]]:
         """A1-PL14: a declaration from the dependency plan or the headers; the brain only when none exists."""
         root = Path(layout.repo_root)
-        known = {d.name: d for d in (layout.dependencies.entries if layout.dependencies else [])}
+        entries = layout.dependencies.entries if layout.dependencies else []
+        known = {d.name: d for d in entries} | {d.qualified_name: d for d in entries if d.qualified_name}
         header_decls: dict[str, tuple[str, str]] = {}
+        header_texts = []
         for rel in self._all_headers(root):
-            for name, decl in find_declarations((root / rel).read_text(encoding="utf-8", errors="replace")).items():
+            text = (root / rel).read_text(encoding="utf-8", errors="replace")
+            header_texts.append(text)
+            for name, decl in find_declarations(text).items():
                 header_decls.setdefault(name, (decl, rel))
         sut_lines = (root / layout.sut_file).read_text(encoding="utf-8", errors="replace").splitlines()
         out, open_items = [], []
         for sym in symbols:
-            dep = known.get(sym)
+            dep = known.get(sym) or known.get(sym.split("(")[0].strip())
             if dep is not None and (dep.declaration or dep.return_type or dep.kind == "variable"):
                 out.append(dep.model_copy(update={"decision": "stub", "decided_by": "rule", "reason":
                            f"declared in {dep.header or 'a header outside the repository'} but not linked: stubbed "
                            "[A1-PL14]"}))
                 continue
-            if sym in header_decls:
-                decl, rel = header_decls[sym]
+            short = sym.split("::")[-1]
+            if sym in header_decls or (short != sym and short in header_decls and
+                                       _declared_in(short, sym.rsplit("::", 1)[0], header_decls[short][1], root)):
+                decl, rel = header_decls[sym if sym in header_decls else short]
                 rt, params = parse_declaration(decl)
-                out.append(uc.Dependency(name=sym, declaration=decl, header=rel, decision="stub", decided_by="rule",
+                out.append(uc.Dependency(name=short, qualified_name=sym if short != sym else "", declaration=decl,
+                                         header=rel, decision="stub", decided_by="rule",
                                          reason="declared in a header, not linked: stubbed [A1-PL14]",
                                          return_type=rt, params=params))
                 continue
@@ -3963,10 +4009,15 @@ class AnalyzerAgent(ba.AgentCore):
                 if re.match(r"^(static|inline|#|typedef)", decl) or "{" in decl:
                     raise ValueError("not a plain declaration")
                 if "(" in decl:
-                    if function_name(decl) != sym:
+                    if function_name(decl) not in (sym, short):
                         raise ValueError("not a declaration of " + sym)
                     rt, params = parse_declaration(decl + ";")
+                    unknown = unknown_types([rt] + [p[0] for p in params], header_texts + ["\n".join(sut_lines)])
+                    if unknown:                                     # a guard: the brain invented a type [A1-PL14]
+                        raise ValueError("uses types the repository does not declare: " + ", ".join(unknown[:4]))
                     fields = {"return_type": rt, "params": params}
+                    if short != sym:
+                        fields["qualified_name"] = sym
                 else:
                     m = re.fullmatch(r"(?:extern\s+)?(.+?)\s*\b" + re.escape(sym) + r"\s*((?:\[[^\]]*\])*)", decl)
                     if not m or not m.group(1).strip():
@@ -3978,7 +4029,8 @@ class AnalyzerAgent(ba.AgentCore):
                                   f"({getattr(exc, 'code', '') or str(exc)[:80]})")
                 continue
             who = f"brain declaration ({self.last_brain.get('brain', '')})"
-            out.append(uc.Dependency(name=sym, declaration=decl + ";", decision="stub", decided_by=who,
+            out.append(uc.Dependency(name=short if "(" in decl else sym, declaration=decl + ";", decision="stub",
+                                     decided_by=who,
                                      reason="no declaration in the repository: proposed by the brain from its uses "
                                             "and confirmed only by Agent3's build [A1-PL14]", **fields))
         return out, open_items
@@ -4022,7 +4074,7 @@ class AnalyzerAgent(ba.AgentCore):
         # Stage A: build/setup failures first [A1-22]
         if last is not None and (not last.link_ok or last.decision == "setup_blocked"):
             repairs, open_items = [], []
-            stubbed = {s.function for s in stubs}
+            stubbed = {s.function for s in stubs} | {s.qualified_name for s in stubs if s.qualified_name}   # A1-PL14
             for f in last.failures:
                 if f.kind in ("compile", "link") and f.symbol in stubbed and f.classification == "stub_defect":
                     continue                       # a planned stub resolves it [A1-22b]

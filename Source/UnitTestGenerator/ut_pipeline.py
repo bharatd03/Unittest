@@ -1461,8 +1461,10 @@ class Orchestrator:
             s.test_items.update(obs.test_items)                            # what each test reached [A1-PL7]
             if bundle.observations:          # the probes may all have been in tests that did not compile [A3-CL12]
                 known = {n: items for n, items in s.test_items.items() if n in set(bundle.tests)}   # A3-OBS5
+                crashed = {t.name: f"{t.status}: {t.message}"[:200] for t in obs.tests          # A2-21f
+                           if t.status in ("crashed", "timeout")}
                 bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
-                    bundle=bundle, observed=obs.observed, test_items=known), uc.FileActionBundle)
+                    bundle=bundle, observed=obs.observed, test_items=known, crashed=crashed), uc.FileActionBundle)
                 self.check_bundle(bundle)
         return await self._oracle_checks(s, bundle)
 

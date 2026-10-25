@@ -760,7 +760,9 @@ def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None =
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         return -9, out + "\nUT_TIMEOUT"
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 206:             # A3-60a: not a missing tool
+            return -126, f"{Path(cmd[0]).name}: the command line is too long for Windows ({len(subprocess.list2cmdline(cmd))} characters)"
         return -127, f"tool not found: {cmd[0]}"
     except OSError as exc:
         return -126, f"{cmd[0]}: {exc}"
@@ -3606,7 +3608,14 @@ class CompilationAgent(ba.AgentCore):
             raise ba.AgentFault("MEASUREMENT_FAILED", "No coverage profile was written [A3-60].")
         merged = run_dir / "merged.profdata"
         env = chain.env()
-        code, text = _run([chain.profdata, "merge", "-sparse", *map(str, raws), "-o", str(merged)], run_dir, 120, env)
+        # A3-60a: the profiles through a list file - one per test run alone (A3-45c) would exceed the length of a
+        # Windows command line (32,767 characters), which Windows reports as a program not found
+        listing = run_dir / "profraw_files.txt"
+        # relative to the run folder (the working directory): a comma in a path would read as a weight
+        listing.write_text("\n".join(os.path.relpath(r, run_dir).replace("\\", "/") for r in raws) + "\n",
+                           encoding="utf-8")
+        code, text = _run([chain.profdata, "merge", "-sparse", f"--input-files={listing}", "-o", str(merged)], run_dir,
+                          max(120.0, 0.05 * len(raws)), env)
         if code != 0:
             raise ba.AgentFault("MEASUREMENT_FAILED", "llvm-profdata failed: " + text.strip()[-200:])
         # No source filter on export: with a sut_access file the SUT is reached through #include,

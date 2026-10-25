@@ -42,7 +42,7 @@ public:
         if (other.raw_ == 0) {
             return from_raw(raw_ >= 0 ? std::numeric_limits<std::int32_t>::max() : std::numeric_limits<std::int32_t>::min());
         }
-        return from_raw(static_cast<std::int32_t>((static_cast<std::int64_t>(raw_) << Frac) / other.raw_));
+        return from_raw(static_cast<std::int32_t>((static_cast<std::int64_t>(raw_) * (std::int64_t{1} << Frac)) / other.raw_));
     }
     constexpr bool operator<(Fixed other) const { return raw_ < other.raw_; }
     constexpr bool operator>(Fixed other) const { return raw_ > other.raw_; }

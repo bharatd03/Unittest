@@ -1513,6 +1513,29 @@ def _options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[int], la
              [rename.sub(lambda m: f"ut_{tag}{m.group(1)}{i}", x) for x in o]) for s_, a, o in opts]
 
 
+POINTEE_ELEMENTS = 256        # A2-21h: what a pointer to a scalar points to - an index of one byte stays inside
+VOID_BUFFER_BYTES = 64        # A2-21h: what an untyped pointer points to
+
+
+def buffer_length(fn: uc.FunctionInfo, p: uc.ParamInfo, body: str) -> int | None:
+    """A2-21h: an integer parameter that bounds the elements read or written through a pointer parameter (a loop
+    over buf[i] while i < len, a memcpy of len bytes): the size of what the test's pointer points to, else None."""
+    ptrs = [q for q in fn.params if q.kind in ("ptr_scalar", "ptr_void", "buffer") and q.name and not q.by_ref]
+    if not ptrs or not p.name:
+        return None
+    name = re.escape(p.name)
+    bounds = re.search(r"\bfor\s*\([^;]*;[^;]*\b" + name + r"\b|\bwhile\s*\([^)]*\b" + name + r"\b|"
+                       r"\bmem(?:cpy|set|cmp|move)\s*\([^;]*\b" + name + r"\b", body)
+    if not bounds:
+        return None
+    used = [q for q in ptrs if re.search(r"\b" + re.escape(q.name) + r"\s*(?:\[|\+\+|\+=|\+\s*\w)|"
+                                         r"\*\s*" + re.escape(q.name) + r"\s*\+\+|\bmem(?:cpy|set|cmp|move)\s*\([^;]*\b"
+                                         + re.escape(q.name) + r"\b", body)]
+    if not used:
+        return None
+    return min(VOID_BUFFER_BYTES if q.kind == "ptr_void" else POINTEE_ELEMENTS for q in used)
+
+
 def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[int], layout: uc.LayoutProfile,
                    body: str = "", macros: dict[str, str] | None = None):
     cpp = layout.language == "cpp"
@@ -1522,9 +1545,12 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
     if p.kind == "int":
         cast = "" if t in ("int", "long", "long long") else f"({t})"
         wide = [v for v in width_values(p) if v not in values]                             # A3-HW4
-        return [([], f"{cast}{v}" if v >= 0 or not cast else f"{cast}({v})", []) for v in values + wide]
+        size = buffer_length(fn, p, body)              # a length of the test's buffer stays inside it [A2-21h]
+        chosen = values + wide if size is None else sorted({v for v in values + [0, 1, size] if 0 <= v <= size})
+        return [([], f"{cast}{v}" if v >= 0 or not cast else f"{cast}({v})", []) for v in chosen]
     if p.kind == "ptr_void":                                          # A2-21h: a zeroed buffer of 64 bytes
-        return [([f"unsigned char ut_b{i}[64] = {{0}};"], f"ut_b{i}", [])] + ([([], null, [])] if p.nullable else [])
+        return [([f"unsigned char ut_b{i}[{VOID_BUFFER_BYTES}] = {{0}};"], f"ut_b{i}", [])] + \
+            ([([], null, [])] if p.nullable else [])
     if p.kind == "interface":                                                                  # A2-21aa
         opts = _fake_options(p, i, layout, values)
         return (opts + ([([], null, [])] if p.nullable and not p.by_ref else [])) if opts else None
@@ -1538,9 +1564,12 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
         base = p.base or "int"
         cast = "" if base in ("int", "long", "long long", "double", "float") else f"({base})"
         observe = "UT_OBSERVE_INT" if not FLOATING.match(base) else "UT_OBSERVE_DBL"
-        opts = [([f"{base} ut_v{i} = {cast}{v};"], f"ut_v{i}" if p.by_ref else f"&ut_v{i}",
-                 [] if "const" in p.type.split("*")[0] or p.by_ref and "const" in p.type else
-                 [f'{observe}("@_o{i}", ut_v{i});']) for v in small]
+        if p.by_ref:
+            opts = [([f"{base} ut_v{i} = {cast}{v};"], f"ut_v{i}",
+                     [] if "const" in p.type else [f'{observe}("@_o{i}", ut_v{i});']) for v in small]
+        else:              # A2-21h: a pointer may be read or written beyond its first element (a buffer, a bit field)
+            opts = [([f"{base} ut_v{i}[{POINTEE_ELEMENTS}] = {{{cast}{v}}};"], f"ut_v{i}",
+                     [] if "const" in p.type.split("*")[0] else [f'{observe}("@_o{i}", ut_v{i}[0]);']) for v in small]
         return opts + ([([], null, [])] if p.nullable and not p.by_ref else [])
     if p.kind == "cstring":
         return [([], s, []) for s in ('""', '"a"', '"ABCDEFGHIJKLMNOPQRSTUVWXYZ"')] + \
@@ -1964,14 +1993,15 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
     call = f"{target}({', '.join(given[n] for n in names)})"
     full = return_of(fn)
     ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", full or "void").strip()
+    can_throw = sc.characterization and throws(body, layout)   # an observed exception, not a failure [A3-45e]
     if not sc.characterization and sc.expected_return:
         lines.append(_assert_return(fn, call, sc.expected_return))
     elif ret == "void" or not ret:
-        lines.append(f"{call};")
+        lines.append(_guard_throw(f"{call};", name, can_throw))
     else:
         observe = _observer(full, layout)
-        lines.append(_observe_call(observe, f"{name}_r", _enum_value(full, layout, call)) if observe is not None
-                     else f"{call};")
+        lines.append(_guard_throw(_observe_call(observe, f"{name}_r", _enum_value(full, layout, call)), f"{name}_r",
+                                  can_throw) if observe is not None else _guard_throw(f"{call};", name, can_throw))
     if not sc.characterization:
         lines += [_assert_value(c.expr, c.value) for c in sc.expected_after]
     return "\n".join(lines)
@@ -2345,7 +2375,7 @@ class GeneratorAgent(ba.AgentCore):
                 raise ba.ContractRejected("the bundle has no observation probes to finalize [A2-21f]")
 
         async def finalize(payload: uc.FinalizeRequest, request, scratch):
-            return finalize_bundle(payload.bundle, payload.observed, payload.test_items)
+            return finalize_bundle(payload.bundle, payload.observed, payload.test_items, payload.crashed)
 
         return [ba.ContractTool("generate", uc.GenerationRequest, uc.FileActionBundle, generate, pre, post,
                                 description="Stubs, test suite and test cases for Agent1's plan."),
@@ -3163,7 +3193,8 @@ def drop_tests(bundle: uc.FileActionBundle, names: list[str]) -> uc.FileActionBu
 
 
 def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
-                    test_items: dict[str, list[str]] | None = None) -> uc.FileActionBundle:
+                    test_items: dict[str, list[str]] | None = None,
+                    crashed: dict[str, str] | None = None) -> uc.FileActionBundle:
     """UT_OBSERVE_*("id", expr) -> a characterization assertion with the observed value [A2-21c].
     With per-test coverage from Agent3, new characterization tests that add nothing are dropped."""
     observed = dict(observed)
@@ -3228,11 +3259,12 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
     for name in set(out.new_tests) & set(out.characterization_tests):
         src = sources.get(name, "")
         ids = re.findall(r"/\* not observed: test did not reach this point \*/", src)
-        if ids and not re.search(r"\bUT_EXPECT", src):
-            unreached.append(name)
+        if (ids and not re.search(r"\bUT_EXPECT", src)) or name in (crashed or {}):
+            unreached.append(name)         # a test that crashed in the observe run crashes the next build too
     if unreached:
         calls = [m.group(1).strip() for n in sorted(unreached)
-                 for m in [re.search(r"\(void\)\((.*)\);\s*/\* not observed", sources[n])] if m]
+                 for m in [re.search(r"\(void\)\((.*)\);\s*/\* not observed", sources[n]) or
+                           re.search(r"UT_EXPECT_\w+\(\s*\(?((?:[\w:]+)\s*\(.*?\))", sources[n])] if m]
         out.crashed_calls = list(dict.fromkeys(out.crashed_calls + calls))[:40]           # facts for the brain [A2-21f]
         out = uc.without_tests(out, sorted(unreached), f"{len(unreached)} characterization test(s) left out: the "
                                "function crashed or did not return before any observation (input that crashes the SUT, "

@@ -1302,6 +1302,7 @@ class FinalizeRequest(Contract):
     bundle: FileActionBundle
     observed: dict[str, str]
     test_items: dict[str, list[str]] = Field(default_factory=dict)
+    crashed: dict[str, str] = Field(default_factory=dict)   # tests that crashed or hung in the observe run [A2-21f]
 
 
 # ============================================================================ Agent3 requests

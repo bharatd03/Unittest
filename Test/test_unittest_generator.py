@@ -3213,6 +3213,26 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertIsNotNone(a1.stub_spec(by["hal_write"]))
 
 
+    def test_a_declaration_in_a_namespace(self):                                            # A1-PL14
+        """The linker names hal::pwm: the header's declaration inside namespace hal is the stub, no brain; a brain's
+        declaration with a type nobody declares is refused; the namespace is never part of the return type."""
+        self.assertEqual(a1.parse_declaration("std::uint16_t hal::pwm(hal::pwm_channel_t, std::uint16_t);"),
+                         ("std::uint16_t", [["hal::pwm_channel_t", "arg0"], ["std::uint16_t", "arg1"]]))
+        self.assertEqual(a1.unknown_types(["std::uint16_t", "hal::pwm_channel_t", "const Foo &"],
+                                          ["typedef struct Foo_s Foo;", "namespace hal { void pwm(int); }"]),
+                         ["hal::pwm_channel_t"])
+        (self.repo / "include/hal.hpp").write_text("#include <cstdint>\nnamespace hal {\n"
+                                                   "void pwm(std::uint8_t channel, std::uint16_t duty);\n}\n")
+        (self.repo / "src/fan.cpp").write_text('#include "hal.hpp"\nint fan(int d)\n{\n    hal::pwm(1, d);\n'
+                                              "    hal::led(d);\n    return d;\n}\n")
+        layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/fan.cpp"))
+        with brain(UTBrain(declarations={"hal::led": "std::uint16_t hal::led(hal::led_t, std::uint16_t);"})):
+            deps, items = run(self.agent._missing_declarations(layout, ["hal::pwm", "hal::led"]))
+        self.assertEqual([(d.name, d.qualified_name, d.decided_by, d.return_type) for d in deps],
+                         [("pwm", "hal::pwm", "rule", "void")])
+        self.assertTrue(any("hal::led" in i and "hal::led_t" in i for i in items), items)
+
+
 class BrainGenerationTests(unittest.TestCase):
     """A2-21g sequences, A2-21m assembly, A2-21n..q."""
     def setUp(self):
@@ -5014,6 +5034,51 @@ class LargeFileRoundTests(unittest.TestCase):
         self.assertEqual(agent._this_round(work, req), [])                  # the last rounds take every function
         self.assertEqual(agent._this_round(work[:30], req.model_copy(update={"iterations_left": 9})), [])
 
+    def test_a_rule_test_that_crashed_is_left_out(self):                                    # A2-21f
+        suite = ("/* evidence: E8 */\nUT_TEST(test_f_auto_1)\n{\n    UT_OBSERVE_INT(\"o1\", f(1));\n}\n"
+                 "/* evidence: E8 */\nUT_TEST(test_f_auto_2)\n{\n    UT_OBSERVE_INT(\"o2\", f(2));\n}\n"
+                 "UT_SUITE_BEGIN\n    UT_CASE(test_f_auto_1)\n    UT_CASE(test_f_auto_2)\nUT_SUITE_END\n")
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(path="t/test_a.c", action="create",
+                                                                           role="testsuite", content=suite)],
+                                     tests=["test_f_auto_1", "test_f_auto_2"], new_tests=["test_f_auto_1", "test_f_auto_2"],
+                                     characterization_tests=["test_f_auto_1", "test_f_auto_2"], observations=["o1", "o2"])
+        out = a2.finalize_bundle(bundle, {"o1": "3", "o2": "4"}, {}, {"test_f_auto_2": "crashed: access violation"})
+        self.assertEqual(out.tests, ["test_f_auto_1"])                    # observed, but it crashed: left out
+        self.assertEqual(out.crashed_calls, ["f(2)"])
+
+    def test_a_pointer_to_a_scalar_points_to_an_array(self):                                # A2-21h
+        fn = uc.FunctionInfo(name="set_bits", qualified_name="set_bits", signature="", file="a.c", line_start=1,
+                             line_end=3, from_frontend=True)
+        p = uc.ParamInfo(name="data", type="uint8_t *", kind="ptr_scalar", base="uint8_t")
+        layout = uc.LayoutProfile(repo_root=".", sut_file="a.c", language="c", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64)
+        opts = a2._param_options(fn, 0, p, [0, 5], layout)
+        self.assertEqual(opts[1], ([f"uint8_t ut_v0[{a2.POINTEE_ELEMENTS}] = {{(uint8_t)5}};"], "ut_v0",
+                                   ['UT_OBSERVE_INT("@_o0", ut_v0[0]);']))
+        ref = a2._param_options(fn, 0, p.model_copy(update={"by_ref": True, "type": "std::uint8_t &"}), [5],
+                                layout.model_copy(update={"language": "cpp"}))
+        self.assertEqual(ref[0][1], "ut_v0")                                # a reference stays one variable
+        self.assertIn("uint8_t ut_v0 = (uint8_t)5;", ref[0][0])
+
+    def test_profiles_are_merged_through_a_list_file(self):                                 # A3-60a
+        source = (SRC / "agent_unittest_compilation.py").read_text(encoding="utf-8")
+        self.assertIn('"--input-files={listing}"', source)
+        err = FileNotFoundError(2, "The filename or extension is too long")
+        err.winerror = 206
+        with mock.patch.object(a3.subprocess, "run", side_effect=err), mock.patch.object(a3.os, "name", "nt"):
+            code, text = a3._run(["llvm-profdata.exe", "merge", "x" * 10], Path("."), 5)
+        self.assertEqual(code, -126)
+        self.assertIn("command line is too long", text)                   # never "tool not found"
+
+    def test_two_pilot_folders_are_one_command(self):                                       # VIEW-12a
+        bat = (SRC / "unittest_generator.bat").read_text(encoding="utf-8")
+        sh = (SRC / "unittest_generator.sh").read_text(encoding="utf-8")
+        self.assertNotIn("NEXT_PILOT", bat)
+        self.assertIn('ut_pipeline.py batch %REPOS% %PAIR_SUTS%', bat)
+        self.assertIn("--sut c_large_pilot=src/body_ctrl.c --sut cpp_large_pilot=src/powertrain.cpp", bat)
+        self.assertIn('ut_pipeline.py batch "${repos[@]}" "${suts[@]}"', sh)
+        self.assertNotIn("pilot c_large_pilot", sh)
+
     def test_the_rule_round_is_no_attempt(self):                                            # A1-PL1, LA-5
         plan = uc.UTPlan(plan_id="p", stage="coverage", rules_only=True, layout=uc.LayoutProfile(
             repo_root=".", sut_file="a.c", language="c", component_root=".", writable_test_dir="t",
@@ -5051,6 +5116,47 @@ class LargePilotFindingsTests(unittest.TestCase):
         self.assertTrue(any(v.name == "pt::g_last" for v in layout.sut_state), layout.sut_state)
         pwm = next(d for d in layout.dependencies.entries if d.name == "pwm")
         self.assertEqual(pwm.decision, "stub", pwm.reason)                         # no definition is never "linked"
+
+    @unittest.skipIf(os.name == "nt", "the sanitizers of TP-26 run on Linux")
+    def test_rule_tests_pass_the_sanitizers(self):                             # TP-26, A2-21h, A2-21f, A3-45e
+        """Forms where a rule test wrote or read past its data on Windows: a pointer written at an index, a loop over
+        a buffer bounded by a length parameter, a C++ function that throws for a solved argument."""
+        tmp = tmpdir()
+        self.addCleanup(tmp.cleanup)
+        san = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+        for name, sut, text in (
+                ("c", "src/bits.c",
+                 "#include <stdint.h>\n#include <stddef.h>\n"
+                 "int set_bits(uint8_t *data, uint8_t start, uint8_t length)\n{\n"
+                 "    if (data == NULL || length > 32u || start + length > 64u) {\n        return 0;\n    }\n"
+                 "    for (uint8_t i = 0u; i < length; i++) {\n        uint8_t bit = (uint8_t)(start + i);\n"
+                 "        data[bit / 8u] = (uint8_t)(data[bit / 8u] | (1u << (bit % 8u)));\n    }\n    return 1;\n}\n"
+                 "uint32_t sum(const uint32_t buf[], uint32_t len)\n{\n    uint32_t s = 0u;\n"
+                 "    for (uint32_t i = 0u; i < len; i++) {\n        s += buf[i];\n    }\n    return s;\n}\n"),
+                ("cpp", "src/lim.cpp",
+                 "#include <stdexcept>\nint limit(int v)\n{\n    if (v > 1000 || v < -1000) {\n"
+                 "        throw std::invalid_argument(\"out of range\");\n    }\n    return v * 2;\n}\n")):
+            with self.subTest(name):
+                root = Path(tmp.name) / name
+                (root / "src").mkdir(parents=True)
+                (root / sut).write_text(text)
+                agent = a1.AnalyzerAgent()
+                layout = agent.discover(uc.DiscoverRequest(repo_root=str(root), sut_file=sut))
+                comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(root / "w"), extra_flags=san))
+                link = a3.Toolchain.link_flags
+                with mock.patch.object(a3.Toolchain, "link_flags", lambda self, cpp: link(self, cpp) + san), \
+                        mock.patch.dict(os.environ, {"ASAN_OPTIONS": "detect_leaks=0"}):
+                    layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
+                        uc.CaptureRequest(layout=layout)))))
+                    last = comp.execute(uc.VerifyRequest(layout=layout, stage="probe"))
+                    plan = run(agent.plan(uc.PlanRequest(layout=layout, last=last, iteration=1)))
+                    gen = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic"))
+                    with mock.patch.object(gen, "_brain_values", return_value={}):
+                        bundle = run(gen.generate_bundle(uc.GenerationRequest(plan=plan)))
+                    result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
+                self.assertTrue(result.link_ok, result.reason)
+                self.assertGreater(len(result.tests), 3)
+                self.assertEqual([(t.name, t.message[:200]) for t in result.tests if t.status != "passed"], [])
 
     def test_several_namespaces_in_one_file(self):            # A2-21z, A2-21ai, A2-21aj, A2-21k, A1-PL1
         """The same names in several namespaces (functions, statics, state, enums, stubs): the files build, the rule
