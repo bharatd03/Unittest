@@ -2326,8 +2326,13 @@ class RunawayAnswerTests(unittest.IsolatedAsyncioTestCase):
                                                                {"title": "a", "lines": [1, 2, 3, 4, 5, 6, 7]},
                                                                {"title": "b", "lines": []}, {"title": "c", "lines": []}]},
                               fixes)
-        self.assertEqual([(s["title"], len(s["lines"])) for s in raw["steps"]], [("a", 5), ("b", 0)])
-        self.assertEqual(len(fixes), 3, fixes)                     # the long title, the long list, the extra step
+        self.assertEqual([(s["title"], len(s["lines"])) for s in raw["steps"]], [("t" * 40, 0), ("a", 5)])
+        self.assertEqual(len(fixes), 3, fixes)                 # the short title cut, the long list, the extra steps
+        code = {"type": "object", "properties": {"tests": {"type": "array", "items": {"type": "object", "properties": {
+            "body": {"type": "string", "maxLength": 600}}}}}}
+        fixes = []
+        kept = ba.apply_bounds(code, {"tests": [{"body": "x;" * 400}, {"body": "y;"}]}, fixes)["tests"]
+        self.assertEqual((kept, len(fixes)), ([{"body": "y;"}], 1))                   # code over its bound: dropped
         plan = ba.model_validator_for(GenPlan, schema)({"name": "p", "steps": [{"title": "a"}] * 3})
         self.assertEqual(len(plan.steps), 2)                                            # never refused as a whole
         choice = {"type": "object", "properties": {"ids": {"type": "array", "maxItems": 9,
@@ -2364,6 +2369,32 @@ class RunawayAnswerTests(unittest.IsolatedAsyncioTestCase):
                                                            plans=plans)
         self.assertEqual((len(FakeOpenAI.chat_bodies()), plans[-1].requests), (2, 2))   # one item: once more room
         self.assertEqual(FakeOpenAI.chat_bodies()[1]["max_tokens"], 2 * FakeOpenAI.chat_bodies()[0]["max_tokens"])
+
+    def test_a_call_keeps_room_for_one_reask(self):                                       # ARCH-13
+        parts = [ba.ContextPart("facts", "f" * 3000), ba.ContextPart("headers", "h" * 7000, priority=1, min_chars=500)]
+        plain, room = ba.TokenPlan(), ba.TokenPlan()
+        ba.plan_context(parts, fixed_chars=0, messages=2, output_tokens=300, windows=[4096], ratio=3.0, plan=plain)
+        ba.plan_context(parts, fixed_chars=0, messages=2, output_tokens=300, windows=[4096], ratio=3.0, plan=room,
+                        reserve=ba.REASK_TOKENS + 300)
+        self.assertEqual((plain.shortened, room.shortened), ([], ["headers"]))
+
+    async def test_a_reask_that_does_not_fit_is_sent_without_the_refused_answer(self):   # ARCH-13
+        refused = json.dumps({"name": "p1", "steps": [{"title": "t" * 60, "lines": [1]}] * 40})   # too long titles
+        FakeOpenAI.replies = [refused, json.dumps(PLAN_REPLY)]
+        router = ba.BrainRouter([self.engine(windows=[4096], max_num_predict=2048, stream=False)])
+        with self.assertLogs("baseagent", "WARNING"):
+            result, _, _ = await router.generate("Plan it.", "c" * 9600, {}, ba.model_validator_for(GenPlan), need=200)
+        self.assertEqual(result["output"].name, "p1")
+        first, second = FakeOpenAI.chat_bodies()
+        self.assertEqual([m["role"] for m in second["messages"]], [m["role"] for m in first["messages"]])
+        self.assertIn("YOUR PREVIOUS ANSWER WAS REFUSED", second["messages"][-1]["content"])
+        self.assertNotIn(refused[:200], json.dumps(second["messages"]))
+        FakeOpenAI.reset()
+        FakeOpenAI.replies = [refused]
+        with self.assertLogs("baseagent", "WARNING"), self.assertRaises(ba.AgentFault) as ctx:
+            await ba.BrainRouter([self.engine(windows=[4096], max_num_predict=2048, stream=False)]).generate(
+                "Plan it.", "c" * 11000, {}, ba.model_validator_for(GenPlan), need=200)
+        self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")          # refused, never a context fault
 
     async def test_generated_work_uses_the_makers_sampling(self):                        # BP-12
         await self.engine().generate("Plan it.", "facts", {"type": "object"}, lambda raw: raw)

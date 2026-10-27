@@ -2250,8 +2250,8 @@ class PlannedScenario(BaseModel):
     ARCH-20d); Agent1 expands them to the open items (gap_ids) before its checks."""
     targets: list[str] = Field(default_factory=list, description="ids from TARGETS this scenario reaches, one to three")
     gap_ids: list[str] = Field(default_factory=list, description="ids from OPEN GAPS that this scenario closes")
-    name: str = Field(description="test name test_<what>_<behaviour>")
-    purpose: str = Field(description="one line: what the test checks")
+    name: str = Field(description="test name test_<what>_<behaviour>", json_schema_extra={"maxLength": 63})
+    purpose: str = Field(description="one line: what the test checks", json_schema_extra={"maxLength": 160})
     args: list[PlannedValue] = Field(description="one entry per parameter, by parameter name")
     setup: list[str] = Field(description="C statements before the call: declare and fill local variables only")
     stubs: list[PlannedStub]
@@ -2261,8 +2261,10 @@ class PlannedScenario(BaseModel):
     evidence_ids: list[str]
     quotes: list[PlannedQuote]
     classification: Literal["confirmed_gap", "characterization_gap", "conflicting_evidence", "insufficient_evidence"]
-    conflict: str = Field(description="conflicting_evidence only: which evidence ids contradict each other, how")
-    information_sought: str = Field(description="insufficient_evidence only: what to look up, a few words")
+    conflict: str = Field(description="conflicting_evidence only, else empty: which evidence ids contradict each "
+                          "other, how", json_schema_extra={"maxLength": 300})                      # ARCH-20c
+    information_sought: str = Field(description="insufficient_evidence only, else empty: what to look up, a few words",
+                                    json_schema_extra={"maxLength": 160})
     calls_before: list[str] = Field(default_factory=list, description=(
         "only when the task asks for a CALL SEQUENCE: the earlier calls of the function (or of other functions of "
         "the SUT), in order, each one C statement such as f(1); - they build up the state before the call"))
@@ -2348,6 +2350,8 @@ PLAN_TASK = (
     "characterization_gap when no evidence states the result: leave expected_return empty, the result is observed. "
     "conflicting_evidence when evidence items contradict each other (say which in conflict). "
     "insufficient_evidence when you need more evidence (say what in information_sought).\n"
+    "- Keep every text short: purpose one line; information_sought and conflict stay \"\" unless the classification "
+    "is insufficient_evidence or conflicting_evidence. Write no explanation outside the fields.\n"
     "- Never guess an expected value.\n"
     "Example of one scenario in this form (for a function int f(int a, int b) with a target T1):\n"
     '{{"targets": ["T1"], "name": "test_f_negative_b", "purpose": "b below 0 returns the error", '

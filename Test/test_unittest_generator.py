@@ -4828,6 +4828,16 @@ class TargetsAndFamiliesTests(unittest.TestCase):
         item = schema["properties"]["scenarios"]["items"]["properties"]
         self.assertEqual((item["targets"]["items"]["enum"], item["targets"]["maxItems"]), (["T1", "T2"], 3))
         self.assertNotIn("gap_ids", item)                                                   # never enumerated
+        self.assertEqual([item[k]["maxLength"] for k in ("name", "purpose", "information_sought", "conflict")],
+                         [63, 160, 160, 300])                                         # short texts [A1-PL3, ARCH-20c]
+        rambling = planned(targets=["T1"], name="test_door_fl_receive_valid", purpose="a valid frame",
+                           information_sought="The result will be observed during testing. " * 20)
+        bounded = ba.bound_schema(schema, 2)
+        fixes = []
+        kept = ba.apply_bounds(bounded, {"scenarios": [rambling]}, fixes)["scenarios"]
+        self.assertEqual(len(kept), 1)                                                    # cut, not dropped
+        self.assertEqual(len(kept[0]["information_sought"]), 160 - 1)                   # cut, the trailing blank too
+        self.assertIn("cut to 160", fixes[0])
 
     def test_a_cut_planning_answer_is_split_up(self):                                   # ARCH-19b
         class Cut(UTBrain):

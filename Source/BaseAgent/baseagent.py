@@ -1405,6 +1405,7 @@ def llm_schema(schema: dict[str, Any]) -> dict[str, Any]:
 _CALL_ITEMS: contextvars.ContextVar[int] = contextvars.ContextVar("baseagent_call_items", default=0)
 _ANSWER_FIXES: contextvars.ContextVar[list | None] = contextvars.ContextVar("baseagent_answer_fixes", default=None)
 RUNAWAY_BLOCK = 64                    # characters of a block that repeats three times in a row [ARCH-19a]
+SHORT_TEXT = 500                      # a text bounded to at most this is cut to its bound, a longer one drops its item
 
 
 def runaway_reason(text: str, limit_chars: int = 0) -> str:
@@ -1481,6 +1482,9 @@ def apply_bounds(schema: dict[str, Any], raw: Any, fixes: list[str] | None = Non
         if isinstance(value, dict) and isinstance(node.get("properties"), dict):
             return {k: walk(node["properties"].get(k, {}), v, f"{where}.{k}" if where else k) for k, v in value.items()}
         if isinstance(value, str) and isinstance(node.get("maxLength"), int) and len(value) > node["maxLength"]:
+            if node["maxLength"] <= SHORT_TEXT:                    # a name or a note: cut, the item stays
+                fixes.append(f"{where}: {len(value)} characters cut to {node['maxLength']} [ARCH-20c]")
+                return value[:node["maxLength"]].rstrip()
             raise _TooLong(f"{where}: {len(value)} characters, at most {node['maxLength']}")
         return value
 
@@ -1632,6 +1636,7 @@ def generate_prompt(task: str, context: str) -> str:
 # answer limit, and the plan is returned with the contract's result (meta.token_plans).
 SHORTENED_MARK = "\n[... shortened to fit the context window]"
 MESSAGE_OVERHEAD_TOKENS = 16          # chat-template tokens per message (role markers etc.)
+REASK_TOKENS = 300                    # room kept for the reasons of one re-ask (ARCH-20, ARCH-13)
 UNLIMITED_WINDOW = 1 << 30            # brains without limits (injected test doubles, demo)
 MIN_SHORTENED_CHARS = 200             # a remnant shorter than this is left out instead
 
@@ -1732,13 +1737,14 @@ def _shorten(text: str, length: int, min_chars: int) -> str:
 
 
 def plan_context(parts: list[ContextPart], *, fixed_chars: int, messages: int, output_tokens: int,
-                 windows: list[int], ratio: float, plan: TokenPlan | None = None) -> str:
+                 windows: list[int], ratio: float, plan: TokenPlan | None = None, reserve: int = 0) -> str:
     """Fit ``parts`` and the answer into the smallest window (ARCH-13, ARCH-14).
 
     Parts are given up in order of priority, highest number first (within a priority the
     largest first): shortened as far as needed but not below their minimum, otherwise left out.
     Required parts (priority 0) are never touched: if they do not fit, CONTEXT_BUDGET_EXCEEDED.
-    Returns the context text; the plan (if given) gets the window, estimate and part names."""
+    Returns the context text; the plan (if given) gets the window, estimate and part names. ``reserve``: room kept
+    for one re-ask - the refused answer and the reasons (ARCH-13)."""
     def estimate(items: list[ContextPart]) -> int:
         chars = fixed_chars + sum(len(item.text) + 2 for item in items)
         return math.ceil(chars / ratio) + MESSAGE_OVERHEAD_TOKENS * messages
@@ -1747,7 +1753,7 @@ def plan_context(parts: list[ContextPart], *, fixed_chars: int, messages: int, o
     current: list[ContextPart | None] = [replace(part) for part in parts]
     shortened, dropped = [], []
     for index in sorted(range(len(parts)), key=lambda i: (-parts[i].priority, -len(parts[i].text), -i)):
-        excess = estimate([p for p in current if p is not None]) + output_tokens - largest
+        excess = estimate([p for p in current if p is not None]) + output_tokens + reserve - largest
         part = current[index]
         if excess <= 0 or part is None or part.priority <= 0:
             break
@@ -2488,13 +2494,26 @@ class QwenEngine:
                         raise
                     attempt += 1
                     content = reply["message"].get("content")
-                    messages = messages[:2] + [
-                        {"role": "assistant", "content": content if isinstance(content, str) else ""},
-                        {"role": "user", "content": reask(reply, exc)}]
-                    if plan is None:
-                        self._check_budget(messages, window, out)
-                    else:
-                        window = self._window(messages, windows, out, ratio, at_least=window)
+                    again = reask(reply, exc)
+                    asked = messages[:2]
+                    for form in (asked + [{"role": "assistant", "content": content if isinstance(content, str) else ""},
+                                          {"role": "user", "content": again}],
+                                 # ARCH-13: without the refused answer - its reasons are in the re-ask
+                                 asked[:1] + [{"role": "user", "content": asked[1]["content"] + "\n\nYOUR PREVIOUS "
+                                               "ANSWER WAS REFUSED. " + again}]):
+                        try:
+                            if plan is None:
+                                self._check_budget(form, window, out)
+                            else:
+                                window = self._window(form, windows, out, ratio, at_least=window)
+                        except AgentFault as budget:
+                            if budget.code != "CONTEXT_BUDGET_EXCEEDED":
+                                raise
+                            continue
+                        messages = form
+                        break
+                    else:                    # no re-ask fits: the answer stays refused, not a context fault
+                        raise exc
                     continue
                 self.usage = usage
                 return result, dict(usage)
@@ -2946,8 +2965,15 @@ class BrainRouter:
         plan.adaptive = need is not None and bool(getattr(settings, "adaptive", False))
         plan.items, plan.need_tokens = _CALL_ITEMS.get(), need or 0
         plan.runaway_chars = int(need * ratio * self.runaway_factor) if need else 0        # ARCH-19a
-        return plan_context(parts, fixed_chars=fixed_chars, messages=2, output_tokens=out, windows=windows,
-                            ratio=ratio, plan=plan)
+        reserve = REASK_TOKENS if kind == "generate" and getattr(settings, "output_retries", 1) else 0
+        try:                                       # ARCH-13: room for one re-ask, given up only for required parts
+            return plan_context(parts, fixed_chars=fixed_chars, messages=2, output_tokens=out, windows=windows,
+                                ratio=ratio, plan=plan, reserve=reserve)
+        except AgentFault:
+            if not reserve:
+                raise
+            return plan_context(parts, fixed_chars=fixed_chars, messages=2, output_tokens=out, windows=windows,
+                                ratio=ratio, plan=plan)
 
     def _observe(self, plan: TokenPlan, result: Any) -> None:
         usage = result.get("usage") if isinstance(result, dict) else None
