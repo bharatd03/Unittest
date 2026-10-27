@@ -100,6 +100,16 @@ measurement. Items the pipeline itself could not handle - with every answer kind
 listed first in the report and collected across runs in `ut_output/pipeline_findings.jsonl`; send that file with a
 report when a new kind of code ends incomplete.
 
+Answers of every brain stay bounded, whatever the model and its settings: the brain names short targets (T1, T2, ...)
+instead of copying lists of line items, every list and text of an answer has a maximum, a streamed answer that repeats
+itself or runs past its planned length is stopped within seconds, and a cut answer keeps its complete scenarios while
+the rest is asked for in smaller requests - never the same request again with more room (ARCH-19a, ARCH-19b, ARCH-20c,
+ARCH-20d). Near-identical functions (one per door, one per message) are planned once and the scenarios carried over
+to the others (A1-PL17). Qwen3 is asked with the sampling its maker recommends (BP-12; `generate_temperature`, `top_p`,
+`top_k` in `ut_config.json`), but nothing depends on it. The cut or stopped answers are in `brain_answers.jsonl` with
+their start, end and why they ended; the live page counts every request sent to a brain, shows the items still open
+next to the tests passed, and estimates the time left from the functions the brain has still to plan.
+
 A stub file of your own (in a `stubs` folder, for example `stubs/hal_stub.c`) is reused for the functions it defines.
 Its other functions and globals - such as `sim_set_echo_us()` or `sim_reset()` declared in `stubs/hal_stub.h` - are the
 controls the tests use to set what the stubbed functions return: the rule-made tests call them with the values of the

@@ -60,6 +60,17 @@ The agent flow is drawn in [ORCHESTRATION.md](../../../Docs/ORCHESTRATION.md).
 14. Files run in parallel (ORC-23, `max_parallel_suts`): a run never writes a shared file without a lock or an
     atomic append, never passes a per-run setting through the process environment, and names its generated files
     per SUT file (A2-21af).
+15. Every item a run leaves open has a cause the developer can act on (LA-3a, LA-6), never only "undetermined":
+    - a dependency the tests cannot drive is a cause of the pipeline: every stub, reused or generated, offers
+      controls the tests and the brain use, and the test build and the fuzz build link the same stubs
+      (A1-DA7a, A2-21ak, A3-FZ13);
+    - a proof that a condition can never take a value is first checked as a defect candidate (A1-37f) before it
+      becomes "change the source"; coverage is never recalculated around a candidate (COV-1);
+    - items that share one cause are reported once, with the cause, not item by item.
+16. Answers nearly in the schema's shape are repaired once, in BaseAgent, for every agent and brain (ARCH-20b):
+    a single value where a list is expected, a list checked item by item, a re-ask that names what was given. An
+    agent adds a `mode="before"` validator only for a form of its own (A1-PL3). Never refuse a whole answer for
+    one bad item.
 
 ## Before you finish
 
@@ -68,6 +79,9 @@ The agent flow is drawn in [ORCHESTRATION.md](../../../Docs/ORCHESTRATION.md).
   release `test-full` (every test, in parallel; TP-16, TP-20). Mark a test that runs a whole pipeline
   with `@full_run`, and never let a test reach a real brain (TP-21).
 - Pilots: `pilot-c`, `pilot-cpp`, `pilot-deps`; benchmark: `benchmark` (no false fix, ORC-16).
+- After a pilot run with a real brain, compare the report header with the run before: "Open items" (per status
+  and cause), "Defect candidates" and "Brain planning" (accepted, fixed, refused). More refused answers or more
+  undetermined items is a regression even when the coverage is the same (LA-3a).
 - The construct corpus (`Test/constructs`): its correct answers pass every check (`test`), and every
   case runs in `test-full` on Windows and Linux (NC-4, NC-9, NC-13).
 - For delivery changes: a run with a repository link (the RepositoryTests use a local bare repository).

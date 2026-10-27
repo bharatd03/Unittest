@@ -1,5 +1,34 @@
 # BaseAgent changes
 
+## 2026-10-27 (afternoon): answers that cannot run away (from the pilot-large run)
+
+**Why.** In the pilot-large run, 14 of 34 planning answers of Qwen3 were cut at their token limit: answers of about
+1,200 tokens ran past 1,794 and, asked again unchanged with twice the room, past 3,588 - about 24 of 38 minutes of
+brain time. The answers enumerated long lists of item IDs, the schema had no maximum for any list, and greedy
+decoding (temperature 0, fixed seed) repeated the same runaway when asked again.
+
+* **`bound_schema`, `apply_bounds`, `strip_bounds`** (ARCH-20c): every list and text of an answer's schema gets a
+  maximum (`engine.answer_list_max` 40, `engine.answer_text_max` 8,000 characters); the top-level list gets the number
+  of items the task asks for when the agent says so (`OutputNeed.asked`). `model_validator_for(model, schema)` holds an
+  answer to the bounds for every brain: lists cut, duplicate choices dropped, an item with a text over its bound
+  dropped; never a refusal of the whole answer. The fixes are logged (`fixed`). A remote server that refuses the
+  bounds gets the same schema without them (`json_schema_plain`) before `json_object`.
+* **`runaway_reason`** and a watchdog on every streamed answer (ARCH-19a): the remote Qwen's stream and Claude's
+  `text_stream` are stopped when the answer passes its planned length times `engine.runaway_factor` (1.5) or a block
+  of at least 64 characters repeats three times in a row. A cut answer that was not streamed is judged the same way.
+* **No unchanged re-ask** (ARCH-19b): a cut or stopped answer keeps its complete items; the rest is the agent's to ask
+  for in smaller requests. Only a call planned for one item, cut without a sign of a runaway, is asked once more
+  with twice the room. `last_brain` tells the agent whether its answer was salvaged and why it ended.
+* **Accounting** (VIEW-5): `TokenPlan.requests`, `ended`, `items`, `need_tokens`, `runaway_chars`; a failed request's
+  tokens are counted; `brain_answer` events carry `requests` and the tokens of every plan of the call; the live page
+  counts every request ("answered x of y sent").
+* **Log** (ARCH-20): a cut or stopped answer goes to `brain_answers.jsonl` with its first and last 400 characters, the
+  tokens used out of its limit and why it ended.
+* **Decoding** (BP-12): `generate_temperature` 0.7, `top_p` 0.8, `top_k` 20, `think_temperature` 0.6, `think_top_p`
+  0.95, `presence_penalty` 0 for generated work of Qwen (remote and Ollama); typed decisions keep `temperature` 0.
+* **Viewer**: a metric's `note` is shown under its value (brain calls answered of sent, items still open, brain
+  planning k of n).
+
 ## 2026-10-27: answers that are nearly in shape (from the USS pilot run)
 
 **Why.** In the USS pilot, 26 of 36 planning answers of Qwen3 were refused as a whole because each quote was a text

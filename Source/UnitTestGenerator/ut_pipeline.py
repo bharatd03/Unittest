@@ -56,6 +56,7 @@ import difflib
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import shutil
@@ -503,6 +504,8 @@ class Orchestrator:
         result.findings_overall = uc.record_findings(uc.findings_path(self.config_path, self.cfg.output_dir),
                                                      result.findings)                                  # NC-5
         delivered = self._deliver(state, result)
+        if getattr(self, "progress", None) is not None:                    # VIEW-11: no longer running
+            self.progress.update(req.sut_file, fraction=1.0, left=0.0)
         if self.hub is not None:
             self.hub.emit("run_end", summary=f"{req.sut_file}: {delivered.final_state}", data={
                 "state": delivered.final_state, "reason": delivered.reason, "seconds": round(time.monotonic() - started),
@@ -743,6 +746,7 @@ class Orchestrator:
         next_brain_asked = False
         budget = asyncio.timeout(None)          # set when every target is met [ORC-32]
         pending: asyncio.Task | None = None     # the search running while the brain plans [ORC-5a]
+        ticker = asyncio.create_task(self._tick(s)) if self.hub is not None else None          # VIEW-11
         try:
             async with budget:
                 for iteration in range(1, s.iter_limit + 1):
@@ -761,6 +765,9 @@ class Orchestrator:
                         return await self._stop(s, f"safety ceiling of the file reached: "
                                                    f"{(s.deadline - s.started) / 60:.0f} min{waited} [LA-7]", last)
                     s.quarantine = {}
+                    began, brain_before = time.monotonic(), getattr(self, "brain_seconds", 0.0)             # VIEW-11
+                    s.round_functions = [fc.name for fc in (last.coverage.functions if last.coverage else [])
+                                         if any(g.gap_id not in s.final_items for g in fc.gaps)]
                     asked_third = set(s.other_model_items)
                     s.open_now = {g.gap_id for fc in (last.coverage.functions if last.coverage else []) for g in fc.gaps}
                     widest = max([self.cfg.journal_tokens] + [p.journal_tokens for p in self.book.profiles.values()])
@@ -911,6 +918,7 @@ class Orchestrator:
                         last_good = result
                     last = result
                     self._metrics(s, result)
+                    self._estimate(s, result, plan, iteration, began, brain_before)              # VIEW-11
                     self._progress(s, result, iteration)                                         # VIEW-11
                     complete = result.verified and result.decision == "complete"
                     if complete and not self._open(result):
@@ -953,6 +961,38 @@ class Orchestrator:
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
+            if ticker is not None:
+                ticker.cancel()
+
+    async def _tick(self, s: "RunState") -> None:
+        """VIEW-11: the progress line refreshed at least once a minute, also during a long brain step."""
+        while True:
+            await asyncio.sleep(60)
+            if self.hub is not None and getattr(self, "progress", None) is not None:
+                line = self.progress.line(s.req.sut_file)
+                self.hub.emit("progress", data={"text": line}, summary=line)
+
+    def _estimate(self, s: "RunState", result: uc.VerificationResult, plan: uc.UTPlan, iteration: int,
+                  began: float, brain_before: float) -> None:
+        """VIEW-11: the time left of this file from the work left - the functions with open items, times the measured
+        brain time per function of this run, plus the measured builds and measurements per round."""
+        if getattr(self, "progress", None) is None or result.coverage is None:
+            return
+        open_fns = [fc.name for fc in result.coverage.functions if any(g.gap_id not in s.final_items for g in fc.gaps)]
+        spent = getattr(self, "brain_seconds", 0.0) - brain_before
+        handled = 0 if plan.rules_only else max(0, len(s.round_functions) - len(plan.deferred))
+        if handled and spent > 0:
+            s.brain_fn_seconds += spent
+            s.brain_fn_count += handled
+            s.round_size = max(s.round_size, handled)
+        s.build_seconds = max(0.0, time.monotonic() - began - spent)
+        if not s.brain_fn_count:
+            self.progress.update(s.req.sut_file, iteration=iteration)
+            return
+        rounds = min(max(0, s.iter_limit - iteration), math.ceil(len(open_fns) / max(1, s.round_size)))
+        functions = min(len(open_fns), rounds * max(1, s.round_size))
+        left = functions * s.brain_fn_seconds / s.brain_fn_count + rounds * s.build_seconds
+        self.progress.update(s.req.sut_file, iteration=iteration, left=left)
 
     # ---------------------------------------------------------------- CA-4: verified tests of a SUT file
     def _verified_store(self, s: "RunState") -> tuple["uc.RunCache | None", str]:
@@ -1901,8 +1941,9 @@ class Orchestrator:
         covered = sum(getattr(metrics, n).covered for n in METRIC_IDS)
         open_items = {g.gap_id for fc in result.coverage.functions for g in fc.gaps}
         fraction = (covered + len(open_items & s.final_items)) / total if total else 0.0
-        progress = getattr(self, "progress", None) or Progress(1)
-        line = progress.line(fraction, iteration)
+        if getattr(self, "progress", None) is None:
+            self.progress = Progress(1)
+        line = self.progress.line(s.req.sut_file, fraction, iteration)
         if self.hub is not None:
             self.hub.emit("progress", data={"text": line, "percent": round(fraction * 100)}, summary=line)
         else:
@@ -1928,7 +1969,10 @@ class Orchestrator:
                 failed = final and not uc.target_met(value.percent, s.targets.get(name, "100"))
                 self.hub.emit("metric", data={"id": mid, "value": value.percent, "total": value.total, "goal": target,
                                               "strict": strict, "failed": failed, "per": rows})
-        self.hub.emit("metric", data={"id": "tests_passed", "value": result.passed, "total": result.total})
+        open_items = sum(1 for fc in (result.coverage.functions if result.coverage else []) for g in fc.gaps
+                         if g.gap_id not in s.final_items)                                            # VIEW-5
+        self.hub.emit("metric", data={"id": "tests_passed", "value": result.passed, "total": result.total,
+                                      "open": open_items, "note": f"{open_items} items open" if open_items else ""})
 
     async def _dependencies(self, s: "RunState", last: uc.VerificationResult | None) -> None:
         """Agent1's dependency analysis with the recorded flags [A1-DA1]; again with Agent3's results
@@ -2452,20 +2496,43 @@ SCENARIO_ID = re.compile(r"\bS-[A-Za-z0-9_.\-]*[A-Za-z0-9_]")
 
 
 class Progress:
-    """VIEW-11: the share of a run's work that is done, over all SUT files of the run, and the time left."""
+    """VIEW-11: the share of a run's work that is done, over all SUT files of the run, and the time left - estimated
+    from the work left (the functions the brain has still to plan, times the measured time per function, plus the
+    builds per round), never from the share of items covered."""
 
     def __init__(self, files: int = 1):
         self.files, self.done, self.started = max(1, files), 0, time.monotonic()
+        self.state: dict[str, dict[str, Any]] = {}       # per SUT file: fraction, iteration, estimate, its start
 
-    def line(self, fraction: float, iteration: int) -> str:
-        overall = min(1.0, (self.done + max(0.0, min(1.0, fraction))) / self.files)
-        elapsed = time.monotonic() - self.started
-        text = f"{overall * 100:.0f} % - file {min(self.done + 1, self.files)} of {self.files} - iteration {iteration}"
-        if 0.03 < overall < 1.0 and elapsed > 20:
-            left = elapsed / overall - elapsed
-            lo, hi = max(1, round(left * 0.7 / 60)), max(1, round(left * 1.4 / 60))
-            text += f" - about {lo}-{hi} min left" if hi > lo else f" - about {lo} min left"
-        return text
+    def update(self, key: str, *, fraction: float | None = None, iteration: int | None = None,
+               left: float | None = None) -> None:
+        now = time.monotonic()
+        st = self.state.setdefault(key, {"fraction": 0.0, "iteration": 0, "left": None, "at": now, "start": now})
+        if fraction is not None:
+            st["fraction"] = max(0.0, min(1.0, fraction))
+        if iteration is not None:
+            st["iteration"] = iteration
+        if left is not None:
+            st["left"], st["at"] = max(0.0, left), now
+
+    def line(self, key: str = "", fraction: float | None = None, iteration: int | None = None) -> str:
+        self.update(key, fraction=fraction, iteration=iteration)
+        st, now = self.state[key], time.monotonic()
+        running = [s for k, s in self.state.items() if s.get("fraction", 0.0) < 1.0] or [st]
+        overall = min(1.0, (self.done + sum(s["fraction"] for s in running)) / self.files)
+        text = (f"{overall * 100:.0f} % - file {min(self.done + 1, self.files)} of {self.files} - "
+                f"iteration {st['iteration']}")
+        if overall >= 1.0:
+            return text
+        lefts = [s["left"] - (now - s["at"]) for s in running if s["left"] is not None]
+        if not lefts:
+            return text + " - estimating the time left"
+        current = max(0.0, max(lefts))
+        per_file = (now - self.started) / self.done if self.done else (now - st["start"]) + current
+        waiting = max(0, self.files - self.done - len(running))
+        left = current + waiting * per_file / max(1, len(running))
+        lo, hi = max(1, round(left * 0.7 / 60)), max(1, round(left * 1.4 / 60))
+        return text + (f" - about {lo}-{hi} min left" if hi > lo else f" - about {lo} min left")
 
 
 class Journal:
@@ -2713,6 +2780,8 @@ class RunState:
     """What one pipeline run has seen so far."""
     def __init__(self, req: uc.PipelineRequest, repo: Path, out: Path, workspace: Path):
         self.req, self.repo, self.out, self.workspace = req, repo, out, workspace
+        self.brain_fn_seconds, self.brain_fn_count, self.round_size, self.build_seconds = 0.0, 0, 0, 0.0   # VIEW-11
+        self.round_functions: list[str] = []
         self.layout: uc.LayoutProfile | None = None
         self.iterations: list[uc.IterationRecord] = []
         self.attempts: dict[str, int] = {}
@@ -3621,7 +3690,7 @@ class RepositoryRun:
                 if self.hub is not None:                              # the page stays live until the last folder
                     self.hub.emit("progress", summary=f"{label}: folder {index + 1} of {len(ready)}",
                                   data={"text": f"folder {index + 1} of {len(ready)}: {label}",
-                                        "pending": len(ready) - index})
+                                        "pending": len(ready) - index - 1})        # not the running one
                 self.view_prefix = f"{label}: "
                 out = top / label
                 out.mkdir(parents=True, exist_ok=True)

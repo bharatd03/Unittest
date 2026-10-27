@@ -996,7 +996,7 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         engine = self.engine()
         await engine.generate("Plan it.", "facts", {"type": "object"}, lambda raw: raw, vary=True)
         body = FakeOpenAI.chat_bodies()[-1]
-        self.assertEqual((body["temperature"], body["seed"]), (0.4, 43))                  # ARCH-20
+        self.assertEqual((body["temperature"], body["seed"]), (0.7, 43))                  # ARCH-20, BP-12
 
     async def test_server_without_json_schema_gets_json_object(self):
         FakeOpenAI.reject_schema = True
@@ -1004,7 +1004,7 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         raw = await engine.predict("{}", PROFILE.brain_questions())
         self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")
         formats = [b.get("response_format", {}).get("type") for b in FakeOpenAI.chat_bodies()]
-        self.assertEqual(formats, ["json_schema", "json_object"])
+        self.assertEqual(formats, ["json_schema", "json_schema", "json_object"])      # without bounds first [ARCH-20c]
         self.assertEqual(engine.format_mode, "json_object")                        # kept for the next calls
 
     async def test_a_gateway_answering_422_gets_json_object(self):                      # ARCH-20b
@@ -1013,7 +1013,7 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         raw = await engine.predict("{}", PROFILE.brain_questions())
         self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")
         formats = [b.get("response_format", {}).get("type") for b in FakeOpenAI.chat_bodies()]
-        self.assertEqual(formats, ["json_schema", "json_object"])
+        self.assertEqual(formats, ["json_schema", "json_schema", "json_object"])
 
     async def test_cut_answer_and_unknown_model(self):
         FakeOpenAI.finish_reason = "length"
@@ -1245,7 +1245,7 @@ class QwenEngineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ba.AgentFault) as ctx:
             await self.engine(preload=False).predict("s", PROFILE.brain_questions())
         self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
-        self.assertIn("num_predict", ctx.exception.message)
+        self.assertIn("token limit", ctx.exception.message)
         self.assertEqual(len(FakeOllama.chat_bodies()), 1)
 
     async def test_think_block_and_code_fence_are_tolerated(self):
@@ -2193,9 +2193,10 @@ class BrainAnswerRobustnessTests(unittest.IsolatedAsyncioTestCase):
             result, _, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan))
         self.assertEqual(result["output"].name, "p1")
         first, second = FakeOllama.chat_bodies()
-        self.assertEqual((first["options"]["seed"], first["options"]["temperature"]), (42, 0.0))
+        self.assertEqual((first["options"]["seed"], first["options"]["temperature"], first["options"]["top_p"],
+                          first["options"]["top_k"]), (42, 0.7, 0.8, 20))                 # BP-12: the maker's settings
         self.assertEqual((second["options"]["seed"], second["options"]["temperature"],
-                          second["options"]["repeat_penalty"]), (43, 0.4, 1.2))
+                          second["options"]["repeat_penalty"]), (43, 0.7, 1.2))
         self.assertEqual(router.retry_after.get("qwen", 0.0), 0.0)                # no cooldown
         self.assertTrue(any("other sampling" in line for line in logs.output))
 
@@ -2220,7 +2221,7 @@ class BrainAnswerRobustnessTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("baseagent", "WARNING") as logs:
             result, _, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan), need=400, plans=plans)
         self.assertEqual([s.title for s in result["output"].steps], ["first"])
-        self.assertEqual(len(FakeOllama.chat_bodies()), 2)                  # asked once with more room first
+        self.assertEqual(len(FakeOllama.chat_bodies()), 1)                  # never asked again unchanged [ARCH-19b]
         self.assertTrue(plans[-1].salvaged and plans[-1].record()["salvaged"])
         self.assertTrue(any("complete items" in line for line in logs.output))
 
@@ -2234,7 +2235,7 @@ class BrainAnswerRobustnessTests(unittest.IsolatedAsyncioTestCase):
             return plan
         with self.assertRaises(ba.AgentFault) as ctx:
             await self.qwen(output_retries=0).generate("t", "c", {}, strict)
-        self.assertIn("num_predict", ctx.exception.message)
+        self.assertIn("token limit", ctx.exception.message)
 
     async def test_claude_cut_answer_uses_its_complete_items(self):
         fake = FakeAnthropic(reply=self.CUT, stop="max_tokens")
@@ -2280,6 +2281,106 @@ class NearShapeTests(unittest.TestCase):
     def test_another_field_failing_is_not_hidden_by_the_item_check(self):
         with self.assertRaises(ba.AgentFault):
             ba.model_validator_for(GenPlan)({"steps": [{"title": "ok"}, {"title": "y" * 60}]})   # no name
+
+
+class RunawayAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """ARCH-19a, ARCH-19b, ARCH-20c, BP-12, VIEW-5: answers stay bounded with any brain and any sampling."""
+    LOOP = '{"title": "loop", "lines": [1, 2, 3, 4, 5, 6, 7, 8]}, '
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAI)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        FakeOpenAI.reset()
+        patcher = mock.patch.dict(os.environ, {"BASEAGENT_TEST_REMOTE_KEY": "test-key"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def engine(self, **changes):
+        settings = ba.QwenRemoteSettings(**{"base_url": self.url, "api_key_env": "BASEAGENT_TEST_REMOTE_KEY",
+                                            "gateway_pause": 0.0, **changes})
+        return ba.QwenRemoteEngine(settings, opener=urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
+    def test_a_runaway_is_named(self):
+        self.assertEqual(ba.runaway_reason('{"a": 1}'), "")
+        self.assertEqual(ba.runaway_reason("x" * 50, limit_chars=40), "past its planned length")
+        self.assertEqual(ba.runaway_reason('{"steps": [' + self.LOOP * 8), "a repeated block")
+        self.assertEqual(ba.runaway_reason('{"steps": [' + self.LOOP * 2), "")            # not yet three times
+
+    def test_answers_are_held_to_their_bounds(self):                                     # ARCH-20c
+        schema = ba.bound_schema(ba.llm_schema(GenPlan.model_json_schema()), 2, list_max=5, text_max=30)
+        steps = schema["properties"]["steps"]
+        self.assertEqual((steps["maxItems"], steps["items"]["properties"]["lines"]["maxItems"]), (2, 5))
+        self.assertEqual(schema["properties"]["name"]["maxLength"], 30)
+        self.assertEqual(steps["items"]["properties"]["title"]["maxLength"], 40)       # its own bound stays
+        self.assertNotIn("maxItems", json.dumps(ba.strip_bounds(schema)))
+        fixes = []
+        raw = ba.apply_bounds(schema, {"name": "p", "steps": [{"title": "t" * 41, "lines": []},
+                                                               {"title": "a", "lines": [1, 2, 3, 4, 5, 6, 7]},
+                                                               {"title": "b", "lines": []}, {"title": "c", "lines": []}]},
+                              fixes)
+        self.assertEqual([(s["title"], len(s["lines"])) for s in raw["steps"]], [("a", 5), ("b", 0)])
+        self.assertEqual(len(fixes), 3, fixes)                     # the long title, the long list, the extra step
+        plan = ba.model_validator_for(GenPlan, schema)({"name": "p", "steps": [{"title": "a"}] * 3})
+        self.assertEqual(len(plan.steps), 2)                                            # never refused as a whole
+        choice = {"type": "object", "properties": {"ids": {"type": "array", "maxItems": 9,
+                                                           "items": {"type": "string", "enum": ["T1", "T2"]}}}}
+        self.assertEqual(ba.apply_bounds(choice, {"ids": ["T1", "T2", "T1", "T1"]})["ids"], ["T1", "T2"])
+
+    async def test_a_streamed_loop_is_stopped_and_its_complete_items_kept(self):         # ARCH-19a
+        FakeOpenAI.stream = True
+        FakeOpenAI.replies = ['{"name": "p1", "steps": [{"title": "first", "lines": [1]}, ' + self.LOOP * 40]
+        plans = []
+        router = ba.BrainRouter([self.engine()])
+        with self.assertLogs("baseagent", "WARNING"):
+            result, _, _ = await router.generate("t", "c", {}, ba.model_validator_for(GenPlan), need=400, plans=plans)
+        self.assertEqual(result["output"].steps[0].title, "first")
+        self.assertEqual((plans[-1].ended, plans[-1].salvaged, plans[-1].requests), ("a repeated block", True, 1))
+        self.assertLess(len(result["output"].steps), 12)                    # stopped long before the end
+
+    async def test_a_cut_answer_is_never_asked_again_unchanged(self):                    # ARCH-19b
+        FakeOpenAI.finish_reason = "length"
+        FakeOpenAI.replies = ['{"name": "p1", "steps": [{"title": "' + "abcdefgh" * 40]      # a runaway: once only
+        plans = []
+        with self.assertRaises(ba.AgentFault) as ctx:
+            await ba.BrainRouter([self.engine()]).generate("t", "c", {}, ba.model_validator_for(GenPlan), need=400,
+                                                           plans=plans)
+        self.assertEqual((len(FakeOpenAI.chat_bodies()), plans[-1].ended), (1, "a repeated block"))
+        self.assertTrue(ctx.exception.truncated)
+        self.assertGreater(plans[-1].used_output_tokens, 0)                 # its tokens count too [VIEW-5]
+        FakeOpenAI.reset()
+        FakeOpenAI.finish_reason = "length"
+        FakeOpenAI.replies = ['{"name": "p1", "steps": [{"title": "only one, cut in the mid']
+        plans = []
+        with self.assertRaises(ba.AgentFault), self.assertLogs("baseagent", "WARNING"):
+            await ba.BrainRouter([self.engine()]).generate("t", "c", {}, ba.model_validator_for(GenPlan), need=400,
+                                                           plans=plans)
+        self.assertEqual((len(FakeOpenAI.chat_bodies()), plans[-1].requests), (2, 2))   # one item: once more room
+        self.assertEqual(FakeOpenAI.chat_bodies()[1]["max_tokens"], 2 * FakeOpenAI.chat_bodies()[0]["max_tokens"])
+
+    async def test_generated_work_uses_the_makers_sampling(self):                        # BP-12
+        await self.engine().generate("Plan it.", "facts", {"type": "object"}, lambda raw: raw)
+        body = FakeOpenAI.chat_bodies()[-1]
+        self.assertEqual((body["temperature"], body["top_p"], body["top_k"], body["seed"]), (0.7, 0.8, 20, 42))
+        self.assertNotIn("presence_penalty", body)
+
+    async def test_a_server_refusing_the_bounds_keeps_the_schema(self):                  # ARCH-20c
+        FakeOpenAI.reject_schema = True
+        schema = ba.bound_schema(ba.llm_schema(GenPlan.model_json_schema()), 2)
+        engine = self.engine()
+        with self.assertLogs("baseagent", "WARNING"):
+            await engine.generate("Plan it.", "facts", schema, lambda raw: raw)
+        bodies = FakeOpenAI.chat_bodies()
+        self.assertIn("maxItems", json.dumps(bodies[0]["response_format"]))
+        self.assertEqual(bodies[1]["response_format"]["type"], "json_schema")
+        self.assertNotIn("maxItems", json.dumps(bodies[1]["response_format"]))
 
 
 class ParallelCallTests(unittest.IsolatedAsyncioTestCase):
@@ -2604,6 +2705,23 @@ class AnswerHandlingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BASEAGENT_ANSWER_LOG", None)
             agent.log_answer("S.plan", "refused")                         # no log configured: nothing, no error
+
+    async def test_a_cut_answer_is_logged_with_its_start_end_and_why(self):                # ARCH-20, ARCH-19a
+        class CutBrain(SeqBrain):
+            async def generate(self, task, context, schema, validate):
+                fault = ba.AgentFault("MODEL_OUTPUT_INVALID", "the answer was stopped")
+                fault.truncated, fault.ended = True, "a repeated block"
+                fault.partial = '{"name": "p", "steps": [' + "abcdefgh" * 120
+                raise fault
+        agent = EchoAgent(router=ba.BrainRouter([CutBrain([])]))
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "brain_answers.jsonl"
+            with mock.patch.dict(os.environ, {"BASEAGENT_ANSWER_LOG": str(log)}), self.assertRaises(ba.AgentFault):
+                await agent.generate("Plan it.", "facts", GenPlan, step="S.plan")
+            record = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual((record["kind"], record["ended"]), ("refused", "a repeated block"))
+        self.assertTrue(record["start"].startswith('{"name": "p"'))
+        self.assertEqual((len(record["start"]), len(record["end"])), (400, 400))
 
     async def test_decisions_and_answers_no_check_let_through_are_logged_too(self):
         brain = SeqBrain([{"name": 1}] * 6)                           # never a valid plan

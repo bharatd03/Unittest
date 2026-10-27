@@ -1,0 +1,9 @@
+{
+  "construct": "a family of four near-identical functions (one per door) with a long branch: planned once, carried over to the others [A1-PL17, A1-PL3a]",
+  "sut": "src/doors.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  }
+}

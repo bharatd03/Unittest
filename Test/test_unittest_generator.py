@@ -855,7 +855,9 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
     def test_progress_line_and_unattended_questions(self):                              # VIEW-11, LA-9
         progress = up.Progress(4)
         progress.done = 1
-        self.assertTrue(progress.line(0.5, 2).startswith("38 % - file 2 of 4 - iteration 2"))
+        self.assertEqual(progress.line("a.c", 0.5, 2), "38 % - file 2 of 4 - iteration 2 - estimating the time left")
+        progress.update("a.c", left=600)                                   # from the work left, not the share [VIEW-11]
+        self.assertRegex(progress.line("a.c"), r"iteration 2 - about \d+-\d+ min left$")
         with mock.patch.object(sys, "stdin", None):
             self.assertEqual(up.ask_user("?", {"1": "a", "2": "b"}, 5, "1"), ("1", ""))
 
@@ -1053,8 +1055,12 @@ class GeneratorTests(unittest.TestCase):
             {"name": "test_select_mode_nobody_home", "scenario_ids": [], "body": body, "evidence_class": "E1"},
             {"name": "select mode/away", "scenario_ids": [], "body": body, "evidence_class": "E1"}]})
         agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm", max_llm_tests_per_function=8))
+        mode = [sc for sc in self.plan.scenarios if sc.function == "select_mode"]
+        extra = [mode[0].model_copy(update={"scenario_id": f"S-x{k}", "checked": False, "made_by": "rule",
+                                            "characterization": False}) for k in range(5)]
+        plan = self.plan.model_copy(update={"scenarios": self.plan.scenarios + extra})   # five tests asked [ARCH-11a]
         with brain(b):
-            bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
+            bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=plan)))
         suite = uc.suite_of(bundle)
         self.assertEqual(list(bundle.trial), ["test_select_mode_invents"])          # the tool decides [NC-7]
         names = re.findall(r"UT_TEST\((\w+)\)", suite)
@@ -3127,12 +3133,16 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertTrue(any(s[2].startswith("brain:qwen") for s in seen[1][0]), seen[1])
 
     def test_brain_scenarios_are_checked_before_agent2(self):
-        bad_range = self.good(name="test_thermostat_command_huge", args=[
+        """A1-PL4 on three answers: the planned number of scenarios each (ARCH-11a, ARCH-20c), every bad one
+        refused with its reason, a quote that is not word for word left out (characterization)."""
+        bad_range = self.good(name="test_thermostat_command_huge", gap_ids=["LC:thermostat_command:11"], args=[
             {"name": "setpoint", "value": "99999999999"}, {"name": "hysteresis", "value": "2"}])
         bad_stub = self.good(name="test_thermostat_command_display", stubs=[{"stub": "write_display", "returns": ["1"]}])
-        bad_quote = self.good(name="test_thermostat_command_quote", quotes=[
+        bad_quote = self.good(name="test_thermostat_command_quote", gap_ids=["LC:thermostat_command:11"], quotes=[
             {"evidence_id": self.e2.evidence_id, "text": "returns 42 on Mondays"}])
-        b = UTBrain(plans={"thermostat_command": [self.good(), bad_range, bad_stub, bad_quote]})
+        answers = [[self.good(), bad_stub], [bad_range], [bad_quote]]
+        b = UTBrain(plans={"thermostat_command": lambda context: answers.pop(0) if answers else []})
+        self.agent.cfg.max_brain_calls_per_function = 3
         last = measured(self.layout, self.gaps)
         with brain(b):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=last, iteration=2)))
@@ -3149,7 +3159,8 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertIn("outside the range of int", notes)                               # A1-PL4 e)
         self.assertIn("write_display is not a stubbed function", notes)                 # A1-PL4 d)
         self.assertIn("word for word", notes)                                           # A1-PL4 b)
-        self.assertEqual(len([t for t in b.generate_calls if "function thermostat_command " in t]), 2)   # A1-PL9
+        self.assertEqual(len([t for t in b.generate_calls if "function thermostat_command " in t]), 3)   # A1-PL9
+        self.assertIn("at most 2 scenarios", b.generate_calls[0])                        # two targets [A1-PL3a]
 
     def test_without_a_quote_a_scenario_only_characterizes(self):
         b = UTBrain(plans={"thermostat_command": [self.good(quotes=[])]})
@@ -4003,7 +4014,7 @@ class BudgetAndPackTests(unittest.TestCase):
         b = RecordingBrain()
         self.plan(b)
         task, context = next(c for c in b.contexts if c[0].startswith("Plan unit-test scenarios"))
-        self.assertLess(context.index("OPEN GAPS"), context.index("GUIDANCE (knowledge pack test-design 1.0"))  # KP-3
+        self.assertLess(context.index("TARGETS ("), context.index("GUIDANCE (knowledge pack test-design 1.0"))  # KP-3
         self.assertLess(context.index("EVIDENCE:"), context.index("GUIDANCE"))
         record = next(p for p in self.agent.token_plans if p["step"] == "A1.plan")                    # ARCH-15
         self.assertEqual(record["outcome"], "answered")
@@ -4036,7 +4047,7 @@ class BudgetAndPackTests(unittest.TestCase):
         self.assertIn("pack:test-design", record["shortened"] + record["dropped"])  # KP-4: the pack gives way
         self.assertLessEqual(record["input_tokens"] + record["output_tokens"], 2048)
         _, context = next(c for c in b.contexts if c[0].startswith("Plan unit-test scenarios"))
-        self.assertIn("OPEN GAPS", context)
+        self.assertIn("TARGETS (", context)
 
     def test_token_summary(self):
         plans = [{"step": "A1.plan", "brain": "qwen", "window": 8192, "input_tokens": 3000, "output_tokens": 900,
@@ -4774,6 +4785,95 @@ class UssPilotFixTests(unittest.TestCase):
     def test_a_failed_build_names_its_first_error(self):                               # A3-FZ13
         out = "cc -c x.c\nwarning: unused\n/usr/bin/ld: x.o: undefined reference to `hal_micros'\nmore\nend"
         self.assertIn("undefined reference to `hal_micros'", a3._first_message(out))
+
+
+class TargetsAndFamiliesTests(unittest.TestCase):
+    """A1-PL3a, ARCH-20d, ARCH-19b, A1-PL17: the brain names targets, a cut answer is split up, and a family of
+    similar functions is planned once."""
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.repo = Path(self.tmp.name) / "c_function_family"
+        shutil.copytree(up.CONSTRUCTS / "c_function_family", self.repo)
+        self.agent = a1.AnalyzerAgent()
+        self.layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/doors.c"))
+        self.text = (self.repo / "src/doors.c").read_text()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fn(self, name):
+        return next(f for f in self.layout.functions if f.name == name)
+
+    def gaps(self, name):
+        """The open items of one door after the rule round: its main path and its error branch."""
+        f = self.fn(name)
+        line = {k: f.line_start + k for k in range(20)}
+        lc = lambda k: uc.GapItem(gap_id=f"LC:{name}:{line[k]}", function=name, metric="LC", line=line[k])
+        return [lc(k) for k in (8, 9, 10, 11, 12, 17)] + [
+            uc.GapItem(gap_id=f"BC:{name}:{line[13]}:9:T", function=name, metric="BC", line=line[13], column=9),
+            lc(14), lc(15)]
+
+    def test_items_of_one_path_form_one_target(self):                                  # A1-PL3a
+        targets = a1.make_targets(self.fn("door_fl_receive"), self.gaps("door_fl_receive"), self.text, self.layout)
+        self.assertEqual([t.tid for t in targets], ["T1", "T2"])
+        main, error = targets
+        self.assertEqual((main.counts, error.counts), ({"LC": 6}, {"BC": 1, "LC": 2}))   # the outcome enters its block
+        self.assertEqual(error.conditions, ["(fl_open != 0u && fl_locked != 0u) is true"])
+        answer = a1.PlannedScenario.model_validate(planned(gap_ids=[], targets=["t2: lines 25-27"]))
+        fixes = a1.expand_targets(answer, {t.tid: t for t in targets})
+        self.assertEqual((answer.targets, sorted(answer.gap_ids)), (["T2"], sorted(error.items)))
+        self.assertEqual(fixes, ["targets: 't2: lines 25-27' -> 'T2'"])
+        schema = ba.llm_schema(self.agent._plan_model(self.fn("door_fl_receive"), set(main.items), [], [],
+                                                      ["T1", "T2"]).model_json_schema())
+        item = schema["properties"]["scenarios"]["items"]["properties"]
+        self.assertEqual((item["targets"]["items"]["enum"], item["targets"]["maxItems"]), (["T1", "T2"], 3))
+        self.assertNotIn("gap_ids", item)                                                   # never enumerated
+
+    def test_a_cut_planning_answer_is_split_up(self):                                   # ARCH-19b
+        class Cut(UTBrain):
+            async def generate(self, task, context, schema, validate):
+                if task.startswith("Plan unit-test scenarios") and len(self.generate_calls) == 0:
+                    self.generate_calls.append(task)
+                    fault = ba.AgentFault("MODEL_OUTPUT_INVALID", "the answer was stopped")
+                    fault.truncated, fault.ended, fault.partial = True, "a repeated block", ""
+                    raise fault
+                return await super().generate(task, context, schema, validate)
+        name = "door_fl_receive"
+        b = Cut(plans={name: [planned(gap_ids=["T1"], name="test_door_fl_receive_valid", args=[
+            {"name": "data", "value": "&buf"}, {"name": "len", "value": "4u"}],
+            setup=["uint8_t buf[4] = {DOOR_FL_ID, 0u, 0u, 0u};"])]})
+        self.agent.cfg.carry_families = False
+        with brain(b):
+            plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps(name)),
+                                                      iteration=2)))
+        asked = [t for t in b.generate_calls if t.startswith("Plan unit-test scenarios")]
+        self.assertEqual(len(asked), 3, plan.planning)               # cut, then smaller: never the same request
+        self.assertIn("at most 2 scenarios", asked[0])
+        self.assertIn("at most 1 scenarios", asked[1])
+        self.assertTrue(any("ARCH-19b" in n for n in plan.planning), plan.planning)
+        self.assertTrue(any(s.function == name and s.made_by.startswith("brain:") for s in plan.scenarios))
+
+    def test_a_family_is_planned_once(self):                                            # A1-PL17
+        fl = planned(gap_ids=["T1"], name="test_door_fl_receive_valid_frame", purpose="a valid frame of the door",
+                     args=[{"name": "data", "value": "&buf"}, {"name": "len", "value": "4u"}],
+                     setup=["uint8_t buf[4] = {DOOR_FL_ID, 0u, 7u, 1u};"])
+        b = UTBrain(plans={"door_fl_receive": [fl]})
+        gaps = self.gaps("door_fl_receive") + self.gaps("door_fr_receive")
+        with brain(b):
+            first = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
+                                                       iteration=2)))
+            self.assertEqual(first.deferred, ["door_fr_receive"])              # waits for its family's first member
+            self.assertTrue(any("A1-PL17" in n for n in first.planning), first.planning)
+            second = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(
+                self.layout, self.gaps("door_fr_receive")), iteration=3)))
+        carried = [s for s in second.scenarios if s.function == "door_fr_receive" and s.scenario_id.startswith("S-carried")]
+        self.assertEqual(len(carried), 1, second.planning)
+        self.assertIn("uint8_t buf[4] = {DOOR_FR_ID, 0u, 7u, 1u};", carried[0].setup)       # names mapped
+        self.assertTrue(set(carried[0].gap_ids) <= {g.gap_id for g in self.gaps("door_fr_receive")})
+        self.assertTrue(carried[0].made_by.startswith("brain:"))
+        asked = [t for t in b.generate_calls if "door_fr_receive" in t]
+        self.assertEqual(len(asked), 1)                       # only for the target the carried one does not aim at
+        self.assertNotIn("door_fr_receive", " ".join(t for t in b.generate_calls[:1]))
 
 
 # ============================================================================ 9. requirements and skill
@@ -6213,7 +6313,7 @@ class MeasuredRightTests(unittest.TestCase):
             self.assertEqual([len(r.results) for r in results], [1, 2])
             self.assertTrue(all((Path(r.output_dir) / "summary.md").is_file() for r in results))
             pending = [e["data"]["pending"] for e in hub.events() if e["kind"] == "progress"]
-            self.assertEqual(pending, [2, 1, 0])                                 # live until the last folder
+            self.assertEqual(pending, [1, 0, 0])               # folders to come, never the running one [VIEW-12a]
 
 
 class ReadOnceTests(unittest.TestCase):

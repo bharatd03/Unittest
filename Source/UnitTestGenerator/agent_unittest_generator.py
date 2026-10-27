@@ -2905,7 +2905,7 @@ class GeneratorAgent(ba.AgentCore):
                 ]
                 need = ba.OutputNeed(items=min(self.cfg.max_llm_tests_per_function,
                                                max(len(fn_scenarios) + len(to_rewrite), 1)),
-                                     tokens_per_item=self.cfg.tokens_per_test, overhead=100)
+                                     tokens_per_item=self.cfg.tokens_per_test, overhead=100, asked=True)   # ARCH-20c
                 task = (
                     f"Write at most {need.items} unit tests for {fn.qualified_name} that cover "              # ARCH-11a
                     "the SCENARIOS and rewrite the TESTS TO REWRITE. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
