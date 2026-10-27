@@ -2620,8 +2620,8 @@ class QwenRemoteEngine(QwenEngine):
                 self.streaming = False
                 LOG.warning("The remote Qwen server does not stream; asking without streaming.")
                 continue
-            if status == 400 and self.format_mode != "none" and re.search(
-                    r"response_format|json_schema|json_object|grammar|schema", detail, re.I):
+            if self.format_mode != "none" and (status == 422 or status == 400 and re.search(
+                    r"response_format|json_schema|json_object|grammar|schema", detail, re.I)):     # ARCH-20b: a gateway
                 self.format_mode = REMOTE_FORMATS[REMOTE_FORMATS.index(self.format_mode) + 1]
                 LOG.warning("The remote Qwen server does not take this output format; using %s.", self.format_mode)
                 continue
@@ -3712,21 +3712,96 @@ def keep_valid(field_name: str, rule: Callable[[Any], str], *, dropped: list[str
 
 
 def validation_summary(exc: ValidationError, limit: int = 3) -> str:
-    """Short, content-free description of what failed (field paths and error types only)."""
+    """Short description of what failed: the field path, the error type and the offending text of the answer (at
+    most 80 characters), so the brain can act on it when it is asked again [ARCH-20b]."""
     parts = []
     for error in exc.errors()[:limit]:
         where = ".".join(str(p) for p in error.get("loc", ())) or "value"
-        parts.append(f"{where}: {error.get('type', 'invalid')}")
+        given = error.get("input")
+        shown = json.dumps(given, default=str)[:80] if given is not None and not isinstance(given, dict) else ""
+        parts.append(f"{where}: {error.get('type', 'invalid')}" + (f" (got {shown})" if shown else ""))
     return "; ".join(parts)
 
 
+def _model_of(annotation: Any) -> tuple[bool, Any]:
+    """(is a list, the element or field type) of a field annotation, through Annotated and Optional."""
+    import typing
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _model_of(typing.get_args(annotation)[0])
+    if origin in (list, tuple, set):
+        args = typing.get_args(annotation)
+        inner = _model_of(args[0])[1] if args else Any
+        return True, inner
+    if origin is not None and type(None) in typing.get_args(annotation):      # Optional[X]
+        rest = [a for a in typing.get_args(annotation) if a is not type(None)]
+        return _model_of(rest[0]) if len(rest) == 1 else (False, annotation)
+    return False, annotation
+
+
+def coerce_shapes(model: type[BaseModel], raw: Any) -> Any:
+    """ARCH-20b: the shapes every brain gets wrong in the same way, repaired before the strict check - a single value
+    where the schema expects a list becomes a list of that value, in nested models too."""
+    if not isinstance(raw, dict) or not (isinstance(model, type) and issubclass(model, BaseModel)):
+        return raw
+    out = dict(raw)
+    for name, field in model.model_fields.items():
+        key = field.alias or name
+        if key not in out or out[key] is None:
+            continue
+        many, inner = _model_of(field.annotation)
+        value = out[key]
+        if many and not isinstance(value, list):
+            value = [value]
+        if isinstance(inner, type) and issubclass(inner, BaseModel):
+            value = [coerce_shapes(inner, v) for v in value] if many else coerce_shapes(inner, value)
+        out[key] = value
+    return out
+
+
+def _keep_valid_items(model: type[BaseModel], raw: Any) -> BaseModel | None:
+    """ARCH-20b: an answer whose top level is one list of items is checked item by item - the items that fail the
+    schema are dropped with their reasons; None when no item is left or another field fails."""
+    if not isinstance(raw, dict):
+        return None
+    lists = [(n, f) for n, f in model.model_fields.items() if _model_of(f.annotation)[0]]
+    if len(lists) != 1:
+        return None
+    name, field = lists[0]
+    key = field.alias or name
+    inner = _model_of(field.annotation)[1]
+    items = raw.get(key)
+    if not isinstance(items, list) or not (isinstance(inner, type) and issubclass(inner, BaseModel)):
+        return None
+    kept, dropped = [], []
+    for k, item in enumerate(items):
+        try:
+            inner.model_validate(item, strict=False)
+            kept.append(item)
+        except ValidationError as exc:
+            dropped.append(f"item {k + 1}: {validation_summary(exc)}")
+    if not kept or not dropped:
+        return None
+    try:
+        result = model.model_validate({**raw, key: kept}, strict=False)
+    except ValidationError:
+        return None
+    LOG.warning("%d of %d items of the answer dropped by the schema [ARCH-20b]: %s", len(dropped), len(items),
+                "; ".join(dropped)[:600])
+    return result
+
+
 def model_validator_for(model: type[BaseModel]) -> Callable[[Any], BaseModel]:
-    """A validate() for brain.generate(): pydantic errors become MODEL_OUTPUT_INVALID with
-    a short reason the brain can act on when it is asked again."""
+    """A validate() for brain.generate(): near shapes repaired, a list answer checked item by item (ARCH-20b);
+    what still fails becomes MODEL_OUTPUT_INVALID with a reason the brain can act on when it is asked again."""
     def validate(raw: Any) -> BaseModel:
+        raw = coerce_shapes(model, raw)
         try:
             return model.model_validate(raw, strict=False)
         except ValidationError as exc:
+            kept = _keep_valid_items(model, raw)
+            if kept is not None:
+                return kept
             raise AgentFault("MODEL_OUTPUT_INVALID", "Output did not match the schema (" +
                              validation_summary(exc) + ").") from exc
     return validate

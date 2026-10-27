@@ -100,6 +100,18 @@ measurement. Items the pipeline itself could not handle - with every answer kind
 listed first in the report and collected across runs in `ut_output/pipeline_findings.jsonl`; send that file with a
 report when a new kind of code ends incomplete.
 
+A stub file of your own (in a `stubs` folder, for example `stubs/hal_stub.c`) is reused for the functions it defines.
+Its other functions and globals - such as `sim_set_echo_us()` or `sim_reset()` declared in `stubs/hal_stub.h` - are the
+controls the tests use to set what the stubbed functions return: the rule-made tests call them with the values of the
+code, the brain is shown them, the fuzz build links the same stub, and a function named like `reset`, `init` or `clear`
+without parameters is called before each test (A1-DA7a, A2-21ak, A3-FZ13). A stub file that offers no control is
+replaced by generated stubs, and the report says so; `analyzer.prefer_project_stubs: true` in `ut_config.json` keeps it.
+
+When the analysis proves that a condition can never take a value, and swapping `||` and `&&` removes that proof, the
+report lists it under "Defect candidates" with the proof, the comment next to it and the items it blocks - for example
+a range check `(d >= MIN) || (d <= MAX)` that is always true. Your source is never changed for it. Exit codes of `run`
+and `batch`: 0 every target met, 3 not every target met, 4 at least one defect candidate, 2 an error (A1-37f).
+
 Two SUT files run at the same time (`pipeline.max_parallel_suts` in `ut_config.json`, default 2; 1 runs them one after another). Set `brain.qwen_remote.max_concurrency` (and `brain.qwen.max_concurrency`) to the number of requests your Qwen server answers at once - `OLLAMA_NUM_PARALLEL` on an Ollama server; it holds for all files of the run together. Answers of the remote server are streamed, so a tunnel such as Cloudflare does not cut a long answer, and a gateway timeout is asked again on the same server before the local Ollama is used (`stream`, `gateway_retries`, `gateway_pause`). `pilot-all` shows every pilot on one viewer page; the **Stop** button there ends the run at its next safe point and keeps what was verified. A request waits up to `slot_wait` (30 min) for a free slot of the remote server rather than going to the local Ollama on the same GPU. Each file gets its own test, stub and access files (`test_<file>.c`, `ut_stubs_<file>.c/.h`, `ut_sut_access_<file>.c`).
 
 With a Claude model, the brain is asked about several functions at the same time (`brain.anthropic.parallel_calls` in `ut_config.json`, default 4; match it to your API quota); with Qwen one at a time. The results are combined in a fixed order, so the same input gives the same tests.

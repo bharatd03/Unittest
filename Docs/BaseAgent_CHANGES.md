@@ -1,5 +1,23 @@
 # BaseAgent changes
 
+## 2026-10-27: answers that are nearly in shape (from the USS pilot run)
+
+**Why.** In the USS pilot, 26 of 36 planning answers of Qwen3 were refused as a whole because each quote was a text
+(`"EV-f-1: returns -1"`) where the schema wants an object. The re-ask said only "Output did not match the schema",
+and the gateway answered the unsupported `response_format` with HTTP 422, which did not trigger the fallback.
+
+* **`coerce_shapes(model, raw)`** (ARCH-20b): a single value where the schema expects a list becomes a list of that
+  value, in nested models too. Runs before the strict check in `model_validator_for`.
+* **`_keep_valid_items(model, raw)`** (ARCH-20b): an answer whose top level is one list of items is checked item by
+  item. The items that fail are dropped and logged with their reasons; the answer is refused only when no item is
+  left or another field fails.
+* **`validation_summary`**: names the field path, the error type and what the brain gave (`(got "...")`, at most 80
+  characters), so the re-ask tells the brain what to change.
+* **`_post_chat`**: HTTP 422, like a 400 that names `response_format`/`json_schema`/`json_object`/`grammar`/`schema`,
+  switches to the `json_object` format and asks again.
+* Agents can turn a text into an object with a `mode="before"` validator on their own model (the unit-test
+  generator does so for quotes, A1-PL3).
+
 ## 2026-10-25 (night): a cache of brain answers
 
 **Why.** About three quarters of a run's time is spent waiting for brain answers. A re-run of unchanged code asked

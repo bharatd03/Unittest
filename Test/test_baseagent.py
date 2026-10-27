@@ -288,6 +288,8 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
         if self.path != "/v1/chat/completions":
             return self._send(404, {"error": {"message": "unknown path"}})
         if cls.reject_schema and body.get("response_format", {}).get("type") == "json_schema":
+            if cls.reject_schema == 422:                         # a gateway that only says it cannot process it
+                return self._send(422, {"detail": "Unprocessable Entity"})
             return self._send(400, {"error": {"message": "response_format type json_schema is not supported"}})
         chats = sum(1 for path, _, _ in cls.calls if path == "/v1/chat/completions")
         status = cls.statuses[min(chats, len(cls.statuses)) - 1] if cls.statuses else cls.status
@@ -1004,6 +1006,14 @@ class QwenRemoteEngineTests(unittest.IsolatedAsyncioTestCase):
         formats = [b.get("response_format", {}).get("type") for b in FakeOpenAI.chat_bodies()]
         self.assertEqual(formats, ["json_schema", "json_object"])
         self.assertEqual(engine.format_mode, "json_object")                        # kept for the next calls
+
+    async def test_a_gateway_answering_422_gets_json_object(self):                      # ARCH-20b
+        FakeOpenAI.reject_schema = 422
+        engine = self.engine()
+        raw = await engine.predict("{}", PROFILE.brain_questions())
+        self.assertEqual(ba.validate_answers(raw, PROFILE)["queue"]["choice"], "billing")
+        formats = [b.get("response_format", {}).get("type") for b in FakeOpenAI.chat_bodies()]
+        self.assertEqual(formats, ["json_schema", "json_object"])
 
     async def test_cut_answer_and_unknown_model(self):
         FakeOpenAI.finish_reason = "length"
@@ -2245,6 +2255,31 @@ class BrainAnswerRobustnessTests(unittest.IsolatedAsyncioTestCase):
             check(GenPlan(name="p", steps=[{"title": "bad", "lines": []}]))
         self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
         self.assertIn("bad title", ctx.exception.message)
+
+
+class NearShapeTests(unittest.TestCase):
+    """ARCH-20b: near shapes repaired, list answers checked item by item, the re-ask names what was given."""
+
+    def test_a_single_value_where_a_list_is_expected_becomes_a_list(self):
+        check = ba.model_validator_for(GenPlan)
+        plan = check({"name": "p", "steps": {"title": "only", "lines": 3}})
+        self.assertEqual([(s.title, s.lines) for s in plan.steps], [("only", [3])])
+
+    def test_items_that_fail_the_schema_are_dropped_and_the_rest_kept(self):
+        check = ba.model_validator_for(GenPlan)
+        with self.assertLogs("baseagent", "WARNING") as logs:
+            plan = check({"name": "p", "steps": [{"title": "x" * 60, "lines": []}, {"title": "ok", "lines": [1]}]})
+        self.assertEqual([s.title for s in plan.steps], ["ok"])
+        self.assertTrue(any("1 of 2 items" in line for line in logs.output))
+        with self.assertRaises(ba.AgentFault) as ctx:                                   # nothing left: refused
+            check({"name": "p", "steps": [{"title": "x" * 60, "lines": []}]})
+        self.assertEqual(ctx.exception.code, "MODEL_OUTPUT_INVALID")
+        self.assertIn("steps.0.title", ctx.exception.message)
+        self.assertIn('(got "xxxx', ctx.exception.message)                            # what was given
+
+    def test_another_field_failing_is_not_hidden_by_the_item_check(self):
+        with self.assertRaises(ba.AgentFault):
+            ba.model_validator_for(GenPlan)({"steps": [{"title": "ok"}, {"title": "y" * 60}]})   # no name
 
 
 class ParallelCallTests(unittest.IsolatedAsyncioTestCase):

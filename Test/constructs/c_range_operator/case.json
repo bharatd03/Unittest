@@ -1,0 +1,9 @@
+{
+  "construct": "a range check written with || instead of && - always true: a defect candidate, not just unreachable code [A1-37f]",
+  "sut": "src/level.c",
+  "language": "c",
+  "expect": {
+    "final_state": "incomplete",
+    "statuses": {}
+  }
+}

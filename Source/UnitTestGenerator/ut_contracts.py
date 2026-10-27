@@ -198,8 +198,28 @@ class Dependency(Contract):
     overload: int = 0                    # C++: 0 the first declaration of its name, 1.. the other overloads [A1-DA4]
 
 
+class StubControl(Contract):
+    """A1-DA7a: one control of a project stub - a function a test calls or a global it sets."""
+    name: str
+    declaration: str                     # "void sim_set_echo_us(uint32_t us)" / "extern int sim_level"
+    return_type: str = "void"
+    params: list[list[str]] = Field(default_factory=list)       # [[type, name], ...]
+    kind: Literal["function", "variable"] = "function"
+    type: str = ""                       # a variable's type
+
+
+class ProjectStub(Contract):
+    """A1-DA7a: a stub file of the repository that is reused, with the controls a test can drive it by."""
+    file: str
+    header: str = ""                     # the header that declares its controls ("" = none)
+    controls: list[StubControl] = Field(default_factory=list)
+    reset: str = ""                      # a control without parameters that resets it, called before each test
+    serves: list[str] = Field(default_factory=list)            # the dependencies it defines for the SUT
+
+
 class DependencyPlan(Contract):
     entries: list[Dependency] = Field(default_factory=list)
+    project_stubs: list[ProjectStub] = Field(default_factory=list)   # reused stubs and their controls [A1-DA7a]
     headers: list[str] = Field(default_factory=list)          # every header the SUT includes [A1-DA3]
     missing_headers: list[str] = Field(default_factory=list)  # with the places searched [A1-DA13]
     real_sources: list[str] = Field(default_factory=list)     # files Agent3 compiles and links [A3-38a]
@@ -839,6 +859,18 @@ class Metrics(Contract):
     MCDC: MetricValue = Field(default_factory=MetricValue)
 
 
+class DefectCandidate(Contract):
+    """A1-37f: a decision whose proven infeasibility the operator explains - a finding for the developer."""
+    candidate_id: str = ""               # D1, D2 ... per file
+    line: int
+    function: str = ""
+    decision: str                        # the decision as written
+    proof: str                           # the proof of A1-37
+    change: str                          # the operator change that removes the proof
+    evidence: str = ""                   # the comment or requirement that names the bounds
+    items: list[str] = Field(default_factory=list)              # the items it blocks
+
+
 class GapItem(Contract):
     gap_id: str
     function: str
@@ -852,6 +884,7 @@ class GapItem(Contract):
     attempts: int = 0
     estimated: bool = False
     variant_proofs: list["VariantProof"] = Field(default_factory=list)   # per build variant [A1-37b, A1-37c]
+    defect: DefectCandidate | None = None      # the proof is explained by a wrong operator [A1-37f]
 
 
 class VariantProof(Contract):
@@ -1096,7 +1129,7 @@ class FuzzResult(Contract):
 # ============================================================================ learning between attempts [LA-1 .. LA-10]
 RootCause = Literal["test_did_not_compile", "test_setup", "wrong_inputs", "needs_call_sequence",
                     "needs_dependency_control", "wrong_expectation", "unreachable", "needs_requirement",
-                    "needs_source_change", "pipeline_limitation", "undetermined"]
+                    "needs_source_change", "pipeline_limitation", "stub_not_driven", "undetermined"]
 FinalStatus = Literal["covered", "proven_unreachable", "needs_requirement", "needs_source_change",
                       "pipeline_limitation", "undetermined"]
 CAUSE_TEXT = {
@@ -1111,6 +1144,7 @@ CAUSE_TEXT = {
     "needs_requirement": "the expected behaviour is not stated",
     "needs_source_change": "the source prevents the item",
     "pipeline_limitation": "the pipeline cannot yet build the test the item needs",
+    "stub_not_driven": "no test set the stub the item depends on, so it always returned its default [LA-3a]",
     "undetermined": "no cause could be decided from the facts"}
 FIX_FORM = {                                                       # LA-4: the form a fix takes
     "test_did_not_compile": "write a test that compiles: use only the names in HEADERS, STUB CONTROL and SETTERS",
@@ -1118,7 +1152,9 @@ FIX_FORM = {                                                       # LA-4: the f
     "wrong_inputs": "choose other values that meet the PATH CONDITIONS of the item",
     "needs_call_sequence": "call the function several times in a row (the earlier calls in setup) to build up its state",
     "needs_dependency_control": "set what the real dependency reads (a global or register), or ask for a stub",
-    "wrong_expectation": "assert only what the evidence states for exactly these inputs, or observe the result"}
+    "wrong_expectation": "assert only what the evidence states for exactly these inputs, or observe the result",
+    "stub_not_driven": "set the stub's return value or call its control (STUB CONTROL, PROJECT STUB CONTROLS) before "
+                       "the call"}
 OWNER = {"covered": "", "proven_unreachable": "developer: the source", "needs_requirement": "developer: requirement "
          "documents", "needs_source_change": "developer: a source change through review", "pipeline_limitation":
          "the pipeline's developers", "undetermined": "developer: with the evidence"}
@@ -1696,6 +1732,8 @@ class PipelineResult(Contract):
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
     cache_use: list[str] = Field(default_factory=list)         # what each cache saved in this run [CA-1]
     brain_answers: list[str] = Field(default_factory=list)     # per brain step: accepted, fixed, refused [KB-25]
+    defect_candidates: list[DefectCandidate] = Field(default_factory=list)   # [A1-37f]
+    open_summary: str = ""                     # open items per final status and root cause [LA-3a]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
     escalations: list[str] = Field(default_factory=list)       # rules that needed the brain, with outcome [ARCH-22]
     item_status: list[ItemStatus] = Field(default_factory=list)    # final status per item not covered [LA-6]
@@ -2151,6 +2189,25 @@ def names_a_run(text: str, *roots: str | Path) -> bool:
 _CODE_STOP = {"if", "else", "for", "while", "do", "return", "void", "const", "static", "inline", "volatile",
               "struct", "enum", "union", "class", "the", "a", "an", "of", "and", "or", "to", "in", "is", "ut", "test",
               "expect", "eq", "int", "line", "true", "false", "null", "nullptr", "observe", "e8", "evidence", "x", "n"}
+
+
+def project_controls(fn: "FunctionInfo", layout: "LayoutProfile") -> list[tuple["ProjectStub", "StubControl"]]:
+    """A2-21ak: the controls of the project stubs that the function and the SUT functions it calls (two levels)
+    depend on."""
+    plan = layout.dependencies
+    if plan is None or not plan.project_stubs:
+        return []
+    names = {f.name: f for f in layout.functions} | {f.qualified_name: f for f in layout.functions}
+    reach, todo = set(fn.calls), [(c, 1) for c in fn.calls]
+    while todo:
+        name, depth = todo.pop()
+        callee = names.get(name)
+        if callee is not None and depth < 3:
+            for c in callee.calls:
+                if c not in reach:
+                    reach.add(c)
+                    todo.append((c, depth + 1))
+    return [(p, c) for p in plan.project_stubs if reach & set(p.serves) for c in p.controls]
 
 
 def item_parts(item: str) -> tuple[str, str, int, str]:

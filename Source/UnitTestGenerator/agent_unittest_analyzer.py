@@ -38,7 +38,7 @@ import zipfile
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, model_validator
 
 import ut_contracts as uc
 from ut_contracts import ba
@@ -83,6 +83,7 @@ class AnalyzerConfig(BaseModel):
     max_requirements_to_link: int = 40
     min_link_probability: float = 0.6
     propose_declarations: bool = True        # A1-PL14
+    prefer_project_stubs: bool = False       # A1-DA7a: keep a project stub that offers no control [ORC-7]
     rule_attempts: int = 2                   # brain attempts per rule failure [ARCH-21, ORC-7]
     # CSV requirement documents: the column of the ID and of the text, first match by name [A1-RQ2]
     requirement_id_columns: list[str] = ["id", "requirement id", "req id", "req-id", "identifier", "key",
@@ -807,31 +808,43 @@ def _vec_text(leaves: list[str], vec: tuple[bool, ...], result: bool) -> str:
 
 
 def enclosing_conditions(source: str, fn: uc.FunctionInfo, line: int) -> list[str]:
-    """Reaching conditions: the if/else chain that must hold to reach ``line``."""
+    """Reaching conditions: the if/else chain that must hold to reach ``line`` [A1-37]. An else-if branch is reached
+    only when every earlier condition of its chain is false and its own condition is true; an else branch when every
+    condition of the chain is false. Each open block is [depth, its conditions, the raw conditions of its chain]."""
     lines = source.splitlines()
-    chain, stack = [], []
+    stack: list[list[Any]] = []
+    closed: list[Any] | None = None                    # the block that closed last: an else on the next line extends it
     for number in range(fn.line_start, min(line, fn.line_end) + 1):
         text = strip_comments(lines[number - 1]) if number - 1 < len(lines) else ""
+        if not text.strip():
+            continue
+        elif_ = re.search(r"\belse\s+if\s*\((.*)\)\s*\{", text)
+        else_ = None if elif_ else re.search(r"\belse\s*\{", text)
+        if elif_ or else_:
+            if text.lstrip().startswith("}") and stack:      # "} else ..." closes the previous branch here
+                closed = stack.pop()
+            chain = list(closed[2]) if closed else []
+            conds = [f"({c}) is false" for c in chain]
+            if elif_ and number < line:
+                conds.append(f"({elif_.group(1).strip()}) is true")
+            stack.append([1, conds, chain + ([elif_.group(1).strip()] if elif_ else [])])
+            closed = None
+            continue
         m = re.search(r"\b(if|while)\s*\((.*)\)\s*\{", text)
         if m and number < line:
-            stack.append((text.count("{") - text.count("}"), f"({m.group(2).strip()}) is true", number))
-        elif re.search(r"\}\s*else\s*\{", text) and stack:
-            depth, cond, start = stack.pop()
-            stack.append((1, cond.replace("is true", "is false"), number))
-        else:
-            delta = text.count("{") - text.count("}")
-            if stack and delta < 0:
-                depth, cond, start = stack[-1]
-                depth += delta
-                if depth <= 0:
-                    stack.pop()
-                else:
-                    stack[-1] = (depth, cond, start)
-            elif stack and delta > 0:
-                depth, cond, start = stack[-1]
-                stack[-1] = (depth + delta, cond, start)
-    chain = [cond for _, cond, _ in stack]
-    return chain
+            stack.append([max(1, text.count("{") - text.count("}")), [f"({m.group(2).strip()}) is true"],
+                          [m.group(2).strip()] if m.group(1) == "if" else []])
+            closed = None
+            continue
+        delta = text.count("{") - text.count("}")
+        if stack and delta:
+            stack[-1][0] += delta
+            if stack[-1][0] <= 0:
+                closed = stack.pop()
+            continue
+        if not text.strip().startswith("}"):
+            closed = None                                    # a statement between: no else can follow
+    return [c for block in stack for c in block[1]]
 
 
 # ============================================================================ Clang front end [A1-DA1 .. A1-DA14]
@@ -1755,6 +1768,33 @@ def prove_infeasible(expr: str, metric: str, index: int | None, outcome: str, fn
     return ""
 
 
+RANGE_WORDS = re.compile(r"\b(range|ranges|limit|limits|bound|bounds|inside|within|between|valid|allowed|min|max)\b",
+                         re.I)
+
+
+def defect_candidate(expr: str, metric: str, index: int | None, outcome: str, fn: uc.FunctionInfo,
+                     constants: dict[str, int], path: list[str], before: str, proof: str, lines: list[str],
+                     line: int) -> uc.DefectCandidate | None:
+    """A1-37f: the proof no longer holds when the operators are swapped (|| for &&, && for ||) - then the operator is
+    the likely defect. The comment at the decision is its evidence when it names the bounds or a range."""
+    if "||" not in expr and "&&" not in expr:
+        return None
+    mutant = re.sub(r"\|\||&&", lambda m: "&&" if m.group(0) == "||" else "||", expr)
+    if prove_infeasible(mutant, metric, index, outcome, fn, constants, path, before) or \
+            any(prove_infeasible(mutant, "DC", None, o, fn, constants, path, before) for o in ("T", "F")):
+        return None                         # the swap does not explain it, or makes the decision constant: redundant
+    names = set(re.findall(r"\b([A-Za-z_]\w*)\b", expr))
+    evidence = ""
+    for k in (line - 1, line - 2, line - 3, line):             # the comment above it, or at its end
+        if 0 < k <= len(lines):
+            m = re.search(r"(//.*|/\*.*?\*/|/\*.*$|^\s*\*.*$)", lines[k - 1])
+            if m and (RANGE_WORDS.search(m.group(1)) or names & set(re.findall(r"\b([A-Za-z_]\w*)\b", m.group(1)))):
+                evidence = f"line {k}: {m.group(1).strip()[:160]}"
+                break
+    return uc.DefectCandidate(line=line, function=fn.qualified_name, decision=expr.strip(), proof=proof[:400],
+                              change=f"{expr.strip()} -> {mutant.strip()}", evidence=evidence)
+
+
 def block_lines(lines: list[str], line: int, branch: str) -> tuple[int, int, int] | None:
     """(first line, last line, first column on the first line) of the then- (T) or else-block (F)
     of the if-statement at ``line`` (1-based)."""
@@ -1787,6 +1827,21 @@ def block_lines(lines: list[str], line: int, branch: str) -> tuple[int, int, int
         return line + text.count("\n", 0, start), line + text.count("\n", 0, end), 0
     m2 = re.match(r"\s*else\s*\{", text[end + 1:])
     if not m2:
+        # no else: when the then-block always returns, the rest of the enclosing block is the false branch [A1-37]
+        then = strip_comments(text[start + 1:end]).strip()
+        last = then.rsplit(";", 2)[-2] if then.count(";") >= 1 else ""
+        if not re.match(r"\s*(?:\}\s*)*return\b", last.split("{")[-1].split("}")[-1]):
+            return None
+        depth = 0
+        for i in range(end + 1, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth < 0:
+                    first = line + text.count("\n", 0, end) + 1
+                    stop = line + text.count("\n", 0, i) - (0 if text[text.rfind("\n", 0, i) + 1:i].strip() else 1)
+                    return (first, stop, 0) if stop >= first else None
         return None
     s2 = end + 1 + m2.end() - 1
     depth = 0
@@ -2047,6 +2102,16 @@ class PlannedQuote(BaseModel):
     evidence_id: str
     text: str = Field(description="exact words copied from that evidence item")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _from_text(cls, value: Any) -> Any:
+        """ARCH-20b, A1-PL3: a quote written as one text ("EV-f-1: the words") is its evidence ID and its words."""
+        if isinstance(value, str):
+            m = re.match(r'\s*\[?(EV-\S+?|E\d)\]?(?:\s*[:=\u2013-]\s+|\s+)["\']?(.*?)["\']?\s*$', value, re.S)
+            return {"evidence_id": m.group(1), "text": m.group(2)} if m and m.group(2) else \
+                {"evidence_id": "", "text": value}
+        return value
+
 
 class PlannedScenario(BaseModel):
     """What the brain returns per scenario [A1-PL3]; Agent1 checks it [A1-PL4]."""
@@ -2144,6 +2209,9 @@ PLAN_TASK = (
     '"args": [{{"name": "a", "value": "1"}}, {{"name": "b", "value": "-1"}}], "setup": [], "stubs": [], '
     '"variables": [], "expected_return": "", "expected_after": [], "evidence_ids": [], "quotes": [], '
     '"classification": "characterization_gap", "conflict": "", "information_sought": ""}}\n'
+    "A confirmed_gap carries the evidence it rests on, for example: \"classification\": \"confirmed_gap\", "
+    '"expected_return": "-1", "evidence_ids": ["EV-f-1"], "quotes": [{{"evidence_id": "EV-f-1", "text": "returns -1 '
+    'when b is negative"}}] - every quote an object with the evidence id and the words copied from it.\n'
     "Values are C code exactly as in the example (\"1\", \"-1\", a macro or enumerator name): never a ':' or '=' "
     "before a value, never the parameter name, a file path or a placeholder.")
 LINK_TASK = (
@@ -2925,6 +2993,7 @@ class AnalyzerAgent(ba.AgentCore):
         # declarations proposed earlier for symbols without one stay in the plan [A1-PL14]
         plan.entries += [d for d in previous.values() if d.name not in {e.name for e in plan.entries}
                          and (d.decided_by.startswith("brain declaration") or "[A1-PL14]" in d.reason)]
+        self._project_stubs(layout, plan)                                                       # A1-DA7a
         layout.dependencies = plan
         layout.requirement_links = await self._link_requirements(layout)                # A1-PL13
         return layout
@@ -3036,6 +3105,93 @@ class AnalyzerAgent(ba.AgentCore):
                 if pattern.search(text) and "extern" not in (pattern.search(text).group(0)):
                     return stub
         return ""
+
+    # ---------------------------------------------------------------- A1-DA7a: controls of a project stub
+    PROTOTYPE = re.compile(r"^[ \t]*(?!typedef\b|static\b|return\b|#)((?:[A-Za-z_][\w:<>]*[\s*&]+)+)([A-Za-z_]\w*)\s*"
+                           r"\(([^;{}()]*)\)\s*(?:;|\{)", re.M)
+    GLOBAL = re.compile(r"^[ \t]*extern\s+(?![^;]*\bconst\b)([^;()]*?)\b([A-Za-z_]\w*)\s*;", re.M)
+
+    @staticmethod
+    def _stub_header(root: Path, stub: str, layout: uc.LayoutProfile) -> str:
+        """The header that declares a project stub's controls: the one of the same name next to it, else a header
+        in a stub folder that the stub includes."""
+        path = root / stub
+        for ext in (".h", ".hpp", ".hh"):
+            if path.with_suffix(ext).is_file():
+                return str(path.with_suffix(ext).relative_to(root)).replace("\\", "/")
+        text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        for name in re.findall(r'#\s*include\s*"([^"]+)"', text):
+            for folder in [str(Path(stub).parent)] + list(layout.stub_dirs):
+                candidate = root / folder / name
+                if candidate.is_file():
+                    return str(candidate.relative_to(root)).replace("\\", "/")
+        return ""
+
+    @classmethod
+    def _controls_in(cls, text: str, served: set[str], production: set[str], definitions: bool) -> list[uc.StubControl]:
+        out: dict[str, uc.StubControl] = {}
+        for m in cls.PROTOTYPE.finditer(text):
+            ret, name, args = " ".join(m.group(1).split()), m.group(2), m.group(3).strip()
+            if name in served or name in production or name in KEYWORDS or name in ("main", "if", "while", "for"):
+                continue
+            if definitions != m.group(0).rstrip().endswith("{"):
+                continue
+            params = []
+            for a in ([] if args in ("", "void") else (x.strip() for x in args.split(","))):
+                pm = re.match(r"^(.*?[\s*&])([A-Za-z_]\w*)\s*(\[[^\]]*\])?$", a)
+                params.append([" ".join(pm.group(1).split()), pm.group(2)] if pm and pm.group(1).strip()
+                              and pm.group(2) not in ("int", "char", "long", "short", "unsigned", "float", "double")
+                              else [a, ""])
+            out.setdefault(name, uc.StubControl(name=name, declaration=f"{ret} {name}({args or 'void'})",
+                                                return_type=ret, params=params))
+        if not definitions:
+            for m in cls.GLOBAL.finditer(text):
+                name = m.group(2)
+                if name not in served and name not in production:
+                    out.setdefault(name, uc.StubControl(name=name, kind="variable", type=" ".join(m.group(1).split()),
+                                                        declaration=f"extern {' '.join(m.group(1).split())} {name}"))
+        return list(out.values())
+
+    def _project_stubs(self, layout: uc.LayoutProfile, plan: uc.DependencyPlan) -> None:
+        """A1-DA7a: the controls of every reused project stub; a stub without any control is not reused (unless
+        the configuration keeps project stubs): its dependencies get generated stubs."""
+        root = Path(layout.repo_root)
+        by_file: dict[str, list[uc.Dependency]] = {}
+        for d in plan.entries:
+            if d.existing_stub and d.decision == "stub":
+                by_file.setdefault(d.existing_stub, []).append(d)
+        production = set()
+        for rel in list(dict.fromkeys(layout.headers + plan.headers)):
+            if (root / rel).is_file() and "/stub" not in "/" + rel.lower():
+                production |= set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", strip_comments(
+                    (root / rel).read_text(encoding="utf-8", errors="replace"))))
+        stubs = []
+        for file, deps in sorted(by_file.items()):
+            served = {d.name for d in deps} | {d.qualified_name for d in deps if d.qualified_name}
+            header = self._stub_header(root, file, layout)
+            controls = []
+            if header:
+                controls = self._controls_in(strip_comments((root / header).read_text(encoding="utf-8", errors="replace")),
+                                             served, production, definitions=False)
+            if not controls and (root / file).is_file():
+                controls = self._controls_in(strip_comments((root / file).read_text(encoding="utf-8", errors="replace")),
+                                             served, production, definitions=True)
+            if not controls and not self.cfg.prefer_project_stubs:
+                for d in deps:
+                    d.existing_stub = ""
+                    d.reason = (f"the project stub {file} offers no control a test can set, so a generated stub with "
+                                "controls is used instead [A1-DA7a]")
+                plan.notes.append(f"{file}: no control a test can set - generated stubs replace it for "
+                                  f"{', '.join(sorted(d.name for d in deps))} [A1-DA7a]")
+                continue
+            reset = next((c.name for c in controls if c.kind == "function" and not c.params and
+                          re.search(r"reset|init|clear", c.name, re.I)), "")
+            stubs.append(uc.ProjectStub(file=file, header=header, controls=controls, reset=reset,
+                                        serves=sorted(served)))
+            for d in deps:
+                d.reason = (f"the existing stub {file} is reused [A1-DA7]; its controls: "
+                            + (", ".join(c.name for c in controls[:6]) or "none") + " [A1-DA7a]")
+        plan.project_stubs = stubs
 
     def _find_definition(self, dep: uc.Dependency, layout: uc.LayoutProfile, build: uc.BuildDescription,
                          tools: uc.Tools, units: dict[str, Any]) -> str:
@@ -3258,6 +3414,8 @@ class AnalyzerAgent(ba.AgentCore):
                     names.add(f"ut_cb_{re.sub(r'[^A-Za-z0-9_]', '_', f.name.replace('(anonymous namespace)::', ''))}_{i}")
         for e in layout.enums:
             names |= {k.split("::")[-1] for k in e.values} | {e.name.split("::")[-1]}
+        names |= {c.name for ps in (layout.dependencies.project_stubs if layout.dependencies else [])
+                  for c in ps.controls}                                                              # A2-21ak
         names |= {uc.state_setter_name(v) for v in uc.settable_state(layout)}                        # A2-21z
         names |= {uc.state_getter_name(v) for v in uc.settable_state(layout)}
         return names
@@ -3474,12 +3632,16 @@ class AnalyzerAgent(ba.AgentCore):
         if not gaps:
             reasons.append("names no open gap of this function: " + ", ".join(planned.gap_ids[:4]))
         unknown_ev = [e for e in planned.evidence_ids if e not in evidence]                # b)
-        if unknown_ev:
-            reasons.append("unknown evidence ids: " + ", ".join(unknown_ev[:4]))
-        for q in planned.quotes:
-            ev = evidence.get(q.evidence_id)
-            if ev is None or not norm_text(q.text) or norm_text(q.text) not in norm_text(ev.text):
-                reasons.append(f"the quote of {q.evidence_id} does not occur word for word in that evidence")
+        dropped_quotes = [q for q in planned.quotes if evidence.get(q.evidence_id) is None or not norm_text(q.text)
+                          or norm_text(q.text) not in norm_text(evidence[q.evidence_id].text)]
+        if unknown_ev or dropped_quotes:         # what rests on them is not asserted; the inputs stay [A1-PL4]
+            planned.evidence_ids = [e for e in planned.evidence_ids if e in evidence]
+            planned.quotes = [q for q in planned.quotes if q not in dropped_quotes]
+            self.last_fixes.append("evidence not usable, left out - the result is observed unless other quoted "
+                                   "evidence states it: " + "; ".join(
+                                       [f"unknown id {e}" for e in unknown_ev[:3]] +
+                                       [f"the quote of {q.evidence_id or '?'} does not occur word for word"
+                                        for q in dropped_quotes[:3]]) + " [A1-PL4]")
         recipe = uc.object_recipe(fn, layout)                         # the object of a member function [A2-21ae]
         if recipe is not None:               # the object exists already: a second declaration is form, not content
             declared = set().union(*(uc.declared_names(x) for x in recipe[0]))
@@ -3751,6 +3913,10 @@ class AnalyzerAgent(ba.AgentCore):
                      + (f" - suggested return values: {', '.join(suggested[s.function + '()'])}"
                         if s.function + "()" in suggested else "") for s in called]
         var_rows = [f"- {s.function}: {s.var_type}" for s in stubs if s.kind == "variable" and not s.is_const]
+        controls = uc.project_controls(fn, layout)                                          # A2-21ak
+        project = ("PROJECT STUB CONTROLS (the project's own stubs of the hardware this code calls: call them in setup "
+                   "to set what those functions return; without them they return their defaults):\n"
+                   + "\n".join(f"- {c.declaration};  ({ps.file})" for ps, c in controls)) if controls else ""
         real = [d.name for d in (layout.dependencies.entries if layout.dependencies else []) if d.decision != "stub"]
         # A1-PL2: what a test can set besides the stubs - globals the headers declare, the SUT's state setters
         stubbed_vars = {s.function for s in stubs if s.kind == "variable"}
@@ -3806,6 +3972,7 @@ class AnalyzerAgent(ba.AgentCore):
             "OPEN GAPS:\n" + "\n".join(gap_rows),
             "STUBS (controllable return values):\n" + ("\n".join(stub_rows) or "- none"),
             "STUB VARIABLES:\n" + ("\n".join(var_rows) or "- none"),
+            *([project] if project else []),                                                  # A2-21ak
             "REAL OR SYSTEM DEPENDENCIES (their real code runs; they have no ut_stub_ control - control them through "
             "what they read, such as the GLOBALS below): " + (", ".join(real[:20]) or "none"),
             "GLOBALS a test can set directly: " + (", ".join(globals_[:20]) or "none"),
@@ -4726,6 +4893,8 @@ class AnalyzerAgent(ba.AgentCore):
                 proof = prove_infeasible(expr, "MCDC", g.condition_index, "", fn, use, path, before)
                 if proof:
                     g.detail += f" | infeasible_condition_combination: {proof} [A3-121a]"
+                    g.defect = defect_candidate(expr, "MCDC", g.condition_index, "", fn, use, path, before, proof,
+                                                lines, g.line)                                    # A1-37f
             elif g.metric in ("DC", "BC"):
                 seen = {o.rsplit("=", 1)[-1] for o in g.observed}
                 missing = [o for o in ("T", "F") if o not in seen] if g.metric == "DC" else [g.gap_id.rsplit(":", 1)[-1]]
@@ -4735,6 +4904,8 @@ class AnalyzerAgent(ba.AgentCore):
                 proofs = [prove_infeasible(expr, g.metric, index, o, fn, use, path, before) for o in missing]
                 if missing and all(proofs):
                     g.detail += f" | infeasible_outcome: {'; '.join(proofs)} [A3-121a]"
+                    g.defect = defect_candidate(expr, g.metric, index, missing[0], fn, use, path, before, proofs[0],
+                                                lines, g.line)                                    # A1-37f
                     if g.metric == "DC" or len(split_conditions(expr)) == 1:
                         for o in missing:
                             block = block_lines(lines, g.line, o)

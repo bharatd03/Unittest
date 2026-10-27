@@ -1,0 +1,29 @@
+{
+  "construct": "a project stub (stubs/hal_stub.c) reused for the HAL, driven only through its own controls sim_set_echo_us / sim_set_no_echo [A1-DA7a, A2-21ak]",
+  "sut": "src/height.c",
+  "language": "c",
+  "expect": {
+    "final_state": "verified_measured",
+    "statuses": {}
+  },
+  "answers": {
+    "scenarios": [
+      {
+        "gap_ids": ["LC:height_distance_mm:30"],
+        "name": "test_height_distance_mm_in_range",
+        "purpose": "an echo of 8746 us is 1500 mm, inside the range",
+        "args": [{"name": "mm", "value": "&out"}],
+        "setup": ["int32_t out = 0;", "sim_set_echo_us(8746u);"],
+        "stubs": [],
+        "variables": [],
+        "expected_return": "",
+        "expected_after": [],
+        "evidence_ids": [],
+        "quotes": [],
+        "classification": "characterization_gap",
+        "conflict": "",
+        "information_sought": ""
+      }
+    ]
+  }
+}

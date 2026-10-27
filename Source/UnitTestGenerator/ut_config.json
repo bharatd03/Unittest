@@ -76,7 +76,7 @@
                "requirement_files": [], "max_brain_calls_per_function": 2,
                "brain_functions_per_round": 30, "state_per_function": 40,
                "max_lookups_per_function": 6, "link_requirements": true, "propose_declarations": true,
-               "rule_attempts": 2},
+               "rule_attempts": 2, "prefer_project_stubs": false},
   "generator": {"mode": "deterministic_then_llm", "max_auto_tests_per_function": 24, "max_llm_tests_per_function": 8,
                 "rule_attempts": 2, "max_brain_values": 12},
   "compilation": {

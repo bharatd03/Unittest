@@ -1578,6 +1578,9 @@ class Orchestrator:
         resolve (BP-9). Every pipeline limitation is a finding across runs (NC-5)."""
         s.item_status = []
         brains = ", ".join(f"{b} ({self.book.of(b).name})" for b in self.book.brains) or "none"
+        shared = set()
+        with contextlib.suppress(Exception):                     # a diagnosis: never a reason to fail the run
+            shared = self._stubs_not_driven(s, last)                                            # LA-3a
         for fc in (last.coverage.functions if last.coverage else []):
             for g in fc.gaps:
                 if g.gap_id in s.needs_kind and not s.proofs.get(g.gap_id):
@@ -1586,8 +1589,12 @@ class Orchestrator:
                                                   f"{brains} [BP-9]", owner=uc.OWNER["pipeline_limitation"])
                 else:
                     status = s.journal.final_status(g.gap_id, fc.name, s.proofs.get(g.gap_id, ""), s.suggested)
+                blocker = next((d for d in getattr(s, "defects", {}).values() if g.gap_id in d.items), None)
+                if blocker is not None and status.status == "proven_unreachable":          # A1-37f, COV-7
+                    status.reason = (f"blocked by defect candidate {blocker.candidate_id} (line {blocker.line}: "
+                                     f"{blocker.change}) - " + status.reason)[:600]
                 s.item_status.append(status)
-                if status.status == "pipeline_limitation":                                   # NC-5
+                if status.status == "pipeline_limitation" and g.gap_id not in shared:          # NC-5
                     fn = next((f for f in self.layout.functions if fc.name in (f.name, f.qualified_name)), None) \
                         if self.layout else None
                     construct = (uc.construct_of(fn, self.layout)[0] or "; ".join(uc.patterns_of(fn, self.layout))) \
@@ -1596,6 +1603,94 @@ class Orchestrator:
                     s.findings.append(self._finding(
                         "pipeline_limitation", construct, entry.result if entry else status.reason, item=g.gap_id,
                         kinds=s.kinds_tried.get(g.gap_id, []), brains=sorted(s.item_brains.get(g.gap_id, set()))))
+        s.open_summary = self._open_summary(s)                                                  # LA-3a
+
+    def _stubs_not_driven(self, s: "RunState", last: uc.VerificationResult) -> set[str]:
+        """LA-3a: the open items after the first call of a stub (or of the SUT function through which it is reached)
+        that no test of the function set - one journal entry per function; returns the items concerned."""
+        layout = self.layout
+        if layout is None or layout.dependencies is None or last.coverage is None:
+            return set()
+        bundle = s.best_bundle or s.bundle
+        sources = uc.test_sources(uc.suite_of(bundle)) if bundle is not None else {}
+        controls: dict[str, set[str]] = {}               # stub -> the names a test drives it by
+        for d in layout.dependencies.entries:
+            if d.decision != "stub" or d.existing_stub:
+                continue
+            spec = uc.StubSpec(function=d.name, declaration=d.declaration, return_type=d.type,
+                               qualified_name=d.qualified_name, overload=getattr(d, "overload", 0),
+                               kind="method" if d.kind == "method" else "function") if d.kind != "variable" else None
+            base = uc.stub_base(spec) if spec is not None else ""
+            if d.kind == "variable":
+                controls[d.name] = {d.name}
+            elif re.sub(r"\b(const|volatile|static|inline|extern)\b", "", d.type.split("(")[0]).strip() not in ("", "void"):
+                controls[d.name] = {f"ut_stub_{base}_return", f"ut_stub_{base}_returns", f"ut_stub_{base}_step"}
+        for ps in layout.dependencies.project_stubs:
+            for served in ps.serves:
+                controls.setdefault(served, set()).update(c.name for c in ps.controls)
+        controls = {k: v for k, v in controls.items() if v}
+        if not controls:
+            return set()
+        lines = uc.read_source(Path(s.workspace) / layout.sut_file).splitlines()
+        by_name = {f.name: f for f in layout.functions} | {f.qualified_name: f for f in layout.functions}
+        out: set[str] = set()
+        for fc in last.coverage.functions:
+            fn = by_name.get(fc.name)
+            if fn is None or not fc.gaps:
+                continue
+            short = fn.name.split("::")[-1]
+            tests = [src for src in sources.values() if re.search(r"\b(?:" + re.escape(short) + r"|ut_static_\w*"
+                                                                   + re.escape(short) + r")\s*\(", src)]
+            reach: dict[str, str] = {}                   # stub -> the SUT function it is reached through ("" direct)
+            for c in fn.calls:
+                if c in controls:
+                    reach.setdefault(c, "")
+                callee = by_name.get(c)
+                for c2 in (callee.calls if callee is not None and callee is not fn else []):
+                    if c2 in controls:
+                        reach.setdefault(c2, c)
+                    callee2 = by_name.get(c2)
+                    for c3 in (callee2.calls if callee2 is not None and callee2 is not fn else []):
+                        if c3 in controls:
+                            reach.setdefault(c3, c)
+            undriven = {stub: via for stub, via in reach.items()
+                        if not any(re.search(r"\b" + re.escape(n) + r"\b", src) for src in tests for n in controls[stub])}
+            if not undriven:
+                continue
+            body = lines[fn.line_start - 1: fn.line_end]
+            first = min((fn.line_start + k for k, text in enumerate(body) for stub, via in undriven.items()
+                         if re.search(r"\b" + re.escape((via or stub).split("::")[-1]) + r"\s*\(", text)),
+                        default=fn.line_start)
+            items = [g.gap_id for g in fc.gaps if g.line >= first and g.gap_id not in s.proofs]
+            if not items:
+                continue
+            named = ", ".join(f"{stub}" + (f" (through {via})" if via else "") for stub, via in sorted(undriven.items()))
+            s.journal._entry(fn.qualified_name, items, "stub_not_driven",
+                             f"{len(tests)} test(s) call {fn.qualified_name}, none set {named}: every call returned "
+                             "the stub's default, so the items after it were never reached", strategy="analysis",
+                             iteration=len(s.iterations))
+            s.findings.append(self._finding("pipeline_limitation", f"stub not driven: {named}",
+                                            f"{fn.qualified_name}: {len(items)} item(s) after {named}"))
+            out |= set(items)
+        return out
+
+    @staticmethod
+    def _open_summary(s: "RunState") -> str:
+        """LA-3a: the open items counted per final status and root cause, with the defect candidates."""
+        if not s.item_status:
+            return ""
+        counts: dict[str, int] = {}
+        for st in s.item_status:
+            entry = s.journal.cause_of(st.item_id)
+            label = "stub_not_driven" if entry is not None and entry.cause == "stub_not_driven" and \
+                st.status == "pipeline_limitation" else st.status.replace("_", " ")
+            counts[label] = counts.get(label, 0) + 1
+        parts = [f"{n} {label}" for label, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+        defects = len(getattr(s, "defects", {}))
+        if defects:
+            parts = [p + (f" ({defects} defect candidate{'s' if defects > 1 else ''})"
+                          if p.endswith("proven unreachable") else "") for p in parts]
+        return f"{len(s.item_status)} open - " + ", ".join(parts)
 
     def _observe_findings(self, s: "RunState", obs: uc.VerificationResult) -> None:
         """A3-OBS6, NC-5: what an observation run could not measure is a finding of the pipeline, not of the SUT."""
@@ -1884,7 +1979,16 @@ class Orchestrator:
             return None
         engine = fuzz.engine or "libFuzzer"                                                 # A3-FZ11
         s.fuzzing.append(f"{engine}: {', '.join(fuzz.functions) or '-'}: {fuzz.reason}")
+        failed = {u.split(": ", 1)[0]: u.split(": ", 1)[-1] for u in fuzz.unsupported}
+        for name, why in failed.items():                    # A3-FZ13: a target that does not build is a finding
+            if re.search(r"does not build|build failed|no statistics", why):
+                s.findings.append(self._finding("pipeline_limitation", f"fuzz target of {name}", why))
         for g in gaps:                                                                       # COV-6, COV-10
+            fn = self._function_of(g.function)
+            why = failed.get(fn.qualified_name if fn else g.function) or failed.get(g.function)
+            if why:                                         # never "none reached it" for a search that did not run
+                s.note(g.gap_id, f"iteration {iteration}: not searched ({engine}): {why[:200]} [A3-FZ13]")
+                continue
             s.note(g.gap_id, f"iteration {iteration}: coverage-guided search ({engine}, {fuzz.executions:,} inputs run, "
                              + (f"{len(fuzz.inputs)} reached new items)" if fuzz.inputs else "none reached it)"))
         s.fuzzing += [f"not fuzzed: {u}" for u in fuzz.unsupported]
@@ -2573,7 +2677,8 @@ class Journal:
             reason = f"a checked source-change suggestion reaches it ({suggested[item].replace('_', ' ')}) [COV-12]"
         elif entry is None:
             status, reason = "undetermined", "no attempt recorded a cause"
-        elif entry.cause in ("test_setup", "test_did_not_compile", "pipeline_limitation", "needs_dependency_control"):
+        elif entry.cause in ("test_setup", "test_did_not_compile", "pipeline_limitation", "needs_dependency_control",
+                             "stub_not_driven"):                                                   # LA-3a
             status, reason = "pipeline_limitation", f"{uc.CAUSE_TEXT[entry.cause]}: {entry.result[:240]}"
         elif entry.cause in ("needs_requirement", "needs_source_change"):
             status, reason = entry.cause, entry.result[:240]
@@ -2619,6 +2724,8 @@ class RunState:
         self.targets: dict[str, str] = dict(uc.MIN_TARGETS["D"])                             # COV-1
         self.strategies: dict[str, list[str]] = {}                # item -> strategies tried [COV-6, COV-10]
         self.proofs: dict[str, str] = {}                          # item -> deterministic proof [COV-4]
+        self.defects: dict[int, uc.DefectCandidate] = {}           # line -> defect candidate [A1-37f]
+        self.open_summary = ""                                      # [LA-3a]
         self.variant_proofs: dict[str, list[uc.VariantProof]] = {}   # item -> proof per build variant [A1-37c]
         self.paths: dict[str, list[str]] = {}
         self.missing: dict[str, list[str]] = {}
@@ -2748,6 +2855,15 @@ class RunState:
             if ("infeasible_" in g.detail or "unreachable_code" in g.detail) and g.gap_id not in self.proofs:
                 self.proofs[g.gap_id] = g.detail
                 self.note(g.gap_id, f"iteration {iteration}: deterministic analysis: no test can reach it")
+            if g.defect is not None:                                                         # A1-37f
+                found = self.defects.setdefault(g.defect.line, g.defect.model_copy(update={
+                    "candidate_id": f"D{len(self.defects) + 1}", "items": []}))
+                if g.gap_id not in found.items:
+                    found.items.append(g.gap_id)
+        for found in self.defects.values():                 # the lines its branch makes unreachable are blocked too
+            for g in plan.gaps:
+                if f"line {found.line}:" in g.detail and "unreachable_code" in g.detail and g.gap_id not in found.items:
+                    found.items.append(g.gap_id)
         for line in plan.planning:
             if "[COV-5]" in line or "dropped by the check" in line or "no scenario this time" in line:
                 fn = line.split(":", 1)[0]
@@ -2788,7 +2904,10 @@ class RunState:
 
     def actions(self, last: uc.VerificationResult) -> list[str]:
         """COV-11: what the developer can do; the run does not wait for it."""
-        rows = []
+        rows = [f"review defect candidate {d.candidate_id} at line {d.line}: `{d.decision}` - {d.proof[:160]}; with "
+                f"`{d.change.split(' -> ')[-1]}` it would not be - either the operator is wrong or the condition is "
+                f"redundant; it blocks {len(d.items)} item(s) [A1-37f, COV-7]"
+                for d in sorted(getattr(self, "defects", {}).values(), key=lambda d: d.line)]
         metrics = last.coverage.file_metrics if last.coverage else None
         for name in uc.METRICS:
             value = getattr(metrics, name) if metrics else None
@@ -2797,14 +2916,16 @@ class RunState:
                 count = sum(1 for i in self.not_reached if i.metric == name)
                 rows.append(f"{METRIC_NAMES[name]} coverage {value.percent:g} % is below its target "
                             f"{uc.target_text(target)} (ASIL {self.asil}, {self.asil_source}): {count} item(s) not reached")
-        for i in self.not_reached[:8]:
+        blocked = {i for d in getattr(self, "defects", {}).values() for i in d.items}       # named with their candidate
+        rest = [i for i in self.not_reached if i.item_id not in blocked]
+        for i in rest[:8]:
             why = (f"no test can reach it: {i.proof[:220]}" if i.proof else
                    f"not reached after: {'; '.join(i.strategies[-3:])[:300]}")
             if any("may be reachable there" in v for v in i.variants):                   # A1-37c
                 why += "; " + "; ".join(v for v in i.variants if "may be reachable there" in v)[:200]
             rows.append(f"{i.item_id} ({i.function}, line {i.line}): {why}")
-        if len(self.not_reached) > 8:
-            rows.append(f"... and {len(self.not_reached) - 8} more item(s): see the report")
+        if len(rest) > 8:
+            rows.append(f"... and {len(rest) - 8} more item(s): see the report")
         functions = sorted({i.function for i in self.not_reached if i.function})
         if functions and self.layout is not None and not self.layout.requirement_files:
             rows.append("Provide the requirement documents for " + ", ".join(functions[:6]) + " (analyzer."
@@ -2816,7 +2937,8 @@ class RunState:
         by_status: dict[str, list[str]] = {}                                                  # LA-6
         for st in self.item_status:
             by_status.setdefault(st.status, []).append(st.item_id)
-        source = by_status.get("needs_source_change", []) + by_status.get("proven_unreachable", [])
+        source = [i for i in by_status.get("needs_source_change", []) + by_status.get("proven_unreachable", [])
+                  if i not in blocked]
         if source and not self.suggestions:
             rows.append(f"Change the source so that tests can reach {', '.join(source[:6])}"
                         + (" ..." if len(source) > 6 else "") + ", then run again [COV-7, LA-6].")
@@ -2878,6 +3000,8 @@ class RunState:
             files_generated=sorted(self.files_generated), files_modified=sorted(self.files_modified),
             characterization_tests=len(bundle.characterization_tests) if bundle else 0,
             oracle_checks=self.oracle_checks, source_fixes=self.source_fixes, open_items=sorted(self.open_items),
+            defect_candidates=sorted(self.defects.values(), key=lambda d: d.line),                      # A1-37f
+            open_summary=getattr(self, "open_summary", ""),                                             # LA-3a
             asil=self.asil, asil_source=self.asil_source, targets=dict(self.targets),
             target_check=self.target_check(last), not_reached=self.not_reached, action_needed=self.action_needed,
             suggestions=self.suggestions,
@@ -2930,6 +3054,10 @@ def report(r: uc.PipelineResult) -> str:
                  f"- Delivery: {r.delivery or 'not delivered yet'}"]
         if r.previous_review:
             rows.append(f"- Previous review pull request: {r.previous_review} [ORC-26]")
+    planning = next((line for line in r.brain_answers if line.startswith("A1.plan:")), "")
+    rows += [f"- Open items: {r.open_summary}"] if r.open_summary else []                        # LA-3a
+    rows += [f"- Defect candidates: {len(r.defect_candidates)} (see below) [A1-37f]"] if r.defect_candidates else []
+    rows += [f"- Brain planning: {planning.split(': ', 1)[1]} [KB-25]"] if planning else []
     rows += [f"- Reason: {r.reason}", f"- Compiler: {r.compiler or '-'}; harness: {r.framework}",
             f"- Tests: {r.total_tests} total, {r.passed} passed, {r.failed} failed; "
             f"{r.characterization_tests} characterization-only (E8)", ""]
@@ -2951,6 +3079,15 @@ def report(r: uc.PipelineResult) -> str:
     if r.target_check:                                                                   # COV-8
         rows += [f"## Coverage targets: ASIL {r.asil} ({r.asil_source}) [COV-1, COV-2]", ""]
         rows += [f"- {line}" for line in r.target_check] + [""]
+    if r.defect_candidates:                                                              # A1-37f
+        rows += ["## Defect candidates [A1-37f]", "", "A condition the analysis proves can never take a value, and that "
+                 "takes it when its operator is swapped: likely a wrong operator. A finding for the developer - the "
+                 "source is not changed by the pipeline (COV-7).", ""]
+        for d in r.defect_candidates:
+            rows += [f"- **{d.candidate_id}** line {d.line} ({d.function}): `{d.decision}`", f"  - proof: {d.proof}",
+                     f"  - the change that removes the proof: `{d.change}`"]
+            rows += ([f"  - evidence: {d.evidence}"] if d.evidence else [])
+            rows += [f"  - blocks {len(d.items)} item(s): {', '.join(d.items[:8])}", ""]
     if r.action_needed:                                                                  # COV-11
         rows += ["## Action needed", "", "The run did not wait for this; it stopped with the evidence below.", ""]
         rows += [f"- {line}" for line in r.action_needed] + [""]
@@ -4300,7 +4437,12 @@ def run_batch(args: argparse.Namespace) -> int:
         verified = bool(result.results) and all(r.final_state != "incomplete" for r in result.results)
         lines.append(f"  {label}: every file verified" if verified else
                      f"  {label}: not every file verified (exit code 3) - see its report above")
+        lines += [f"    {r.sut_file}: {r.open_summary}" for r in result.results if r.open_summary]    # LA-3a
         code = code if verified else 3
+        if any(r.defect_candidates for r in result.results):                                      # A1-37f
+            lines.append(f"  {label}: defect candidates (exit code 4): " + "; ".join(
+                f"{r.sut_file} {d.candidate_id} line {d.line}" for r in result.results for d in r.defect_candidates))
+            code = 4
     if args.summary:
         args.summary.parent.mkdir(parents=True, exist_ok=True)
         args.summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -4409,6 +4551,8 @@ def main() -> int:
                     result = asyncio.run(Orchestrator(args.config).run(req.model_copy(
                         update={"requirements": list(req.requirements) + again})))
                 print(report(result))
+                if result.defect_candidates:                         # a finding for the developer [A1-37f]
+                    return 4
                 return 0 if result.final_state != "incomplete" else 3
             repo_req = uc.RepositoryRequest(repository=args.repo if is_link(args.repo) else str(Path(args.repo).resolve()),
                                             sut_files=suts, branch=args.branch, test_dir=args.test_dir,
@@ -4418,6 +4562,8 @@ def main() -> int:
             print((Path(outcome.output_dir) / "summary.md").read_text(encoding="utf-8"))
             for record in outcome.deliveries:
                 print(f"- {', '.join(record.sut_files)}: {RepositoryRun._describe(record)}")
+            if any(r.defect_candidates for r in outcome.results):                                 # A1-37f
+                return 4
             return 0 if outcome.results and all(r.final_state != "incomplete" for r in outcome.results) else 3
         agent = PipelineAgent(config_path=args.config)
         if args.transport == "http":

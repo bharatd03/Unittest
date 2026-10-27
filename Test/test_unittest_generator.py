@@ -3137,8 +3137,10 @@ class BrainPlanningTests(unittest.TestCase):
         with brain(b):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=last, iteration=2)))
         mine = [s for s in plan.scenarios if s.function == "thermostat_command"]
-        self.assertEqual(len(mine), 1, plan.planning)                                   # A1-PL4: three dropped
-        s = mine[0]
+        self.assertEqual(len(mine), 2, plan.planning)                                   # A1-PL4: two dropped
+        quoted = next(s for s in mine if s.test_name == "test_thermostat_command_quote")     # A1-PL4: bad quote left out
+        self.assertTrue(quoted.characterization and not quoted.expected_return)          # -> characterization only
+        s = next(s for s in mine if s.test_name == "test_thermostat_command_sensor_error")
         self.assertTrue(s.made_by.startswith("brain:qwen") and s.checked)              # A1-PL10
         self.assertFalse(s.characterization)                                            # A1-PL4 c): normative
         self.assertEqual((s.expected_return, s.strongest_class), ("-1", "E2"))
@@ -4642,6 +4644,136 @@ class CorpusRunTests(unittest.TestCase):
                 self.assertIn(status, [s.status for s in result.item_status if s.item_id.startswith(item)
                                        or s.function == item], name)
         print("\nConstruct corpus [NC-4]:\n" + "\n".join(outcomes))
+
+
+class UssPilotFixTests(unittest.TestCase):
+    """From the USS pilot run: else-if chains, the false branch of an if that returns, a wrong operator as a defect
+    candidate (A1-37, A1-37f), quotes written as text (A1-PL3, A1-PL4) and project stubs driven through their own
+    controls (A1-DA7a, A2-21ak, A3-FZ13)."""
+    BODY = ("int pick(int a)\n{\n    if (a > 10) {\n        return 1;\n    } else if (a > 5) {\n        return 2;\n"
+            "    } else {\n        return 3;\n    }\n}\n")
+
+    def fn(self, name="pick", start=1, end=10, param="a", ptype="int"):
+        return uc.FunctionInfo(name=name, qualified_name=name, signature="", file="a.c", line_start=start,
+                               line_end=end, params=[uc.ParamInfo(name=param, type=ptype, kind="int")])
+
+    def test_an_else_if_branch_needs_every_earlier_condition_false(self):            # A1-37
+        fn = self.fn()
+        self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 4), ["(a > 10) is true"])
+        self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 6), ["(a > 10) is false", "(a > 5) is true"])
+        self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 8), ["(a > 10) is false", "(a > 5) is false"])
+
+    def test_the_false_branch_of_an_if_that_returns_is_the_rest_of_the_block(self):  # A1-37
+        lines = ["int f(int d)", "{", "    if (d > 3) {", "        return 1;", "    }", "    d++;", "    return 0;", "}"]
+        self.assertEqual(a1.block_lines(lines, 3, "F"), (6, 7, 0))
+        lines[3] = "        d--;"                                                      # does not return: unknown
+        self.assertIsNone(a1.block_lines(lines, 3, "F"))
+
+    def test_a_wrong_operator_is_a_defect_candidate(self):                             # A1-37f
+        fn = self.fn("level_valid", 3, 10, "d", "int32_t")
+        constants = {"MIN_LEVEL": 20, "MAX_LEVEL": 4000}
+        lines = ["", "int level_valid(int32_t d)", "{", "    /* inside sensor range */",
+                 "    if ((d >= MIN_LEVEL) || (d <= MAX_LEVEL)) {", "        return 1;", "    }", "    return 0;", "}"]
+        wrong = "(d >= MIN_LEVEL) || (d <= MAX_LEVEL)"
+        proof = a1.prove_infeasible(wrong, "DC", None, "F", fn, constants)
+        self.assertTrue(proof)
+        d = a1.defect_candidate(wrong, "DC", None, "F", fn, constants, [], "", proof, lines, 5)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.change, wrong + " -> (d >= MIN_LEVEL) && (d <= MAX_LEVEL)")
+        self.assertIn("inside sensor range", d.evidence)
+        right = "(d >= MIN_LEVEL) && (d <= MAX_LEVEL)"                                 # correct: nothing proven
+        self.assertEqual(a1.prove_infeasible(right, "DC", None, "F", fn, constants), "")
+        redundant = "(d >= 0) || (d < 0)"                                              # swapped it is never true
+        proof = a1.prove_infeasible(redundant, "DC", None, "F", fn, constants)
+        self.assertTrue(proof)
+        self.assertIsNone(a1.defect_candidate(redundant, "DC", None, "F", fn, constants, [], "", proof, lines, 5))
+
+    def test_a_quote_written_as_text_is_its_evidence_id_and_words(self):            # A1-PL3, ARCH-20b
+        for text in ("EV-f-1: returns -1 on error", "[EV-f-1] returns -1 on error", 'EV-f-1 "returns -1 on error"'):
+            q = a1.PlannedQuote.model_validate(text)
+            self.assertEqual((q.evidence_id, q.text), ("EV-f-1", "returns -1 on error"), text)
+        self.assertEqual(a1.PlannedQuote.model_validate("no id at all").evidence_id, "")
+        self.assertRegex(a1.PLAN_TASK, r'"quotes": \[\{+"evidence_id": "EV-f-1", "text": "\w')   # one filled
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_a_project_stub_is_driven_through_its_controls(self):                     # A1-DA7a, A2-21ak, A3-FZ13
+        folder = up.CONSTRUCTS / "c_project_stub_controls"
+        with tmpdir() as d:
+            layout = CorpusAnswerTests._layout(None, folder, {"sut": "src/height.c"}, d)
+            [ps] = layout.dependencies.project_stubs
+            self.assertEqual((ps.file, ps.header, ps.reset), ("stubs/hal_stub.c", "stubs/hal_stub.h", "sim_reset"))
+            self.assertEqual({c.name for c in ps.controls}, {"sim_set_echo_us", "sim_set_no_echo", "sim_reset"})
+            self.assertEqual(set(ps.serves), {"hal_trigger", "hal_echo_width_us"})
+            fn = next(f for f in layout.functions if f.name == "height_distance_mm")      # through height_ping_us
+            self.assertIn("sim_set_echo_us", a2.project_stub_text(fn, layout))
+            sut = (Path(d) / "c_project_stub_controls" / "src/height.c").read_text().splitlines()
+            drivers = {c.name: values for c, values in a2.project_drivers(fn, layout, sut, {})}
+            self.assertEqual(drivers["sim_set_no_echo"], [None, 0, 1])
+            self.assertIn(None, drivers["sim_set_echo_us"])
+            self.assertTrue(all(v is None or v >= 0 for v in drivers["sim_set_echo_us"]))   # unsigned
+            plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="")
+            _, source, header = a2.render_stubs(plan)
+            self.assertIn('#include "hal_stub.h"', header)
+            self.assertIn("sim_reset();", source)
+            repo = Path(d) / "c_project_stub_controls"
+            self.assertEqual(a3.reused_stub_sources(layout, [], repo), ["stubs/hal_stub.c"])   # test and fuzz build
+            self.assertEqual(a3.project_stub_includes(layout, repo), [f"-I{repo / 'stubs'}"])
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_a_project_stub_without_controls_is_replaced(self):                       # A1-DA7a
+        folder = up.CONSTRUCTS / "c_project_stub_controls"
+        with tmpdir() as d:
+            work = Path(d) / "src_copy"
+            shutil.copytree(folder, work / "c_project_stub_controls")
+            stub = work / "c_project_stub_controls" / "stubs"
+            (stub / "hal_stub.h").write_text("#ifndef HAL_STUB_H\n#define HAL_STUB_H\n#endif\n")
+            (stub / "hal_stub.c").write_text('#include "hal.h"\nvoid hal_trigger(void) { }\n'
+                                             "uint32_t hal_echo_width_us(void) { return 0u; }\n")
+            layout = CorpusAnswerTests._layout(None, work / "c_project_stub_controls", {"sut": "src/height.c"}, d)
+            self.assertEqual(layout.dependencies.project_stubs, [])
+            hal = [e for e in layout.dependencies.entries if e.name in ("hal_trigger", "hal_echo_width_us")]
+            self.assertTrue(hal and all(e.decision == "stub" and not e.existing_stub for e in hal), hal)
+            self.assertTrue(any("A1-DA7a" in n for n in layout.dependencies.notes))
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_items_after_a_stub_no_test_drives_have_one_cause(self):                  # LA-3a
+        folder = up.CONSTRUCTS / "c_project_stub_controls"
+        with tmpdir() as d:
+            layout = CorpusAnswerTests._layout(None, folder, {"sut": "src/height.c"}, d)
+            suite = ("UT_TEST(test_height_distance_mm_zero) {\n    int32_t mm = 0;\n    height_distance_mm(&mm);\n}\n"
+                     "UT_TEST(test_height_ping_us_zero) {\n    height_ping_us();\n}\n")
+            bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+                path="tests/test_height.c", action="create", role="testsuite", content=suite)])
+            gaps = lambda fn, lines: [types.SimpleNamespace(gap_id=f"LC:{fn}:{n}", line=n) for n in lines]
+            last = types.SimpleNamespace(coverage=types.SimpleNamespace(functions=[
+                types.SimpleNamespace(name="height_ping_us", gaps=gaps("height_ping_us", [15, 16, 18])),
+                types.SimpleNamespace(name="height_distance_mm", gaps=gaps("height_distance_mm", [27, 29, 30, 31]))]))
+            s = types.SimpleNamespace(best_bundle=bundle, bundle=None, workspace=str(Path(d) / "c_project_stub_controls"),
+                                      proofs={}, journal=up.Journal("src/height.c", Path(d)), findings=[], iterations=[1],
+                                      item_status=[], defects={})
+            orch = up.Orchestrator.__new__(up.Orchestrator)
+            orch.layout = layout
+            shared = orch._stubs_not_driven(s, last)
+            self.assertEqual(shared, {"LC:height_ping_us:15", "LC:height_ping_us:16", "LC:height_ping_us:18",
+                                      "LC:height_distance_mm:27", "LC:height_distance_mm:29",
+                                      "LC:height_distance_mm:30", "LC:height_distance_mm:31"})
+            self.assertEqual(len(s.journal.entries), 2)                                    # one per function
+            entry = s.journal.cause_of("LC:height_distance_mm:30")
+            self.assertEqual(entry.cause, "stub_not_driven")
+            self.assertIn("(through height_ping_us)", entry.result)
+            self.assertEqual([f.kind for f in s.findings], ["pipeline_limitation"] * 2)
+            s.item_status = [uc.ItemStatus(item_id=i, function=i.split(":")[1], status="pipeline_limitation",
+                                           owner="pipeline", reason="r") for i in sorted(shared)]
+            self.assertEqual(up.Orchestrator._open_summary(s), "7 open - 7 stub_not_driven")
+            suite = suite.replace("    int32_t mm = 0;", "    int32_t mm = 0;\n    sim_set_echo_us(8746u);")
+            bundle.actions[0].content = suite.replace("    height_ping_us();", "    sim_set_no_echo(true);\n"
+                                                                                  "    height_ping_us();")
+            s.journal, s.findings = up.Journal("src/height.c", Path(d)), []
+            self.assertEqual(orch._stubs_not_driven(s, last), set())                       # driven: not this cause
+
+    def test_a_failed_build_names_its_first_error(self):                               # A3-FZ13
+        out = "cc -c x.c\nwarning: unused\n/usr/bin/ld: x.o: undefined reference to `hal_micros'\nmore\nend"
+        self.assertIn("undefined reference to `hal_micros'", a3._first_message(out))
 
 
 # ============================================================================ 9. requirements and skill
