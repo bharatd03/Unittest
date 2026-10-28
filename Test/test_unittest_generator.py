@@ -1882,6 +1882,8 @@ class EmbeddedRuleTests(unittest.TestCase):
         self.assertEqual(layout.language, "cpp")                                # by the content, not ".hpp" alone
         plan = mock.Mock(layout=layout)
         self.assertEqual(a2.class_templates(plan), {"RingBuffer": ("RingBuffer", "std::int32_t, 4")})
+        self.assertEqual(uc.instantiated_class("RingBuffer", layout), "RingBuffer<std::int32_t, 4>")  # one fact for
+        self.assertEqual(uc.template_args(layout, "RingBuffer"), {"T": "std::int32_t", "N": "4"})  # every agent
         self.assertIn("template class RingBuffer<std::int32_t, 4>;", a2.template_instances(plan))
         p = a2._instantiate_param(uc.ParamInfo(name="v", type="const T &", kind="other", base="T", by_ref=True),
                                   {"T": "std::int32_t", "N": "4"})
@@ -4383,16 +4385,39 @@ class NewCodeTests(unittest.TestCase):
 
     def test_guards_and_predictions(self):                                              # NC-6
         for reason in ("setup calls functions that do not exist here: mystery_init",
-                       "ut_stub_x_return is set twice in a row (1, then 2)", "unbalanced braces or parentheses",
+                       "ut_stub_x_return is set twice in a row (1, then 2)",
                        "x: 'abc' is not an integer value (literal, enumerator or macro)"):
             self.assertEqual(uc.check_kind(reason), "prediction", reason)
         for reason in ("claims the gap cannot or need not be covered ('unreachable'); ignored [COV-5]",
                        "the quote of EV-1 does not occur word for word in that evidence",
-                       "checks nothing: no UT_EXPECT_... or UT_OBSERVE_...", "a reason no check declares"):
-            self.assertEqual(uc.check_kind(reason), "guard", reason)
-        self.assertTrue(uc.only_predictions(["unbalanced braces or parentheses"]))
-        self.assertFalse(uc.only_predictions(["unbalanced braces or parentheses", "checks nothing"]))
+                       "checks nothing: no UT_EXPECT_... or UT_OBSERVE_...", "a reason no check declares",
+                       uc.c_form_problem("f(0x42'});"), "c: not one C expression: it contains ';'"):
+            self.assertEqual(uc.check_kind(reason), "guard", reason)       # well-formed C is a fact, not a prediction
+        self.assertTrue(uc.only_predictions(["x is set twice in a row (1, then 2)"]))
+        self.assertFalse(uc.only_predictions(["x is set twice in a row (1, then 2)", "checks nothing"]))
         self.assertFalse(uc.only_predictions([]))
+
+    def test_well_formed_c_is_one_fact_for_every_check(self):
+        """One lexer decides "is this well-formed C?" for every agent (run 2026-10-28, gpio_driver.c: a value with the
+        rest of the JSON in it, 0x42'}], , reached the suite as a trial and stopped the file)."""
+        for text in ("int a = 1'000;", "x = 'a'; y = \"}{\";", "/* { */ g();", 's = R"x(})x";', "u8'a' + L'}'"):
+            self.assertEqual(uc.c_form_problem(text), "", text)
+        for text in ("uart_put(0x42'});", "a[(1];", "f(1));", "/* open"):
+            self.assertTrue(uc.c_form_problem(text), text)
+        self.assertEqual(uc.check_kind(uc.c_form_problem("uart_put(0x42'});")), "guard")     # never a trial
+        self.assertEqual(a1.fix_value("0x42'}], ", "c"), "0x42")              # the value ends where C ends
+        self.assertEqual(uc.without_json_tail("0x42'}]x"), "0x42'}]x")         # anything else stays and is refused
+        for value, problem in (("0x42", ""), ("a == 1", ""), ("a <= b", ""), ("x = 3", "assignment"),
+                               ("x += 1", "assignment"), ("f(1);", "';'"), ("{1, 2}", "braced")):
+            self.assertIn(problem, uc.c_expression_problem(value, braces=False), value)
+        trial: dict[str, str] = {}
+        dropped: list[str] = []
+        with self.assertRaises(ba.AgentFault):                    # refused where it is made, not in the suite
+            a2.GeneratorAgent._grounding({"uart_put", "UT_EXPECT_EQ_INT"}, set(), function="uart_put", trial=trial,
+                                         dropped=dropped)(a2.GeneratedTests.model_validate({"tests": [
+                {"name": "test_uart_put_x", "scenario_ids": [], "evidence_class": "E8",
+                 "body": "uart_put(0x42'}]); UT_EXPECT_EQ_INT(1, 1);"}]}))
+        self.assertEqual(trial, {})
 
     def test_a_test_refused_only_by_a_prediction_goes_to_a_trial(self):                # NC-7
         trial: dict[str, str] = {}

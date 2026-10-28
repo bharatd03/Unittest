@@ -911,88 +911,24 @@ def _guard_throw(line: str, oid: str, can_throw: bool) -> str:
 
 
 # ============================================================================ header SUT [A1-DA19]
-SCALAR_ARG = re.compile(r"^(?:(?:std::)?(?:u?int(?:8|16|32|64)_t|size_t)|(?:unsigned\s+|signed\s+)?(?:char|short|int|long|"
-                        r"long long)|unsigned|bool|float|double|\d+[uUlL]*)$")
-
-
-def _namespace_at(text: str, pos: int) -> str:
-    """The namespaces open at a position of a header (comments and strings are not removed: headers only)."""
-    stack: list[str | None] = []
-    for m in re.finditer(r"\bnamespace\s+([\w:]+)?\s*\{|\{|\}", text[:pos]):
-        if m.group(0).startswith("namespace"):
-            stack.append(m.group(1) or "")
-        elif m.group(0) == "{":
-            stack.append(None)
-        elif stack:
-            stack.pop()
-    return "::".join(n for n in stack if n)
+# A1-DA19: the class templates of a header SUT are one fact of ut_contracts, shared with Agent1.
+SCALAR_ARG = uc.SCALAR_ARG
+_namespace_at = uc.namespace_at
+_repository_text = uc.repository_text
+_declared_types = uc.declared_types
+_usable_arg = uc.usable_template_arg
+_top_level_commas = uc.top_level_commas
+_instantiate_param = uc.instantiate_param
 
 
 def class_templates(plan: uc.UTPlan) -> dict[str, tuple[str, str]]:
-    """A1-DA19: class templates the header SUT defines, short name -> (qualified name, template arguments):
-    the arguments the repository uses with it, else int for a type and 4 for a value parameter."""
-    layout = plan.layout
-    root = Path(layout.repo_root)
-    sut = root / layout.sut_file
-    if not layout.header_sut or layout.language != "cpp" or not sut.is_file():
-        return {}
-    text = sut.read_text(encoding="utf-8", errors="replace")
-    code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), text, flags=re.S)
-    out: dict[str, tuple[str, str]] = {}
-    usage = _repository_text(str(root), str(sut))
-    own_types = _declared_types(code)
-    for m in re.finditer(r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*(?:class|struct)\s+(\w+)\s*(?:final\s*)?[:{]", code):
-        params, name = m.group(1), m.group(2)
-        defaults = []
-        for prm in _top_level_commas(params):
-            prm = prm.strip()
-            if not prm:
-                continue
-            if re.match(r"^(typename|class)\b", prm):
-                d = re.search(r"=\s*(.+)$", prm)
-                defaults.append(d.group(1).strip() if d else "int")
-            else:
-                d = re.search(r"=\s*(.+)$", prm)
-                defaults.append(d.group(1).strip() if d else "4")
-        args = defaults
-        for use in re.finditer(r"\b" + re.escape(name) + r"\s*<\s*([^<>;{}()]+?)\s*>", usage):
-            found = [a.strip() for a in use.group(1).split(",")]
-            if len(found) == len(defaults) and all(_usable_arg(a, own_types) for a in found):
-                args = found
-                break
-        ns = _namespace_at(code, m.start())
-        out[name] = (f"{ns}::{name}" if ns else name, ", ".join(args))
-    return out
+    """A1-DA19: class templates the header SUT defines, short name -> (qualified name, template arguments)."""
+    return uc.class_templates(plan.layout)
 
 
-@functools.lru_cache(maxsize=8)
-def _repository_text(root: str, sut: str) -> str:
-    """A1-DA19: the C/C++ text of the repository except the SUT, read once per repository and run."""
-    parts = []
-    for path in Path(root).rglob("*"):
-        if path.is_file() and path.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx") \
-                and str(path) != sut and "ut_work" not in path.parts and ".git" not in path.parts:
-            try:
-                parts.append(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-    return "\n".join(parts)
-
-
-def _declared_types(code: str) -> set[str]:
-    """Types the header SUT itself declares (class, struct, enum, typedef, using): a template argument the
-    access file can name, because it includes the SUT."""
-    names = set(re.findall(r"\b(?:class|struct|union|enum(?:\s+class)?)\s+([A-Za-z_]\w*)\s*[:{;]", code))
-    names |= set(re.findall(r"\btypedef\b[^;{}]*?\b([A-Za-z_]\w*)\s*;", code))
-    names |= set(re.findall(r"\busing\s+([A-Za-z_]\w*)\s*=", code))
-    return names
-
-
-def _usable_arg(arg: str, own_types: set[str]) -> bool:
-    """A template argument the access file can name: a scalar, a number or a type the SUT header declares."""
-    arg = re.sub(r"\s+", " ", arg.strip())
-    base = re.sub(r"^(?:const|volatile)\s+|\s*[*&]+$", "", arg).strip()
-    return bool(SCALAR_ARG.match(arg) or SCALAR_ARG.match(base) or base.split("::")[-1] in own_types)
+def _template_args(plan: uc.UTPlan, cls: str) -> dict[str, str]:
+    """Template parameter name -> argument for a class template of the header SUT."""
+    return uc.template_args(plan.layout, cls)
 
 
 def function_templates(plan: uc.UTPlan) -> list[str]:
@@ -1052,59 +988,12 @@ def function_templates(plan: uc.UTPlan) -> list[str]:
     return rows
 
 
-def _top_level_commas(text: str) -> list[str]:
-    parts, depth, cur = [], 0, ""
-    for c in text:
-        if c in "<([":
-            depth += 1
-        elif c in ">)]":
-            depth -= 1
-        if c == "," and depth == 0:
-            parts.append(cur)
-            cur = ""
-        else:
-            cur += c
-    return parts + [cur]
-
-
 def template_instances(plan: uc.UTPlan) -> list[str]:
     """A1-DA19: explicit instantiations in the sut_access file, so the template's code is compiled and measured."""
     rows = [f"template class {q}<{args}>;" for q, args in class_templates(plan).values()]
     rows += function_templates(plan)
     return (["/* A1-DA19: the templates of the header SUT, instantiated for the tests. */", "#include <cstdint>",
              "#include <cstddef>", *rows, ""] if rows else [])
-
-
-def _template_args(plan: uc.UTPlan, cls: str) -> dict[str, str]:
-    """Template parameter name -> argument for a class template of the header SUT."""
-    templates = class_templates(plan)
-    short = cls.split("::")[-1]
-    if short not in templates:
-        return {}
-    text = (Path(plan.layout.repo_root) / plan.layout.sut_file).read_text(encoding="utf-8", errors="replace")
-    m = re.search(r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*(?:class|struct)\s+" + re.escape(short) + r"\b", text)
-    if not m:
-        return {}
-    names = [re.sub(r"=.*$", "", p).strip().split()[-1] for p in _top_level_commas(m.group(1)) if p.strip()]
-    return dict(zip(names, [a.strip() for a in templates[short][1].split(",")]))
-
-
-def _instantiate_param(p: uc.ParamInfo, mapping: dict[str, str]) -> uc.ParamInfo:
-    """A parameter of a class template's method with the template arguments put in (const T & -> const int &)."""
-    if not mapping or p.base not in mapping:
-        return p
-    arg = mapping[p.base]
-    t = re.sub(r"\b" + re.escape(p.base) + r"\b", arg, p.type)
-    pointer = t.rstrip().endswith(("*", "&"))
-    if not SCALAR_ARG.match(arg) or re.match(r"^\d", arg):
-        return p
-    if arg == "bool":
-        kind = "ptr_scalar" if pointer else "bool"
-    elif arg in ("float", "double"):
-        kind = "ptr_scalar" if pointer else "float"
-    else:
-        kind = "ptr_scalar" if pointer else "int"
-    return p.model_copy(update={"type": t, "base": arg, "kind": kind, "canonical": t})
 
 
 def static_functions(layout: uc.LayoutProfile) -> list[uc.FunctionInfo]:
@@ -2134,13 +2023,13 @@ DECLARED_OBJECT = re.compile(r"(?:^|[;{}])\s*(?:(?:const|static|volatile|constex
                              r"([A-Za-z_][\w:]*(?:<[^;(){}]*>)?)\s*[&*]*\s+([A-Za-z_]\w*)\s*[({]", re.M)
 NOT_A_TYPE = {"return", "else", "case", "goto", "throw", "new", "delete", "sizeof", "typedef", "using", "do",
               "co_return", "co_yield", "co_await", "not", "and", "or"}
-CODE_NOISE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
 CHECKS = re.compile(r"\bUT_(?:EXPECT|OBSERVE|ASSERT)\w*\s*\(")
 
 
 def code_only(text: str) -> str:
-    """The text without comments, string and character literals: braces in a comment are not code [A2-24]."""
-    return CODE_NOISE.sub(" ", text)
+    """The text without comments, string and character literals: braces in a comment are not code [A2-24]. The
+    lexer of ut_contracts, so every agent reads C text the same way."""
+    return uc.c_masked(text)
 
 
 def _has_auto(function: str, auto_names: list[str], layout: uc.LayoutProfile) -> bool:
@@ -3184,9 +3073,9 @@ class GeneratorAgent(ba.AgentCore):
         arity = uc.macro_arity_problem(code_only(body))                                           # A2-21ah (a)
         if arity:
             return arity
-        code = code_only(body)
-        if code.count("{") != code.count("}") or code.count("(") != code.count(")"):
-            return "unbalanced braces or parentheses"
+        form = uc.c_form_problem(body)                  # a fact: a test that is not well-formed C cannot compile
+        if form:
+            return form
         statements = [part.strip() for part in re.sub(r"/\*.*?\*/|//[^\n]*", " ", body, flags=re.S).split(";")]
         for first, second in zip(statements, statements[1:]):
             a, b = PLAIN_ASSIGNMENT.fullmatch(first), PLAIN_ASSIGNMENT.fullmatch(second)
@@ -3276,9 +3165,9 @@ class GeneratorAgent(ba.AgentCore):
         cases = re.findall(r"UT_CASE\(\s*(\w+)\s*\)", suite.content)
         if len(names) != len(set(names)) or sorted(names) != sorted(cases):
             raise ba.AgentFault("CONTRACT_VIOLATION", "duplicate tests or registration mismatch [A2-24]")
-        code = code_only(suite.content)                     # braces in comments and strings are not code [A2-24]
-        if code.count("{") != code.count("}"):
-            raise ba.AgentFault("CONTRACT_VIOLATION", "suite braces are unbalanced")
+        form = uc.c_form_problem(suite.content)  # every test passed the same check, so only a generator fault [A2-24]
+        if form:
+            raise ba.AgentFault("CONTRACT_VIOLATION", f"the suite is {form}")
         checks += ["single writer per file", "no duplicate tests", "every test registered", "balanced suite"]
         return checks
 

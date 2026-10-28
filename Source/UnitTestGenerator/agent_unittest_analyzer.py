@@ -2609,7 +2609,7 @@ def fix_value(value: str, name: str = "", keep_quotes: bool = False) -> str:
     if name:
         v = re.sub(r"^\s*" + re.escape(name) + r"\s*(?:=|:(?!:))\s*", "", v)
     v = VALUE_PREFIX.sub("", v)
-    v = v.rstrip(";,").strip()
+    v = uc.without_json_tail(v.rstrip(";,").strip())          # "0x42'}], ": the rest of the JSON is not the value
     if len(v) >= 2 and v[0] == v[-1] == "`":
         v = v[1:-1].strip()
     if not keep_quotes and len(v) >= 2 and v[0] == v[-1] == '"' and re.fullmatch(r"[-+!~]?[\w.:]+", v[1:-1].strip()):
@@ -4097,22 +4097,47 @@ class AnalyzerAgent(ba.AgentCore):
         fixes, problems, decls, stmts = [], [], [], []
         cpp = layout.language == "cpp"
         params = {p.name: p for p in text_params(fn)}
+
+        def values(where: str, given: list[str]) -> list[str] | None:
+            """Each value one C expression (a fact): JSON left in it is cut off, anything else refuses the entry."""
+            out = [fix_value(v) for v in given]
+            bad = next(((v, uc.c_expression_problem(v, braces=False)) for v in out
+                        if uc.c_expression_problem(v, braces=False)), None)
+            if bad:
+                problems.append(f"{where}: {bad[0][:40]!r} is {bad[1]}")
+                return None
+            return out
         for a in planned.args:
             p = params.get(a.name)
             if p is None or not (a.elements or a.fields):
                 continue
             var = f"ut_{re.sub(r'[^A-Za-z0-9_]', '_', a.name)}"
             base = pointee(p) or re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
-            if a.elements and p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring"):
-                decls.append(f"{base or 'unsigned char'} {var}[{max(len(a.elements), 1)}] = "
-                             f"{{{', '.join(a.elements[:256])}}};")
+            known_fields = {f.name for f in p.fields}
+            scalar = p.kind in ("int", "enum", "bool", "float") or (p.kind == "ptr_scalar" and p.by_ref)
+            if scalar and fix_value(a.value) and not uc.c_expression_problem(fix_value(a.value), braces=False):
+                fixes.append(f"args.{a.name}: a {p.type} takes its value; elements and fields left out [structured]")
+                a.elements, a.fields = [], []          # the type is a fact: one value, so the list is form noise
+                continue
+            if a.elements and p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring") and not p.by_ref:
+                given = values(f"args.{a.name}", list(a.elements[:256]))
+                if given is None:
+                    continue
+                decls.append(f"{base or 'unsigned char'} {var}[{max(len(given), 1)}] = {{{', '.join(given)}}};")
                 a.value = var
-            elif a.fields and (p.kind in ("ptr_struct", "struct") or p.by_ref):
+            elif a.fields and p.kind in ("ptr_struct", "struct"):
+                unknown = [f.field for f in a.fields if known_fields and f.field.split(".")[0] not in known_fields]
+                given = values(f"args.{a.name}", [f.value for f in a.fields[:32]])
+                if unknown:
+                    problems.append(f"{a.name}: {', '.join(unknown[:4])} is not a field of {base}")
+                if unknown or given is None:
+                    continue
                 decls.append(f"{base} {var} = {{{'' if cpp else '0'}}};")
-                decls += [f"{var}.{f.field} = {f.value};" for f in a.fields[:32]]
-                a.value = f"&{var}" if p.kind == "ptr_struct" or (not p.by_ref and "*" in p.type) else var
+                decls += [f"{var}.{f.field} = {v};" for f, v in zip(a.fields, given)]
+                a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
             else:
-                problems.append(f"{a.name}: elements are for a buffer or pointer, fields for a structure parameter")
+                problems.append(f"{a.name}: elements are for a buffer or pointer, fields for a structure parameter"
+                                f" (its type is {p.type})")
                 continue
             fixes.append(f"args.{a.name}: declared and filled by the generator, passed as {a.value} [structured]")
             a.elements, a.fields = [], []
@@ -4123,6 +4148,10 @@ class AnalyzerAgent(ba.AgentCore):
                 elements.setdefault((key, path), (name, indexed))
         for s in planned.state:
             var = s.variable.strip()
+            given = values(f"state {var}", [s.value])
+            if given is None:
+                continue
+            s.value = given[0]
             if s.index < 0 and not s.field and var in alias:
                 stmts.append(f"ut_state_set_{alias[var]}({s.value});")
                 continue
@@ -4166,6 +4195,8 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             ctrl = f"ut_stub_{uc.stub_base(spec)}_{w.param}_out"
             base = stub_pointee(ptype)
+            if values(f"writes {w.stub}.{w.param}", list(w.elements[:256]) + [f.value for f in w.fields[:32]]) is None:
+                continue
             if w.elements:
                 stmts.append(f"{{ {base} ut_w[] = {{{', '.join(w.elements[:256])}}}; memcpy({ctrl}, ut_w, sizeof ut_w); "
                              f"{ctrl}_len = (int)sizeof ut_w; }}")
@@ -4174,7 +4205,9 @@ class AnalyzerAgent(ba.AgentCore):
                              + " ".join(f"ut_w.{f.field} = {f.value};" for f in w.fields[:32])
                              + f" memcpy({ctrl}, &ut_w, sizeof ut_w); {ctrl}_len = (int)sizeof ut_w; }}")
         for r in planned.registers:
-            stmts.append(f"UT_REG32({r.address}) = {r.value};")
+            given = values("registers", [r.address, r.value])
+            if given is not None:
+                stmts.append(f"UT_REG32({given[0]}) = {given[1]};")
         cls = uc.class_of(fn)
         for m in planned.members:
             info = next((x for x in layout.class_members if x.name == m.member and
@@ -4183,7 +4216,16 @@ class AnalyzerAgent(ba.AgentCore):
                 problems.append(f"members: {m.member} is not a member of the object")
                 continue
             ref = f"*ut_member({uc.member_tag(info)}{{}})" if info.static else f"ut_obj.*ut_member({uc.member_tag(info)}{{}})"
-            value = f"{{{', '.join(m.elements[:256])}}}" if m.elements else m.value
+            container = bool(re.search(r"\bstd::(?:array|vector)\s*<", info.type))
+            if m.elements and not container:            # a scalar member takes its value, never a list
+                m.value, m.elements = (m.value or (m.elements[0] if len(m.elements) == 1 else "")), []
+                if not m.value:
+                    problems.append(f"members {m.member}: a {info.type} takes one value, not a list")
+                    continue
+            given = values(f"members {m.member}", list(m.elements[:256]) if m.elements else [m.value])
+            if given is None:
+                continue
+            value = f"{{{', '.join(given)}}}" if m.elements else given[0]
             stmts.append(f"({ref}) = {value};" if not m.elements else f"{ref} = {value};")
         if decls or stmts:
             planned.setup = decls + list(planned.setup) + stmts
@@ -4203,6 +4245,9 @@ class AnalyzerAgent(ba.AgentCore):
         v = value.strip()
         if not v:
             return f"{p.name}: no value"
+        form = uc.c_expression_problem(v, braces=p.kind not in ("int", "enum", "bool", "float"))
+        if form:
+            return f"{p.name}: {v!r} is {form}"
         t = re.sub(r"\b(const|volatile)\b", "", p.type).strip()
         base_ident = re.sub(r"^[&*\s]+", "", v).split("[")[0].split(".")[0].split("->")[0].strip()
         if p.kind in ("int", "enum", "bool"):
@@ -4457,6 +4502,7 @@ class AnalyzerAgent(ba.AgentCore):
                        known: set[str], layout: uc.LayoutProfile) -> tuple[uc.Scenario | None, list[str]]:
         """A1-PL4: every check, deterministically, before Agent2 receives the scenario. The format fixes of ARCH-20
         are applied first and recorded in ``self.last_fixes``."""
+        fn = uc.instantiated(fn, layout)          # a method of a class template: its parameters as tests call them
         lowered, structured_problems = self._lower_structured(planned, fn, layout, stubs)   # the brain said what
         self.last_fixes = lowered + self._normalize_planned(planned, fn, open_ids, evidence, layout,
                                                             self._internal_values(layout), known)  # A1-PL2a, A1-PL4
@@ -4510,8 +4556,8 @@ class AnalyzerAgent(ba.AgentCore):
         for stmt in planned.setup:                                                         # grounding
             if PLAN_FORBIDDEN.search(stmt):
                 reasons.append(f"setup statement not allowed: {stmt[:60]}")
-            elif stmt.count("(") != stmt.count(")") or stmt.count("{") != stmt.count("}"):
-                reasons.append(f"setup statement unbalanced: {stmt[:60]}")
+            elif uc.c_form_problem(stmt):
+                reasons.append(f"setup statement {uc.c_form_problem(stmt)}: {stmt[:60]}")
             else:
                 missing = self._calls_known(stmt, known | local)
                 named = uc.name_problem("", set(missing), known)                         # a guard [A2-21ai]

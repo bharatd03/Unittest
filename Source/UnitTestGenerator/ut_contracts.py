@@ -8,6 +8,7 @@ Requirement IDs refer to unittest_generator_requirments.txt.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
@@ -2913,6 +2914,7 @@ def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str
     ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
              .endswith(f"{short}::{short}")]
     ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
+    ctor = instantiated(ctor, layout) if ctor else None           # A1-DA19: the instantiation the tests use
     lines, args = [], []
     for i, p in enumerate(ctor.params if ctor else []):
         base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
@@ -2928,7 +2930,7 @@ def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str
             args.append(f"&ut_dep{i}")
         else:
             args.append("{}")
-    lines.append(f"{cls} ut_obj{('(' + ', '.join(args) + ')') if args else ''};")
+    lines.append(f"{instantiated_class(cls, layout)} ut_obj{('(' + ', '.join(args) + ')') if args else ''};")
     return lines, f"ut_obj.{fn.qualified_name.split('::')[-1]}"
 
 
@@ -3150,6 +3152,293 @@ def next_kind(current: str, cause: str, allowed: list[str] | tuple[str, ...]) ->
     return next((k for k in KIND_LADDER[start:] if k in allowed), "")
 
 
+# ============================================================================ C text, one lexer for every check
+# One answer to "is this text well-formed C?" for every agent: comments, string and character literals (prefixes,
+# escapes, raw strings, digit separators 1'000) are recognized the way the compiler does, and brackets must nest.
+# The result is a fact, not a prediction: text this lexer refuses cannot compile.
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _digit_separator(text: str, i: int) -> bool:
+    """A ' between two characters of a number (1'000, 0xFF'FF) separates digits; anywhere else it opens a literal."""
+    if i == 0 or i + 1 >= len(text) or not text[i - 1].isalnum() or not text[i + 1].isalnum():
+        return False
+    j = i - 1
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_.'"):
+        j -= 1
+    return text[j].isdigit()
+
+
+def c_lex(text: str) -> tuple[str, str]:
+    """(masked, problem): the text with comments and the contents of literals replaced by spaces (newlines kept,
+    so positions and lines stay), and the first form problem ("" when the text is well-formed)."""
+    out, problem, stack, i, n = list(text), "", [], 0, len(text)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                problem = problem or "a comment that is not closed"
+                blank(i, n)
+                break
+            blank(i, j + 2)
+            i = j + 2
+            continue
+        if c == '"' and i > 0 and text[i - 1] == "R" and (i < 2 or not (text[i - 2].isalnum() or text[i - 2] == "_")
+                                                           or text[i - 3: i - 1] in ("u8",) or text[i - 2] in "uUL"):
+            k = text.find("(", i + 1)
+            end = text.find(")" + text[i + 1: k] + '"', k + 1) if k >= 0 else -1
+            if end < 0:
+                problem = problem or "a raw string that is not closed"
+                blank(i, n)
+                break
+            blank(i, end + len(text[i + 1: k]) + 2)
+            i = end + len(text[i + 1: k]) + 2
+            continue
+        if c == '"' or (c == "'" and not _digit_separator(text, i)):
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            if j >= n or text[j] != c:
+                problem = problem or ("a string literal that is not closed" if c == '"' else
+                                      f"a character literal that is not closed ({text[max(i - 12, 0): i + 12].strip()})")
+                blank(i, j)
+                i = j
+                continue
+            blank(i, j + 1)
+            i = j + 1
+            continue
+        if c in "([{":
+            stack.append(c)
+        elif c in _CLOSERS:
+            if stack and stack[-1] == _CLOSERS[c]:
+                stack.pop()
+            else:
+                problem = problem or (f"'{c}' where '{stack[-1]}' is still open" if stack else
+                                      f"'{c}' without its opening '{_CLOSERS[c]}'")
+        i += 1
+    if stack and not problem:
+        problem = f"'{stack[-1]}' is not closed"
+    return "".join(out), problem
+
+
+def c_masked(text: str) -> str:
+    """The text without comments and literal contents: braces in a comment or a string are not code."""
+    return c_lex(text)[0]
+
+
+def c_form_problem(text: str) -> str:
+    """"" when the text is well-formed C (literals closed, brackets nested), else why not - a fact."""
+    problem = c_lex(text)[1]
+    return f"not well-formed C: {problem}" if problem else ""
+
+
+def _assigns(masked: str) -> bool:
+    """An '=' that assigns: not part of ==, !=, <= or >= (<<= and >>= assign)."""
+    for i, c in enumerate(masked):
+        if c != "=":
+            continue
+        after, before = masked[i + 1: i + 2], masked[i - 1: i] if i else ""
+        if after == "=" or before == "=":
+            continue
+        if before in ("!", "<", ">") and masked[i - 2: i] not in ("<<", ">>"):
+            continue
+        return True
+    return False
+
+
+def c_expression_problem(value: str, braces: bool = True) -> str:
+    """A value a brain gives is one C expression: well-formed, no ';', and - for a scalar (braces=False) - no braced
+    list. "" when it is one."""
+    masked, problem = c_lex(value)
+    if problem:
+        return f"not one C expression: {problem}"
+    if ";" in masked:
+        return "not one C expression: it contains ';'"
+    if _assigns(masked):
+        return "not one C expression: an assignment (give the value only)"
+    if not braces and ("{" in masked or "}" in masked):
+        return "not one C expression: a braced list for a single value"
+    return ""
+
+
+JSON_TAIL = re.compile(r"""\s*(?=.*['"\]}])['"\]}),\s]*""")
+
+
+def without_json_tail(value: str) -> str:
+    """A value with the rest of the JSON written into it ("0x42'}], ") ends where C ends: the longest well-formed
+    prefix, when only quotes, brackets and commas follow it. Anything else is returned unchanged."""
+    if not c_lex(value)[1]:
+        return value
+    for k in range(len(value) - 1, 0, -1):
+        head, tail = value[:k].rstrip(), value[k:]
+        if head and not c_lex(head)[1] and JSON_TAIL.fullmatch(tail):
+            return head
+    return value
+
+
+# ============================================================================ class templates of a header SUT [A1-DA19]
+# One fact for every agent: the instantiation the tests use (the arguments the repository uses, else int for a type
+# and 4 for a value), so the rule tests, the object of a structured scenario and the access file name the same class.
+SCALAR_ARG = re.compile(r"^(?:(?:std::)?(?:u?int(?:8|16|32|64)_t|size_t)|(?:unsigned\s+|signed\s+)?(?:char|short|int|"
+                        r"long|long long)|unsigned|bool|float|double|\d+[uUlL]*)$")
+
+
+def namespace_at(text: str, pos: int) -> str:
+    """The namespaces open at a position of a header (comments and strings are not removed: headers only)."""
+    stack: list[str | None] = []
+    for m in re.finditer(r"\bnamespace\s+([\w:]+)?\s*\{|\{|\}", text[:pos]):
+        if m.group(0).startswith("namespace"):
+            stack.append(m.group(1) or "")
+        elif m.group(0) == "{":
+            stack.append(None)
+        elif stack:
+            stack.pop()
+    return "::".join(n for n in stack if n)
+
+
+def top_level_commas(text: str) -> list[str]:
+    parts, depth, cur = [], 0, ""
+    for c in text:
+        if c in "<([":
+            depth += 1
+        elif c in ">)]":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+    return parts + [cur]
+
+
+@functools.lru_cache(maxsize=8)
+def repository_text(root: str, sut: str) -> str:
+    """A1-DA19: the C/C++ text of the repository except the SUT, read once per repository and run."""
+    parts = []
+    for path in Path(root).rglob("*"):
+        if path.is_file() and path.suffix.lower() in (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx") \
+                and str(path) != sut and "ut_work" not in path.parts and ".git" not in path.parts:
+            try:
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    return "\n".join(parts)
+
+
+def declared_types(code: str) -> set[str]:
+    """Types the header SUT itself declares (class, struct, enum, typedef, using): a template argument the
+    access file can name, because it includes the SUT."""
+    names = set(re.findall(r"\b(?:class|struct|union|enum(?:\s+class)?)\s+([A-Za-z_]\w*)\s*[:{;]", code))
+    names |= set(re.findall(r"\btypedef\b[^;{}]*?\b([A-Za-z_]\w*)\s*;", code))
+    names |= set(re.findall(r"\busing\s+([A-Za-z_]\w*)\s*=", code))
+    return names
+
+
+def usable_template_arg(arg: str, own_types: set[str]) -> bool:
+    """A template argument the access file can name: a scalar, a number or a type the SUT header declares."""
+    arg = re.sub(r"\s+", " ", arg.strip())
+    base = re.sub(r"^(?:const|volatile)\s+|\s*[*&]+$", "", arg).strip()
+    return bool(SCALAR_ARG.match(arg) or SCALAR_ARG.match(base) or base.split("::")[-1] in own_types)
+
+
+def _template_heads(layout: "LayoutProfile") -> tuple[str, list[tuple[re.Match, str, str]]]:
+    sut = Path(layout.repo_root) / layout.sut_file
+    if not layout.header_sut or layout.language != "cpp" or not sut.is_file():
+        return "", []
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), sut.read_text(encoding="utf-8",
+                  errors="replace"), flags=re.S)
+    return code, [(m, m.group(1), m.group(2)) for m in re.finditer(
+        r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*(?:class|struct)\s+(\w+)\s*(?:final\s*)?[:{]", code)]
+
+
+def class_templates(layout: "LayoutProfile") -> dict[str, tuple[str, str]]:
+    """A1-DA19: class templates the header SUT defines, short name -> (qualified name, template arguments)."""
+    code, heads = _template_heads(layout)
+    if not heads:
+        return {}
+    usage = repository_text(str(Path(layout.repo_root)), str(Path(layout.repo_root) / layout.sut_file))
+    own_types = declared_types(code)
+    out: dict[str, tuple[str, str]] = {}
+    for m, params, name in heads:
+        defaults = []
+        for prm in top_level_commas(params):
+            prm = prm.strip()
+            if not prm:
+                continue
+            d = re.search(r"=\s*(.+)$", prm)
+            defaults.append(d.group(1).strip() if d else ("int" if re.match(r"^(typename|class)\b", prm) else "4"))
+        args = defaults
+        for use in re.finditer(r"\b" + re.escape(name) + r"\s*<\s*([^<>;{}()]+?)\s*>", usage):
+            found = [a.strip() for a in use.group(1).split(",")]
+            if len(found) == len(defaults) and all(usable_template_arg(a, own_types) for a in found):
+                args = found
+                break
+        ns = namespace_at(code, m.start())
+        out[name] = (f"{ns}::{name}" if ns else name, ", ".join(args))
+    return out
+
+
+def template_args(layout: "LayoutProfile", cls: str) -> dict[str, str]:
+    """Template parameter name -> argument for a class template of the header SUT."""
+    short = cls.split("::")[-1].split("<")[0]
+    templates = class_templates(layout)
+    if short not in templates:
+        return {}
+    _, heads = _template_heads(layout)
+    params = next((p for _, p, name in heads if name == short), None)
+    if params is None:
+        return {}
+    names = [re.sub(r"=.*$", "", p).strip().split()[-1] for p in top_level_commas(params) if p.strip()]
+    return dict(zip(names, [a.strip() for a in templates[short][1].split(",")]))
+
+
+def instantiated_class(cls: str, layout: "LayoutProfile") -> str:
+    """The class a test declares: a class template with the arguments of its instantiation, else the class."""
+    short = cls.split("::")[-1]
+    templates = class_templates(layout)
+    return f"{templates[short][0]}<{templates[short][1]}>" if short in templates else cls
+
+
+def instantiate_param(p: "ParamInfo", mapping: dict[str, str]) -> "ParamInfo":
+    """A parameter of a class template's method with the template arguments put in (const T & -> const int &)."""
+    if not mapping or p.base not in mapping:
+        return p
+    arg = mapping[p.base]
+    t = re.sub(r"\b" + re.escape(p.base) + r"\b", arg, p.type)
+    pointer = t.rstrip().endswith(("*", "&"))
+    if not SCALAR_ARG.match(arg) or re.match(r"^\d", arg):
+        return p
+    if arg == "bool":
+        kind = "ptr_scalar" if pointer else "bool"
+    elif arg in ("float", "double"):
+        kind = "ptr_scalar" if pointer else "float"
+    else:
+        kind = "ptr_scalar" if pointer else "int"
+    return p.model_copy(update={"type": t, "base": arg, "kind": kind, "canonical": t})
+
+
+def instantiated(fn: "FunctionInfo", layout: "LayoutProfile") -> "FunctionInfo":
+    """The function as a test calls it: a method of a class template with the template arguments put in."""
+    if not fn.member or "::" not in fn.qualified_name:
+        return fn
+    mapping = template_args(layout, fn.qualified_name.rsplit("::", 1)[0])
+    if not mapping:
+        return fn
+    return fn.model_copy(update={"params": [instantiate_param(p, mapping) for p in fn.params]})
+
+
 # ============================================================================ checks: guard or prediction [NC-6]
 # NC-6: every check that refuses an answer before the tool declares its kind here. A guard protects the trust of the
 # result and is never overruled; a prediction only predicts what the tool would reject, and never removes an item by
@@ -3158,7 +3447,6 @@ def next_kind(current: str, cause: str, allowed: list[str] | tuple[str, ...]) ->
 # sequence the dependency plan does not have is a guard of the plan: no test can be assembled with it.
 PREDICTION_CHECKS = {
     "calls functions that do not exist here": "unknown name",              # A2-20, A1-PL4 grounding
-    "unbalanced": "unbalanced braces or parentheses",
     "is set twice in a row": "value set twice",                           # A2-21t
     "is not an integer value": "value form",                              # A1-PL4 e
     "is not a floating-point value": "value form",

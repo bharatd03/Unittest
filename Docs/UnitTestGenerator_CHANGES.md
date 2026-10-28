@@ -3,6 +3,54 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (2): one fact instead of several checks - well-formed C and class templates
+
+### What happened
+
+* `pilot-embedded`, `src/gpio_driver.c` stopped with CONTRACT_VIOLATION "suite braces are unbalanced". Qwen wrote the
+  rest of the JSON into a value (`"c": "0x42'}], "`). The value check called it a prediction, so the scenario was
+  kept as a trial "for the compiler to decide". The test check counted braces with a regular expression and also
+  called the result a prediction. The suite check counted braces the same way, but as a hard error, and stopped the
+  file before the compiler ever saw it.
+* `include/ring_buffer.hpp`: the tests written from a structured scenario declared `RingBuffer ut_obj;` and `T ut_v`
+  although the instantiation `RingBuffer<std::int32_t, 4>` was known. Only the generator's rule tests used it, so
+  the same function failed to compile in every round. The brain had also put member values into fields of the
+  `const T &` parameter, which was accepted because it is a reference.
+
+### Root cause
+
+The same fact was decided in several places, in several ways:
+* "is this text well-formed C?": a regular expression in `code_only`, brace counts in the generator's test check,
+  the analyzer's set-up check and the suite check;
+* the template instantiation: computed in the generator only.
+
+### Change
+
+* **One lexer for C text** (`ut_contracts.c_lex`): comments, string and character literals (prefixes, escapes, raw
+  strings, digit separators `1'000`) and nested brackets, as the compiler reads them. `code_only`, the test check,
+  the set-up check and the suite check all use it. Its result is a fact (a guard), no longer a prediction, so a test
+  that is not well-formed C is refused where it is made and never reaches the suite. The suite check stays, as a
+  check of the generator itself. The regular expression `CODE_NOISE` and the prediction "unbalanced" are removed.
+* **A brain value is one C expression** (`c_expression_problem`): well-formed, no `;`, no assignment, and no braced
+  list for a scalar. A value followed only by JSON punctuation is cut where C ends (`0x42'}], ` -> `0x42`,
+  `without_json_tail`). Anything else is refused with the reason. This applies to arguments, elements, fields, state,
+  stub writes, registers and members.
+* **The class templates of a header SUT are one fact in `ut_contracts`** (`class_templates`, `template_args`,
+  `instantiated_class`, `instantiated`). The generator's copy is removed. The rule tests, the object of a structured
+  scenario (`object_recipe`) and the parameters a scenario is checked against all use it.
+* **Elements and fields only where the type has them:** elements for a pointer (never a reference), fields for a
+  structure whose fields are known (field names checked). For a scalar parameter with a value, stray elements and
+  fields are left out (the type is a fact). For a scalar member, a list becomes its one value.
+
+### Checked
+
+* The brain's answers of the two runs, through the changed checks, with the C++ front end:
+  * `RingBuffer::push`: the object is `RingBuffer<std::int32_t, 4> ut_obj;`, `v` is `0uLL`, and `count_ = 4` is set
+    through the member accessor, so the test reaches the full buffer;
+  * `uart_put`: `0x42'}], ` becomes `0x42`, and `0x42'}]x` is refused as a guard.
+* The test classes for contracts, the analyzer, the generator, the embedded pilots, brain planning and generation,
+  and the pilot fixes (132 tests). The full test suite was not run.
+
 ## 2026-10-28: medium pilots, namespaces, structured scenarios
 
 ### Medium pilots (`pilot-medium`)
