@@ -239,6 +239,15 @@ if /i "%ACTION%"=="test-full" set "UT_TESTS=full"
 echo.
 if /i "%ACTION%"=="test-full" echo Running every test in parallel, including whole pipeline runs ...
 if /i not "%ACTION%"=="test-full" echo Running the component tests ...
+rem  The tests build their test programs in a folder of their own, not in the system TEMP folder: an antivirus may
+rem  block a new, unsigned program there (ut_runner.exe). Exclude only ut_tmp and ut_work from the scan.
+set "UT_TMP=%~dp0ut_tmp"
+if exist "%UT_TMP%" rmdir /s /q "%UT_TMP%"
+mkdir "%UT_TMP%"
+set "TMP=%UT_TMP%"
+set "TEMP=%UT_TMP%"
+set "TMPDIR=%UT_TMP%"
+echo Test programs are built in %UT_TMP% (exclude it and %~dp0ut_work from your antivirus scan)
 > "%RESULTS%" echo ==== Unit-test generator tests (%ACTION%) %date% %time% ====
 "%PY%" ut_pipeline.py check --config ut_config.json >> "%RESULTS%" 2>&1
 >> "%RESULTS%" echo.
