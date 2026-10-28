@@ -326,7 +326,7 @@ def member_tag(m: "MemberInfo") -> str:
     return "ut_tag_" + safe_name(m.class_name.replace("(anonymous namespace)::", "")) + "__" + m.name
 
 
-def member_access_source(members: list["MemberInfo"]) -> list[str]:
+def member_access_source(members: list["MemberInfo"], layout: "LayoutProfile | None" = None) -> list[str]:
     """Structured scenario (C++): accessors of data members - private ones included - by the explicit instantiation
     of a template with a pointer to the member (an explicit instantiation does not check access [temp.spec]). A test
     writes ut_obj.*ut_member(ut_tag_<class>__<member>{}) = value."""
@@ -338,6 +338,7 @@ def member_access_source(members: list["MemberInfo"]) -> list[str]:
     for m in members:
         tag = member_tag(m)
         cls = m.class_name.replace("(anonymous namespace)::", "")
+        cls = instantiated_class(cls, layout) if layout is not None else cls       # a class template's instance
         ptr = f"{m.type} *" if m.static else f"{m.type} {cls}::*"
         rows += [f"struct {tag} {{ using type = {ptr}; friend type ut_member({tag}); }};",
                  f"template struct ut_member_access<{tag}, &{cls}::{m.name}>;"]
@@ -3351,14 +3352,59 @@ def usable_template_arg(arg: str, own_types: set[str]) -> bool:
     return bool(SCALAR_ARG.match(arg) or SCALAR_ARG.match(base) or base.split("::")[-1] in own_types)
 
 
-def _template_heads(layout: "LayoutProfile") -> tuple[str, list[tuple[re.Match, str, str]]]:
-    sut = Path(layout.repo_root) / layout.sut_file
-    if not layout.header_sut or layout.language != "cpp" or not sut.is_file():
+def _template_heads(layout: "LayoutProfile", path: Path | None = None) -> tuple[str, list[tuple[re.Match, str, str]]]:
+    """The class templates one file defines (the header SUT by default)."""
+    sut = path or Path(layout.repo_root) / layout.sut_file
+    if (path is None and not layout.header_sut) or layout.language != "cpp" or not sut.is_file():
         return "", []
     code = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), sut.read_text(encoding="utf-8",
                   errors="replace"), flags=re.S)
     return code, [(m, m.group(1), m.group(2)) for m in re.finditer(
         r"\btemplate\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>\s*(?:class|struct)\s+(\w+)\s*(?:final\s*)?[:{]", code)]
+
+
+_INSTANCES: dict[tuple, dict[str, tuple[str, str, list[str]]]] = {}
+
+
+def test_instances(layout: "LayoutProfile") -> dict[str, tuple[str, str, list[str]]]:
+    """The instantiation a test declares of each class template the SUT's code has - short name -> (qualified name,
+    template arguments, parameter names). A header SUT: its own templates (class_templates). Any other SUT: the
+    templates its headers define, with the arguments the SUT's code instantiates (a use in the SUT file or in those
+    headers, MovingAverage<std::uint16_t, 4>) - only then the methods the SUT file defines exist for a test."""
+    key = (layout.repo_root, layout.sut_file, layout.sut_sha256, tuple(layout.headers), layout.header_sut)
+    if key in _INSTANCES:
+        return _INSTANCES[key]
+    out: dict[str, tuple[str, str, list[str]]] = {}
+    root = Path(layout.repo_root)
+    files = [root / layout.sut_file] if layout.header_sut else [root / h for h in layout.headers]
+    usage = "\n".join(read_source(f) for f in [root / layout.sut_file, *files] if f.is_file())
+    for path in files:
+        code, heads = _template_heads(layout, path)
+        own = declared_types(code)
+        for m, params, name in heads:
+            names, defaults = [], []
+            for prm in top_level_commas(params):
+                prm = prm.strip()
+                if not prm:
+                    continue
+                d = re.search(r"=\s*(.+)$", prm)
+                names.append(re.sub(r"=.*$", "", prm).strip().split()[-1])
+                defaults.append(d.group(1).strip() if d else ("int" if re.match(r"^(typename|class)\b", prm) else "4"))
+            args = defaults if layout.header_sut else []
+            for text in ([usage] if not layout.header_sut else [usage, repository_text(str(root), str(path))]):
+                for use in re.finditer(r"\b" + re.escape(name) + r"\s*<\s*([^<>;{}()]+?)\s*>", text):
+                    found = [a.strip() for a in use.group(1).split(",")]
+                    if len(found) == len(names) and all(usable_template_arg(a, own) or SCALAR_ARG.match(a)
+                                                        for a in found):
+                        args = found
+                        break
+                if args != defaults or not layout.header_sut:
+                    break
+            if args:
+                ns = namespace_at(code, m.start())
+                out[name] = (f"{ns}::{name}" if ns else name, ", ".join(args), names)
+    _INSTANCES[key] = out
+    return out
 
 
 def class_templates(layout: "LayoutProfile") -> dict[str, tuple[str, str]]:
@@ -3389,24 +3435,15 @@ def class_templates(layout: "LayoutProfile") -> dict[str, tuple[str, str]]:
 
 
 def template_args(layout: "LayoutProfile", cls: str) -> dict[str, str]:
-    """Template parameter name -> argument for a class template of the header SUT."""
-    short = cls.split("::")[-1].split("<")[0]
-    templates = class_templates(layout)
-    if short not in templates:
-        return {}
-    _, heads = _template_heads(layout)
-    params = next((p for _, p, name in heads if name == short), None)
-    if params is None:
-        return {}
-    names = [re.sub(r"=.*$", "", p).strip().split()[-1] for p in top_level_commas(params) if p.strip()]
-    return dict(zip(names, [a.strip() for a in templates[short][1].split(",")]))
+    """Template parameter name -> argument of the instantiation a test uses (test_instances)."""
+    found = test_instances(layout).get(cls.split("::")[-1].split("<")[0])
+    return dict(zip(found[2], [a.strip() for a in top_level_commas(found[1])])) if found else {}
 
 
 def instantiated_class(cls: str, layout: "LayoutProfile") -> str:
     """The class a test declares: a class template with the arguments of its instantiation, else the class."""
-    short = cls.split("::")[-1]
-    templates = class_templates(layout)
-    return f"{templates[short][0]}<{templates[short][1]}>" if short in templates else cls
+    found = test_instances(layout).get(cls.split("::")[-1])
+    return f"{found[0]}<{found[1]}>" if found else cls
 
 
 def instantiate_param(p: "ParamInfo", mapping: dict[str, str]) -> "ParamInfo":

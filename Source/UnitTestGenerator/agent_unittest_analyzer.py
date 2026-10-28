@@ -1527,6 +1527,8 @@ class FrontEnd:
         pointer = core.endswith("*") or by_ref
         base_dt = core.rstrip("*&").strip() if pointer else t
         base = self._through_typedefs(_plain_type(base_dt), enums)                    # A1-DA21: pb_byte_t -> uint8_t
+        if base.startswith("std::") and (INTEGRAL_T.match(base[5:]) or FLOAT_T.match(base[5:])):
+            base = base[5:]                       # std::uint8_t is uint8_t: the same builtin, named in namespace std
         info.base = _unqualified(qcore.rstrip("*&").strip()) if pointer else _unqualified(qt)
         info.by_ref = by_ref
         enum = enums.get(base) or enums.get(_plain_type(qcore.rstrip("*&")))
@@ -2542,6 +2544,83 @@ PLAN_TASK = (
     'when b is negative"}}] - every quote an object with the evidence id and the words copied from it.\n'
     "Values are C code exactly as in the example (\"1\", \"-1\", a macro or enumerator name): never a ':' or '=' "
     "before a value, never the parameter name, a file path or a placeholder.")
+CONST_DEF = re.compile(r"\b(?:constexpr|const)\s+((?:(?:static|inline|unsigned|signed|long|short)\s+)*[A-Za-z_][\w:]*)"
+                       r"\s+([A-Za-z_]\w*)\s*(?:=\s*([^;{}=]+?)|\{\s*([^;{}]+?)\s*\})\s*;")
+
+
+def integral_constants(text: str) -> list[tuple[str, str]]:
+    """(name, expression) of the integer constants a file defines with const or constexpr - facts of the source,
+    like its integer macros (A1-PL2a): a test outside the file writes the value."""
+    out = []
+    for m in CONST_DEF.finditer(text):
+        ctype = re.sub(r"\b(static|inline)\b", "", m.group(1)).strip()
+        if INTEGRAL_T.match(re.sub(r"\bstd::", "", ctype)) or ctype in ("bool",):
+            out.append((m.group(2), (m.group(3) or m.group(4) or "").strip()))
+    return out
+
+
+def target_param(name: str, ctype: str, layout: uc.LayoutProfile) -> uc.ParamInfo:
+    """The kind of value a target of this C/C++ type takes (a member, a state variable, a field, an element), as a
+    parameter of that type: through the repository's typedefs to a builtin, an enumeration or "other"."""
+    t = _plain_type(pointer_core(ctype or ""))
+    seen: set[str] = set()
+    while t and t not in seen:
+        seen.add(t)
+        bare = re.sub(r"\bstd::", "", t)
+        if bare in ("bool", "_Bool"):
+            return uc.ParamInfo(name=name, type=bare, kind="bool")
+        enum = next((e for e in layout.enums if e.name == t or e.name.split("::")[-1] == t.split("::")[-1]), None)
+        if enum is not None:
+            return uc.ParamInfo(name=name, type=enum.name, kind="enum", base=enum.name, enum_values=list(enum.values))
+        if INTEGRAL_T.match(bare):
+            return uc.ParamInfo(name=name, type=bare, kind="int")
+        if FLOAT_T.match(bare):
+            return uc.ParamInfo(name=name, type=bare, kind="float")
+        nxt = layout.typedefs.get(t) or layout.typedefs.get(bare)
+        if not nxt:
+            break
+        t = _plain_type(pointer_core(nxt))
+    return uc.ParamInfo(name=name, type=ctype or "", kind="other")
+
+
+def array_element(ctype: str) -> str:
+    """The element type of an array type (uint8_t[4] -> uint8_t, std::array<int, 3> -> int); else the type."""
+    m = re.match(r"^\s*(?:const\s+)?std::(?:array|vector)\s*<\s*([^,>]+)", ctype or "")
+    return m.group(1).strip() if m else re.sub(r"\s*\[[^\]]*\]\s*$", "", ctype or "").strip()
+
+
+def as_list(value: str) -> list[str]:
+    """A list a brain wrote into one value ("[0, 0, 1]" or "{0, 0, 1}") as its items; a single value as one item."""
+    v = fix_value(value)
+    if len(v) >= 2 and v[0] + v[-1] in ("[]", "{}"):
+        return [x.strip() for x in uc.top_level_commas(v[1:-1]) if x.strip()]
+    return [v] if v else []
+
+
+def field_at(fields: list[uc.FieldInfo], path: str) -> uc.FieldInfo | None:
+    """The field a path (pos.x) names in a structure's fields, or None."""
+    for part in path.split(".") if path else []:
+        found = next((f for f in fields if f.name == part), None)
+        if found is None:
+            return None
+        if part == path.split(".")[-1]:
+            return found
+        fields = found.fields
+    return None
+
+
+def record_fields(type_name: str, layout: uc.LayoutProfile) -> list[uc.FieldInfo]:
+    """The fields of a structure type, from a parameter or state variable of that type (the front end's)."""
+    short = re.sub(r"\b(const|volatile|struct|union|class)\b", "", type_name).strip().split("::")[-1]
+    for f in layout.functions:
+        for p in f.params:
+            if p.fields and re.sub(r"\b(const|volatile|struct|union|class)\b|[*&]", "", p.base or p.type).strip() \
+                    .split("::")[-1] == short:
+                return list(p.fields)
+    return next((list(v.fields) for v in layout.sut_state if v.fields and re.sub(
+        r"\b(const|volatile|struct|union|class)\b|\[.*\]", "", v.type).strip().split("::")[-1] == short), [])
+
+
 def thrown_types(code: str) -> list[str]:
     """The exception types a throw expression in this code names (throw std::overflow_error("...")): a fact of the
     source, the only types an expected exception may name."""
@@ -3873,6 +3952,10 @@ class AnalyzerAgent(ba.AgentCore):
                 value = eval_int(m.group(2), constants)
                 if value is not None:
                     constants.setdefault(m.group(1), value)
+            for name, expr in integral_constants(text):               # C/C++ const and constexpr integers
+                value = eval_int(expr, constants)
+                if value is not None:
+                    constants.setdefault(name, value)
         for e in layout.enums:
             for k, v in e.values.items():
                 constants[k.split("::")[-1]] = v
@@ -3893,6 +3976,7 @@ class AnalyzerAgent(ba.AgentCore):
             visible = set(re.findall(r"\b([A-Za-z_]\w*)\b", "\n".join(self._dependency_headers_text(layout))))
             constants = self._constants_for_values(layout)
             names = re.findall(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+\S", text, re.M)
+            names += [n for n, _ in integral_constants(text)]          # constexpr std::uint32_t kPumpMaxOnMs = ...
             names += [k.split("::")[-1] for e in layout.enums for k in e.values]
             for name in dict.fromkeys(names):
                 if name in visible or name in LIMITS or name not in constants:
@@ -4133,52 +4217,104 @@ class AnalyzerAgent(ba.AgentCore):
         return []
 
     def _lower_structured(self, planned: "PlannedScenario", fn: uc.FunctionInfo, layout: uc.LayoutProfile,
-                          stubs: list[uc.StubSpec]) -> tuple[list[str], list[str]]:
+                          stubs: list[uc.StubSpec], constants: dict[str, int] | None = None,
+                          known: set[str] | None = None) -> tuple[list[str], list[str]]:
         """Structured scenario: the brain said what, this writes how - deterministically, the same code for every
         brain. Buffers and structures become declared objects passed in the right form, state becomes setter calls,
         earlier calls become calls of the function (through its wrapper or the object), stub outputs become the
-        stub's output controls, registers UT_REG32 assignments and object members accessor assignments. Returns
+        stub's output controls, registers UT_REG32 assignments and object members accessor assignments. Every value
+        is checked and shaped by the type of what it sets (``typed``), the same check a plain argument gets. Returns
         (fixes, problems); a name that is not in the lists is a problem and the scenario is refused with it."""
         fixes, problems, decls, stmts = [], [], [], []
         cpp = layout.language == "cpp"
         params = {p.name: p for p in text_params(fn)}
+        constants = constants if constants is not None else self._constants_for_values(layout)
+        known = known if known is not None else self._known_names(layout, stubs)
+        internal = self._internal_values(layout)
+        scoped = uc.namespace_names(layout, uc.headers_text(layout)) if cpp else {}
 
-        def values(where: str, given: list[str]) -> list[str] | None:
-            """Each value one C expression (a fact): JSON left in it is cut off, anything else refuses the entry."""
-            out = [fix_value(v) for v in given]
-            bad = next(((v, uc.c_expression_problem(v, braces=False)) for v in out
-                        if uc.c_expression_problem(v, braces=False)), None)
-            if bad:
-                problems.append(f"{where}: {bad[0][:40]!r} is {bad[1]}")
+        def typed(where: str, value: str, target: uc.ParamInfo) -> str | None:
+            """One value for one target, by facts: the rest of the JSON cut off, a name only the SUT file sees
+            replaced by its value (A1-PL2a), an enumerator or a namespaced name written in full (A2-21ai), then one
+            C expression and the target type's check (range, form, known names). None refuses the entry."""
+            v = uc.with_values(fix_value(value), internal)
+            if target.kind == "enum":
+                full = next((k for k in target.enum_values if k.split("::")[-1] == v.split("::")[-1]), None)
+                v = full or v
+            elif scoped:
+                v = uc.qualify_names(v, scoped)[0]
+            problem = uc.c_expression_problem(v, braces=target.kind not in ("int", "enum", "bool", "float"))
+            problem = f"{where}: {v[:40]!r} is {problem}" if problem else self._value_problem(
+                target.model_copy(update={"name": where}), v, fn, constants, set(), known, layout)
+            if problem:
+                problems.append(problem)
                 return None
-            return out
+            return v
+
+        def all_typed(where: str, values: list[str], target: uc.ParamInfo) -> list[str] | None:
+            out = [typed(where, v, target) for v in values]
+            return None if any(v is None for v in out) else out
+
+        def fields_of(var: str, where: str, given: list["PlannedField"], fields: list[uc.FieldInfo]) -> list[str] | None:
+            """Assignments of a structure's fields: a field must be one of its fields (when they are known); an array
+            field takes a list, element by element."""
+            rows, known_fields = [], {f.name for f in fields}
+            for f in given[:32]:
+                path = f.field.strip()
+                if known_fields and path.split(".")[0] not in known_fields:
+                    problems.append(f"{where}: {path} is not a field (its fields: {', '.join(sorted(known_fields)[:12])})")
+                    return None
+                info = field_at(fields, path)
+                if info is not None and info.kind == "array":
+                    items = all_typed(f"{where}.{path}", as_list(f.value), target_param("", array_element(info.type),
+                                                                                       layout))
+                    if items is None:
+                        return None
+                    rows += [f"{var}.{path}[{i}] = {x};" for i, x in enumerate(items[: info.array_len or 256])]
+                    continue
+                v = typed(f"{where}.{path}", f.value, target_param("", info.type, layout) if info else
+                          uc.ParamInfo(name="", type="", kind="other"))
+                if v is None:
+                    return None
+                rows.append(f"{var}.{path} = {v};")
+            return rows
         for a in planned.args:
             p = params.get(a.name)
-            if p is None or not (a.elements or a.fields):
+            if p is None:
                 continue
+            if p.kind == "enum" and a.value:                                     # the enumerator in full [A2-21ai]
+                full = next((k for k in p.enum_values if k.split("::")[-1] == fix_value(a.value).split("::")[-1]), None)
+                a.value = full or a.value
             var = f"ut_{re.sub(r'[^A-Za-z0-9_]', '_', a.name)}"
             base = pointee(p) or re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
-            known_fields = {f.name for f in p.fields}
+            record = p.kind in ("ptr_struct", "struct")
+            value = fix_value(a.value)
+            if record and not (a.elements or a.fields) and value and value not in NULLS and \
+                    (eval_int(value, constants) is not None or value.startswith("{")):
+                init = value if value.startswith("{") and not uc.c_form_problem(value) else "{" + ("" if cpp else "0") + "}"
+                decls.append(f"{base} {var} = {init};")    # a structure is its initializer; no field given: zero
+                a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
+                fixes.append(f"args.{a.name}: a {base} declared {'with ' + init if init != value else 'zeroed'} "
+                             f"and passed as {a.value} [structured]")
+                continue
+            if not (a.elements or a.fields):
+                continue
             scalar = p.kind in ("int", "enum", "bool", "float") or (p.kind == "ptr_scalar" and p.by_ref)
-            if scalar and fix_value(a.value) and not uc.c_expression_problem(fix_value(a.value), braces=False):
+            if scalar and value and not uc.c_expression_problem(value, braces=False):
                 fixes.append(f"args.{a.name}: a {p.type} takes its value; elements and fields left out [structured]")
                 a.elements, a.fields = [], []          # the type is a fact: one value, so the list is form noise
                 continue
             if a.elements and p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring") and not p.by_ref:
-                given = values(f"args.{a.name}", list(a.elements[:256]))
+                given = all_typed(f"args.{a.name}", list(a.elements[:256]), target_param("", base, layout))
                 if given is None:
                     continue
                 decls.append(f"{base or 'unsigned char'} {var}[{max(len(given), 1)}] = {{{', '.join(given)}}};")
                 a.value = var
-            elif a.fields and p.kind in ("ptr_struct", "struct"):
-                unknown = [f.field for f in a.fields if known_fields and f.field.split(".")[0] not in known_fields]
-                given = values(f"args.{a.name}", [f.value for f in a.fields[:32]])
-                if unknown:
-                    problems.append(f"{a.name}: {', '.join(unknown[:4])} is not a field of {base}")
-                if unknown or given is None:
+            elif a.fields and record:
+                rows = fields_of(var, f"args.{a.name}", a.fields, p.fields)
+                if rows is None:
                     continue
-                decls.append(f"{base} {var} = {{{'' if cpp else '0'}}};")
-                decls += [f"{var}.{f.field} = {v};" for f, v in zip(a.fields, given)]
+                decls += [f"{base} {var} = {{{'' if cpp else '0'}}};", *rows]
                 a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
             else:
                 problems.append(f"{a.name}: elements are for a buffer or pointer, fields for a structure parameter"
@@ -4187,29 +4323,39 @@ class AnalyzerAgent(ba.AgentCore):
             fixes.append(f"args.{a.name}: declared and filled by the generator, passed as {a.value} [structured]")
             a.elements, a.fields = [], []
         alias = self._state_aliases(layout)
-        elements: dict[tuple[str, str], tuple[str, bool]] = {}
+        scalars = {uc.state_setter_name(v)[len("ut_state_set_"):]: v for v in uc.settable_state(layout)}
+        elements: dict[tuple[str, str], tuple[str, bool, uc.StateVar]] = {}
         for name, v, indexed, path, _ in uc.element_setters(layout):
             for key in {v.name, v.name.replace("(anonymous namespace)::", ""), v.name.split("::")[-1]}:
-                elements.setdefault((key, path), (name, indexed))
+                elements.setdefault((key, path), (name, indexed, v))
         for s in planned.state:
             var = s.variable.strip()
-            given = values(f"state {var}", [s.value])
-            if given is None:
+            if var in alias:                         # a plain variable: an index or a field does not apply (its type)
+                if s.index >= 0 or s.field.strip():
+                    fixes.append(f"state {var}: a plain variable - index and field left out [structured]")
+                v = typed(f"state {var}", s.value, target_param("", scalars[alias[var]].type, layout))
+                if v is not None:
+                    stmts.append(f"ut_state_set_{alias[var]}({v});")
                 continue
-            s.value = given[0]
-            if s.index < 0 and not s.field and var in alias:
-                stmts.append(f"ut_state_set_{alias[var]}({s.value});")
-                continue
-            setter = elements.get((var, s.field.strip()))
+            field = s.field.strip()
+            setter = elements.get((var, field)) or elements.get((var, field.split(".", 1)[-1] if field.startswith(
+                var.split("::")[-1] + ".") else field))
             if setter is None:
                 problems.append(f"state {var}{'[' + str(s.index) + ']' if s.index >= 0 else ''}"
-                                f"{'.' + s.field if s.field else ''}: not a variable, element or field of SUT STATE")
+                                f"{'.' + field if field else ''}: not a variable, element or field of SUT STATE")
                 continue
-            name, indexed = setter
+            name, indexed, sv = setter
             if indexed and s.index < 0:
                 problems.append(f"state {var}: an array - give its index")
                 continue
-            stmts.append(f"{name}({str(s.index) + ', ' if indexed else ''}{s.value});")
+            if indexed and sv.array_len and s.index >= sv.array_len:
+                problems.append(f"state {var}[{s.index}]: the index is outside 0..{sv.array_len - 1}")
+                continue
+            info = field_at(sv.fields, field) if field else None
+            ctype = info.type if info else array_element(sv.type)
+            v = typed(f"state {var}{'.' + field if field else ''}", s.value, target_param("", ctype, layout))
+            if v is not None:
+                stmts.append(f"{name}({str(s.index) + ', ' if indexed else ''}{v});")
         for c in planned.calls:
             g = uc.function_of(c.function, layout) or next(
                 (f for f in layout.functions if f.qualified_name.replace("(anonymous namespace)::", "") == c.function
@@ -4217,6 +4363,7 @@ class AnalyzerAgent(ba.AgentCore):
             if g is None:
                 problems.append(f"calls: {c.function} is not a function of the SUT")
                 continue
+            g = uc.instantiated(g, layout)
             if len(c.args) != len(g.params):
                 problems.append(f"calls: {c.function} takes {len(g.params)} argument(s), {len(c.args)} given")
                 continue
@@ -4229,7 +4376,11 @@ class AnalyzerAgent(ba.AgentCore):
                 callee = "ut_static_" + re.sub(r"\W", "_", g.name.replace("(anonymous namespace)::", ""))
             else:
                 callee = g.qualified_name.replace("(anonymous namespace)::", "")
-            planned.calls_before.append(f"{callee}({', '.join(c.args)});")
+            args = [typed(f"calls {c.function}.{p.name}", x, p) if p.kind in ("int", "enum", "bool", "float") else
+                    fix_value(x) for x, p in zip(c.args, g.params)]
+            if any(x is None for x in args):
+                continue
+            planned.calls_before.append(f"{callee}({', '.join(args)});")
         by_stub = {s.function: s for s in stubs} | {s.qualified_name: s for s in stubs if s.qualified_name}
         for w in planned.writes:
             spec = next((s for s in stubs if (s.qualified_name or s.function) == w.stub and
@@ -4240,17 +4391,32 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             ctrl = f"ut_stub_{uc.stub_base(spec)}_{w.param}_out"
             base = stub_pointee(ptype)
-            if values(f"writes {w.stub}.{w.param}", list(w.elements[:256]) + [f.value for f in w.fields[:32]]) is None:
-                continue
             if w.elements:
-                stmts.append(f"{{ {base} ut_w[] = {{{', '.join(w.elements[:256])}}}; memcpy({ctrl}, ut_w, sizeof ut_w); "
+                given = all_typed(f"writes {w.stub}.{w.param}", list(w.elements[:256]), target_param("", base, layout))
+                if given is None:
+                    continue
+                stmts.append(f"{{ {base} ut_w[] = {{{', '.join(given)}}}; memcpy({ctrl}, ut_w, sizeof ut_w); "
                              f"{ctrl}_len = (int)sizeof ut_w; }}")
             elif w.fields:
-                stmts.append(f"{{ {base} ut_w = {{{'' if cpp else '0'}}}; "
-                             + " ".join(f"ut_w.{f.field} = {f.value};" for f in w.fields[:32])
+                rows = fields_of("ut_w", f"writes {w.stub}.{w.param}", w.fields, record_fields(base, layout))
+                if rows is None:
+                    continue
+                stmts.append(f"{{ {base} ut_w = {{{'' if cpp else '0'}}}; " + " ".join(rows)
                              + f" memcpy({ctrl}, &ut_w, sizeof ut_w); {ctrl}_len = (int)sizeof ut_w; }}")
+        variables = {s.function: s for s in stubs if s.kind == "variable"} | {
+            s.qualified_name: s for s in stubs if s.kind == "variable" and s.qualified_name}
+        for v in planned.variables:                       # a stub variable: its full name and the value its type takes
+            spec = variables.get(v.name)
+            if spec is None:
+                continue
+            v.name = spec.qualified_name or spec.function
+            value = typed(f"variables {v.name}", v.value, target_param("", re.sub(
+                r"\b" + re.escape(spec.function.split("::")[-1]) + r"\b.*$", "", spec.var_type).strip(), layout))
+            if value is not None:
+                v.value = value
+        word = uc.ParamInfo(name="", type="uint32_t", kind="int")              # a 32-bit register [A3-HW1]
         for r in planned.registers:
-            given = values("registers", [r.address, r.value])
+            given = all_typed("registers", [r.address, r.value], word)
             if given is not None:
                 stmts.append(f"UT_REG32({given[0]}) = {given[1]};")
         cls = uc.class_of(fn)
@@ -4261,17 +4427,21 @@ class AnalyzerAgent(ba.AgentCore):
                 problems.append(f"members: {m.member} is not a member of the object")
                 continue
             ref = f"*ut_member({uc.member_tag(info)}{{}})" if info.static else f"ut_obj.*ut_member({uc.member_tag(info)}{{}})"
-            container = bool(re.search(r"\bstd::(?:array|vector)\s*<", info.type))
-            if m.elements and not container:            # a scalar member takes its value, never a list
-                m.value, m.elements = (m.value or (m.elements[0] if len(m.elements) == 1 else "")), []
+            container = re.search(r"\bstd::(?:array|vector)\s*<\s*([^,>]+)", info.type)
+            items = list(m.elements[:256]) or (as_list(m.value) if container else [])
+            if container:
+                given = all_typed(f"members {m.member}", items, target_param("", container.group(1), layout))
+                if given is not None:
+                    stmts.append(f"{ref} = {{{', '.join(given)}}};")
+                continue
+            if items and not m.value:                  # a scalar member takes its value, never a list
+                m.value = items[0] if len(items) == 1 else ""
                 if not m.value:
                     problems.append(f"members {m.member}: a {info.type} takes one value, not a list")
                     continue
-            given = values(f"members {m.member}", list(m.elements[:256]) if m.elements else [m.value])
-            if given is None:
-                continue
-            value = f"{{{', '.join(given)}}}" if m.elements else given[0]
-            stmts.append(f"({ref}) = {value};" if not m.elements else f"{ref} = {value};")
+            v = typed(f"members {m.member}", m.value, target_param("", info.type, layout))
+            if v is not None:
+                stmts.append(f"({ref}) = {v};")
         if decls or stmts:
             planned.setup = decls + list(planned.setup) + stmts
             fixes.append(f"structured: {len(decls) + len(stmts)} statement(s) written by the generator")
@@ -4548,7 +4718,8 @@ class AnalyzerAgent(ba.AgentCore):
         """A1-PL4: every check, deterministically, before Agent2 receives the scenario. The format fixes of ARCH-20
         are applied first and recorded in ``self.last_fixes``."""
         fn = uc.instantiated(fn, layout)          # a method of a class template: its parameters as tests call them
-        lowered, structured_problems = self._lower_structured(planned, fn, layout, stubs)   # the brain said what
+        lowered, structured_problems = self._lower_structured(planned, fn, layout, stubs, constants,
+                                                              known)                    # the brain said what
         self.last_fixes = lowered + self._normalize_planned(planned, fn, open_ids, evidence, layout,
                                                             self._internal_values(layout), known)  # A1-PL2a, A1-PL4
         reasons: list[str] = list(structured_problems)
@@ -4612,14 +4783,13 @@ class AnalyzerAgent(ba.AgentCore):
                     reasons.append(f"setup calls functions that do not exist here: {', '.join(missing[:4])}")
         by_name = {p.name: p for p in text_params(fn)}
         given = {a.name: a.value for a in planned.args}
-        if not fn.member:
-            if set(given) != set(by_name):
-                reasons.append(f"args must name every parameter exactly once: {', '.join(by_name) or 'none'}")
-            for name, value in given.items():                                              # e)
-                if name in by_name:
-                    problem = self._value_problem(by_name[name], value, fn, constants, local, known, layout)
-                    if problem:
-                        reasons.append(problem)
+        if set(given) != set(by_name):                    # a method's parameters are facts as much as a function's
+            reasons.append(f"args must name every parameter exactly once: {', '.join(by_name) or 'none'}")
+        for name, value in given.items():                                                  # e)
+            if name in by_name:
+                problem = self._value_problem(by_name[name], value, fn, constants, local, known, layout)
+                if problem:
+                    reasons.append(problem)
         stub_specs = {}
         for s in stubs:
             stub_specs[s.function] = s

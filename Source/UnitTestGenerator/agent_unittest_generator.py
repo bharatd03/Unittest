@@ -1139,7 +1139,7 @@ def assemble_suite(plan: uc.UTPlan, tests: list[tuple[str, str, str]], stub_head
         prototypes += [element_setter_prototype(e) for e in uc.element_setters(layout)]       # structured
     if layout.language == "cpp":                     # structured: accessors of the object members the tests set
         used = set(re.findall(r"\b(ut_tag_\w+)\b", "\n".join(src for _, src, _ in tests) + "\n".join(shared or [])))
-        prototypes += uc.member_access_source([m for m in layout.class_members if uc.member_tag(m) in used])
+        prototypes += uc.member_access_source([m for m in layout.class_members if uc.member_tag(m) in used], layout)
     lines += [f'#include "{h}"' for h in register_headers(plan) if h not in sut_headers]      # A2-21ab
     helpers = callback_helpers(layout)
     extra = ["#include <stddef.h>"] + (["#include <stdbool.h>"] if layout.language == "c" and any(
@@ -2242,7 +2242,7 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
             members = [f.model_copy(update={"params": [_instantiate_param(p, mapping) for p in f.params]})
                        for f in members]
             ctor = next((f for f in members if f.qualified_name.endswith(f"{short}::{short}")), None)
-            cls = f"{class_templates(plan)[short][0]}<{class_templates(plan)[short][1]}>"
+            cls = uc.instantiated_class(cls, layout)                                       # A1-DA19
         for fn in members:
             if fn is ctor or fn.name not in wanted or fn.qualified_name.split("::")[-1].startswith("~"):
                 continue

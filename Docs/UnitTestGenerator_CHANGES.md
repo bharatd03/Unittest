@@ -3,6 +3,72 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (5): every structured value is checked by the type of what it sets - from the pilot-medium run
+
+### What the run showed (13:21, commit 328430c)
+
+| File | Coverage | Brain plans refused | Brain tests not kept |
+|---|---|---|---|
+| `climate_ctrl.c` | LC 88.3 %, MC/DC 53.4 % | 194 of 300 (64.7 %) | 102 of 102 |
+| `chassis_ctrl.cpp` | LC 71.9 %, MC/DC 39.0 % | 43 of 102 (42.2 %) | 37 of 41 (36 did not compile) |
+
+The brain added almost nothing after the rule round. The causes were in the structured lowering, not in the brain:
+* **C:** 170 of the 194 refusals were "state s_mode.s_mode: not a variable": for a plain variable the brain repeated
+  its name as the field. An array field was assigned as one value (`ut_out.mix_pct = [0, 0, 0, 0]`).
+* **C++:** a plain argument was checked against its type, but a value for a member, state, a field, an element, an
+  earlier call or a stub variable was not. So these reached the compiler:
+  * a huge integer for an `int16_t` member;
+  * a private member's name as a value (`implausible_`);
+  * a constant only the SUT file defines (`kPumpMaxOnMs`);
+  * `Mode::Service` without its namespace;
+  * `g_supply_mv` without `hal::`.
+* **C++:** the arguments of a member function were never checked at all (`if not fn.member`).
+* **C++:** `MovingAverage ut_obj;` without its template arguments: the template fact covered header SUTs only.
+* **C++:** `const std::uint8_t *` had the kind "other" (std:: was not read as the builtin). So the search could not
+  generate `crc8`'s data, and a buffer's elements were refused.
+
+### Change: one rule, the type is the fact
+
+* `typed` in `_lower_structured`: every value is handled the same way. First the rest of the JSON is cut off. A
+  name only the SUT file sees becomes its value (A1-PL2a). An enumerator or a namespaced name is written in full
+  (A2-21ai). Then the value must be one C expression and pass the check of its target's type (`_value_problem`, the
+  check plain arguments get: range, form, known names). The target's type is a fact (`target_param`, through the
+  typedefs).
+* It applies to argument elements and fields, state (index within the array's length), earlier calls, stub
+  writes, stub variables (with their full name), registers (32 bits) and members.
+* The form follows the type:
+  * a plain variable takes no index or field;
+  * an array field takes a list, element by element;
+  * a structure argument given as a value is its initializer (zeroed when no field is given);
+  * a container member takes a list, a scalar member one value.
+* The arguments of a member function are checked like any other (all parameters named, each value by its type).
+* `integral_constants`: C/C++ `const` and `constexpr` integers are constants of the source, like integer macros
+  (A1-PL2a, `_constants_for_values`).
+* `test_instances`: the instantiation a test uses of a class template, for every SUT. A header SUT uses its own
+  templates. Any other SUT uses the templates its headers define, with the arguments the SUT's code uses
+  (`MovingAverage<std::uint16_t, 4>`). The object rule, the parameters, calls and the member accessors all use it.
+  The explicit instantiation in the access file stays for header SUTs only.
+* Front end: `std::uint8_t` is the builtin `uint8_t` (and so on), so `const std::uint8_t *` is a buffer. The Stage A
+  cache version is now 3, so a cached layout with the old kinds is not reused.
+
+### Checked: Qwen's own answers of that run, replayed (A1's checks, the generator, the compile gate)
+
+| | Plans kept | Tests built | Do not compile |
+|---|---|---|---|
+| C, in the run | 106 of 300 | | 8 (the rest failed or added nothing) |
+| C, replayed with the change | 222 of 300 | 220 | 2 |
+| C++, in the run | 59 of 102 | 41 | 36 |
+| C++, replayed with the change | 54 of 102 | 51 | 2 |
+
+* The plans still refused are right to be refused: numbers outside the type, JSON in a value, NULL where the
+  function does not check it, parameters left out.
+* The tests still not compiling are values the checks marked as predictions; the compiler decided (NC-7).
+* Whether the kept tests reach new items can only be measured by a pipeline run.
+* New: `TypedValueTests` (C and C++, from the slips of the run). Changed:
+  `test_a_scenario_refused_only_by_predictions_is_tried` gives the method its argument.
+* 28 test classes (209 tests) pass except one that also fails without the change in this container. The pipeline
+  tests were not run here.
+
 ## 2026-10-28 (4): steps 5, 7 and 8 - a decision instead of a rewrite, short answer fields, dead code removed
 
 ### Step 5: a failing asserted test is decided, then a rule acts - no brain rewrites it

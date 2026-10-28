@@ -750,7 +750,8 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
 
         def check(**kw):
             planned = a1.PlannedScenario(**{**dict(gap_ids=["LC:1"], name="test_wait_update_case", purpose="p",
-                                                   args=[], setup=[], stubs=[], variables=[], expected_return="",
+                                                   args=[{"name": "max_loops", "value": "1"}], setup=[], stubs=[],
+                                                   variables=[], expected_return="",
                                                    expected_after=[], evidence_ids=[], quotes=[],
                                                    classification="characterization_gap", conflict="",
                                                    information_sought=""), **kw})
@@ -6402,6 +6403,80 @@ class MeasuredRightTests(unittest.TestCase):
             self.assertTrue(all((Path(r.output_dir) / "summary.md").is_file() for r in results))
             pending = [e["data"]["pending"] for e in hub.events() if e["kind"] == "progress"]
             self.assertEqual(pending, [1, 0, 0])               # folders to come, never the running one [VIEW-12a]
+
+
+class TypedValueTests(unittest.TestCase):
+    """Structured scenarios, from the pilot-medium run of 2026-10-28: every value is checked and shaped by the type of
+    what it sets - the same check a plain argument gets - and templates, enumerators and constants are written from
+    the facts. The brain's answers of that run, replayed: C 106 -> 222 of 300 plans kept, C++ 36 of 41 -> 2 of 51
+    tests that do not compile."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tmpdir()
+        cls.layouts = {}
+        for pilot, sut in (("c_medium_pilot", "src/climate_ctrl.c"), ("cpp_medium_pilot", "src/chassis_ctrl.cpp")):
+            repo = copy_pilot(pilot, Path(cls.tmp.name))
+            layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=sut))
+            agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(cls.tmp.name) / f"w_{pilot}")))
+            cls.layouts[pilot] = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(
+                layout=layout, build=agent.capture(uc.CaptureRequest(layout=layout)))))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def check(self, pilot: str, function: str, **answer):
+        layout = self.layouts[pilot]
+        agent = a1.AnalyzerAgent()
+        fn = uc.function_of(function, layout)
+        self.assertIsNotNone(fn, function)
+        stubs = agent._stubs(layout, None)
+        planned = a1.PlannedScenario.model_validate({**dict(
+            gap_ids=["LC:1"], name="test_typed_case", purpose="p", args=[], stubs=[], variables=[], expected_return="",
+            expected_after=[], evidence_ids=[], quotes=[], classification="characterization_gap", conflict="",
+            information_sought=""), **answer})
+        return agent._check_planned(planned, fn, {"LC:1"}, set(), {}, stubs, agent._constants_for_values(layout),
+                                    agent._known_names(layout, stubs), layout)
+
+    def test_c_values_take_the_form_of_their_type(self):
+        args = [{"name": "in", "value": "1"}, {"name": "req", "value": "{0}"},
+                {"name": "out", "fields": [{"field": "mix_pct", "value": "[0, 1, 2, 3]"}]}, {"name": "dt_ms", "value": "10"}]
+        scenario, notes = self.check("c_medium_pilot", "clim_step", args=args,
+                                     state=[{"variable": "s_mode", "index": -1, "field": "s_mode", "value": "CLIM_MODE_AUTO"}])
+        self.assertIsNotNone(scenario, notes)
+        setup = " ".join(scenario.setup)
+        self.assertIn("ut_state_set_s_mode(CLIM_MODE_AUTO);", setup)              # a plain variable: no field
+        self.assertIn("clim_inputs_t ut_in = {0};", setup)                          # a structure is its initializer
+        self.assertIn("ut_out.mix_pct[3] = 3;", setup)                              # an array field, element by element
+        self.assertEqual([a.value for a in scenario.args], ["&ut_in", "&ut_req", "&ut_out", "10"])
+        scenario, notes = self.check("c_medium_pilot", "clim_step", args=args[:3] + [{"name": "dt_ms", "value": "120000"}])
+        self.assertIsNone(scenario)
+        self.assertTrue(any("outside the range of uint16_t" in n for n in notes), notes)
+
+    def test_cpp_values_come_from_the_facts(self):
+        layout = self.layouts["cpp_medium_pilot"]
+        self.assertEqual(uc.instantiated_class("vehicle::chassis::MovingAverage", layout),
+                         "vehicle::chassis::MovingAverage<std::uint16_t, 4>")       # the instance the SUT uses
+        crc = uc.function_of("crc8", layout)
+        self.assertEqual(next(p.kind for p in crc.params if p.name == "data"), "ptr_scalar")  # std::uint8_t is uint8_t
+        scenario, notes = self.check("cpp_medium_pilot", "vehicle::chassis::select_mode",
+                                     args=[{"name": "current", "value": "Mode::Service", "elements": ["Mode::Service"]},
+                                           {"name": "button", "value": "2"}, {"name": "vehicle_stopped", "value": "0"}])
+        self.assertEqual(scenario.args[0].value, "vehicle::chassis::Mode::Service", notes)   # the enumerator in full
+        scenario, notes = self.check("cpp_medium_pilot", "vehicle::chassis::pump_step",
+                                     args=[{"name": "request", "value": "1"}, {"name": "dt_ms", "value": "0"}],
+                                     state=[{"variable": "g_pump_on_ms", "index": -1, "field": "", "value": "kPumpMaxOnMs"}])
+        self.assertIn("ut_state_set_g_pump_on_ms(300000);", " ".join(scenario.setup), notes)   # A1-PL2a: a constexpr
+        scenario, notes = self.check("cpp_medium_pilot", "vehicle::chassis::SteerLimiter::limit",
+                                     args=[{"name": "request_deci_deg", "value": "2" + "0" * 60}])
+        self.assertIsNone(scenario)                                         # a method's arguments are checked too
+        self.assertTrue(any("outside the range" in n for n in notes), notes)
+        scenario, notes = self.check("cpp_medium_pilot", "vehicle::chassis::SteerLimiter::limit",
+                                     args=[{"name": "request_deci_deg", "value": "5"}],
+                                     members=[{"member": "max_rate_", "value": "1" + "0" * 30}])
+        self.assertIsNone(scenario)                                         # a member's value against its type
+        self.assertTrue(any("members max_rate_" in n and "range" in n for n in notes), notes)
 
 
 class ReadOnceTests(unittest.TestCase):

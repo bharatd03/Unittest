@@ -1231,7 +1231,7 @@ class Orchestrator:
     STAGE_A_FIELDS = ("build", "compile_flags", "build_flags_source", "dependencies", "functions", "enums", "sut_state",
                       "local_statics", "interfaces", "typedefs", "private_types", "requirement_links", "include_dirs",
                       "class_members")
-    STAGE_A_VERSION = "2"             # 2: state with its elements and fields, class members (structured scenarios)
+    STAGE_A_VERSION = "3"             # 3: std:: integer types as builtins; 2: state elements and fields, class members
 
     def _stage_a_key(self, s: "RunState") -> str:
         """CA-10: the SUT's version, the discover result, the run's build description, the toolchain, the
