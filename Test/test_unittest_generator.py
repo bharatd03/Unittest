@@ -6099,8 +6099,9 @@ class LargePilotFindingsTests(unittest.TestCase):
         self.assertTrue(any("crashed_test" in n for n in comp._measure_notes), comp._measure_notes)
 
     def test_a_failing_stub_gets_its_origin_and_rule_repairs(self):            # A3-CL14a, A3-CL14b, ARCH-21a
-        """Two stubs of hal::pwm - the header's and one the brain invented: the repair's facts name both origins, and
-        the rules' own repairs, tried without a brain, take the build forward; the brain is never needed for them."""
+        """Two entries of hal::pwm - the header's and one the brain invented: only the first is rendered, so the
+        program links (one definition per stub). The invented one alone does not build: the repair's facts name its
+        origin, and the rules' own repairs, tried without a brain, take the build forward."""
         tmp = tmpdir()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name) / "repo"
@@ -6125,15 +6126,16 @@ class LargePilotFindingsTests(unittest.TestCase):
             update={"entries": layout.dependencies.entries + [invented]})})
         plan = uc.UTPlan(plan_id="p", stage="setup", layout=layout,
                          stubs=[s for s in (a1.stub_spec(rule), a1.stub_spec(invented)) if s])
-        bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
-            uc.GenerationRequest(plan=plan)))
+        generator = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic"))
+        bundle = run(generator.generate_bundle(uc.GenerationRequest(plan=plan)))
+        self.assertTrue(comp.execute(uc.VerifyRequest(layout=layout, stage="build_check", bundle=bundle)).link_ok)
+        plan = plan.model_copy(update={"stubs": [s for s in (a1.stub_spec(invented),) if s]})     # the invented alone
+        bundle = run(generator.generate_bundle(uc.GenerationRequest(plan=plan)))
         req = uc.VerifyRequest(layout=layout, stage="build_check", bundle=bundle)
         result = comp.execute(req)
         self.assertFalse(result.link_ok)
         origins = comp._line_origins(req, result)
         self.assertIn("PROPOSED BY THE BRAIN", origins)
-        self.assertIn("declared in include/hal.hpp", origins)
-        self.assertIn("two stubs of the same function", origins)
         self.assertIn("include/hal.hpp", comp._project_declarations(req, result))
         options = comp._repair_options(req, comp._repairable(result, req))
         self.assertTrue(any(text.startswith("remove the") for text, _ in options.values()), options)

@@ -2480,17 +2480,11 @@ PLAN_TASK = (
     "Plan unit-test scenarios for the function {fn} that reach the TARGETS (and, for EVIDENCE:<function>, check "
     "the behaviour the EVIDENCE states). Return JSON {{\"scenarios\": [...]}} with at most {limit} scenarios.\n"
     "Rules:\n"
-    "- You say WHAT the test sets; the generator writes the code. Never write a declaration, an address (&), a "
-    "cast or a statement.\n"
-    "- args: one entry per parameter, by its name. A plain parameter: value (an integer, floating or character "
-    "literal, an enumerator or a macro of the facts; NULL only where PARAMETERS says it may be NULL). A buffer, "
-    "array or pointer parameter: elements (the values it points to). A structure parameter or a pointer to one: "
-    "fields.\n"
-    "- state: SUT STATE to set before the call: the variable, for an array its index (else -1), for a structure "
-    "its field (else \"\"), and the value. calls: earlier calls of CALLABLE FUNCTIONS, only when a target needs "
-    "state that calls build up.\n"
-    "- stubs: return values of the STUBS, one per call in call order; writes: what a stub of STUB OUTPUTS writes "
-    "into its output parameter; variables: STUB VARIABLES to set; registers: REGISTERS; members: OBJECT MEMBERS.\n"
+    "- You say WHAT the test sets; the generator writes the code: never a declaration, an address (&) or a cast.\n"
+    "- args: one entry per parameter, by its name, with its value (a literal, an enumerator or a macro of the "
+    "facts; NULL only where PARAMETERS says it may be NULL).\n"
+    "{forms}"
+    "- stubs: return values of the STUBS, one per call in call order; variables: STUB VARIABLES to set.\n"
     "- targets: the ids of the TARGETS a scenario reaches (one to three, for example [\"T2\"]); never write out "
     "line numbers or item ids. Every TARGET is to be reached by a test: choose inputs, state and stub values that "
     "reach it.\n"
@@ -2510,14 +2504,42 @@ PLAN_TASK = (
     '"args": [{{"name": "a", "value": "1"}}, {{"name": "b", "value": "-1"}}], "state": [], "stubs": [], '
     '"variables": [], "expected_return": "", "expected_after": [], "evidence_ids": [], "quotes": [], '
     '"classification": "characterization_gap", "conflict": "", "information_sought": ""}}\n'
-    'Other forms: a buffer parameter {{"name": "data", "elements": ["0x01", "0x02"]}}; a structure parameter '
-    '{{"name": "cfg", "fields": [{{"field": "limit", "value": "5"}}]}}; state of an array of structures '
-    '{{"variable": "tbl", "index": 1, "field": "count", "value": "3"}}.\n'
     "A confirmed_gap carries the evidence it rests on, for example: \"classification\": \"confirmed_gap\", "
     '"expected_return": "-1", "evidence_ids": ["EV-f-1"], "quotes": [{{"evidence_id": "EV-f-1", "text": "returns -1 '
     'when b is negative"}}] - every quote an object with the evidence id and the words copied from it.\n'
     "Values are C code exactly as in the example (\"1\", \"-1\", a macro or enumerator name): never a ':' or '=' "
     "before a value, never the parameter name, a file path or a placeholder.")
+def plan_forms(fn: uc.FunctionInfo, lists: dict[str, Any]) -> str:
+    """The rules of the structured fields this function's answer has - only those (a small window keeps the
+    facts): buffers and structures among its parameters, its SUT state, earlier calls, stub outputs, registers,
+    object members."""
+    kinds = {p.kind for p in text_params(fn)} | {"struct" for p in text_params(fn) if p.by_ref and p.fields}
+    rows = []
+    if kinds & {"buffer", "ptr_scalar", "ptr_void", "cstring"}:
+        rows.append('- A buffer, array or pointer parameter: elements, the values it points to, for example '
+                    '{"name": "data", "elements": ["0x01", "0x02"]}.\n')
+    if kinds & {"struct", "ptr_struct"}:
+        rows.append('- A structure parameter or a pointer to one: fields, for example {"name": "cfg", "fields": '
+                    '[{"field": "limit", "value": "5"}]}.\n')
+    if lists.get("callables") and not lists.get("state"):
+        rows.append("- calls: earlier calls of CALLABLE FUNCTIONS with their argument values, only when a target "
+                    "needs state that calls build up.\n")
+    if lists.get("state"):
+        rows.append('- state: SUT STATE to set before the call - the variable, for an array its index (else -1), for '
+                    'a structure its field (else ""), and the value, for example {"variable": "tbl", "index": 1, '
+                    '"field": "count", "value": "3"}.\n')
+        if lists.get("callables"):
+            rows.append("- calls: earlier calls of CALLABLE FUNCTIONS with their argument values, only when a target "
+                        "needs state that calls build up.\n")
+    if lists.get("outputs"):
+        rows.append("- writes: what a stub of STUB OUTPUTS writes into its output parameter (elements or fields).\n")
+    if lists.get("registers"):
+        rows.append("- registers: the value a register of REGISTERS holds before the call.\n")
+    if lists.get("members"):
+        rows.append("- members: OBJECT MEMBERS to set before the call (elements for a container).\n")
+    return "".join(rows).replace("{", "{{").replace("}", "}}")
+
+
 LINK_TASK = (
     "Some REQUIREMENTS below do not name a function. For each one, decide which FUNCTIONS (if any) implement the "
     "behaviour it states. Return JSON {\"links\": [{\"requirement_id\", \"functions\", \"quote\", \"probability\"}]}: "
@@ -4021,11 +4043,11 @@ class AnalyzerAgent(ba.AgentCore):
                              cls.split("::")[-1]):
                 continue
             name = g.qualified_name.replace("(anonymous namespace)::", "")
-            if g is fn or any(re.search(r"\b" + re.escape(s.replace("(anonymous namespace)::", "").split("::")[-1])
-                                        + r"\b", "\n".join(lines[g.line_start - 1: g.line_end]))
-                              for s in state_names):
-                callables.append(name)
-                call_rows.append(f"- {name}({', '.join(p.type for p in g.params)})")
+            if (state_names or uc.keeps_state(fn, layout)) and (g is fn or any(
+                    re.search(r"\b" + re.escape(s.replace("(anonymous namespace)::", "").split("::")[-1]) + r"\b",
+                              "\n".join(lines[g.line_start - 1: g.line_end])) for s in state_names)):
+                callables.append(name)                             # calls build up state: only with state
+                call_rows.append(f"- {name}({', '.join(p.type for p in text_params(g))})")
         outputs, output_rows = [], []
         called = {c.split("::")[-1] for c in fn.calls}
         for s in stubs:
@@ -5052,7 +5074,8 @@ class AnalyzerAgent(ba.AgentCore):
                                  tokens_per_item=self.cfg.tokens_per_scenario, overhead=100,   # ARCH-11a, BP-5
                                  asked=True)                                                  # ARCH-20c
             # as many scenarios as the answer limit was planned for, not the configured maximum [ARCH-11a]
-            task = PLAN_TASK.format(fn=fn.qualified_name, limit=need.items)
+            task = PLAN_TASK.format(fn=fn.qualified_name, limit=need.items,
+                                    forms=plan_forms(fn, lists).replace("{{", "{").replace("}}", "}"))
             try:
                 allowed = next_brains()                                            # COV-6, A1-PL8: the next brain
                 if allowed is not None and not allowed:

@@ -2166,7 +2166,8 @@ class Orchestrator:
         with its message for the journal (LA-3) and the knowledge base. An error outside every test is left to the
         build (A3-CL12)."""
         new = set(bundle.new_tests)
-        if not getattr(self.cfg, "compile_gate", True) or not new or plan.stage != "coverage":
+        cfg = getattr(self, "cfg", None)
+        if not getattr(cfg, "compile_gate", True) or not new or getattr(plan, "stage", "") != "coverage":
             return bundle
 
         async def check(b: uc.FileActionBundle) -> dict[str, str]:
@@ -2187,7 +2188,7 @@ class Orchestrator:
         ids = {n: set(SCENARIO_ID.findall(sources.get(n, ""))) for n in failing}
         redo = [sc for sc in plan.scenarios if not sc.inputs and any(sc.scenario_id in i for i in ids.values())
                 and (sc.made_by.startswith("brain:") or not sc.checked)] \
-            if not plan.rules_only and getattr(self.cfg, "gate_rewrites", 1) > 0 else []
+            if not plan.rules_only and getattr(cfg, "gate_rewrites", 1) > 0 else []
         note = (f"{len(failing)} new test(s) did not compile in the gate [A3-CL15]: "
                 + "; ".join(d[:160] for d in list(failing.values())[:4]))[:1200]
         base = uc.without_tests(bundle, sorted(failing), note)
