@@ -3,6 +3,15 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (9): no HTML coverage pages (paths over 260 characters on Windows)
+
+`llvm-cov show -format=html` wrote one page per source under `coverage/coverage/<the source's absolute path>.html`,
+with the absolute path repeated inside the run folder. On Windows that is longer than 260 characters, and
+`rmdir /s /q ut_tmp` at the start of `test` could not delete the folders the last test run left ("The system cannot
+find the path specified"). No step, report or delivery reads the pages (coverage.json, coverage.lcov and mcdc.txt are
+the measurement), so the call is removed: one llvm-cov run less per measurement. `test` deletes `ut_tmp` with the
+`\\?\` prefix, so the folders an earlier version left are removed too.
+
 ## 2026-10-28 (8): refusals the code caused - false refusals, the schema without the type facts, repeated questions
 
 ### Why

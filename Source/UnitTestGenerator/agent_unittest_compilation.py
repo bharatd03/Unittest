@@ -4075,7 +4075,6 @@ class CompilationAgent(ba.AgentCore):
         code2, lcov = _run([chain.cov, "export", "-format=lcov", *args], run_dir, 120, env)
         # Only the SUT (or the file including it) is instrumented, so every decision shown is the SUT's.
         code3, show = _run([chain.cov, "show", "--show-mcdc", "--show-branches=count", *args], run_dir, 120, env)
-        _run([chain.cov, "show", "-format=html", f"-output-dir={report_dir}", "--show-mcdc", *args], run_dir, 120, env)
         if code != 0 or code2 != 0:
             raise ba.AgentFault("MEASUREMENT_FAILED", "llvm-cov export failed.")
         if chain.mcdc and code3 != 0:
