@@ -4446,8 +4446,8 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             record = p.kind in ("ptr_struct", "struct")
             value = fix_value(a.value)
-            if record and not (a.elements or a.fields) and value and value not in NULLS and \
-                    (eval_int(value, constants) is not None or value.startswith("{")):
+            if record and not (a.elements or a.fields) and (not value or value not in NULLS and (  # no field given:
+                    eval_int(value, constants) is not None or value.startswith("{"))):          # a zeroed structure
                 init = value if value.startswith("{") and not uc.c_form_problem(value) else "{" + ("" if cpp else "0") + "}"
                 decls.append(f"{base} {var} = {init};")    # a structure is its initializer; no field given: zero
                 a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
@@ -4557,8 +4557,24 @@ class AnalyzerAgent(ba.AgentCore):
                 callee = "ut_static_" + re.sub(r"\W", "_", g.name.replace("(anonymous namespace)::", ""))
             else:
                 callee = g.qualified_name.replace("(anonymous namespace)::", "")
-            args = [typed(f"calls {c.function}.{p.name}", x, p) if p.kind in ("int", "enum", "bool", "float") else
-                    fix_value(x) for x, p in zip(c.args, g.params)]
+            args = []
+            for i, (x, p) in enumerate(zip(c.args, g.params)):
+                where = f"calls {c.function}.{p.name}"
+                if p.kind in ("int", "enum", "bool", "float"):
+                    args.append(typed(where, x, p))
+                elif p.kind == "ptr_scalar" and p.by_ref:          # a reference to a scalar: a named variable
+                    base = pointee(p) or re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
+                    v = typed(where, x, target_param(p.name, base, layout))
+                    var = f"ut_c{len(planned.calls_before)}_{i}"
+                    if v is not None:
+                        decls.append(f"{base} {var} = {v};")
+                    args.append(var if v is not None else None)
+                else:                                              # any other: one C expression at least
+                    v = fix_value(x)
+                    problem = uc.c_expression_problem(v)
+                    if problem:
+                        problems.append(f"{where}: {v[:40]!r} is {problem}")
+                    args.append(None if problem else v)
             if any(x is None for x in args):
                 continue
             planned.calls_before.append(f"{callee}({', '.join(args)});")

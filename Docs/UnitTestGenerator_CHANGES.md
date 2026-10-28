@@ -3,6 +3,44 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (14): the run of 23:08 - coverage answers without a fault; two more defects
+
+### What the run showed (commit 76ff90a)
+
+Coverage as before: 22 of 23 files at 100 %; `ctrl.c` 71.43 % MC/DC.
+
+Refusals: 6 of 31 planning scenarios (19 %).
+* **Coverage: 1 of 13** (a repeat on `ctrl.c`).
+* **Requirement checks: 5 of 18:**
+  * 2 structures given without fields (`klist.c`);
+  * 1 runaway number;
+  * 1 member names given as constructor values (`capacity_`);
+  * 1 test that had already failed.
+
+Rejections for a fault:
+* **Coverage: 0 of 12.** 9 more were redundant (no fault).
+* **Requirement checks: 4 of 15.** 3 recorded only what the code does (no expected value); 1 did not compile.
+
+No false refusal in a trial.
+
+### Change
+
+* **The value of a call made before (`calls`) is checked by the parameter's type.** In the test that did not compile,
+  `ring_buffer.hpp`'s `push(const T &)` got `{"value": 1}`: only plain scalars were checked, a reference to a scalar
+  was passed unchecked. Now:
+  * a reference to a scalar takes a named variable with its typed value (as an argument does);
+  * any other parameter takes one C expression or the answer is refused.
+
+  Value-form check: `Box::add(const std::int32_t &)` with every literal form.
+* **A structure parameter with no field given is a zeroed structure,** as an object's constructor value not given is
+  `{}`. `klist.c` was refused with "item: no value". A field it then needs (`next` not NULL) is still decided by the
+  checks and the trial. Value-form check: `f_rec` with no fields.
+
+### Checked
+
+* `corpus`: 40 cases and the value forms.
+* The component tests here: 317 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-28 (13): the run of 22:38 - what is left, and four more defects of ours
 
 ### What the run showed (commit after (12))

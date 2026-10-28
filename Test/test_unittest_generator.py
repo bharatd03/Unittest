@@ -4765,6 +4765,7 @@ class Box {
 public:
     Box(int start, int step);
     int get() const;
+    void add(const std::int32_t &d);
 private:
     std::int16_t value_;
     int step_;
@@ -4790,6 +4791,7 @@ int f_state() { return s_count > 10U ? (s_mode == Mode::On ? 2 : 1) : 0; }
 int f_dep() { return dev::g_level > 0 ? dev::read() : -1; }
 Box::Box(int start, int step) : value_(static_cast<std::int16_t>(start)), step_(step) {}
 int Box::get() const { return value_ + step_; }
+void Box::add(const std::int32_t &d) { value_ = static_cast<std::int16_t>(value_ + d); }
 """
 
 
@@ -4858,6 +4860,7 @@ def value_form_entries() -> list[dict]:
             add(fn, args=[{"name": "v", "value": v}])
     for v in ("true", "false", "0", "1"):
         add("f_bool", args=[{"name": "v", "value": v}])
+    add("f_rec", args=[{"name": "r", "value": ""}])             # a structure with no field given: zeroed
     for fn in ("f_float", "f_double"):
         for v in ("0", "1", "-1", "1.0", "1.0f", "-2.5", "1e3", "0.5F", ".5", "2.", "1.5e-3"):
             add(fn, args=[{"name": "v", "value": v}])
@@ -4875,6 +4878,7 @@ def value_form_entries() -> list[dict]:
         add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v, v]}])
         add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v]}])   # a value not given: {}
         add("Box::get", args=[], members=[{"member": "value_", "value": v}])
+        add("Box::get", args=[], calls=[{"function": "Box::add", "args": [v]}])    # a const reference: its value
     return out
 
 
