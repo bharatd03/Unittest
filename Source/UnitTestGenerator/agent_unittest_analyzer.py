@@ -4337,7 +4337,8 @@ class AnalyzerAgent(ba.AgentCore):
                 reg_rows.append(f"- {address} ({macro})")
         exceptions = thrown_types(callee_text) if layout.language == "cpp" else []
         members, member_rows, member_kinds = [], [], {}
-        if fn.member:
+        made_here = fn.member and fn.qualified_name.split("::")[-1] == cls.split("::")[-1]
+        if fn.member and not made_here:              # a constructor's object does not exist before the call
             for m in layout.class_members:
                 if m.class_name.replace("(anonymous namespace)::", "") == cls:
                     members.append(m.name)
@@ -4600,6 +4601,10 @@ class AnalyzerAgent(ba.AgentCore):
             if given is not None:
                 stmts.append(f"UT_REG32({given[0]}) = {given[1]};")
         cls = uc.class_of(fn)
+        if planned.members and fn.member and fn.qualified_name.split("::")[-1] == cls.split("::")[-1]:
+            problems.append("members: the constructor makes the object - there is no object to set before the call; "
+                            "check its members after the call in expected_after")
+            planned.members = []
         for m in planned.members:
             info = next((x for x in layout.class_members if x.name == m.member and
                          x.class_name.replace("(anonymous namespace)::", "") == cls), None)
@@ -4789,11 +4794,19 @@ class AnalyzerAgent(ba.AgentCore):
             if calls != list(planned.calls_before or []):
                 fixes.append("calls_before: state helpers named by the variable's other name")
                 planned.calls_before = calls
+            cls = uc.class_of(fn) if fn.member else ""
+            members = {m.name: m for m in layout.class_members
+                       if cls and m.class_name.replace("(anonymous namespace)::", "") == cls}
             for c in planned.expected_after:                  # a state variable read through its getter [A2-21z]
                 new = helpers(c.expr)
                 name = new.strip()
                 if alias.get(name) and not re.search(r"\b" + re.escape(name) + r"\b", visible):
                     new = f"ut_state_get_{alias[name]}()"
+                member = re.fullmatch(r"\s*(?:ut_obj\s*\.\s*|this\s*->\s*)?([A-Za-z_]\w*)\s*", new)
+                if member and member.group(1) in members:       # a member of the object, private ones too: read
+                    info = members[member.group(1)]             # through the generated accessor (structured)
+                    tag = f"{uc.member_tag(info)}{{}}"
+                    new = f"(*ut_member({tag}))" if info.static else f"(ut_obj.*ut_member({tag}))"
                 if new != c.expr:
                     fixes.append(f"expected_after: {c.expr[:60]!r} -> {new[:60]!r}")
                     c.expr = new
@@ -5527,9 +5540,13 @@ class AnalyzerAgent(ba.AgentCore):
                     {k: v for k, v in lists.items() if k not in ("rows", "member_kinds")}],
                     sort_keys=True, default=str).encode("utf-8"))
                 earlier = self._asked.get(fn.qualified_name)
-                if earlier is not None and earlier[0] == digest and earlier[1] == 0:
+                checks_only = all(g.startswith("EVIDENCE:") for g in open_ids)
+                if earlier is not None and earlier[0] == digest and (earlier[1] == 0 or checks_only):
+                    # a requirement check (A1-25y) is asked once per state of its facts: its answer was built and
+                    # judged; asked again unchanged, the brain repeats it
                     plan_notes["planning"].append(f"{fn.name}: facts unchanged since its last brain call, which gave "
-                                                  "no accepted scenario - not asked again in this round [A1-PL18]")
+                                                  + ("no accepted scenario" if earlier[1] == 0 else
+                                                     "its requirement check") + " - not asked again [A1-PL18]")
                     return []
             if extra:
                 context.insert(1, uc.part("re-ask", extra.strip()))
@@ -5582,8 +5599,11 @@ class AnalyzerAgent(ba.AgentCore):
                     planned.calls_before, planned.calls = [], []
             problems, sought, before, repeats = [], [], len(accepted), 0
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
+                aimed = [str(t) for t in (planned.targets or planned.gap_ids)] or sorted(open_ids)
+                purpose = "requirement check" if aimed and all(t.startswith("EVIDENCE:") for t in aimed) \
+                    else "coverage"                                   # the rates of the two apart [ORC-12b]
                 if planned.name in req.failed_tests:                         # A1-PL8: not again unchanged
-                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="refused",
+                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="refused",
                                     causes=["failed before"])                                       # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name}): its test {req.failed_tests[planned.name]} "
                                     "earlier in this run; plan other inputs or set-up under another name")
@@ -5600,14 +5620,14 @@ class AnalyzerAgent(ba.AgentCore):
                                                   [:400] + " [ARCH-20]")
                 if scenario is None:
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k, reasons=reasons)
-                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="refused",
+                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="refused",
                                     causes=refusal_causes(reasons))                                 # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): " + "; ".join(reasons))
                     continue
                 if scenario.trial:          # refused only by predictions: the brain may correct it in the re-ask;
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k,   # otherwise the tool decides
                                     reasons=scenario.trial, then="trial if the re-ask does not cover its items")
-                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="trial",
+                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="trial",
                                     causes=refusal_causes(scenario.trial))                         # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): "
                                     + "; ".join(scenario.trial))
@@ -5622,7 +5642,7 @@ class AnalyzerAgent(ba.AgentCore):
                 if uc.scenario_signature(scenario) in tried_before:           # A1-PL4 g, LA-4
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k,
                                     reasons=["the same scenario was tried in an earlier iteration"])
-                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="refused",
+                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="refused",
                                     causes=["repeat"])                                              # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): the same inputs and "
                                     "set-up were tried in an earlier iteration and did not reach the items (see "
@@ -5636,7 +5656,7 @@ class AnalyzerAgent(ba.AgentCore):
                                                     "expected_return", "expected_after"})
                 if any(s.model_dump(include=set(same)) == same for s in accepted):
                     continue                                                  # the re-ask repeated it
-                self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="accepted")   # ORC-12b
+                self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="accepted")   # ORC-12b
                 self._tried_text.setdefault(fn.name, {})[uc.scenario_signature(scenario)] = brief(scenario,
                                                                                                     by_tid)  # A1-PL18
                 accepted.append(scenario)

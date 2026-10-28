@@ -3,6 +3,61 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (12): the requirement-check round measured and asked once; three defects of the generator
+
+### The run of 21:49 (commit 4c4f026), with the rejections by their real cause
+
+Refusals: 18 of 51 planning scenarios (35 %; before: 49 %):
+* 14 repeats of an earlier round or of a failed test;
+* 2 runaway numbers;
+* 2 structures given without fields.
+
+Rejections: 22 of 30 brain tests not kept:
+* refused in its trial: 10, all "it ran, but reached none of the items it targets";
+* redundant: 9;
+* did not compile: 2;
+* not in the best round: 1.
+
+39 of the 51 answers were requirement checks (`EVIDENCE:<function>`, A1-25y) on files the rule-based tests had
+already covered to 100 %. So the small pilots measured that round, not the planning for open items. And the round
+had defects of its own.
+
+### Change
+
+1. **A trial of a requirement check is judged by what it checks.** `EVIDENCE:<function>` is no coverage item, so a
+   trial that targets only it could never "reach" it: all 10 were rejected. Such a trial now holds when it compiles,
+   passes and asserts (`UT_EXPECT_...`). A trial that also targets items must still reach one of them.
+2. **A requirement check is asked once per state of its facts (A1-PL18).** Its answer is built and judged. The facts
+   (the function, its open items, the evidence, the names it may use) are unchanged, so asking again only gave
+   repeats. It is asked again when the evidence or its open items change.
+3. **A requirement check without a quoted requirement is named so.** It only recorded what the code does, which on
+   a file at 100 % adds nothing. It is reported as "no requirement check: recorded what the code does, adds no
+   coverage", not as a mistake of the brain.
+4. **The rates of the two kinds apart (ORC-12b).**
+   * `A1.plan refusal rate (coverage)` and `(requirement check)`; every scenario in the answer log carries its
+     `purpose`.
+   * `brain tests rejection rate (coverage)` and `(requirement check)`; the run records which written tests are
+     requirement checks.
+5. **A member of the object checked after the call** (`expected_after: violations_`, a private member): it reached
+   the compiler as a bare name. It is now read through the generator's member accessor
+   `(ut_obj.*ut_member(tag{}))`. New corpus case `cpp_member_after_check`; it fails without the change.
+   * **A constructor scenario with `members`** (`TorqueMap::TorqueMap`: "set rpm_ before the call"): the object does
+     not exist before the call, so the test used an undeclared `ut_obj`. A constructor is no longer offered
+     `members`. Given anyway, they are refused with the reason: check them in `expected_after`.
+   * **A cut-off expression** (`0xFFFFFFFFul - 1ul - 1ul -`) was taken for a prediction and went to the compiler. An
+     expression that ends with an operator is now not one C expression (a guard). The value-form check caught the
+     first version of this rule refusing `2.` (a float literal); `2.` is accepted.
+6. **The search target defines `ut_sut_reset` when the stubs call it.** The stubs' `ut_before_each` calls it for the
+   state of the SUT and of real dependencies (`reset_state`). The search target defined it only for the SUT's own
+   state. So `ctrl.c` (no state of its own, a real dependency's global) never got a search: "ld.lld: undefined
+   symbol: ut_sut_reset" in every run, and MC/DC stayed at 57 %. Both now use `reset_state`. Test
+   `test_the_search_target_resets_the_state_the_stubs_reset`; it fails without the change.
+
+### Checked
+
+* `corpus`: 40 cases and the value forms.
+* The component tests here: 317 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-28 (11): rejections by their real cause; each parameter offered only the slot its type takes
 
 ### The run of 21:05 (commit c5340e8)

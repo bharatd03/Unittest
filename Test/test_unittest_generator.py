@@ -3411,6 +3411,8 @@ class BrainPlanningTests(unittest.TestCase):
                 failed_tests={"test_thermostat_command_x": "failed"})))                  # only the record changed
             self.assertEqual(len(calls), first, "asked again with the same facts")
             self.assertTrue(any("facts unchanged since its last brain call" in p for p in plan.planning), plan.planning)
+            self.assertTrue(any(p.startswith("clamp_percent: facts unchanged") and "its requirement check" in p
+                                for p in plan.planning), plan.planning)      # a requirement check: asked once [A1-25y]
             run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps[:1]), iteration=4)))
         self.assertGreater(len(calls), first, "changed targets are asked again")
 
@@ -5975,6 +5977,43 @@ class LargeFileRoundTests(unittest.TestCase):
             writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64), iterations_left=1)
         self.assertEqual(agent._this_round(work, req), [])                  # the last rounds take every function
         self.assertEqual(agent._this_round(work[:30], req.model_copy(update={"iterations_left": 9})), [])
+
+    def test_the_search_target_resets_the_state_the_stubs_reset(self):                     # A2-21s, A3-FZ8
+        """The stubs' ut_before_each calls ut_sut_reset() when the SUT or a real dependency has state; the search
+        target defines it then too - a SUT without state of its own but with a real dependency's global linked."""
+        layout = uc.LayoutProfile(repo_root=".", sut_file="src/ctrl.c", language="c", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t", suite_file="t/x.c", sut_sha256="0" * 64,
+                                  dependencies=uc.DependencyPlan(entries=[uc.Dependency(
+                                      name="calib", kind="variable", decision="real", definition="lib/util.c",
+                                      type="int[4]")], real_sources=["lib/util.c"]))
+        self.assertEqual(layout.sut_state, [])
+        fn = uc.FunctionInfo(name="control", qualified_name="control", signature="int control(int x)", file="src/ctrl.c",
+                             line_start=1, line_end=2, from_frontend=True,
+                             params=[uc.ParamInfo(name="x", type="int", kind="int")], return_type="int")
+        text = a3.FuzzPlan(fn, layout, []).build(Path("src/ctrl.c")) or ""
+        self.assertIn("void ut_sut_reset(void)", text)
+        self.assertIn("    ut_sut_reset();", text)
+
+    def test_rates_part_coverage_from_requirement_checks(self):                            # ORC-12b, A1-25y
+        """The refusal and rejection rates of the planning for open items and of the requirement checks apart; a
+        requirement check that only recorded what the code does is named so, not counted as a brain mistake."""
+        with tmpdir() as d:
+            out = Path(d)
+            rows = [{"step": "A1.plan", "kind": "scenario", "outcome": "accepted", "purpose": "coverage"},
+                    {"step": "A1.plan", "kind": "scenario", "outcome": "refused", "purpose": "requirement check",
+                     "causes": ["repeat"]},
+                    {"step": "A1.plan", "kind": "scenario", "outcome": "accepted", "purpose": "requirement check"}]
+            (out / "brain_answers.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+            bundle = uc.FileActionBundle(bundle_id="b", tests=["test_a"])
+            s = types.SimpleNamespace(best_bundle=bundle, bundle=bundle, written={"test_a", "test_b"},
+                                      checks={"test_b"}, lost={"test_b": "redundant: no new coverage"})
+            rates = up.Orchestrator._brain_rates(types.SimpleNamespace(cfg=types.SimpleNamespace(rate_target=5.0)),
+                                                 out, s, None)
+        self.assertIn("A1.plan refusal rate (coverage): 0.0 % (0 of 1 scenarios refused)", rates)
+        self.assertTrue(any(r.startswith("A1.plan refusal rate (requirement check): 50.0 % (1 of 2") for r in rates))
+        self.assertTrue(any(r.startswith("brain tests rejection rate (coverage): 0.0 %") for r in rates), rates)
+        self.assertTrue(any("(requirement check): 100.0 %" in r and "no requirement check: recorded what the code does"
+                            in r for r in rates), rates)
 
     def test_a_rule_test_that_crashed_is_left_out(self):                                    # A2-21f
         suite = ("/* evidence: E8 */\nUT_TEST(test_f_auto_1)\n{\n    UT_OBSERVE_INT(\"o1\", f(1));\n}\n"

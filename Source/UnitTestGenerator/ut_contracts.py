@@ -3287,6 +3287,10 @@ def c_expression_problem(value: str, braces: bool = True) -> str:
         return "not one C expression: an assignment (give the value only)"
     if not braces and ("{" in masked or "}" in masked):
         return "not one C expression: a braced list for a single value"
+    end = masked.rstrip()
+    if end and (end[-1] in "+-*/%&|^<>=!?:,~" and not end.endswith(("++", "--"))
+                or end[-1] == "." and not end[-2:-1].isdigit()):       # 2. is a number, a. is cut off
+        return "not one C expression: it ends with an operator (cut off)"
     return ""
 
 

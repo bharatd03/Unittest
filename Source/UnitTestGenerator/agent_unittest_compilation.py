@@ -2555,7 +2555,8 @@ class FuzzPlan:
             ('extern "C" ' if self.cpp else "") + "void ut_stub_call(void) { if (ut_fz_active && ++ut_fz_calls > "
             f"{int(self.budget)}UL) {{ ut_fz_active = 0; longjmp(ut_fz_jump, 1); }} }}",
             "unsigned long long ut_asm_value; unsigned long long ut_asm_result(void) { return ut_asm_value; }",
-            uc.sut_reset_source(self.layout.sut_state, self.cpp) if self.layout.sut_state else "",   # A3-FZ8
+            # the same state the stubs' ut_before_each resets: the SUT's and that of real dependencies [A2-21s]
+            uc.sut_reset_source(uc.reset_state(self.layout), self.cpp) if uc.reset_state(self.layout) else "",  # A3-FZ8
             "static const uint8_t *ut_p; static size_t ut_left;",
             "static void ut_take(void *out, size_t n) { size_t k = n < ut_left ? n : ut_left; memset(out, 0, n); "
             "memcpy(out, ut_p, k); ut_p += k; ut_left -= k; }",
@@ -2568,7 +2569,7 @@ class FuzzPlan:
             "    ut_fz_calls = 0;",
             "    if (setjmp(ut_fz_jump) != 0) { ut_fz_active = 0; return 0; }",
             "    ut_fz_active = 1;",
-            "    ut_sut_reset();" if self.layout.sut_state else "",
+            "    ut_sut_reset();" if uc.reset_state(self.layout) else "",
             *self.lines,
             "    if (getenv(\"UT_FUZZ_PRINT\")) { printf(\"UT_FUZZ\"); " + " ".join(self.prints) + " printf(\"\\n\"); fflush(stdout); }",
             f"    (void){call};" if fn.return_type.strip() != "void" else f"    {call};",

@@ -1796,10 +1796,14 @@ class Orchestrator:
                 status = {t.name: t for t in obs.tests}
                 open_now = getattr(s, "open_now", set()) or set()
                 whole = set(obs.coverage.covered_items) if obs.coverage and not obs.test_items else set()
+                sources = uc.test_sources(uc.suite_of(bundle))
                 for name in tried:
                     # A3-OBS6: without a checked per-test measurement, the build of the tests on trial is judged whole
                     reached = set(obs.test_items.get(name, [])) or whole
-                    targets = set(bundle.trial_targets.get(name) or []) or open_now
+                    given = set(bundle.trial_targets.get(name) or [])
+                    # a requirement check (EVIDENCE:<function>) is no coverage item: it holds when it asserts and passes
+                    checks = {t for t in given if t.startswith("EVIDENCE:")}
+                    targets = (given - checks) or (set() if checks else open_now)
                     result = status.get(name)
                     if name in compiled or not obs.link_ok:
                         decided[name] = f"the compiler rejected it: {compiled.get(name) or obs.reason}"[:400]
@@ -1807,6 +1811,8 @@ class Orchestrator:
                         decided[name] = f"{result.status if result else 'not run'}: {result.message if result else ''}"
                     elif targets and not reached & targets:
                         decided[name] = "it ran, but reached none of the items it targets"
+                    elif checks and not targets and not re.search(r"\bUT_EXPECT_", sources.get(name, "")):
+                        decided[name] = "a requirement check that asserts nothing"
                     else:
                         accepted.append(name)
                         if hasattr(s, "test_items"):
@@ -2134,6 +2140,12 @@ class Orchestrator:
         self.check_bundle(bundle)
         if isinstance(getattr(s, "written", None), set):                                       # ORC-12b
             s.written |= {n for n in bundle.new_tests if n in bundle.made}
+            if isinstance(getattr(s, "checks", None), set):          # written for EVIDENCE:<function> only [A1-25y]
+                aims = {sc.scenario_id: sc.gap_ids for sc in plan.scenarios}
+                sources = uc.test_sources(uc.suite_of(bundle))
+                s.checks |= {n for n in bundle.new_tests if n in bundle.made and (ids := [
+                    aims[i] for i in SCENARIO_ID.findall(sources.get(n, "")[:400]) if i in aims]) and all(
+                    g.startswith("EVIDENCE:") for gap in ids for g in gap)}
         self._note_dropped(s, bundle)
         bundle = await self._compile_gate(s, plan, bundle, journal or {}, guidance)            # A3-CL15
         if bundle.trial:                                                                   # NC-7
@@ -2288,8 +2300,8 @@ class Orchestrator:
         """ORC-12b: the refusal rate per brain step and cause - what the checks refused out of what the brain gave -
         and the rejection rate of the tests written from the brain's answers - what the run did not keep."""
         target = float(getattr(self.cfg, "rate_target", 5.0))
-        scenarios: dict[str, int] = {}
-        causes: dict[str, int] = {}
+        scenarios: dict[str, dict[str, int]] = {}            # purpose (coverage, requirement check) -> outcome -> n
+        causes: dict[str, dict[str, int]] = {}
         answers: dict[str, dict[str, int]] = {}
         with contextlib.suppress(OSError):
             for line in (out / "brain_answers.jsonl").read_text(encoding="utf-8").splitlines():
@@ -2297,11 +2309,13 @@ class Orchestrator:
                     rec = json.loads(line)
                     step, kind = str(rec.get("step", "?")), rec.get("kind", "")
                     if kind == "scenario":
-                        outcome = str(rec.get("outcome", ""))
-                        scenarios[outcome] = scenarios.get(outcome, 0) + 1
+                        outcome, purpose = str(rec.get("outcome", "")), str(rec.get("purpose") or "coverage")
+                        row = scenarios.setdefault(purpose, {})
+                        row[outcome] = row.get(outcome, 0) + 1
                         if outcome in ("refused", "trial"):
                             for c in rec.get("causes") or ["other"]:
-                                causes[str(c)] = causes.get(str(c), 0) + 1
+                                cause = causes.setdefault(purpose, {})
+                                cause[str(c)] = cause.get(str(c), 0) + 1
                     elif kind in ("answer", "decision", "refused") and step != "A1.plan":
                         row = answers.setdefault(step, {})
                         key = "refused" if kind == "refused" else "answered"
@@ -2310,12 +2324,15 @@ class Orchestrator:
         def mark(rate: float) -> str:
             return f" - ABOVE THE TARGET OF {target:g} %" if rate > target else ""
         rows = []
-        given = sum(v for k, v in scenarios.items() if k != "duplicate")
-        if given:
-            refused = scenarios.get("refused", 0) + scenarios.get("trial", 0)
+        for purpose in ("coverage", "requirement check"):      # planned for open items / for the documented behaviour
+            row = scenarios.get(purpose, {})
+            given = sum(v for k, v in row.items() if k != "duplicate")
+            if not given:
+                continue
+            refused = row.get("refused", 0) + row.get("trial", 0)
             rate = 100.0 * refused / given
-            top = ", ".join(f"{c} {n}" for c, n in sorted(causes.items(), key=lambda x: -x[1])[:6])
-            rows.append(f"A1.plan refusal rate: {rate:.1f} % ({refused} of {given} scenarios refused"
+            top = ", ".join(f"{c} {n}" for c, n in sorted(causes.get(purpose, {}).items(), key=lambda x: -x[1])[:6])
+            rows.append(f"A1.plan refusal rate ({purpose}): {rate:.1f} % ({refused} of {given} scenarios refused"
                         + (f"; by cause: {top}" if top else "") + f"){mark(rate)}")
         for step, row in sorted(answers.items()):
             total = row.get("refused", 0) + row.get("answered", 0)
@@ -2325,19 +2342,24 @@ class Orchestrator:
                             f"{mark(rate)}")
         bundle = s.best_bundle or s.bundle
         kept = set(bundle.tests) if bundle else set()
-        written = set(getattr(s, "written", set()))
-        if written:
+        all_written = set(getattr(s, "written", set()))
+        checks = set(getattr(s, "checks", set())) & all_written
+        last = set(s.bundle.tests) if s.bundle else set()
+        for purpose, written in (("coverage", all_written - checks), ("requirement check", checks)):
+            if not written:
+                continue
             lost = written - kept
             by: dict[str, int] = {}
-            last = set(s.bundle.tests) if s.bundle else set()
             for n in lost:
                 why = s.lost.get(n) or ("kept in the last round, not in the best round's suite reported" if n in last
                                         else "left out, cause not recorded")
+                if purpose == "requirement check" and why.startswith("redundant"):
+                    why = "no requirement check: recorded what the code does, adds no coverage"
                 by[why] = by.get(why, 0) + 1
             rate = 100.0 * len(lost) / len(written)
             top = ", ".join(f"{c} {n}" for c, n in sorted(by.items(), key=lambda x: -x[1]))
-            rows.append(f"brain tests rejection rate: {rate:.1f} % ({len(lost)} of {len(written)} tests written from the "
-                        f"brain's answers not kept" + (f"; {top}" if top else "") + f"){mark(rate)}")
+            rows.append(f"brain tests rejection rate ({purpose}): {rate:.1f} % ({len(lost)} of {len(written)} tests "
+                        f"written from the brain's answers not kept" + (f"; {top}" if top else "") + f"){mark(rate)}")
         return rows
 
     @staticmethod
@@ -3047,6 +3069,7 @@ class RunState:
         self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
         self.unbuilt: dict[str, int] = {}                     # function -> rounds with no test of it built [LA-5]
         self.written: set[str] = set()                        # tests written from the brain's answers [ORC-12b]
+        self.checks: set[str] = set()                         # of them, the requirement checks (A1-25y) [ORC-12b]
         self.lost: dict[str, str] = {}                        # such a test -> why the run did not keep it [ORC-12b]
         self.unmeasured = 0                                   # iterations in a row not measured [A3-60b]
         self.declarations_dropped: list[str] = []             # the brain's declarations that did not build [A1-PL14]
