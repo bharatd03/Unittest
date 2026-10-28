@@ -1156,6 +1156,7 @@ class Scenario(Contract):
     stub_values: list[StubValues] = Field(default_factory=list)
     variables: list[NamedValue] = Field(default_factory=list)
     expected_return: str = ""          # asserted only for a normative scenario [A1-PL4 c]
+    expected_exception: str = ""       # C++: the exception the evidence states the call throws (normative only)
     expected_after: list[ExpectedCheck] = Field(default_factory=list)
     quotes: list[Quote] = Field(default_factory=list)
     linked: bool = False               # rests on evidence linked by the brain [A1-PL13]
@@ -1177,6 +1178,7 @@ class RepairItem(Contract):
     classification: str = ""
     attempts: int = 0
     action: Literal["rewrite", "drop"] = "rewrite"     # A2-21p
+    failure_kind: str = ""                              # test | crash | timeout | regression: what the run showed
 
 
 class UTPlan(Contract):
@@ -2828,12 +2830,6 @@ def scenario_signature(sc: Any) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-def normalized_body(text: str) -> str:
-    """A2-21p: a test body without comments and white space differences, to recognise an unchanged rewrite."""
-    text = re.sub(r"/\*.*?\*/|//[^\n]*", " ", text or "", flags=re.S)
-    return re.sub(r"\s+", "", text)
-
-
 _HEADER_CACHE: dict[tuple, str] = {}
 
 
@@ -2998,7 +2994,9 @@ def patterns_of(fn: "FunctionInfo", layout: "LayoutProfile") -> list[str]:
 ANSWER_KINDS = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision",
                 "file_edit")     # file_edit: a free edit of generated files after the offered repairs failed [BP-11]
 KIND_LADDER = ("values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part")
-MINIMUM_KINDS = ("values", "scenario", "test", "repair", "decision", "file_edit")   # Qwen3 8B's before BP; BP-11
+# Qwen3 8B: structured answers only - the brain says what, the generator writes how. A whole test written as free code
+# ("test") is not among them: a scenario the generator cannot build goes back to the plan with its reason.
+MINIMUM_KINDS = ("values", "scenario", "call_sequence", "repair", "decision", "file_edit")   # BP-11
 # BP-3: a cause on the test-building side, and the narrowest kind that contains the missing piece
 CAUSE_KIND = {"needs_call_sequence": "call_sequence", "test_setup": "setup", "needs_dependency_control": "stub",
               "pipeline_limitation": "test"}
@@ -3447,7 +3445,6 @@ def instantiated(fn: "FunctionInfo", layout: "LayoutProfile") -> "FunctionInfo":
 # sequence the dependency plan does not have is a guard of the plan: no test can be assembled with it.
 PREDICTION_CHECKS = {
     "calls functions that do not exist here": "unknown name",              # A2-20, A1-PL4 grounding
-    "is set twice in a row": "value set twice",                           # A2-21t
     "is not an integer value": "value form",                              # A1-PL4 e
     "is not a floating-point value": "value form",
     "pass a variable declared in setup": "value form",

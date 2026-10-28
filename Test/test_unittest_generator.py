@@ -297,6 +297,21 @@ def brain(b: UTBrain):
         yield b
 
 
+@contextlib.contextmanager
+def writer_brain(b: UTBrain):
+    """A brain whose profile writes whole tests (BP-2, the full profile): only such a brain gets Agent2's test writer;
+    the minimum profile (Qwen3 8B) answers in the structured form only."""
+    loader = uc.brain_profiles
+
+    def full(config_path):                           # the configuration's profiles, this brain as full
+        book = loader(config_path)
+        book.brains[b.brain_name] = "full"
+        return book
+    with brain(b), mock.patch.dict(uc.DEFAULT_BRAIN_PROFILES, {b.brain_name: "full"}), \
+            mock.patch.object(uc, "brain_profiles", full):
+        yield b
+
+
 # ============================================================================ 2. contracts
 class ContractTests(unittest.TestCase):
     def test_metric_status(self):
@@ -700,6 +715,34 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
         self.assertIn("STATE: MotorCtrl::step keeps state", facts)
         self.assertIn("JOURNAL (why earlier attempts missed", facts)
 
+    def test_a_stated_exception_is_planned_and_asserted(self):                         # structured
+        """The brain picks the exception from the types the function throws (a fact of the source); the generator
+        writes UT_EXPECT_THROW. A type the function does not throw is left out."""
+        agent = a1.AnalyzerAgent()
+        fn = self.fn["MotorCtrl::step"]
+        known = agent._known_names(self.layout, [])
+        ev = {"EV-step-1": uc.EvidenceRef(evidence_id="EV-step-1", evidence_class="E1", source="docs/r.md", line=1,
+                                          text="A target outside -100000..100000 is refused with invalid_argument.")}
+        self.assertEqual(a1.thrown_types(a1.uc.c_masked('if (x) throw std::invalid_argument("a"); /* throw X() */')),
+                         ["std::invalid_argument"])
+
+        def check(exception):
+            planned = a1.PlannedScenario(gap_ids=["LC:1"], name="test_step_refuses_a_far_target", purpose="p",
+                                         args=[{"name": "target", "value": "100001"}], stubs=[], variables=[],
+                                         expected_return="", expected_exception=exception, expected_after=[],
+                                         evidence_ids=["EV-step-1"], quotes=[{"evidence_id": "EV-step-1", "text":
+                                         "refused with invalid_argument"}], classification="confirmed_gap",
+                                         conflict="", information_sought="")
+            return agent._check_planned(planned, fn, {"LC:1"}, set(), ev, [], {}, known, self.layout)
+        scenario, _ = check("std::invalid_argument")
+        self.assertEqual((scenario.expected_exception, scenario.characterization), ("std::invalid_argument", False))
+        plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", scenarios=[scenario])
+        body = a2.assemble_scenario(scenario, plan, "test_step_refuses_a_far_target")
+        self.assertIn("UT_EXPECT_THROW(ut_obj.step(100001), std::invalid_argument);", body)
+        scenario, notes = check("std::out_of_range")                            # not thrown here: left out
+        self.assertEqual(scenario.expected_exception, "")
+        self.assertTrue(any("throws std::invalid_argument" in n for n in notes), notes)
+
     def test_a_scenario_refused_only_by_predictions_is_tried(self):                    # NC-6, NC-7, BP-2
         agent = a1.AnalyzerAgent()
         fn = self.fn["MotorCtrl::wait_update"]
@@ -769,14 +812,7 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
         self.assertIn("UT_REG_SET_LATER", a1.PLAN_SAFE_CALLS)
         self.assertEqual(uc.norm_quote("/// @return true when the flag is set"), uc.norm_quote("true when the flag is  set"))
 
-    def test_an_unchanged_rewrite_and_a_repeated_scenario_are_refused(self):          # A2-21p, A1-PL4 g
-        old = "UT_TEST(test_a)\n{\n    /* S-1: x */\n    UT_EXPECT_EQ_INT(f(1), 1); /* EV-f-1 */\n}\n"
-        check = a2.GeneratorAgent._grounding({"f", "UT_EXPECT_EQ_INT"}, set(), {"test_a"}, "f", [], {"test_a": old})
-        answer = a2.GeneratedTests.model_validate({"tests": [{"name": "test_a", "scenario_ids": [],
-                                                              "body": "UT_EXPECT_EQ_INT(f(1),  1);", "evidence_class": "E2"}]})
-        with self.assertRaises(ba.AgentFault) as caught:
-            check(answer)
-        self.assertIn("the same as the failing test", caught.exception.message)
+    def test_a_repeated_scenario_is_recognised(self):                                  # A1-PL4 g
         one = uc.Scenario(scenario_id="S-1", function="f", description="", gap_ids=["LC:f:3"],
                           args=[uc.NamedValue(name="a", value="1")])
         two = one.model_copy(update={"scenario_id": "S-9", "args": [uc.NamedValue(name="a", value=" 1 ")]})
@@ -872,13 +908,12 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
 
 
 class BodyCheckTests(unittest.TestCase):
-    def test_a_value_set_twice_in_a_row_is_refused(self):                                  # A2-21t
+    def test_well_formed_bodies_pass_the_body_check(self):                             # A2-20, A2-21t
+        """The prediction "a value set twice in a row" is gone: it never fired in 143 runs (step 8)."""
         allowed = {"thermostat_command", "UT_EXPECT_EQ_INT"}
-        problem = a2.GeneratorAgent._body_problem(
-            "ut_stub_read_sensor_return = 17; ut_stub_read_sensor_return = 18; "
-            "UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1); /* EV-thermostat_command-1 */", allowed)
-        self.assertIn("ut_stub_read_sensor_return is set twice in a row (17, then 18)", problem)
-        for body in ("ut_stub_read_sensor_return = 17; UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);",
+        for body in ("ut_stub_read_sensor_return = 17; ut_stub_read_sensor_return = 18; "
+                     "UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);",
+                     "ut_stub_read_sensor_return = 17; UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);",
                      "x = 1; thermostat_command(1, 2); x = 2;", "s.a = 1; s.b = 2;", "x = 1; x = x + 1;",
                      "x = 1; x += 2;", "volatile int k = 1; k = 2;"):
             self.assertEqual(a2.GeneratorAgent._body_problem(body, allowed), "", body)
@@ -1035,7 +1070,7 @@ class GeneratorTests(unittest.TestCase):
         b = UTBrain(tests={"select_mode": [
             {"name": "test_bad", "scenario_ids": [], "body": "UT_EXPECT_EQ_INT(invented_api(1), 2);", "evidence_class": "E2"}]})
         agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
-        with brain(b):
+        with writer_brain(b):
             bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
         # A2-20, A2-21: an unknown name is a prediction of the compiler's verdict - the test is not used as it is,
         # it is built alone in a trial and the tool decides [NC-6, NC-7]
@@ -1059,7 +1094,7 @@ class GeneratorTests(unittest.TestCase):
         extra = [mode[0].model_copy(update={"scenario_id": f"S-x{k}", "checked": False, "made_by": "rule",
                                             "characterization": False}) for k in range(5)]
         plan = self.plan.model_copy(update={"scenarios": self.plan.scenarios + extra})   # five tests asked [ARCH-11a]
-        with brain(b):
+        with writer_brain(b):
             bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=plan)))
         suite = uc.suite_of(bundle)
         self.assertEqual(list(bundle.trial), ["test_select_mode_invents"])          # the tool decides [NC-7]
@@ -1099,7 +1134,7 @@ class GeneratorTests(unittest.TestCase):
         for parallel, delays in ((1, {}), (3, {"thermostat_command": 0.3, "select_mode": 0.1, "clamp_percent": 0.0})):
             b = ParallelBrain(parallel, delays, tests=same_name)
             agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
-            with brain(b):
+            with writer_brain(b):
                 bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
             suites.append(uc.suite_of(bundle))
             if parallel > 1:
@@ -1129,7 +1164,7 @@ class GeneratorTests(unittest.TestCase):
         b = UTBrain(tests={"clamp_percent": [{"name": "test_clamp_percent_invented_limit", "scenario_ids": [],
                                               "body": "UT_EXPECT_EQ_INT(clamp_percent(150), 77);",
                                               "evidence_class": "E2"}]})
-        with brain(b):
+        with writer_brain(b):
             bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm")).generate_bundle(
                 uc.GenerationRequest(plan=self.plan)))
         suite = uc.suite_of(bundle)
@@ -1153,7 +1188,7 @@ class GeneratorTests(unittest.TestCase):
 
     def test_llm_tests_keep_their_evidence_class(self):
         agent = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="llm"))
-        with brain(UTBrain()):
+        with writer_brain(UTBrain()):
             bundle = run(agent.generate_bundle(uc.GenerationRequest(plan=self.plan)))
         suite = uc.suite_of(bundle)
         self.assertIn("UT_TEST(test_select_mode_nobody_home)", suite)
@@ -2620,7 +2655,7 @@ class PipelineTests(unittest.TestCase):
             {"original_fragment": "return 2;", "corrected_fragment": "return 1; /* heat, see @return */",
              "rationale": "E2: @return 1 to heat"},
             {"original_fragment": "return 2;", "corrected_fragment": "return 1;", "rationale": "E2: @return 1 to heat"}])
-        with brain(fix_brain):
+        with writer_brain(fix_brain):                 # its E2 test is a whole test, written by a full profile [BP-2]
             result = self.run_pipeline(repo, "src/thermostat.c")
         print("\n" + up.report(result))
         self.assertEqual(len(result.source_fixes), 1, result.open_items)
@@ -2652,27 +2687,17 @@ class PipelineTests(unittest.TestCase):
                                     text=True).stdout
             self.assertEqual(status, "")                                         # nothing changed in the worktree
 
-    def test_a_wrong_brain_test_is_rewritten_when_no_source_change_exists(self):
+    def test_a_wrong_brain_test_takes_its_values_from_the_run_when_no_source_change_exists(self):
         """A4-23j, from the first pilot run with the remote Qwen: the brain's test sets a temperature at the edge of the
-        band and expects heating; the classification blames the source, Agent4 finds no change - the test is
-        rewritten, the run ends verified and the report keeps the item for the developer."""
+        band and expects heating; the classification blames the source, Agent4 finds no change - the test keeps its
+        inputs and takes its values from the run (A2-21p), the run ends verified and the report keeps the item for the
+        developer."""
         wrong = "ut_stub_read_sensor_return = 18;\nUT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);"
-        right = "ut_stub_read_sensor_return = 10;\nUT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);"
-
-        class RewritingBrain(UTBrain):
-            async def generate(self, task, context, schema, validate):
-                # also where the name is only mentioned: the generator keeps one test per name [A2-24]
-                if "TESTS TO REWRITE" in str(context) and "test_thermostat_heats_below_band" in str(context):
-                    self.generate_calls.append(task)
-                    return {"model": self.model_id, "output": validate({"tests": [
-                        {"name": "test_thermostat_heats_below_band", "scenario_ids": [], "body": right,
-                         "evidence_class": "E2"}]}), "usage": {}}
-                return await UTBrain.generate(self, task, context, schema, validate)
         tests = dict(CANNED_TESTS, thermostat_command=[{"name": "test_thermostat_heats_below_band", "scenario_ids": [],
                                                          "body": wrong, "evidence_class": "E2"}])
         same = {"original_fragment": "return 1;", "corrected_fragment": "return 1;", "rationale": "E2: @return 1"}
         repo = copy_pilot("c_pilot", self.d)
-        with brain(RewritingBrain(tests=tests, candidates=[same])):
+        with writer_brain(UTBrain(tests=tests, candidates=[same])):     # a brain that writes whole tests [BP-2]
             result = self.run_pipeline(repo, "src/thermostat.c")
         print("\n" + up.report(result))
         self.assertEqual(result.final_state, "verified_measured", result.reason)
@@ -2680,8 +2705,8 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any("[A4-23j]" in item and "test_thermostat_heats_below_band" in item
                             for item in result.open_items), result.open_items)
         suite = (repo / "tests/test_thermostat.c").read_text()
-        self.assertIn("ut_stub_read_sensor_return = 10;", suite)                     # rewritten, delivered
-        self.assertNotIn("ut_stub_read_sensor_return = 18;", suite)
+        self.assertIn("ut_stub_read_sensor_return = 18;", suite)                     # its inputs kept ...
+        self.assertIn("UT_EXPECT_EQ_INT(thermostat_command(20, 2), 0);", suite)      # ... its value from the run
         self.assertEqual(sum("agent_sourcecode_corrector.candidates" in item for item in result.open_items), 1)
         journal = Path(result.journal)                                           # LA-2: the deviation is recorded
         self.assertTrue(journal.is_file(), result.journal)
@@ -2893,7 +2918,7 @@ class PipelineTests(unittest.TestCase):
                                   {"name": "test_clamp_percent_two_arguments", "scenario_ids": [],
                                    "body": "UT_EXPECT_EQ_INT(clamp_percent(150, 1), 100);", "evidence_class": "E2"}]
         repo = copy_pilot("c_pilot", self.d)
-        with brain(UTBrain(tests=tests)):
+        with writer_brain(UTBrain(tests=tests)):      # whole tests: a full profile [BP-2]
             result = self.run_pipeline(repo, "src/thermostat.c")
         self.assertEqual(result.final_state, "verified_measured", result.reason)
         suite = (repo / "tests/test_thermostat.c").read_text()
@@ -3515,7 +3540,7 @@ class BrainGenerationTests(unittest.TestCase):
             raise ba.AgentFault("MODEL_UNAVAILABLE", "scripted")
         agent.generate = generate
         with brain(DownBrain()):                                                   # TP-21
-            run(agent._llm_tests(plan, req, set(), [scenario], {}, {}, set()))
+            run(agent._llm_tests(plan, req, set(), [scenario], set()))
         self.assertTrue(seen)
         self.assertIn("EXAMPLES (verified tests of similar functions in other code", seen[0])
         self.assertIn("UT_TEST(t_example) { crc8(0); }", seen[0])
@@ -3586,13 +3611,29 @@ class BrainGenerationTests(unittest.TestCase):
                                 gap_ids=["EVIDENCE:clamp_percent"], description="check the stated range",
                                 characterization=False, evidence=[self.e2], strongest_class="E2")
         plan = self.plan.model_copy(update={"scenarios": list(self.plan.scenarios) + [normative]})
-        with brain(UTBrain()) as b:
+        with writer_brain(UTBrain()) as b:
             bundle = run(a2.GeneratorAgent().generate_bundle(uc.GenerationRequest(plan=plan)))
         self.assertTrue(any("_auto_" in n for n in bundle.tests))                       # deterministic first
         self.assertIn("test_clamp_percent_upper_limit", bundle.tests)                   # A2-21n
         self.assertTrue(b.generate_calls)
 
-    def test_failing_e2_test_is_rewritten_with_the_diagnostic(self):
+    def test_a_structured_brain_never_writes_a_whole_test(self):                   # BP-2, structured
+        """Qwen3 8B (the minimum profile) answers in the structured form only: a requirement scenario no checked plan
+        states is not given to a test writer; it stays open, and the reason goes to the journal for the next plan."""
+        normative = uc.Scenario(scenario_id="S-evidence-clamp_percent", function="clamp_percent",
+                                gap_ids=["EVIDENCE:clamp_percent"], description="check the stated range",
+                                characterization=False, evidence=[self.e2], strongest_class="E2")
+        plan = self.plan.model_copy(update={"scenarios": list(self.plan.scenarios) + [normative]})
+        with brain(UTBrain()) as b:
+            bundle = run(a2.GeneratorAgent().generate_bundle(uc.GenerationRequest(plan=plan)))
+        self.assertTrue(any("_auto_" in n for n in bundle.tests))                       # the rules still work
+        self.assertNotIn("test_clamp_percent_upper_limit", bundle.tests)
+        self.assertFalse([c for c in b.generate_calls if "Write at most" in str(c)])   # A2 was not asked
+        self.assertTrue(any(n.startswith("clamp_percent: not built (") for n in bundle.notes), bundle.notes)
+
+    def test_a_failing_e2_test_judged_wrong_takes_its_values_from_the_run(self):        # A2-21p, A3-85b
+        """No brain rewrites the test: it keeps its inputs, its assertions become observations, and the observe run
+        and finalize give them the run's values - the reference form of the oracle check."""
         old = ('/* evidence: E2 */\nUT_TEST(test_clamp_percent_upper_limit)\n{\n    UT_EXPECT_EQ_INT(clamp_percent(150), 99);\n}\n'
                'UT_SUITE_BEGIN\n    UT_CASE(test_clamp_percent_upper_limit)\nUT_SUITE_END\n')
         repair = uc.RepairItem(item_id="test-test_clamp_percent_upper_limit", owner="agent2",
@@ -3601,10 +3642,20 @@ class BrainGenerationTests(unittest.TestCase):
         plan = self.plan.model_copy(update={"repairs": [repair], "drop_tests": ["test_clamp_percent_upper_limit"]})
         with brain(UTBrain()) as b:
             bundle = run(a2.GeneratorAgent().generate_bundle(uc.GenerationRequest(plan=plan, existing_suite=old)))
-        self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 100);", uc.suite_of(bundle))  # A2-21p
+        suite = uc.suite_of(bundle)
+        self.assertIn('UT_OBSERVE_INT("test_clamp_percent_upper_limit_g1", clamp_percent(150));', suite)  # same input
+        self.assertNotIn("clamp_percent(150), 99", suite)
+        self.assertEqual(bundle.actions[-1].evidence_classes["test_clamp_percent_upper_limit"], "E8")  # from the run
         change = next(c for c in bundle.expectation_changes if c.test == "test_clamp_percent_upper_limit")
-        self.assertIn("expected 99, actual 100", change.reason)                         # A2-21e
-        self.assertTrue(any("expected 99, actual 100" in c for c in b.generate_calls) or bundle.expectation_changes)
+        self.assertIn("expected 99, actual 100", change.reason)                         # A2-21e: reported
+        self.assertFalse([c for c in b.generate_calls if "clamp_percent" in str(c)])   # no brain rewrite
+        done = a2.finalize_bundle(bundle, {"test_clamp_percent_upper_limit_g1": "100"})
+        self.assertIn("UT_EXPECT_EQ_INT(clamp_percent(150), 100);", uc.suite_of(done))   # the reference form
+        crashed = repair.model_copy(update={"failure_kind": "crash"})
+        bundle = run(a2.GeneratorAgent().generate_bundle(uc.GenerationRequest(
+            plan=plan.model_copy(update={"repairs": [crashed]}), existing_suite=old)))
+        self.assertNotIn("test_clamp_percent_upper_limit", bundle.tests)                # its inputs miss: dropped
+        self.assertTrue(any("inputs miss" in n for n in bundle.notes), bundle.notes)
 
 
 class FixCandidateTests(unittest.TestCase):
@@ -4338,7 +4389,8 @@ class BrainProfileTests(unittest.TestCase):
         full, minimum = list(uc.ANSWER_KINDS), list(uc.MINIMUM_KINDS)
         self.assertEqual(uc.next_kind("scenario", "test_setup", full), "setup")
         self.assertEqual(uc.next_kind("setup", "test_setup", full), "stub")          # the next wider kind
-        self.assertEqual(uc.next_kind("scenario", "test_setup", minimum), "test")    # setup is not allowed
+        self.assertEqual(uc.next_kind("scenario", "test_setup", minimum), "")        # structured only: no free code
+        self.assertEqual(uc.next_kind("scenario", "needs_call_sequence", minimum), "call_sequence")
         self.assertEqual(uc.next_kind("scenario", "needs_call_sequence", full), "call_sequence")
         self.assertEqual(uc.next_kind("scenario", "wrong_inputs", full), "scenario")  # not a building cause
         self.assertEqual(uc.next_kind("test", "pipeline_limitation", ["values", "scenario", "test"]), "")   # BP-9
@@ -4385,7 +4437,6 @@ class NewCodeTests(unittest.TestCase):
 
     def test_guards_and_predictions(self):                                              # NC-6
         for reason in ("setup calls functions that do not exist here: mystery_init",
-                       "ut_stub_x_return is set twice in a row (1, then 2)",
                        "x: 'abc' is not an integer value (literal, enumerator or macro)"):
             self.assertEqual(uc.check_kind(reason), "prediction", reason)
         for reason in ("claims the gap cannot or need not be covered ('unreachable'); ignored [COV-5]",
@@ -4393,8 +4444,8 @@ class NewCodeTests(unittest.TestCase):
                        "checks nothing: no UT_EXPECT_... or UT_OBSERVE_...", "a reason no check declares",
                        uc.c_form_problem("f(0x42'});"), "c: not one C expression: it contains ';'"):
             self.assertEqual(uc.check_kind(reason), "guard", reason)       # well-formed C is a fact, not a prediction
-        self.assertTrue(uc.only_predictions(["x is set twice in a row (1, then 2)"]))
-        self.assertFalse(uc.only_predictions(["x is set twice in a row (1, then 2)", "checks nothing"]))
+        self.assertTrue(uc.only_predictions(["x: 'abc' is not an integer value"]))
+        self.assertFalse(uc.only_predictions(["x: 'abc' is not an integer value", "checks nothing"]))
         self.assertFalse(uc.only_predictions([]))
 
     def test_well_formed_c_is_one_fact_for_every_check(self):

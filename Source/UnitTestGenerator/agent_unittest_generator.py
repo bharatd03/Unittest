@@ -1072,12 +1072,13 @@ SUITE_TEST = re.compile(r"(?:/\*\s*evidence:\s*(E\d)(\s+linked)?\s*\*/\s*\n)?UT_
 def parse_suite(text: str) -> dict[str, dict[str, str]]:
     """Tests of an existing generated suite: name -> {"source", "evidence"} (verbatim)."""
     tests = {}
+    masked = uc.c_masked(text)                  # a brace in a string or a comment is not code
     for m in SUITE_TEST.finditer(text):
         depth, i = 0, m.end() - 1
         while i < len(text):
-            if text[i] == "{":
+            if masked[i] == "{":
                 depth += 1
-            elif text[i] == "}":
+            elif masked[i] == "}":
                 depth -= 1
                 if depth == 0:
                     break
@@ -1881,6 +1882,45 @@ def ground_expectations(body: str, test: str, texts: list[str], bool_ok: bool) -
     return body, changed
 
 
+def observed_instead(name: str, source: str, repair: uc.RepairItem) -> str | None:
+    """A2-21p: Agent3 decided that a failing asserted test, not the source, is wrong (or Agent4 found no source
+    change, A4-23j). The run's value is the fact: the test keeps its inputs and observes what it asserted; the observe
+    run and finalize (A2-21f) turn each observation back into an assertion with the run's value - the reference form
+    of the oracle check (A3-85b), so the change is accepted only when the test detects every mutant the reference
+    detects, and it is reported as a change of expectation. The values now come from the run: E8. A crash or a timeout
+    means its inputs miss: dropped (None), its items are planned again with the reason. No brain rewrites the test."""
+    if repair.failure_kind in ("crash", "timeout"):
+        return None
+    masked = uc.c_masked(source)
+    head = re.search(r"UT_TEST\(\s*\w+\s*\)\s*\{", masked)
+    end = masked.rfind("}")
+    if not head or end <= head.end():
+        return None
+    body = source[head.end(): end]
+    body = re.sub(r"^\s*/\*.*?\*/\s*\n", "", body, count=1, flags=re.S)          # its old purpose line
+    body, _ = ground_expectations(body, name, [], False)       # nothing is stated any more: every value observed
+    count = len(re.findall(r"UT_OBSERVE_\w+\(", body))
+    for macro in ("UT_EXPECT_THROW", "UT_EXPECT_ANY_THROW", "UT_EXPECT_NULL", "UT_EXPECT_NOT_NULL"):
+        while True:
+            m = re.search(r"\b" + macro + r"\s*\(", body)
+            if not m:
+                break
+            args, after = _call_args(body, m.end() - 1)
+            if not args:
+                break
+            count += 1
+            oid = f"{name}_g{count}"
+            text = (f'UT_OBSERVE_THROW("{oid}", {args[0]})' if "THROW" in macro else
+                    f'UT_OBSERVE_BOOL("{oid}", ({args[0]}) != 0)')
+            body = body[: m.start()] + text + body[after:]
+    if not re.search(r"\bUT_OBSERVE_\w+\(", body) or re.search(r"\bUT_EXPECT_", body):
+        return None                                  # nothing left to observe, or a check it cannot observe
+    why = (repair.diagnostic or repair.issue)[:140]
+    return render_test(name, body.strip("\n"), "E8", False,
+                       f"values from the run - it disagreed with the expected ones ({why}) and the test was judged "
+                       "wrong [A2-21p]")
+
+
 def return_of(fn: uc.FunctionInfo) -> str:
     """The return type: from the front end, else from the signature text [A1-DA14]."""
     if fn.return_type:
@@ -1993,7 +2033,9 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
     full = return_of(fn)
     ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", full or "void").strip()
     can_throw = sc.characterization and throws(body, layout)   # an observed exception, not a failure [A3-45e]
-    if not sc.characterization and sc.expected_return:
+    if not sc.characterization and sc.expected_exception:                 # the stated exception [structured]
+        lines.append(f"UT_EXPECT_THROW({call}, {sc.expected_exception});")
+    elif not sc.characterization and sc.expected_return:
         lines.append(_assert_return(fn, call, sc.expected_return))
     elif ret == "void" or not ret:
         lines.append(_guard_throw(f"{call};", name, can_throw))
@@ -2410,7 +2452,7 @@ class GeneratorAgent(ba.AgentCore):
                 drop.add(r.affected_test)
                 name = name or r.affected_test
             if name and r.action == "rewrite" and name in existing and existing[name]["evidence"] != "E8":
-                rewrite[name] = r                                                      # A2-21p
+                rewrite[name] = r          # A2-21p: Agent3 decided the test is wrong, not the source - see below
         kept = [(n, t["source"], t["evidence"]) for n, t in existing.items() if n not in drop]
         linked = {n for n, t in existing.items() if n not in drop and t.get("linked")}
         stub_path, stub_source, stub_header = render_stubs(plan)
@@ -2424,6 +2466,16 @@ class GeneratorAgent(ba.AgentCore):
                                          role="sut_access", content=access[1]))
         new_tests: list[tuple[str, str, str]] = []
         names = {n for n, _, _ in kept}
+        for name, r in sorted(rewrite.items()):           # A2-21p: the decision, then a rule - never a rewrite
+            replacement = observed_instead(name, existing[name]["source"], r)
+            if replacement is None:
+                notes.append(f"{name}: {r.failure_kind or 'failed'} - its inputs miss: dropped, its items are "
+                             "planned again [A2-21p]")
+                continue
+            new_tests.append((name, replacement, "E8"))
+            names.add(name)
+            notes.append(f"{name}: the run disagrees with its expected values and the test, not the source, was "
+                         "judged wrong: same inputs, its values taken from the run (reference form, A3-85b) [A2-21p]")
         if plan.stage == "coverage" and any(s.inputs for s in plan.scenarios):
             fuzz = fuzz_tests(plan, names)
             new_tests += fuzz
@@ -2445,12 +2497,23 @@ class GeneratorAgent(ba.AgentCore):
             names |= {n for n, _, _ in new_tests}
             allowed = self._allowed_symbols(plan, self._headers_text(layout), stub_header)
             llm_scenarios, assembled = [], 0
+            # BP-2: a whole test is written as code only by a brain whose profile has the kind "test". For the others
+            # (Qwen3 8B) every brain test comes from a structured scenario the generator builds; a scenario it cannot
+            # build is not built, and the reason goes to the journal, so the next plan changes it [structured].
+            writers = await uc.brains_for(self, "test", "A2.tests")
+
+            def to_writer(sc: uc.Scenario, why: str) -> None:
+                if writers or plan.rules_only:            # the rule round leaves them to the plan below [A1-PL1]
+                    llm_scenarios.append(sc)
+                    return
+                notes.append(f"{sc.function}: not built ({why}): no brain of this run writes whole tests - the next "
+                             "plan gets the reason [BP-2, structured]")
             for sc in plan.scenarios:
                 if sc.inputs:
                     continue
                 if sc.checked:                                                        # A2-21m
                     if sc.kind in ("test", "suite_part") and not sc.trial:    # BP-3: the assembled form missed
-                        llm_scenarios.append(sc)
+                        to_writer(sc, f"asked as {sc.kind}")
                         continue
                     name = self._test_name(sc, names)
                     fn = uc.function_of(sc.function, layout, sc.function_line)
@@ -2488,11 +2551,12 @@ class GeneratorAgent(ba.AgentCore):
                         notes.append(f"{name}: refused by predictions ({'; '.join(sc.trial)[:160]}) and not "
                                      "assembled; dropped [NC-7]")
                         continue
-                    llm_scenarios.append(sc)
+                    to_writer(sc, f"the generator could not build it: {problem}" if body is not None and problem
+                              else "the generator could not build it: an argument or the object is missing")
                 elif not sc.characterization:                                         # A2-21n
-                    llm_scenarios.append(sc)
+                    to_writer(sc, "no checked plan states the documented behaviour yet")
                 elif self.cfg.mode == "llm" or not _has_auto(sc.function, [n for n, _, _ in auto], layout):
-                    llm_scenarios.append(sc)                                          # A2-21o
+                    to_writer(sc, "no rule test and no checked plan")                 # A2-21o
             if assembled:
                 notes.append(f"{assembled} tests assembled from checked scenarios - planned by the brain or solved by rule "
                              "[A2-21m, A1-PL15]")
@@ -2500,9 +2564,9 @@ class GeneratorAgent(ba.AgentCore):
                 notes.append(f"{len(llm_scenarios)} scenario(s) of {len({sc.function for sc in llm_scenarios})} "
                              "function(s) left to the brain's plan after this round's measurement [A1-PL1]")
                 llm_scenarios = []
-            if self.cfg.mode in ("deterministic_then_llm", "llm") and (llm_scenarios or rewrite):
+            if self.cfg.mode in ("deterministic_then_llm", "llm") and llm_scenarios:
                 llm_tests, llm_notes, llm_linked, llm_trial, llm_made, llm_shared = await self._llm_tests(
-                    plan, req, names, llm_scenarios, rewrite, existing, allowed)
+                    plan, req, names, llm_scenarios, allowed)
                 new_tests += llm_tests
                 notes += llm_notes
                 linked |= llm_linked
@@ -2520,11 +2584,12 @@ class GeneratorAgent(ba.AgentCore):
             if old["evidence"] != "E8" and replacement is not None and _assertions(old["source"]) != _assertions(replacement[1]):
                 changes.append(uc.ExpectationChange(test=name, old="; ".join(_assertions(old["source"])),
                                                     new="; ".join(_assertions(replacement[1])),
-                                                    reason="rewritten from Agent3's diagnostic [A2-21p]: " +
+                                                    reason="values from the run, the test judged wrong "
+                                                    "[A2-21p]: " +
                                                     (rewrite[name].diagnostic[:160] if name in rewrite else
                                                      "repair requested by Agent1"), evidence=old["evidence"]))
             elif name in rewrite and replacement is None:
-                notes.append(f"{name}: not rewritten; dropped [A2-21p]")
+                pass                                         # dropped with its reason above [A2-21p]
         tests = kept + new_tests
         suite = assemble_suite(plan, tests, stub_header, [shared[k] for k in sorted(shared)])
         actions.append(uc.FileAction(path=layout.suite_file, action="replace" if existing_text else "create",
@@ -2719,10 +2784,9 @@ class GeneratorAgent(ba.AgentCore):
 
     # ---------------------------------------------------------------- LLM tests
     async def _llm_tests(self, plan: uc.UTPlan, req: uc.GenerationRequest, names: set[str],
-                         scenarios: list[uc.Scenario], rewrite: dict[str, uc.RepairItem],
-                         existing: dict[str, dict[str, str]], allowed: set[str]
+                         scenarios: list[uc.Scenario], allowed: set[str]
                          ) -> tuple[list, list[str], set[str], dict[str, str], dict[str, str], dict[str, str]]:
-        """Tests the brain writes (A2-21n..A2-21p); returns (tests, notes, linked, trial, made, shared): the tests
+        """Whole tests a full-profile brain writes (A2-21n, A2-21o, BP-2); returns (tests, notes, linked, trial, made, shared): the tests
         refused only by predictions go to a trial (NC-7), ``made`` names the brain and kind of every test (BP-7),
         ``shared`` the checked shared set-up of a suite part (BP-2)."""
         layout = plan.layout
@@ -2735,14 +2799,6 @@ class GeneratorAgent(ba.AgentCore):
         for s in scenarios:
             fn_of = uc.function_of(s.function, layout, s.function_line)
             by_function.setdefault((s.function, fn_of.line_start if fn_of else 0), []).append(s)
-        rewrites_of: dict[str, list[str]] = {}
-        for name in rewrite:                                       # the function a failing test calls [A2-21p]
-            fn = next((f for f in layout.functions if re.search(
-                r"\b" + re.escape(callee_of(f).split("::")[-1]) + r"\s*\(", existing[name]["source"])), None)
-            if fn is not None:
-                rewrites_of.setdefault(fn.name, []).append(name)
-                if not any(key[0] == fn.name for key in by_function):
-                    by_function.setdefault((fn.name, fn.line_start), [])
         # ARCH-18: the functions' tests are asked for at the same time; every call sees the same names
         # and evidence it would see alone, and the answers are combined below in the order of the
         # functions, with names made unique there (A2-21q).
@@ -2763,11 +2819,9 @@ class GeneratorAgent(ba.AgentCore):
             async def write():
                 fn = uc.function_of(fn_name, layout, key[1])
                 if fn is None or (fn.is_static and not fn.from_frontend):
-                    return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, [], {}, "", ""
+                    return [], [f"{fn_name}: static or unknown, covered only through its callers"], fn, {}, "", ""
                 if uc.internal_member(fn, layout):                                                # A2-21ae
-                    return [], [f"{fn_name}: {uc.call_form(fn, layout)}"], fn, [], {}, "", ""
-                first = min((k2[1] for k2 in by_function if k2[0] == fn.name), default=fn.line_start)
-                to_rewrite = rewrites_of.get(fn.name, []) if fn.line_start == first else []   # once per name
+                    return [], [f"{fn_name}: {uc.call_form(fn, layout)}"], fn, {}, "", ""
                 call_as = f"Call it as {wrapper_name(fn)}(...): it is static [A2-21k]. " if fn.is_static else ""
                 member = (uc.call_form(fn, layout) or "It is a class member: construct an object in the test (see "
                           "HEADERS) and call it on the object.") + " " if fn.member else ""                 # A2-21ae
@@ -2795,8 +2849,6 @@ class GeneratorAgent(ba.AgentCore):
                     else:
                         row += f" | conditions: {'; '.join(s.required_conditions) or '-'} | stubs: {'; '.join(s.stub_hints) or '-'}"
                     scenario_rows.append(row)
-                fixes = [f"- {name}: {rewrite[name].issue}: {rewrite[name].diagnostic[:300]}\n{existing[name]['source']}"
-                         for name in to_rewrite]
                 state_text = state_part(fn, layout, sut_lines) if setter_vars(plan) else ""         # A2-21aj
                 # ARCH-17: what the tests are built from stays whole; the headers keep at least their
                 # beginning; KB examples and the list of names give way first.
@@ -2834,8 +2886,6 @@ class GeneratorAgent(ba.AgentCore):
                                "test):\n" + uc.dependency_code(fn, layout), uc.P_EVIDENCE, min_chars=600)]
                       if uc.dependency_code(fn, layout) else []),
                     uc.part("scenarios", "SCENARIOS:\n" + ("\n".join(scenario_rows) or "- none")),
-                    uc.part("rewrite", "TESTS TO REWRITE (keep the name, the scenario and the evidence; fix what the "
-                                       "diagnostic shows):\n" + ("\n".join(fixes) if fixes else "- none")),
                     uc.part("evidence", "EVIDENCE (expected behaviour):\n" + ("\n".join(
                         f"- {e.evidence_id} {e.evidence_class}{' (linked by the brain)' if e.linked_by else ''} "
                         f"{e.source}:{e.line}: {e.text}" for e in evidence.values()) or
@@ -2851,13 +2901,13 @@ class GeneratorAgent(ba.AgentCore):
                                            for e in examples), uc.P_EXAMPLES)] if examples else []),
                 ]
                 need = ba.OutputNeed(items=min(self.cfg.max_llm_tests_per_function,
-                                               max(len(fn_scenarios) + len(to_rewrite), 1)),
+                                               max(len(fn_scenarios), 1)),
                                      tokens_per_item=self.cfg.tokens_per_test, overhead=100, asked=True)   # ARCH-20c
                 task = (
                     f"Write at most {need.items} unit tests for {fn.qualified_name} that cover "              # ARCH-11a
-                    "the SCENARIOS and rewrite the TESTS TO REWRITE. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
+                    "the SCENARIOS. Return JSON {\"tests\": [{\"name\", \"scenario_ids\", "
                     "\"purpose\", \"evidence_ids\", \"body\", \"evidence_class\"}]}. name: test_<what>_<behaviour> (at least "
-                    f"three words, at most {NAME_LIMIT} characters; a rewritten test keeps its name). purpose: one line. body: statements only, no function "
+                    f"three words, at most {NAME_LIMIT} characters). purpose: one line. body: statements only, no function "
                     "header, no #include. Use only: the function under test and other functions declared in HEADERS, the "
                     "ut_stub_* variables, and these macros: UT_EXPECT_EQ_INT(actual, expected), UT_EXPECT_TRUE(c), "
                     "UT_EXPECT_FALSE(c), UT_EXPECT_EQ_DBL(a, e, tol), UT_EXPECT_EQ_STR(a, e), UT_OBSERVE_INT(\"id\", expr), "
@@ -2878,9 +2928,7 @@ class GeneratorAgent(ba.AgentCore):
                 dropped: list[str] = []
                 tried: dict[str, str] = {}
                 forms: list[str] = []
-                check = self._grounding(allowed, names - set(to_rewrite),
-                                        set(to_rewrite), fn.name, dropped, {n: existing[n]["source"] for n in to_rewrite},
-                                        trial=tried, shared_ok=bool(part_brains), void_names=void_functions(layout),
+                check = self._grounding(allowed, names, function=fn.name, dropped=dropped, trial=tried, shared_ok=bool(part_brains), void_names=void_functions(layout),
                                         fixed=forms, qualify=uc.namespace_names(layout, self._headers_text(layout)))
                 try:
                     result = await self.generate(task, context, GeneratedTests, need=need, step="A2.tests",
@@ -2888,7 +2936,7 @@ class GeneratorAgent(ba.AgentCore):
                                                  allowed=part_brains or None)
                 except ba.AgentFault as exc:
                     return [], [f"{fn.qualified_name}: no LLM tests ({exc.code}: {exc.message[:200]})"], fn, \
-                        to_rewrite, {}, "", ""
+                        {}, "", ""
                 used = self.brain_of_call()
                 made_by = f"{used.get('brain', '')}/{used.get('model_id', '')} {'suite_part' if part_brains else 'test'}"
                 shared_text = ""
@@ -2923,11 +2971,11 @@ class GeneratorAgent(ba.AgentCore):
                     texts = [e.text for e in stated]
                     bool_ok = re.sub(r"\s+", "", fn.return_type or "") in ("bool", "_Bool") and \
                         any(e.evidence_class in ("E1", "E2", "E3") for e in stated)
-                    purpose = f"{', '.join(t.scenario_ids) or (fn_scenarios[0].scenario_id if fn_scenarios else 'rewrite')}: " \
+                    purpose = f"{', '.join(t.scenario_ids) or (fn_scenarios[0].scenario_id if fn_scenarios else '')}: " \
                               f"{t.purpose or (fn_scenarios[0].purpose or fn_scenarios[0].description[:100] if fn_scenarios else '')}" \
                               + (f" [{', '.join(cited)}]" if cited else "")
                     produced.append((t, cls, is_linked, purpose, texts, bool_ok))
-                return produced, own_notes, fn, to_rewrite, tried, made_by, shared_text
+                return produced, own_notes, fn, tried, made_by, shared_text
             return run
         work = list(by_function.items())
         if len(work) > 1:                                                                          # VIEW-16
@@ -2940,19 +2988,15 @@ class GeneratorAgent(ba.AgentCore):
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-            produced, own_notes, fn, to_rewrite, tried, made_by, shared_text = result
+            produced, own_notes, fn, tried, made_by, shared_text = result
             notes.extend(own_notes)
             if shared_text and fn is not None:
                 shared_out[_ident(fn.qualified_name)] = shared_text
-            # a name already used, or kept for the rewrite of another function's test, is changed [A2-24, A2-21q]
-            reserved = names | (set(rewrite) - set(to_rewrite))
+            reserved = set(names)                     # a name already used is changed [A2-24, A2-21q]
             for t, cls, is_linked, purpose, texts, bool_ok in produced:
-                name = t.name if t.name in to_rewrite and t.name not in names else \
-                    readable_test_name(t.name, fn.name, reserved) if t.name in reserved else t.name
+                name = readable_test_name(t.name, fn.name, reserved) if t.name in reserved else t.name
                 reserved.add(name)
-                # A2-21u; a rewritten test keeps its evidence and goes through the oracle-strength check (A2-21p)
-                body, unstated = (t.body, 0) if t.name in to_rewrite else \
-                    ground_expectations(t.body, name, texts, bool_ok)
+                body, unstated = ground_expectations(t.body, name, texts, bool_ok)                   # A2-21u
                 if unstated:
                     notes.append(f"{fn.qualified_name}: {name}: {unstated} expected value(s) not stated by the cited "
                                  "evidence; observed instead of asserted [A2-21u]")
@@ -3076,35 +3120,26 @@ class GeneratorAgent(ba.AgentCore):
         form = uc.c_form_problem(body)                  # a fact: a test that is not well-formed C cannot compile
         if form:
             return form
-        statements = [part.strip() for part in re.sub(r"/\*.*?\*/|//[^\n]*", " ", body, flags=re.S).split(";")]
-        for first, second in zip(statements, statements[1:]):
-            a, b = PLAIN_ASSIGNMENT.fullmatch(first), PLAIN_ASSIGNMENT.fullmatch(second)
-            if a and b and a.group(1) == b.group(1) and "(" not in a.group(2) and a.group(1) not in b.group(2):
-                return (f"{a.group(1)} is set twice in a row ({a.group(2).strip()}, then {b.group(2).strip()}): only "
-                        "the last value counts - set it once to the value the test needs [A2-21t]")
         return ""
 
     @classmethod
-    def _grounding(cls, allowed: set[str], existing_names: set[str], rewritten: set[str] | None = None,
-                   function: str = "", dropped: list[str] | None = None, old_sources: dict[str, str] | None = None,
-                   trial: dict[str, str] | None = None, shared_ok: bool = False,
+    def _grounding(cls, allowed: set[str], existing_names: set[str], function: str = "",
+                   dropped: list[str] | None = None, trial: dict[str, str] | None = None, shared_ok: bool = False,
                    void_names: set[str] | None = None, fixed: list[str] | None = None,
                    qualify: dict[str, str] | None = None):
         """The check of one LLM answer, test by test [A2-21t]: names are repaired (A2-21q), a test whose body
         fails a check is dropped and noted in ``dropped``; the brain is asked again only when none is left. With
         ``trial``, a test refused only by a prediction is kept and named there: the tool decides (NC-6, NC-7).
         ``shared_ok``: helpers of the shared set-up (ut_...) count as known names (BP-2)."""
-        rewritten = rewritten or set()
 
         def check(parsed: GeneratedTests) -> None:
             seen: set[str] = set()
             kept: list[GeneratedTest] = []
             problems: list[str] = []
             for t in parsed.tests:
-                if not (t.name in rewritten and t.name not in seen):
-                    name = readable_test_name(t.name, function, existing_names | seen | rewritten)
-                    if name != t.name:
-                        t = t.model_copy(update={"name": name})
+                name = readable_test_name(t.name, function, existing_names | seen)
+                if name != t.name:
+                    t = t.model_copy(update={"name": name})
                 body, changed = uc.void_values_as_statements(t.body, void_names or set())        # A2-21ah (b)
                 if changed:
                     t = t.model_copy(update={"body": body})
@@ -3123,11 +3158,6 @@ class GeneratorAgent(ba.AgentCore):
                         CHECKS.search(code_only(t.body)):                                    # NC-7
                     trial[t.name] = problem
                     problem = ""
-                old = (old_sources or {}).get(t.name)
-                if not problem and old is not None and t.body.strip() and \
-                        uc.normalized_body(t.body) in uc.normalized_body(old):
-                    problem = ("the rewrite is the same as the failing test: change what the diagnostic and the "
-                               "JOURNAL show [A2-21p, LA-4]")
                 if not problem and not CHECKS.search(code_only(t.body)):
                     problem = ("checks nothing: no UT_EXPECT_... or UT_OBSERVE_... in the body - assert the expected "
                                "value or observe the result [A2-21t]")
@@ -3172,8 +3202,6 @@ class GeneratorAgent(ba.AgentCore):
         return checks
 
 
-# "x = value" with nothing else: a second one in a row makes the first without effect [A2-21t]
-PLAIN_ASSIGNMENT = re.compile(r"([A-Za-z_][\w.\[\]>-]*)\s*=(?!=)\s*(.+)", re.S)
 
 
 def _assertions(source: str) -> list[str]:

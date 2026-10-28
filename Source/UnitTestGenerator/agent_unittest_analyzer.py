@@ -2267,26 +2267,37 @@ def carry_text(text: str, mapping: dict[str, str]) -> str:
     return re.sub(r"[A-Za-z_]\w*", one, text)
 
 
+# ARCH-20c: short, closed answer fields - the brain's schema carries the limits the checks enforce anyway, so a
+# constrained decoder stops a runaway answer ("0uLL, 0uLL, ...") where it starts; the checks stay the judge.
+VALUE = {"maxLength": 120}              # one C expression
+ITEM = {"maxLength": 60}                # one element, field value or return value
+
+
+def _most(n: int) -> dict[str, int]:
+    return {"maxItems": n}
+
+
 class PlannedValue(BaseModel):
     name: str = Field(description="parameter or variable name")
-    value: str = Field(description="a C/C++ value or expression")
+    value: str = Field(description="a C/C++ value or expression", json_schema_extra=VALUE)
 
 
 class PlannedField(BaseModel):
     field: str = Field(description="a field name from the lists, for example status or pos.x")
-    value: str = Field(description="its value: a literal, an enumerator or a macro")
+    value: str = Field(description="its value: a literal, an enumerator or a macro", json_schema_extra=ITEM)
 
 
 class PlannedArgValue(PlannedValue):
     """Structured scenario: a parameter's value - or, for a buffer, an array, a pointer or a structure, only what it
     contains; the generator declares the object, fills it and passes it in the right form."""
-    value: str = Field(default="", description="the value of a plain parameter; empty for a buffer or a structure")
-    elements: list[str] = Field(default_factory=list, description=(
+    value: str = Field(default="", description="the value of a plain parameter; empty for a buffer or a structure",
+                       json_schema_extra=VALUE)
+    elements: list[Annotated[str, Field(json_schema_extra=ITEM)]] = Field(default_factory=list, description=(
         "a buffer, array or pointer parameter: its element values in order (the test declares the buffer and passes "
-        "it); empty otherwise"))
+        "it); empty otherwise"), json_schema_extra=_most(64))
     fields: list[PlannedField] = Field(default_factory=list, description=(
         "a structure parameter or a pointer to one: its field values (the test declares the structure and passes "
-        "it); empty otherwise"))
+        "it); empty otherwise"), json_schema_extra=_most(32))
 
 
 class PlannedState(BaseModel):
@@ -2294,48 +2305,54 @@ class PlannedState(BaseModel):
     variable: str = Field(description="a variable from SUT STATE")
     index: int = Field(default=-1, description="an array variable: the element index; -1 otherwise")
     field: str = Field(default="", description="a structure variable: the field from SUT STATE; empty otherwise")
-    value: str = Field(description="the value to set")
+    value: str = Field(description="the value to set", json_schema_extra=VALUE)
 
 
 class PlannedCall(BaseModel):
     """Structured scenario: a call made before the call under test, to build up state."""
     function: str = Field(description="a function from CALLABLE FUNCTIONS")
-    args: list[str] = Field(default_factory=list, description="its argument values in order")
+    args: list[Annotated[str, Field(json_schema_extra=VALUE)]] = Field(
+        default_factory=list, description="its argument values in order", json_schema_extra=_most(8))
 
 
 class PlannedWrite(BaseModel):
     """Structured scenario: what a stub writes into a pointer or reference parameter when it is called."""
     stub: str = Field(description="a stub from STUB OUTPUTS")
     param: str = Field(description="its output parameter from STUB OUTPUTS")
-    elements: list[str] = Field(default_factory=list, description="element values written, in order (a buffer)")
-    fields: list[PlannedField] = Field(default_factory=list, description="field values written (a structure)")
+    elements: list[Annotated[str, Field(json_schema_extra=ITEM)]] = Field(
+        default_factory=list, description="element values written, in order (a buffer)", json_schema_extra=_most(64))
+    fields: list[PlannedField] = Field(default_factory=list, description="field values written (a structure)",
+                                       json_schema_extra=_most(32))
 
 
 class PlannedRegister(BaseModel):
     address: str = Field(description="a register address from REGISTERS, for example 0x40021000")
-    value: str = Field(description="the 32-bit value it holds")
+    value: str = Field(description="the 32-bit value it holds", json_schema_extra=ITEM)
 
 
 class PlannedMember(BaseModel):
     """Structured scenario (C++): a data member of the object set before the call, private ones included."""
     member: str = Field(description="a member from OBJECT MEMBERS")
-    value: str = Field(default="", description="its value; empty for a container")
-    elements: list[str] = Field(default_factory=list, description="a container member: its elements in order")
+    value: str = Field(default="", description="its value; empty for a container", json_schema_extra=VALUE)
+    elements: list[Annotated[str, Field(json_schema_extra=ITEM)]] = Field(
+        default_factory=list, description="a container member: its elements in order", json_schema_extra=_most(64))
 
 
 class PlannedStub(BaseModel):
     stub: str = Field(description="function name of a stub listed under STUBS")
-    returns: list[str] = Field(description="return value per call, in call order; the last one stays")
+    returns: list[Annotated[str, Field(json_schema_extra=ITEM)]] = Field(
+        description="return value per call, in call order; the last one stays", json_schema_extra=_most(16))
 
 
 class PlannedCheck(BaseModel):
-    expr: str = Field(description="checked after the call: an output variable from setup or ut_stub_<name>_calls")
-    value: str
+    expr: str = Field(description="checked after the call: an output variable from setup or ut_stub_<name>_calls",
+                      json_schema_extra=VALUE)
+    value: str = Field(json_schema_extra=ITEM)
 
 
 class PlannedQuote(BaseModel):
     evidence_id: str
-    text: str = Field(description="exact words copied from that evidence item")
+    text: str = Field(description="exact words copied from that evidence item", json_schema_extra={"maxLength": 300})
 
     @model_validator(mode="before")
     @classmethod
@@ -2367,8 +2384,10 @@ class PlannedScenario(BaseModel):
     members: list[PlannedMember] = Field(default_factory=list, description="C++: object members before the call")
     stubs: list[PlannedStub]
     variables: list[PlannedValue] = Field(description="stub variables (STUB VARIABLES) to set before the call")
-    expected_return: str = Field(description="the return value the EVIDENCE states; empty when it states none")
-    expected_after: list[PlannedCheck]
+    expected_return: str = Field(description="the return value the EVIDENCE states; empty when it states none",
+                                 json_schema_extra=ITEM)
+    expected_exception: SkipJsonSchema[str] = Field(default="")       # offered only when the function throws
+    expected_after: list[PlannedCheck] = Field(json_schema_extra=_most(8))
     evidence_ids: list[str]
     quotes: list[PlannedQuote]
     classification: Literal["confirmed_gap", "characterization_gap", "conflicting_evidence", "insufficient_evidence"]
@@ -2400,7 +2419,8 @@ def _listed(values: Any) -> Any:
 
 def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, variables: Any,
                   target_ids: Any = None, per_scenario: int = 3, state: Any = (), fields: Any = (),
-                  callables: Any = (), outputs: Any = (), registers: Any = (), members: Any = ()) -> type[BaseModel]:
+                  callables: Any = (), outputs: Any = (), registers: Any = (), members: Any = (),
+                  exceptions: Any = ()) -> type[BaseModel]:
     """ARCH-20a, A1-PL3: the answer of one planning call with the lists of this function - its targets (A1-PL3a; its
     open items when it has none), its evidence, its parameters, the stubs whose return value a test can set and the
     stub variables. With targets the brain never writes the items out (ARCH-20d)."""
@@ -2408,7 +2428,8 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                          field=(_listed(fields), Field(description="a field from the lists")))
     arg = create_model("PlannedArg", __base__=PlannedArgValue,
                        name=(_listed(params), Field(description="a parameter name from PARAMETERS")),
-                       fields=(list[field], Field(default_factory=list, description="a structure parameter: its fields")))
+                       fields=(list[field], Field(default_factory=list, description="a structure parameter: its fields",
+                                                  json_schema_extra=_most(32))))
     state_m = create_model("PlannedStateChoice", __base__=PlannedState,
                            variable=(_listed(state), Field(description="a variable from SUT STATE")))
     call_m = create_model("PlannedCallChoice", __base__=PlannedCall,
@@ -2417,23 +2438,31 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                            stub=(_listed({o.split(".")[0] for o in outputs}), Field(description="a stub of STUB OUTPUTS")),
                            param=(_listed({o.split(".", 1)[1] for o in outputs if "." in o}),
                                   Field(description="its output parameter")),
-                           fields=(list[field], Field(default_factory=list)))
+                           fields=(list[field], Field(default_factory=list, json_schema_extra=_most(32))))
     reg_m = create_model("PlannedRegisterChoice", __base__=PlannedRegister,
                          address=(_listed(registers), Field(description="a register from REGISTERS")))
     member_m = create_model("PlannedMemberChoice", __base__=PlannedMember,
                             member=(_listed(members), Field(description="a member from OBJECT MEMBERS")))
     hidden = SkipJsonSchema                         # a structured field with nothing to offer stays out of the schema
     structured = dict(
-        state=((list[state_m], Field(default_factory=list, description="SUT state to set before the call"))
+        state=((list[state_m], Field(default_factory=list, description="SUT state to set before the call",
+                                     json_schema_extra=_most(32)))
                if state else (hidden[list[PlannedState]], Field(default_factory=list))),
-        calls=((list[call_m], Field(default_factory=list, description="earlier calls that build up state, in order"))
+        calls=((list[call_m], Field(default_factory=list, description="earlier calls that build up state, in order",
+                                    json_schema_extra=_most(12)))                    # the check refuses more than 12
                if callables else (hidden[list[PlannedCall]], Field(default_factory=list))),
-        writes=((list[write_m], Field(default_factory=list, description="what stubs write into output parameters"))
+        writes=((list[write_m], Field(default_factory=list, description="what stubs write into output parameters",
+                                      json_schema_extra=_most(8)))
                 if outputs else (hidden[list[PlannedWrite]], Field(default_factory=list))),
-        registers=((list[reg_m], Field(default_factory=list, description="register values before the call"))
+        registers=((list[reg_m], Field(default_factory=list, description="register values before the call",
+                                       json_schema_extra=_most(16)))
                    if registers else (hidden[list[PlannedRegister]], Field(default_factory=list))),
-        members=((list[member_m], Field(default_factory=list, description="object members before the call"))
-                 if members else (hidden[list[PlannedMember]], Field(default_factory=list))))
+        members=((list[member_m], Field(default_factory=list, description="object members before the call",
+                                        json_schema_extra=_most(16)))
+                 if members else (hidden[list[PlannedMember]], Field(default_factory=list))),
+        expected_exception=((_listed(["", *exceptions]), Field(default="", description=(
+            "C++: the exception type from EXCEPTIONS the EVIDENCE says the call throws; empty when none")))
+            if exceptions else (hidden[str], Field(default=""))))
     stub = create_model("PlannedStubChoice", __base__=PlannedStub,
                         stub=(_listed(stubs), Field(description="function name of a stub listed under STUBS")))
     var = create_model("PlannedVariable", __base__=PlannedValue,
@@ -2449,9 +2478,13 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                       gap_ids=(list[_listed(open_ids)], Field(description="ids from OPEN GAPS that this scenario closes")))
     scenario = create_model(
         "PlannedScenarioChoice", __base__=PlannedScenario, **listed, **structured,
-        args=(list[arg], Field(description="one entry per parameter, by parameter name")),
-        stubs=(list[stub], ...), variables=(list[var], Field(description="stub variables to set before the call")),
-        evidence_ids=(list[_listed(evidence_ids)], ...), quotes=(list[quote], ...))
+        args=(list[arg], Field(description="one entry per parameter, by parameter name",
+                               json_schema_extra=_most(len(list(params))))),         # a fact: its parameters
+        stubs=(list[stub], Field(json_schema_extra=_most(max(1, len(list(stubs)))))),
+        variables=(list[var], Field(description="stub variables to set before the call",
+                                    json_schema_extra=_most(max(1, len(list(variables)))))),
+        evidence_ids=(list[_listed(evidence_ids)], Field(json_schema_extra=_most(4))),
+        quotes=(list[quote], Field(json_schema_extra=_most(4))))
     return create_model("PlannedScenariosChoice", __base__=PlannedScenarios, scenarios=(list[scenario], ...))
 
 
@@ -2509,6 +2542,13 @@ PLAN_TASK = (
     'when b is negative"}}] - every quote an object with the evidence id and the words copied from it.\n'
     "Values are C code exactly as in the example (\"1\", \"-1\", a macro or enumerator name): never a ':' or '=' "
     "before a value, never the parameter name, a file path or a placeholder.")
+def thrown_types(code: str) -> list[str]:
+    """The exception types a throw expression in this code names (throw std::overflow_error("...")): a fact of the
+    source, the only types an expected exception may name."""
+    masked = uc.c_masked(code)
+    return sorted(set(re.findall(r"\bthrow\s+((?:::)?[A-Za-z_][\w:]*)\s*[({]", masked)))
+
+
 def plan_forms(fn: uc.FunctionInfo, lists: dict[str, Any]) -> str:
     """The rules of the structured fields this function's answer has - only those (a small window keeps the
     facts): buffers and structures among its parameters, its SUT state, earlier calls, stub outputs, registers,
@@ -2537,6 +2577,9 @@ def plan_forms(fn: uc.FunctionInfo, lists: dict[str, Any]) -> str:
         rows.append("- registers: the value a register of REGISTERS holds before the call.\n")
     if lists.get("members"):
         rows.append("- members: OBJECT MEMBERS to set before the call (elements for a container).\n")
+    if lists.get("exceptions"):
+        rows.append("- expected_exception: when the EVIDENCE says the call throws, its type from EXCEPTIONS (then "
+                    "expected_return stays empty).\n")
     return "".join(rows).replace("{", "{{").replace("}", "}}")
 
 
@@ -3993,7 +4036,7 @@ class AnalyzerAgent(ba.AgentCore):
         return planned_model(open_ids, [e.evidence_id for e in evidence], [p.name for p in text_params(fn)],
                              settable, variables, targets, per_scenario, lists.get("state", []),
                              lists.get("fields", []), lists.get("callables", []), lists.get("outputs", []),
-                             lists.get("registers", []), lists.get("members", []))
+                             lists.get("registers", []), lists.get("members", []), lists.get("exceptions", []))
 
     # ---------------------------------------------------------------- structured scenario: the brain says what
     def _structured_lists(self, fn: uc.FunctionInfo, layout: uc.LayoutProfile, stubs: list[uc.StubSpec],
@@ -4065,6 +4108,7 @@ class AnalyzerAgent(ba.AgentCore):
             if re.search(r"\b" + re.escape(macro) + r"\b", callee_text):
                 registers.append(address)
                 reg_rows.append(f"- {address} ({macro})")
+        exceptions = thrown_types(callee_text) if layout.language == "cpp" else []
         members, member_rows = [], []
         if fn.member:
             for m in layout.class_members:
@@ -4072,9 +4116,10 @@ class AnalyzerAgent(ba.AgentCore):
                     members.append(m.name)
                     member_rows.append(f"- {m.name} ({m.type}{', static' if m.static else ''})")
         return {"state": state_names, "fields": sorted(fields), "callables": callables[:40],
-                "outputs": outputs, "registers": registers, "members": members,
+                "outputs": outputs, "registers": registers, "members": members, "exceptions": exceptions,
                 "rows": {"state": state_rows, "callables": call_rows[:40], "outputs": output_rows,
-                         "registers": reg_rows, "members": member_rows}}
+                         "registers": reg_rows, "members": member_rows,
+                         "exceptions": [f"- {e}" for e in exceptions]}}
 
     @staticmethod
     def _type_fields(type_name: str, layout: uc.LayoutProfile) -> list[str]:
@@ -4629,9 +4674,22 @@ class AnalyzerAgent(ba.AgentCore):
         trial = list(reasons)                                     # only predictions: the tool decides [NC-7]
         cited = [evidence[e] for e in planned.evidence_ids if e in evidence]
         strong = [e for e in cited if e.evidence_class != "E8"]
-        normative = planned.classification == "confirmed_gap" and bool(strong) and \
-            bool(planned.expected_return.strip() or planned.expected_after) and bool(planned.quotes)   # c)
         notes = []
+        exception = planned.expected_exception.strip()
+        if exception:
+            sut_lines = uc.read_source(Path(layout.repo_root) / layout.sut_file).splitlines()
+            code = "\n".join(sut_lines[fn.line_start - 1: fn.line_end] + [
+                "\n".join(sut_lines[g.line_start - 1: g.line_end]) for g in layout.functions if g.name in fn.calls])
+            thrown = thrown_types(code)
+            if exception not in thrown and exception.split("::")[-1] not in {t.split("::")[-1] for t in thrown}:
+                notes.append(f"expected_exception {exception!r} left out: {fn.name} throws "
+                             f"{', '.join(thrown) or 'nothing'} [A1-PL4]")
+                exception = ""
+            elif planned.expected_return.strip():
+                notes.append("expected_return left out: a call that throws returns nothing [A1-PL4]")
+                planned.expected_return = ""
+        normative = planned.classification == "confirmed_gap" and bool(strong) and \
+            bool(planned.expected_return.strip() or planned.expected_after or exception) and bool(planned.quotes)  # c)
         if planned.classification == "confirmed_gap" and not normative:
             notes.append("downgraded to characterization: no quoted E1-E7 evidence or no expected value [A1-PL4 c]")
         if normative:
@@ -4649,6 +4707,7 @@ class AnalyzerAgent(ba.AgentCore):
                                                     for s in planned.stubs],
             variables=[uc.NamedValue(name=v.name, value=v.value) for v in planned.variables],
             expected_return=planned.expected_return.strip() if normative else "",
+            expected_exception=exception if normative else "",
             expected_after=[uc.ExpectedCheck(expr=c.expr, value=c.value) for c in planned.expected_after] if normative
             else [], quotes=[uc.Quote(evidence_id=q.evidence_id, text=q.text) for q in planned.quotes],
             evidence=cited if normative else [], strongest_class=min((e.evidence_class for e in strong), default="E8")
@@ -4917,6 +4976,9 @@ class AnalyzerAgent(ba.AgentCore):
             *(["OBJECT MEMBERS (members: the value of a member of the object before the call, private ones too; "
                "elements for a container):\n" + "\n".join(structured["rows"]["members"])]
               if structured and structured["rows"]["members"] else []),
+            *(["EXCEPTIONS the function throws (expected_exception: the one the EVIDENCE states for this case):\n"
+               + "\n".join(structured["rows"]["exceptions"])]
+              if structured and structured["rows"].get("exceptions") else []),
         ]
         # ARCH-17: facts stay whole; evidence, earlier tests and the style give way in that order
         # (reverse) when the call does not fit the brain's window.
@@ -5275,9 +5337,10 @@ class AnalyzerAgent(ba.AgentCore):
             scenario.scenario_id = f"S-brain-{uc.function_stem(fn, layout)}-{req.iteration}-{index}"
             scenario.function_line = fn.line_start                                               # overloads [NC-4]
         if not accepted and all(g.startswith("EVIDENCE:") for g in open_ids):
-            # only a documented-behaviour check was asked: it stays in the plan for Agent2's brain [A1-PL1, A2-21n]
-            plan_notes["planning"].append(f"{fn.name}: the documented behaviour is left to the test writer: no "
-                                          f"scenario of the brain passed the check [A1-PL1]")
+            # only a documented-behaviour check was asked: it stays open and is planned again with the reasons
+            # (a brain whose profile writes whole tests gets it in Agent2) [A1-PL1, A2-21n, BP-2]
+            plan_notes["planning"].append(f"{fn.name}: the documented behaviour is planned again: no scenario of "
+                                          f"the brain passed the check [A1-PL1]")
             return []
         if not accepted:                                     # no rule plan in the brain's place [A1-PL8, ARCH-24]
             why = (" | ".join(d[2:160] for d in dropped[:3]) if dropped else
@@ -5531,7 +5594,7 @@ class AnalyzerAgent(ba.AgentCore):
             repairs.append(uc.RepairItem(item_id=f.failure_id, owner="agent2", target_file=layout.suite_file,
                                          issue=f.classification, diagnostic=f.diagnostic, symbol=f.symbol, line=f.line,
                                          affected_test=f.affected_test, classification=f.classification,
-                                         attempts=tries, action=action))
+                                         attempts=tries, action=action, failure_kind=f.kind))
             if f.classification == "undetermined" and not evidence:
                 repairs[-1].diagnostic += " | no further expected-behaviour evidence found [A1-25j]"
         disputed |= new_disputes

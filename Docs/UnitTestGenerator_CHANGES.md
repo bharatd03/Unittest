@@ -3,6 +3,108 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (4): steps 5, 7 and 8 - a decision instead of a rewrite, short answer fields, dead code removed
+
+### Step 5: a failing asserted test is decided, then a rule acts - no brain rewrites it
+
+Before, a failing test with E1-E7 evidence was classified (the rules, then the brain: source or test?). When the
+test was judged wrong, or Agent4 found no source change (A4-23j), Agent2's brain rewrote it as code. In 17 of 143
+runs the rewrite was the same as the failing test, 73 times ("the rewrite is the same as the failing test"), and the
+file stopped without progress (`ctrl.c`, 20261028-113342).
+
+Now the decision stays, and its follow-up is a rule (`observed_instead`):
+* **test judged wrong** (an assertion failed): the test keeps its inputs. Its assertions become observations, and the
+  observe run and finalize give them the run's values. That is the reference form of the oracle check (A3-85b): the
+  change is accepted only when the test detects every mutant the reference detects, and it is reported as a change
+  of expectation. The values now come from the run, so the test is E8. The requirement item stays open and is
+  planned again;
+* **crash or timeout**: its inputs miss. The test is dropped, and its items are planned again with the reason.
+
+The compile gate (A3-CL15) asks the brain to write a test again only for a brain whose profile writes whole tests.
+For Qwen, the compiler's message goes into the journal and the next plan changes the scenario.
+
+### Step 7: short, closed answer fields (ARCH-20c)
+
+The planning schema now carries the limits its checks enforce anyway:
+* a value has at most 120 characters, an element, field or return value at most 60;
+* at most 12 earlier calls, 16 return values per stub, 64 elements, 32 fields, 8 expected checks and 4 quotes;
+* at most as many arguments as the function has parameters.
+
+A decoder that follows the schema stops a runaway answer ("0uLL, 0uLL, ...") where it starts. The checks stay the
+judge. The schema grows by about 100 tokens.
+
+### Step 8: removed, by the evidence of 143 runs
+
+Counted in every report, log and brain-answer file of the validation runs:
+
+| Repair or check | Fired | Action |
+|---|---|---|
+| "the rewrite is the same as the failing test" (A2-21p) | 73 times in 17 runs | removed with the rewrite (step 5), with `normalized_body` |
+| "a value set twice in a row" (A2-21t, a prediction) | never | removed |
+| the rewrite context, task text and name reservation in Agent2 | dead after step 5 | removed |
+| `parse_suite`'s own brace count | | now the shared lexer |
+| A1's value clean-up `fix_value` | 221 times in 71 runs | kept |
+| A1's checks of a plan (A1-PL4) | 48 times | kept |
+| predictions built in a trial (NC-7) | 97 times in 28 runs | kept |
+| Agent2's free-code repairs: "checks nothing", unstated expected values, namespaces, void values, shared set-up | fired only for Qwen's free-code tests, which no longer exist | kept for the full-profile writer - see the decision below |
+
+**Open decision:** the whole-test writer of Agent2 now serves only full-profile brains (Opus and the others, without
+access in these runs). Removing it removes its repairs too (about 400 lines: `_llm_tests`, `_grounding`, the shared
+set-up of a suite part, the kinds setup, stub, test and suite_part). Then no brain writes code anywhere.
+
+### Checked
+
+* New and changed tests: `test_a_failing_e2_test_judged_wrong_takes_its_values_from_the_run` (the observation, then
+  the reference form after finalize, and a crash dropped); `test_well_formed_bodies_pass_the_body_check`. The A4-23j
+  pipeline test now expects the inputs kept and the value from the run (sensor 18 gives 0). The tests that need
+  Agent2's writer use a full-profile brain (`writer_brain`, which also patches the profiles of `ut_config.json`).
+* 25 test classes around the change (197 tests): all pass except one that also fails without the change in this
+  container. The pipeline tests (which need LangGraph) were not run here.
+
+## 2026-10-28 (3): structured A2 - Qwen3 8B never writes a test as code
+
+Step 3 of the plan from fact-based instead of guess-based (project doc
+`unittest-generator-guess-vs-fact-analysis-2026-10-28.md`).
+
+### Where free code came from
+
+Agent2's brain wrote whole tests as C code in four cases:
+* a requirement item (`EVIDENCE:<function>`) whose structured plan failed its checks: the rule left a placeholder
+  scenario "to the test writer" (A2-21n);
+* a checked structured scenario the generator could not build;
+* a characterization scenario without a rule test (A2-21o);
+* the profile ladder (BP-3): for the minimum profile, every set-up cause climbed straight to the kind `test`.
+
+These produced most of A2's refusals: "checks nothing", invented setters, names only the SUT file sees, and the
+same refusal in every round (`uart_put`, `RingBuffer::push`, `MotorCtrl::sync`, `body_ctrl.c`).
+
+### Change
+
+* **The minimum profile (Qwen3 8B) has no kind `test`.** Its kinds are values, scenario, call_sequence (the
+  structured `calls`), repair, decision and file_edit. The ladder ends at the structured forms; a cause it cannot
+  answer is reported as needing a wider profile (BP-9), not answered with free code.
+* **Agent2 writes a whole test only for a brain whose profile has the kind `test`** (the full profile). For the
+  others, a scenario the generator cannot build is not built. The note "<function>: not built (<reason>) ..." goes into
+  the journal, and Agent1 plans the item again with that reason, within its attempts. For Qwen, every new brain test
+  now comes from a structured scenario, built and checked by the generator.
+* **A stated exception is a structured field** (`expected_exception`, C++). It is offered only when the function or
+  a function it calls throws. The brain picks the type from EXCEPTIONS, a list read from the source's throw
+  expressions, and the generator writes `UT_EXPECT_THROW(call, type)`. A type the function does not throw is left out.
+  With an exception, the expected return value is left out (a call that throws returns nothing).
+* Not changed: the rewrite of a failing asserted test (A2-21p) still asks the brain for code. It becomes a decision
+  in step 5.
+
+### Checked
+
+* New tests:
+  * `test_a_structured_brain_never_writes_a_whole_test`: with the minimum profile, Agent2 is not asked, the rules
+    still work, and the note goes to the journal;
+  * `test_a_stated_exception_is_planned_and_asserted`: `MotorCtrl::step` with a target out of range gives
+    `UT_EXPECT_THROW(ut_obj.step(100001), std::invalid_argument);`.
+* The tests of Agent2's writer now use a brain with the full profile (`writer_brain`), the only one that still gets it.
+* 23 test classes around the change (192 tests): all pass except one that also fails without the change in this
+  container. The full test suite was not run.
+
 ## 2026-10-28 (2): one fact instead of several checks - well-formed C and class templates
 
 ### What happened

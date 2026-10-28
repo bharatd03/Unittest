@@ -20,7 +20,7 @@
     "_comment": "BP-1, BP-2, BP-6, BP-8: what each brain may write. Answer kinds: values, scenario, call_sequence, setup, stub, test, suite_part, repair, decision, file_edit (a free edit of generated files after the offered repairs failed, BP-11; without it a brain only chooses among the repairs the rules offer). A brain without an entry gets minimum.",
     "brains": {"opus": "full", "fable": "full", "sonnet": "full", "haiku": "full", "qwen_remote": "minimum", "qwen": "minimum"},
     "definitions": {
-      "minimum": {"kinds": ["values", "scenario", "test", "repair", "decision", "file_edit"], "journal_tokens": 1500,
+      "minimum": {"kinds": ["values", "scenario", "call_sequence", "repair", "decision", "file_edit"], "journal_tokens": 1500,
                   "long_function_lines": 150, "window_tokens": 16384, "scenarios_per_call": 4},
       "full": {"kinds": ["values", "scenario", "call_sequence", "setup", "stub", "test", "suite_part", "repair", "decision", "file_edit"],
                "journal_tokens": 8000, "long_function_lines": 0, "window_tokens": 1000000, "scenarios_per_call": 4}

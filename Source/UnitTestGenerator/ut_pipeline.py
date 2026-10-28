@@ -2186,9 +2186,12 @@ class Orchestrator:
             return bundle
         sources = uc.test_sources(uc.suite_of(bundle))
         ids = {n: set(SCENARIO_ID.findall(sources.get(n, ""))) for n in failing}
+        # only a brain that writes whole tests rewrites one (BP-2); for the others the message goes to the journal
+        # and the next plan changes the scenario [structured]
+        writes = "test" in (getattr(s, "kinds_available", None) or uc.MINIMUM_KINDS)
         redo = [sc for sc in plan.scenarios if not sc.inputs and any(sc.scenario_id in i for i in ids.values())
                 and (sc.made_by.startswith("brain:") or not sc.checked)] \
-            if not plan.rules_only and getattr(cfg, "gate_rewrites", 1) > 0 else []
+            if not plan.rules_only and writes and getattr(cfg, "gate_rewrites", 1) > 0 else []
         note = (f"{len(failing)} new test(s) did not compile in the gate [A3-CL15]: "
                 + "; ".join(d[:160] for d in list(failing.values())[:4]))[:1200]
         base = uc.without_tests(bundle, sorted(failing), note)
@@ -2386,15 +2389,15 @@ class Orchestrator:
     @staticmethod
     def _back_to_the_test(s: "RunState", failure: uc.Failure) -> None:
         """A4-23j: Agent4 found no source change for this failure, so the source is not shown to be wrong. The
-        failure goes back to Agent1 as undetermined: the test is rewritten (A2-21p) and, after its attempts, dropped
-        (A1-36); the report keeps the open item for the developer."""
-        note = "Agent4 found no source change that passes its checks: rewrite the test [A4-23j]"
+        failure goes back to Agent1 as undetermined: the test keeps its inputs and observes its results (A2-21p); the
+        report keeps the open item and the change of expectation for the developer."""
+        note = "Agent4 found no source change that passes its checks: the test observes its results [A4-23j]"
         failure.classification, failure.route = "undetermined", "agent1"
         if note not in failure.diagnostic:
             failure.diagnostic = f"{failure.diagnostic} | {note}"[:600]
         s.open_items.add(f"{failure.affected_test or failure.failure_id}: failed against its evidence "
-                         f"({failure.diagnostic.split(' | ')[0][:200]}); Agent4 found no source change, so the test is "
-                         "rewritten - review whether the source or the test is wrong [A4-23j]")
+                         f"({failure.diagnostic.split(' | ')[0][:200]}); Agent4 found no source change, so the test "
+                         "observes its results - review whether the source or the test is wrong [A4-23j]")
 
     async def _correct_source(self, s: "RunState", failure: uc.Failure, result: uc.VerificationResult,
                               last_good: uc.VerificationResult | None) -> uc.VerificationResult | None:
@@ -2802,7 +2805,7 @@ class Journal:
             failed_build = [(n, quarantined[n][0]) for n in tests if n in quarantined]
             if not tests:
                 why = next((n for n in notes if n.startswith((sc.function + ":", sc.function.split("::")[-1] + ":"))
-                            and ("dropped" in n or "no LLM tests" in n or "cannot be named" in n)), "")
+                            and ("dropped" in n or "no LLM tests" in n or "cannot be named" in n or "not built" in n)), "")
                 cause = "test_setup" if SETUP_MESSAGE.search(why) or "cannot be named" in why else "undetermined"
                 if not why and sc.test_name and sc.test_name in sources:
                     why = f"the scenario repeats the existing test {sc.test_name}: nothing new was written"
