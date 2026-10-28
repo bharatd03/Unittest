@@ -634,6 +634,8 @@ def register_polls(fn: uc.FunctionInfo, body: str, layout: uc.LayoutProfile | No
                 continue
             if not ("->" in reg or "()" in reg or re.fullmatch(r"[A-Z][A-Z0-9_]*", first)):
                 continue
+            if re.fullmatch(r"[A-Za-z_][\w:]*\(.*\)", reg):   # the value a call returns (__get_PRIMASK()): none to set
+                continue
             if (reg, mask) not in out:
                 out.append((reg, mask))
     return out
@@ -2550,7 +2552,8 @@ class GeneratorAgent(ba.AgentCore):
                             needs_kind.update({g: missing for g in sc.gap_ids})   # not even a whole test [BP-9]
                     body = assemble_scenario(sc, plan, name, block)
                     problem = self._body_problem(body, allowed | setup_names(sc.setup) | setup_names(
-                        block[0] if block else [])) if body is not None else "?"
+                        block[0] if block else []) | ({"ut_obj"} if fn is not None and fn.member else set())) \
+                        if body is not None else "?"         # ut_obj(30): the object built with its values
                     predicted = bool(problem) and body is not None and uc.check_kind(problem) == "prediction"
                     if body is not None and (not problem or predicted):
                         evidence = sc.strongest_class if not sc.characterization else "E8"

@@ -3,6 +3,53 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (13): the run of 22:38 - what is left, and four more defects of ours
+
+### What the run showed (commit after (12))
+
+Coverage: 22 of 23 files at 100 %. `ctrl.c` MC/DC rose from 57.14 % to 71.43 %: its coverage search builds again
+(200,000 inputs, one reached new items).
+
+Refusals: 5 of 33 planning scenarios (15 %; the runs before: 35 %, 49 %, 53 %).
+
+| Kind | Refused | Causes |
+|---|---|---|
+| coverage | 1 of 13 (7.7 %) | 1 repeat (`ctrl.c`) |
+| requirement check | 4 of 20 | 2 runaway numbers (the model), 2 structures given without fields (`klist.c`) |
+
+Rejections, now by kind:
+* **Coverage: 8 of 11 not kept, all "redundant".** Another test of the same round (the search, the rules) reached
+  the same items. That is no fault of the answer.
+* **Requirement checks: 9 of 15 not kept.**
+  * 4 asserted nothing (the answer gave no expected value) - the model's;
+  * 2 recorded only what the code does;
+  * 1 did not compile (`violations_ == 0`);
+  * 1 not in the best round;
+  * 1 trial with an `ut_obj(...)` refused wrongly (below).
+
+The trials found three false refusals by the "unknown name" prediction. The tool accepted those tests.
+
+### Change
+
+* **`ut_obj(5, 1000)` is the object built with its constructor values, not a call.** A2's name check read it as a
+  call of an unknown function `ut_obj` and sent the test to a trial: 3 false refusals in the run. The corpus check
+  now also fails when a correct answer's test is refused by a prediction (it failed on `cpp_ctor_throws`, 3 tests).
+* **A member in an after-call expression** (`violations_ == 0`, not only a bare `violations_`) is read through the
+  accessor. Every identifier that names a member of the object is replaced, `ut_obj.` and `this->` included.
+  Corpus case `cpp_member_after_check` has the expression form too.
+* **A register bit read through a call is no register** (`(__get_PRIMASK() & 1u)`, `critical.c`). The rule tests
+  wrote `__get_PRIMASK() |= 1u;`, which does not compile (2 tests). A call's value is not set; the replaced assembly
+  (`ut_asm_value`, A3-HW3) sets it.
+* **The rejection rate counts faults.** A test another test of the round made redundant, or one a later round kept,
+  is listed as "also not kept, no fault", outside the rate.
+
+### Checked
+
+* `corpus`: 40 cases (`cpp_member_after_check` with the expression form) and the value forms, with no correct
+  answer sent to a trial.
+* The rule tests of `critical.c` all compile.
+* The component tests here: 317 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-28 (12): the requirement-check round measured and asked once; three defects of the generator
 
 ### The run of 21:49 (commit 4c4f026), with the rejections by their real cause

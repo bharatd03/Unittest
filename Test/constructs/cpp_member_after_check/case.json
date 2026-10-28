@@ -45,6 +45,44 @@
         "contains": [
           "ut_member("
         ]
+      },
+      {
+        "function": "Tally::bump",
+        "answer": {
+          "args": [],
+          "expected_return": "0",
+          "expected_after": [
+            {
+              "expr": "count_ == 1",
+              "value": "1"
+            }
+          ],
+          "classification": "confirmed_gap",
+          "evidence_ids": [
+            "EV-bump-1"
+          ],
+          "quotes": [
+            {
+              "evidence_id": "EV-bump-1",
+              "text": "adds one to the count"
+            }
+          ]
+        },
+        "evidence": [
+          {
+            "evidence_id": "EV-bump-1",
+            "evidence_class": "E2",
+            "source": "include/tally.hpp",
+            "line": 5,
+            "text": "adds one to the count; @return the count before"
+          }
+        ],
+        "reaches": [
+          "++count_;"
+        ],
+        "contains": [
+          "ut_member("
+        ]
       }
     ]
   }

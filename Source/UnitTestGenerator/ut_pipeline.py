@@ -2356,10 +2356,15 @@ class Orchestrator:
                 if purpose == "requirement check" and why.startswith("redundant"):
                     why = "no requirement check: recorded what the code does, adds no coverage"
                 by[why] = by.get(why, 0) + 1
-            rate = 100.0 * len(lost) / len(written)
-            top = ", ".join(f"{c} {n}" for c, n in sorted(by.items(), key=lambda x: -x[1]))
-            rows.append(f"brain tests rejection rate ({purpose}): {rate:.1f} % ({len(lost)} of {len(written)} tests "
-                        f"written from the brain's answers not kept" + (f"; {top}" if top else "") + f"){mark(rate)}")
+            # not a fault of the answer: another test of the round reached the same items, or a later round kept it
+            fine = {c: n for c, n in by.items() if c.startswith(("redundant", "kept in the last round"))}
+            faults = {c: n for c, n in by.items() if c not in fine}
+            rate = 100.0 * sum(faults.values()) / len(written)
+            top = ", ".join(f"{c} {n}" for c, n in sorted(faults.items(), key=lambda x: -x[1]))
+            also = ", ".join(f"{c} {n}" for c, n in sorted(fine.items(), key=lambda x: -x[1]))
+            rows.append(f"brain tests rejection rate ({purpose}): {rate:.1f} % ({sum(faults.values())} of {len(written)} "
+                        f"tests written from the brain's answers not kept for a fault" + (f"; {top}" if top else "")
+                        + (f"; also not kept, no fault: {also}" if also else "") + f"){mark(rate)}")
         return rows
 
     @staticmethod

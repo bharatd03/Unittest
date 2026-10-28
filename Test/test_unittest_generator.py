@@ -4966,6 +4966,9 @@ def check_corpus_case(name: str, folder: Path, spec: dict, d: str) -> list[str]:
         bundle = run(gen.generate_bundle(uc.GenerationRequest(plan=uc.UTPlan(
             plan_id="corpus", layout=layout, stage="coverage", scenarios=scenarios, stubs=stubs))))
     sources = uc.test_sources(uc.suite_of(bundle))
+    for test, why in bundle.trial.items():                # a correct answer is never refused, not even by a prediction
+        if test in wanted:
+            problems.append(f"{name}: {test}: refused by a prediction (sent to a trial): {why[:200]}")
     for test, (_, contains) in wanted.items():
         if test not in sources:
             problems.append(f"{name}: {test}: not built - {'; '.join(n for n in bundle.notes if 'not built' in n)[:300]}")
@@ -6014,6 +6017,12 @@ class LargeFileRoundTests(unittest.TestCase):
         self.assertTrue(any(r.startswith("brain tests rejection rate (coverage): 0.0 %") for r in rates), rates)
         self.assertTrue(any("(requirement check): 100.0 %" in r and "no requirement check: recorded what the code does"
                             in r for r in rates), rates)
+        s.lost["test_b"] = "redundant: no new coverage"
+        s.checks = set()                                  # a coverage test that another test made redundant: no fault
+        rates = up.Orchestrator._brain_rates(types.SimpleNamespace(cfg=types.SimpleNamespace(rate_target=5.0)), out, s,
+                                             None)
+        self.assertTrue(any(r.startswith("brain tests rejection rate (coverage): 0.0 % (0 of 2") and
+                            "also not kept, no fault: redundant: no new coverage 1" in r for r in rates), rates)
 
     def test_a_rule_test_that_crashed_is_left_out(self):                                    # A2-21f
         suite = ("/* evidence: E8 */\nUT_TEST(test_f_auto_1)\n{\n    UT_OBSERVE_INT(\"o1\", f(1));\n}\n"

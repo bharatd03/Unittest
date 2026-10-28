@@ -4802,11 +4802,15 @@ class AnalyzerAgent(ba.AgentCore):
                 name = new.strip()
                 if alias.get(name) and not re.search(r"\b" + re.escape(name) + r"\b", visible):
                     new = f"ut_state_get_{alias[name]}()"
-                member = re.fullmatch(r"\s*(?:ut_obj\s*\.\s*|this\s*->\s*)?([A-Za-z_]\w*)\s*", new)
-                if member and member.group(1) in members:       # a member of the object, private ones too: read
-                    info = members[member.group(1)]             # through the generated accessor (structured)
+                def accessor(m: "re.Match[str]") -> str:          # a member of the object, private ones too,
+                    info = members.get(m.group(1))                   # read through the generated accessor
+                    if info is None:
+                        return m.group(0)
                     tag = f"{uc.member_tag(info)}{{}}"
-                    new = f"(*ut_member({tag}))" if info.static else f"(ut_obj.*ut_member({tag}))"
+                    return f"(*ut_member({tag}))" if info.static else f"(ut_obj.*ut_member({tag}))"
+                if members:                       # count_, violations_ == 0, ut_obj.count_, this->count_
+                    new = re.sub(r"(?:\but_obj\s*\.\s*|\bthis\s*->\s*|(?<![\w.>:]))([A-Za-z_]\w*)\b(?!\s*\()",
+                                 accessor, new)
                 if new != c.expr:
                     fixes.append(f"expected_after: {c.expr[:60]!r} -> {new[:60]!r}")
                     c.expr = new
