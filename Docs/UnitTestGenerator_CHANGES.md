@@ -3,6 +3,58 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (11): rejections by their real cause; each parameter offered only the slot its type takes
+
+### The run of 21:05 (commit c5340e8)
+
+Coverage: 22 of 23 files at 100 %; `ctrl.c` MC/DC from 28.57 % to 57.14 % (now planned by the brain).
+Refusals: 28 of 57 planning scenarios.
+
+| Cause | Refusals | Whose |
+|---|---|---|
+| A runaway number or expression (cut at 32 characters) | 9 | the model |
+| The same scenario as an earlier round | 11 | the model; asked again on files at 100 % |
+| A constructor value written as a JSON object of the members (`{"capacity_": 1, ...}`) | 4 | ours: any text up to 120 characters was allowed there |
+| A structure parameter given elements, or a parameter left out | 4 | ours: every parameter was offered value, elements and fields, and the count was not required |
+
+Rejections: 19 of 25 brain tests not kept. 9 of them were filed as "failing, redundant or replaced" (the default
+for every test without a recorded cause) and 8 as "crashed or not observed" (everything finalize left out). So the
+rate could not tell the brain's mistakes from tests that are not mistakes, such as a test that adds nothing on a
+file already at 100 %.
+
+### Change
+
+* **Rejections by their real cause.** `FileActionBundle.dropped` (test -> why): `without_tests(..., why=)`, finalize,
+  the generator and the trial record it, and the run's rate reads it. The causes:
+  * crashed, timeout;
+  * not observed (no observation was reached);
+  * redundant (no new coverage);
+  * did not run (the observe build failed);
+  * failing (the run disagreed with its expected values);
+  * refused in its trial;
+  * did not compile (gate, build);
+  * kept in the last round but not in the best round's suite reported.
+
+  What has no recorded cause is "left out, cause not recorded", no longer hidden under a guess.
+* **Each parameter only the slot its type takes.**
+  * a scalar or a reference to one: a value;
+  * a buffer or pointer: elements;
+  * a structure: fields;
+  * an interface: nothing.
+
+  `args` requires every parameter (`minItems` = `maxItems` = the count). BaseAgent keeps `minItems` and removes it
+  only for Claude, which takes 0 or 1.
+* **The functions a scenario may call get typed argument lists.** Each has its count; the values are typed like
+  arguments (32 characters, enumerators). The object's constructor takes 0 to n values (a value not given is `{}`).
+
+### Checked
+
+* The run's 57 recorded answers, replayed: 38 accepted, 19 refused; 7 of the 19 can no longer be written as they were:
+  * the 4 JSON objects as constructor values (over 32 characters);
+  * the 3 left-out parameters.
+* Left: the runaway numbers (9, the model's) and one structure given as `NULL` where it is not checked.
+* `corpus`: every case and value form within the new schema, minItems included.
+
 ## 2026-10-28 (10): the pilot-small run of 20:31 - a request that could not be sent, constructor values, re-asks
 
 ### What the run showed (commit c39dfab)

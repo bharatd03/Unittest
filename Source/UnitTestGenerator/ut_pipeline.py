@@ -1827,7 +1827,9 @@ class Orchestrator:
             if hasattr(s, "trials"):
                 s.trials.append(f"{name}: refusal stands - {why}"[:300])
         out = uc.without_tests(bundle, list(decided), f"{len(decided)} test(s) refused by predictions did not pass "
-                               f"their trial; {len(accepted)} did [NC-7]" if decided or accepted else "")
+                               f"their trial; {len(accepted)} did [NC-7]" if decided or accepted else "",
+                               why="refused in its trial")
+        self._note_dropped(s, out)
         out.trial = {}
         return out
 
@@ -2132,6 +2134,7 @@ class Orchestrator:
         self.check_bundle(bundle)
         if isinstance(getattr(s, "written", None), set):                                       # ORC-12b
             s.written |= {n for n in bundle.new_tests if n in bundle.made}
+        self._note_dropped(s, bundle)
         bundle = await self._compile_gate(s, plan, bundle, journal or {}, guidance)            # A3-CL15
         if bundle.trial:                                                                   # NC-7
             bundle = await self._trial(s, bundle)
@@ -2153,9 +2156,10 @@ class Orchestrator:
                     bundle=bundle, observed=obs.observed, test_items=known, crashed=crashed, ran=ran,
                     build_message="" if obs.link_ok else obs.reason[:400]), uc.FileActionBundle)
                 self.check_bundle(bundle)
+                self._note_dropped(s, bundle)
                 if isinstance(getattr(s, "lost", None), dict):                                 # ORC-12b
                     for name in before - set(bundle.tests):
-                        s.lost.setdefault(name, "crashed or not observed" if obs.link_ok
+                        s.lost.setdefault(name, "left out after the observe run" if obs.link_ok
                                           else "the observe build failed")
         return await self._oracle_checks(s, bundle)
 
@@ -2325,14 +2329,23 @@ class Orchestrator:
         if written:
             lost = written - kept
             by: dict[str, int] = {}
+            last = set(s.bundle.tests) if s.bundle else set()
             for n in lost:
-                why = s.lost.get(n, "failing, redundant or replaced")
+                why = s.lost.get(n) or ("kept in the last round, not in the best round's suite reported" if n in last
+                                        else "left out, cause not recorded")
                 by[why] = by.get(why, 0) + 1
             rate = 100.0 * len(lost) / len(written)
             top = ", ".join(f"{c} {n}" for c, n in sorted(by.items(), key=lambda x: -x[1]))
             rows.append(f"brain tests rejection rate: {rate:.1f} % ({len(lost)} of {len(written)} tests written from the "
                         f"brain's answers not kept" + (f"; {top}" if top else "") + f"){mark(rate)}")
         return rows
+
+    @staticmethod
+    def _note_dropped(s: Any, bundle: uc.FileActionBundle) -> None:
+        """ORC-12b: why each test the bundle left out was left out - for the rejection rate by cause."""
+        if isinstance(getattr(s, "lost", None), dict):
+            for name, why in bundle.dropped.items():
+                s.lost.setdefault(name, why)
 
     async def _drop_quarantined(self, s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult,
                                 iteration: int = 0) -> uc.FileActionBundle:

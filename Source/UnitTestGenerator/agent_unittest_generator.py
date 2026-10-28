@@ -2616,6 +2616,11 @@ class GeneratorAgent(ba.AgentCore):
             elif name in rewrite and replacement is None:
                 pass                                         # dropped with its reason above [A2-21p]
         tests = kept + new_tests
+        final = {n for n, _, _ in tests}
+        kinds = {r.affected_test: r.failure_kind for r in plan.repairs if r.affected_test}
+        dropped = {n: {"crash": "crashed", "timeout": "timeout"}.get(kinds.get(n, ""), "failing: the run disagreed "
+                                                                                  "with its expected values")
+                   for n in drop if n in existing and n not in final}
         suite = assemble_suite(plan, tests, stub_header, [shared[k] for k in sorted(shared)])
         actions.append(uc.FileAction(path=layout.suite_file, action="replace" if existing_text else "create",
                                      role="testsuite", content=suite,
@@ -2629,7 +2634,7 @@ class GeneratorAgent(ba.AgentCore):
                                      trial={n: w for n, w in trial.items() if n in {x for x, _, _ in tests}},
                                      trial_targets={n: g for n, g in trial_targets.items() if n in trial},
                                      made={n: m for n, m in made.items() if n in {x for x, _, _ in tests}},
-                                     recipes=recipes, needs_kind=needs_kind)
+                                     recipes=recipes, needs_kind=needs_kind, dropped=dropped)
         bundle.validation = self.validate(bundle, plan)
         return bundle
 
@@ -3257,7 +3262,7 @@ def drop_tests(bundle: uc.FileActionBundle, names: list[str]) -> uc.FileActionBu
     if not names:
         return bundle
     return uc.without_tests(bundle, names, f"{len(names)} redundant characterization test(s) removed: "
-                                           "they added no coverage")
+                                           "they added no coverage", why="redundant: no new coverage")
 
 
 def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
@@ -3337,8 +3342,11 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
         out = uc.without_tests(out, sorted(not_run), f"{len(not_run)} characterization test(s) left out: they did not "
                                "run because the observe build failed (test_did_not_compile, not a crash; their items "
                                "are planned again)" + (f": {build_message[:300]}" if build_message else "")
-                               + " [A2-21f]")
+                               + " [A2-21f]", why="did not run: the observe build failed")
     if unreached:
+        out.dropped.update({n: ("timeout" if "timeout" in (crashed or {}).get(n, "") else "crashed")
+                            if n in (crashed or {}) else "not observed: no observation was reached" for n in unreached
+                            if n in set(out.tests)})
         calls = [m.group(1).strip() for n in sorted(unreached)
                  for m in [re.search(r"\(void\)\((.*)\);\s*/\* not observed", sources[n]) or
                            re.search(r"UT_EXPECT_\w+\(\s*\(?((?:[\w:]+)\s*\(.*?\))", sources[n])] if m]

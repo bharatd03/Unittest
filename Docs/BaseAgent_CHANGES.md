@@ -1,5 +1,11 @@
 # BaseAgent changes
 
+## 2026-10-28 (late evening): minItems in answer schemas
+
+`llm_schema` keeps `minItems` (the unit-test generator requires every parameter of a function in an answer). For a
+server that refuses bounds, `strip_bounds` removes it with the others. The Claude models take `minItems` of 0 or 1
+only, so their request drops larger values (`without_min_items`); the agent's check still enforces the count.
+
 ## 2026-10-28 (evening): a request with a nested answer schema is sent, and a non-size failure is not reported as size
 
 In the pilot-small run of 20:31, every planning call for a function with two or more parameters failed with

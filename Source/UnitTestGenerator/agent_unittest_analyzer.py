@@ -2452,7 +2452,8 @@ def _listed(values: Any) -> Any:
 def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, variables: Any,
                   target_ids: Any = None, per_scenario: int = 3, state: Any = (), fields: Any = (),
                   callables: Any = (), outputs: Any = (), registers: Any = (), members: Any = (),
-                  exceptions: Any = (), member_kinds: dict[str, uc.ParamInfo] | None = None) -> type[BaseModel]:
+                  exceptions: Any = (), member_kinds: dict[str, uc.ParamInfo] | None = None,
+                  call_params: dict[str, list[uc.ParamInfo]] | None = None) -> type[BaseModel]:
     """ARCH-20a, A1-PL3: the answer of one planning call with the lists of this function - its targets (A1-PL3a; its
     open items when it has none), its evidence, its parameters, the stubs whose return value a test can set and the
     stub variables. With targets the brain never writes the items out (ARCH-20d)."""
@@ -2462,24 +2463,52 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
     names = [p.name if isinstance(p, uc.ParamInfo) else p for p in params]
 
     def arg_of(k: int, p: uc.ParamInfo | None) -> type[BaseModel]:
-        """One parameter's entry: its name and a value of its type; None: any parameter name, any value."""
-        typed_value = p is not None
+        """One parameter's entry: its name, and only the slot its type takes (a fact) - a value for a scalar, elements
+        for a buffer or pointer, fields for a structure; None: any parameter name, every slot."""
+        if p is None:
+            return create_model("PlannedArg", __base__=PlannedArgValue,
+                                name=(_listed(names), Field(description="a parameter name from PARAMETERS")),
+                                fields=(list[field], Field(default_factory=list, json_schema_extra=_most(32),
+                                                           description="a structure parameter: its fields")))
+        record = p.kind in ("struct", "ptr_struct") or (p.by_ref and bool(p.fields))
+        listed = p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring") and not p.by_ref
+        hidden = SkipJsonSchema
         return create_model(
-            f"PlannedArg{k}" if typed_value else "PlannedArg", __base__=PlannedArgValue,
-            name=(_listed([p.name] if typed_value else names), Field(description="a parameter name from PARAMETERS")),
-            value=(Annotated[str, Field(json_schema_extra=value_schema(p) if typed_value else VALUE)],
-                   Field(default="", description="its value" + ("" if not typed_value or p.kind not in (
-                       "struct", "ptr_struct", "buffer", "ptr_scalar", "ptr_void", "interface") or p.by_ref else
-                       ": empty - give its fields or elements"))),
-            fields=(list[field], Field(default_factory=list, description="a structure parameter: its fields",
-                                       json_schema_extra=_most(32))))
+            f"PlannedArg{k}", __base__=PlannedArgValue,
+            name=(_listed([p.name]), Field(description="a parameter name from PARAMETERS")),
+            value=(Annotated[str, Field(json_schema_extra=value_schema(p))],
+                   Field(default="", description="its value" + (": empty - give its fields or elements"
+                                                                 if record or (listed and p.kind != "cstring") else ""))),
+            elements=((list[Annotated[str, Field(json_schema_extra=ITEM)]], Field(
+                default_factory=list, json_schema_extra=_most(64),
+                description="the values it points to, in order (the test declares the buffer)"))
+                if listed else (hidden[list[str]], Field(default_factory=list))),
+            fields=((list[field], Field(default_factory=list, description="its fields", json_schema_extra=_most(32)))
+                    if record else (hidden[list[PlannedField]], Field(default_factory=list))))
     typed_params = [p for p in params if isinstance(p, uc.ParamInfo)]
     arg_models = [arg_of(k, p) for k, p in enumerate(typed_params)] or [arg_of(0, None)]
     arg = arg_models[0] if len(arg_models) == 1 else Union[tuple(arg_models)]
+    call_params = call_params or {}
+
+    def call_of(k: int, name: str) -> type[BaseModel]:
+        """One function a scenario may call before: its argument values, as many as it has, typed like arguments."""
+        ps = call_params[name]
+        made = "::" in name and name.split("::")[-1] == name.split("::")[-2]   # a constructor: a value not given is {}
+        kinds = {json.dumps(value_schema(q), sort_keys=True) for q in ps}
+        item = value_schema(ps[0]) if len(kinds) == 1 else dict(SCALAR_VALUE) if all(
+            q.kind in ("int", "enum", "bool", "float") or (q.kind == "ptr_scalar" and q.by_ref) for q in ps) else VALUE
+        return create_model(f"PlannedCall{k}", __base__=PlannedCall,
+                            function=(_listed([name]), Field(description="a function from CALLABLE FUNCTIONS")),
+                            args=(list[Annotated[str, Field(json_schema_extra=item)]], Field(
+                                default_factory=list, description="its argument values in order",
+                                json_schema_extra={"minItems": 0 if made else len(ps), "maxItems": len(ps)})))
+    call_ms = [call_of(k, c) for k, c in enumerate(sorted(callables)) if c in call_params]
     state_m = create_model("PlannedStateChoice", __base__=PlannedState,
                            variable=(_listed(state), Field(description="a variable from SUT STATE")))
-    call_m = create_model("PlannedCallChoice", __base__=PlannedCall,
-                          function=(_listed(callables), Field(description="a function from CALLABLE FUNCTIONS")))
+    call_m = call_ms[0] if len(call_ms) == 1 else Union[tuple(call_ms)] if call_ms and len(call_ms) == len(
+        set(callables)) else create_model("PlannedCallChoice", __base__=PlannedCall,
+                                          function=(_listed(callables), Field(description="a function from CALLABLE "
+                                                                                          "FUNCTIONS")))
     write_m = create_model("PlannedWriteChoice", __base__=PlannedWrite,
                            stub=(_listed({o.split(".")[0] for o in outputs}), Field(description="a stub of STUB OUTPUTS")),
                            param=(_listed({o.split(".", 1)[1] for o in outputs if "." in o}),
@@ -2531,8 +2560,8 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                       gap_ids=(list[_listed(open_ids)], Field(description="ids from OPEN GAPS that this scenario closes")))
     scenario = create_model(
         "PlannedScenarioChoice", __base__=PlannedScenario, **listed, **structured,
-        args=(list[arg], Field(description="one entry per parameter, by parameter name",
-                               json_schema_extra=_most(len(names)))),                # a fact: its parameters
+        args=(list[arg], Field(description="one entry per parameter, by parameter name",   # a fact: its parameters
+                               json_schema_extra={"minItems": len(names), "maxItems": len(names)})),
         stubs=(list[stub], Field(json_schema_extra=_most(max(1, len(list(stubs)))))),
         variables=(list[var], Field(description="stub variables to set before the call",
                                     json_schema_extra=_most(max(1, len(list(variables)))))),
@@ -4217,7 +4246,7 @@ class AnalyzerAgent(ba.AgentCore):
                              settable, variables, targets, per_scenario, lists.get("state", []),
                              lists.get("fields", []), lists.get("callables", []), lists.get("outputs", []),
                              lists.get("registers", []), lists.get("members", []), lists.get("exceptions", []),
-                             lists.get("member_kinds"))
+                             lists.get("member_kinds"), lists.get("call_params"))
 
     # ---------------------------------------------------------------- structured scenario: the brain says what
     def _structured_lists(self, fn: uc.FunctionInfo, layout: uc.LayoutProfile, stubs: list[uc.StubSpec],
@@ -4260,7 +4289,7 @@ class AnalyzerAgent(ba.AgentCore):
                     fields |= {f"{path}[{i}]" for i in range(min(f.array_len or 0, 16))}
                 if f.fields and path.count(".") < 2:                    # a nested structure or union
                     todo += [(g, f"{path}.{g.name}") for g in f.fields[:12]]
-        callables, call_rows = [], []
+        callables, call_rows, call_params = [], [], {}
         cls = uc.class_of(fn)
         for g in layout.functions:
             if g.line_start == 0 or g.qualified_name.split("::")[-1].startswith("~"):
@@ -4275,10 +4304,12 @@ class AnalyzerAgent(ba.AgentCore):
                               "\n".join(lines[g.line_start - 1: g.line_end])) for s in state_names)):
                 callables.append(name)                             # calls build up state: only with state
                 call_rows.append(f"- {name}({', '.join(p.type for p in text_params(g))})")
+                call_params[name] = list(uc.instantiated(g, layout).params)
         made = uc.constructor_of(cls, layout) if fn.member and uc.object_recipe(fn, layout) else None
         if made is not None and any(p.kind in ("int", "enum", "bool", "float") for p in made.params):
             name = made.qualified_name.replace("(anonymous namespace)::", "")   # the object's values [A2-21ae]
             callables.append(name)
+            call_params[name] = list(made.params)
             call_rows.append(f"- {name}({', '.join(p.type for p in made.params)}) - the constructor of the object: "
                              "name it first to build the object with these values (else each value is {})")
         outputs, output_rows = [], []
@@ -4316,7 +4347,7 @@ class AnalyzerAgent(ba.AgentCore):
                         else target_param(m.name, m.type, layout)
         return {"state": state_names, "fields": sorted(fields), "callables": callables[:40],
                 "outputs": outputs, "registers": registers, "members": members, "exceptions": exceptions,
-                "member_kinds": member_kinds,
+                "member_kinds": member_kinds, "call_params": call_params,
                 "rows": {"state": state_rows, "callables": call_rows[:40], "outputs": output_rows,
                          "registers": reg_rows, "members": member_rows,
                          "exceptions": [f"- {e}" for e in exceptions]}}

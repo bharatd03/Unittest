@@ -626,6 +626,13 @@ int limit(int request, int top)
         for listed in ('["EVIDENCE:brake_step", "LC:brake_step:9"]', '"enum": ["in"]', '"enum": ["state"]',
                        '["ticks"]', '["EV-brake_step-1"]'):          # one entry per parameter, typed by its type
             self.assertIn(listed, schema)                         # log_event returns nothing: not a choice
+        args = ba.llm_schema(model.model_json_schema())["properties"]["scenarios"]["items"]["properties"]["args"]
+        slots = {b["properties"]["name"]["enum"][0]: set(b["properties"]) for b in args["items"]["anyOf"]}
+        kinds = {p.name: p.kind for p in a1.text_params(self.fn["brake_step"])}
+        for name, keys in slots.items():          # only the slot its type takes (a fact), every parameter required
+            self.assertEqual("fields" in keys, kinds[name] in ("struct", "ptr_struct"), (name, kinds[name], keys))
+            self.assertNotIn("elements", keys) if kinds[name] in ("struct", "ptr_struct", "int", "enum") else None
+        self.assertEqual((args["minItems"], args["maxItems"]), (2, 2))
         parsed = model.model_validate({"scenarios": [self.planned(gap_ids=["XX"]).model_dump()]})
         self.assertEqual(parsed.scenarios[0].gap_ids, ["XX"])      # still parsed: the check is the judge [ARCH-20]
 
@@ -4884,6 +4891,8 @@ def schema_problems(node: Any, value: Any, where: str = "") -> list[str]:
     if isinstance(value, list):
         out = [f"{where}: {len(value)} items, at most {node['maxItems']}"] \
             if isinstance(node.get("maxItems"), int) and len(value) > node["maxItems"] else []
+        out += [f"{where}: {len(value)} items, at least {node['minItems']}"] \
+            if isinstance(node.get("minItems"), int) and len(value) < node["minItems"] else []
         return out + [x for k, v in enumerate(value) for x in schema_problems(node.get("items"), v, f"{where}[{k}]")]
     if isinstance(value, dict):
         props = node.get("properties") or {}
@@ -5978,6 +5987,10 @@ class LargeFileRoundTests(unittest.TestCase):
         out = a2.finalize_bundle(bundle, {"o1": "3", "o2": "4"}, {}, {"test_f_auto_2": "crashed: access violation"})
         self.assertEqual(out.tests, ["test_f_auto_1"])                    # observed, but it crashed: left out
         self.assertEqual(out.crashed_calls, ["f(2)"])
+        self.assertEqual(out.dropped, {"test_f_auto_2": "crashed"})       # the cause, for the rejection rate [ORC-12b]
+        redundant = a2.finalize_bundle(bundle, {"o1": "3", "o2": "4"}, {"test_f_auto_1": ["LC:1"],
+                                                                        "test_f_auto_2": ["LC:1"]})
+        self.assertIn("redundant: no new coverage", redundant.dropped.values())
 
     def test_a_pointer_to_a_scalar_points_to_an_array(self):                                # A2-21h
         fn = uc.FunctionInfo(name="set_bits", qualified_name="set_bits", signature="", file="a.c", line_start=1,

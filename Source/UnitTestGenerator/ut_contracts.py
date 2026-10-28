@@ -1404,6 +1404,7 @@ class FileActionBundle(Contract):
     made: dict[str, str] = Field(default_factory=dict)        # test -> "brain/model kind" that wrote it [BP-7]
     recipes: dict[str, str] = Field(default_factory=dict)     # test -> building block (Recipe JSON) to store [NC-2]
     needs_kind: dict[str, str] = Field(default_factory=dict)  # item -> answer kind no available brain may give [BP-9]
+    dropped: dict[str, str] = Field(default_factory=dict)     # test -> why it was left out (the rejection rate) [ORC-12b]
 
 
 EXAMPLE_KINDS = ("test_example", "plan_example")                  # KB-23
@@ -1925,12 +1926,15 @@ def remove_tests(suite: str, names: list[str] | set[str]) -> str:
     return suite
 
 
-def without_tests(bundle: "FileActionBundle", names: list[str] | set[str], note: str = "") -> "FileActionBundle":
-    """A copy of the bundle without the named tests [A3-CL12, A2-21i]."""
+def without_tests(bundle: "FileActionBundle", names: list[str] | set[str], note: str = "",
+                  why: str = "") -> "FileActionBundle":
+    """A copy of the bundle without the named tests [A3-CL12, A2-21i]; ``why``: the cause recorded for each."""
     gone = set(names)
     out = bundle.model_copy(deep=True)
     if not gone:
         return out
+    if why:
+        out.dropped.update({n: why for n in gone if n in set(out.tests)})
     for action in out.actions:
         if action.role == "testsuite":
             action.content = remove_tests(action.content, gone)
