@@ -12,6 +12,8 @@
 #                                              several namespaces: nested, C++17 nested, alias, overloads, extern "C")
 #    ./unittest_generator.sh pilot-large       the two large pilots (about 5000 lines each, C and C++ with templates)
 #    ./unittest_generator.sh pilot-all         every pilot, every production file (25 files), one summary
+#    ./unittest_generator.sh pilot-small       the eight small pilots, every production file, one summary
+#    ./unittest_generator.sh pilot-ordered     the small pilots, then the medium, then the large ones, one after another
 #    ./unittest_generator.sh view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 #    ./unittest_generator.sh baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 #    ./unittest_generator.sh benchmark [on|off|both]
@@ -51,7 +53,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-medium|pilot-large|pilot-all|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-medium|pilot-large|pilot-all|pilot-small|pilot-ordered|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -114,7 +116,7 @@ case "$ACTION" in
         if [ "${!i}" = "--branch" ]; then j=$((i + 1)); SETUP+=(--branch "${!j}"); fi
       done
     fi ;;
-  pilot-deps|pilot-all) SETUP=(ensure --repo "$PILOTS/c_deps_pilot") ;;
+  pilot-deps|pilot-all|pilot-small|pilot-ordered) SETUP=(ensure --repo "$PILOTS/c_deps_pilot") ;;
   pilot-large) SETUP=(ensure --repo "$PILOTS/c_large_pilot") ;;
   pilot-medium) SETUP=(ensure --repo "$PILOTS/c_medium_pilot") ;;
 esac
@@ -189,6 +191,26 @@ case "$ACTION" in
     done
     "$PY" ut_pipeline.py batch "${repos[@]}" "${suts[@]}" --config ut_config.json "$@"
     exit $? ;;
+  pilot-small)
+    # the eight small pilots, every production file Agent1 selects; the header-only SUT is named; one summary
+    SUMMARY="$HERE/ut_output/pilots/pilot_small_summary.txt"; mkdir -p "$HERE/ut_output/pilots"
+    repos=()
+    for name in c_pilot cpp_pilot c_deps_pilot c_embedded_pilot cpp_embedded_pilot c_hal_pilot c_realrepo_pilot \
+                cpp_realrepo_pilot; do
+      repo="$HERE/ut_output/pilots/$name"; rm -rf "$repo"; cp -r "$PILOTS/$name" "$repo"; repos+=(--repo "$repo")
+    done
+    "$PY" ut_pipeline.py batch "${repos[@]}" --sut cpp_embedded_pilot=src/motor_ctrl.cpp \
+      --sut cpp_embedded_pilot=src/counter.cpp --sut cpp_embedded_pilot=src/app_main.cpp \
+      --sut cpp_embedded_pilot=include/ring_buffer.hpp --summary "$SUMMARY" --config ut_config.json "$@"
+    exit $? ;;
+  pilot-ordered)
+    # small, then medium, then large: each group its own batch; the next starts when the one before ends
+    RC=0
+    for group in pilot-small pilot-medium pilot-large; do
+      "$0" "$group" "$@" || RC=$?
+    done
+    echo "Small, medium and large pilots done. Small pilots: $HERE/ut_output/pilots/pilot_small_summary.txt"
+    exit $RC ;;
   pilot-all)
     # every pilot folder, every production file Agent1 selects [ORC-35]; the header-only SUT is named;
     # one command for all of them, so one viewer page from the first file to the last [VIEW-12a]

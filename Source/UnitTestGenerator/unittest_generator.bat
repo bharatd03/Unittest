@@ -17,6 +17,8 @@ rem    unittest_generator.bat pilot-medium      full pipeline on the two medium 
 rem                                             calls into several namespaces: nested, C++17 nested, alias, overloads, extern "C")
 rem    unittest_generator.bat pilot-large       full pipeline on the two large pilots (about 5000 lines each, C and C++ with templates)
 rem    unittest_generator.bat pilot-all         full pipeline on every pilot, every production file (25 files), one summary
+rem    unittest_generator.bat pilot-small       full pipeline on the eight small pilots, every production file, one summary
+rem    unittest_generator.bat pilot-ordered     the small pilots, then the medium, then the large ones, one after another
 rem    unittest_generator.bat view RUN_FOLDER   show an earlier run again in the viewer (and viewer.html)
 rem    unittest_generator.bat baseagent-test    the BaseAgent tests, results in test_results_baseagent.txt [TP-24]
 rem    unittest_generator.bat benchmark [on|off|both]
@@ -172,6 +174,7 @@ if /i "%ACTION%"=="run" if defined REPO set "SETUP_ARGS=ensure --repo "%REPO%""
 if /i "%ACTION%"=="run" if defined REPO if defined BRANCH set "SETUP_ARGS=ensure --repo "%REPO%" --branch "%BRANCH%""
 if /i "%ACTION%"=="pilot-deps" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
 if /i "%ACTION%"=="pilot-all" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
+if /i "%ACTION%"=="pilot-small" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_deps_pilot""
 if /i "%ACTION%"=="pilot-large" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_large_pilot""
 if /i "%ACTION%"=="pilot-medium" set "SETUP_ARGS=ensure --repo "%PILOTS%\c_medium_pilot""
 "%PY%" ut_setup.py %SETUP_ARGS%
@@ -218,10 +221,12 @@ if /i "%ACTION%"=="pilot-realrepo" goto pilot_realrepo
 if /i "%ACTION%"=="pilot-large" goto pilot_large
 if /i "%ACTION%"=="pilot-medium" goto pilot_medium
 if /i "%ACTION%"=="pilot-all" goto pilot_all
+if /i "%ACTION%"=="pilot-small" goto pilot_small
+if /i "%ACTION%"=="pilot-ordered" goto pilot_ordered
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="calibrate" goto calibrate
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-medium, pilot-large, pilot-all, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-medium, pilot-large, pilot-all, pilot-small, pilot-ordered, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -375,6 +380,33 @@ echo Running the pipeline on every pilot, one viewer page for all of them - this
 set "UT_EXIT=%errorlevel%"
 echo Each pilot's report and summary: %~dp0ut_output\RUN\PILOT\summary.md
 goto end
+:pilot_small
+rem  The eight small pilots (every production file Agent1 selects; the header-only SUT named), one batch, one summary.
+set "UT_HOME=%~dp0"
+set "SMALL_SUMMARY=%~dp0ut_output\pilots\pilot_small_summary.txt"
+if not exist "%~dp0ut_output\pilots" mkdir "%~dp0ut_output\pilots"
+set "REPOS="
+for %%P in (c_pilot cpp_pilot c_deps_pilot c_embedded_pilot cpp_embedded_pilot c_hal_pilot c_realrepo_pilot cpp_realrepo_pilot) do call :pilot_copy "%%P"
+echo.
+echo Running the pipeline on the eight small pilots, one viewer page for all of them - this takes a while ...
+"%PY%" ut_pipeline.py batch %REPOS% --sut cpp_embedded_pilot=src/motor_ctrl.cpp --sut cpp_embedded_pilot=src/counter.cpp --sut cpp_embedded_pilot=src/app_main.cpp --sut cpp_embedded_pilot=include/ring_buffer.hpp --summary "%SMALL_SUMMARY%" --config ut_config.json %EXTRA%
+set "UT_EXIT=%errorlevel%"
+goto end
+
+:pilot_ordered
+rem  Small, then medium, then large: each group is its own batch; the next one starts when the one before ends.
+set "ORDERED_EXIT=0"
+call "%~f0" pilot-small %EXTRA%
+if not "%errorlevel%"=="0" set "ORDERED_EXIT=%errorlevel%"
+call "%~f0" pilot-medium %EXTRA%
+if not "%errorlevel%"=="0" set "ORDERED_EXIT=%errorlevel%"
+call "%~f0" pilot-large %EXTRA%
+if not "%errorlevel%"=="0" set "ORDERED_EXIT=%errorlevel%"
+echo.
+echo Small, medium and large pilots done. Small pilots: %~dp0ut_output\pilots\pilot_small_summary.txt; the medium and large results are printed above.
+set "UT_EXIT=%ORDERED_EXIT%"
+goto end
+
 :pilot_copy
 set "REPO=%UT_HOME%ut_output\pilots\%~1"
 if exist "%REPO%" rmdir /s /q "%REPO%"
