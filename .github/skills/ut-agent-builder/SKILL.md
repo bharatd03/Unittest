@@ -71,6 +71,13 @@ The agent flow is drawn in [ORCHESTRATION.md](../../../Docs/ORCHESTRATION.md).
     a single value where a list is expected, a list checked item by item, a re-ask that names what was given. An
     agent adds a `mode="before"` validator only for a form of its own (A1-PL3). Never refuse a whole answer for
     one bad item.
+17. Answers are bounded whatever the brain and its settings (ARCH-19a, ARCH-19b, ARCH-20c, ARCH-20d):
+    - never ask a brain to copy a list the agent knows: give it short targets (T1, T2, ...) and expand them;
+    - every list and text of an answer schema has a maximum, and the top-level list asks for what the task asks
+      (`OutputNeed(asked=True)`);
+    - a cut answer keeps its complete items and the rest is asked for smaller; never the same request again with
+      more room;
+    - correctness never depends on sampling (temperature, top-p): a test with a looping scripted brain proves it.
 
 ## Before you finish
 

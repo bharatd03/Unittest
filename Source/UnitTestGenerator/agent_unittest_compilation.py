@@ -610,7 +610,7 @@ class CompilationConfig(BaseModel):
     minimize_tests: bool = True        # observe stage: per-test coverage so redundant probes can be dropped
     keep_runs: int = 10                # run folders kept in work_dir (older ones are deleted)
     keep_active_s: float = 7200.0      # a run folder younger than this is never deleted (parallel files) [ORC-23]
-    quarantine_rounds: int = 2         # rebuilds without generated tests that do not compile [A3-CL12]
+    quarantine_rounds: int = 4         # rebuilds without generated tests that do not compile [A3-CL12]
     max_minimize_tests: int = 300
     parallel_runs: int = 4             # programs at once: per-test measurement, oracle mutants [A3-OBS5, A3-85k, ORC-7]
     fuzz_seconds: int = 60             # per function [A3-FZ3]
@@ -634,6 +634,45 @@ class FlagSuggestion(BaseModel):
 
 class FlagSuggestions(BaseModel):
     flags: list[FlagSuggestion]
+
+
+def no_error_limit(compiler: str) -> list[str]:
+    """A3-CL12: every error of the test file at once, so that one rebuild leaves out every test that does not compile
+    (clang stops after 20 errors by default; GCC has no limit)."""
+    return ["-ferror-limit=0"] if "clang" in Path(compiler).name.lower() else []
+
+
+STANDARD_HEADERS = set("""assert.h complex.h ctype.h errno.h fenv.h float.h inttypes.h iso646.h limits.h locale.h math.h
+setjmp.h signal.h stdalign.h stdarg.h stdatomic.h stdbool.h stddef.h stdint.h stdio.h stdlib.h stdnoreturn.h string.h
+tgmath.h threads.h time.h uchar.h wchar.h wctype.h algorithm array atomic bitset cassert cctype cerrno cfloat cinttypes
+climits cmath cstdarg cstddef cstdint cstdio cstdlib cstring ctime deque exception functional initializer_list iomanip
+ios iostream iterator limits list map memory mutex new numeric optional queue set sstream stack stdexcept string
+string_view thread tuple type_traits unordered_map unordered_set utility variant vector""".split())
+_HEADER_NAMES: dict[str, set[str]] = {}
+
+
+def include_exists(name: str, layout: uc.LayoutProfile, bundle: uc.FileActionBundle | None = None) -> bool:
+    """A3-CL14b: does an included file exist - a standard header, a generated file, the harness, or a file of the
+    repository (by its path from the repository, an include folder or the SUT's folder, or by its name)?"""
+    name = name.replace("\\", "/").strip()
+    base = Path(name).name
+    if name in STANDARD_HEADERS or base.startswith("ut_harness") or name.startswith("sys/"):
+        return True
+    if bundle is not None and any(a.path.replace("\\", "/").endswith(name) for a in bundle.actions):
+        return True
+    root = Path(layout.repo_root)
+    for folder in [".", str(Path(layout.sut_file).parent), *getattr(layout, "include_dirs", [])]:
+        with contextlib.suppress(OSError, ValueError):
+            if (root / folder / name).is_file():
+                return True
+    if str(root) not in _HEADER_NAMES:
+        found = set()
+        with contextlib.suppress(OSError):
+            for dirpath, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in (".git", "ut_output", "ut_cache", "node_modules")]
+                found |= {f for f in files if f.lower().endswith((".h", ".hpp", ".hh", ".hxx", ".inc", ".inl"))}
+        _HEADER_NAMES[str(root)] = found
+    return base in _HEADER_NAMES[str(root)]
 
 
 class FileEdit(BaseModel):
@@ -2656,6 +2695,9 @@ class CompilationAgent(ba.AgentCore):
         async def capture(payload: uc.CaptureRequest, request, scratch):
             return await asyncio.to_thread(self.capture, payload)
 
+        async def gate(payload: uc.VerifyRequest, request, scratch):                          # A3-CL15
+            return await asyncio.to_thread(self.execute, payload)
+
         def flags_pre(payload: uc.FlagRequest, request):
             uc.check_signature(payload.layout, request)
             if not (Path(payload.layout.repo_root) / payload.layout.sut_file).is_file():
@@ -2681,6 +2723,9 @@ class CompilationAgent(ba.AgentCore):
                             self._postcondition, description="Build, run all tests, measure coverage, classify."),
             ba.ContractTool("observe", uc.VerifyRequest, uc.VerificationResult, run("observe"), stage_is("observe"),
                             description="Run probe tests and return observed values [A3-OBS1]."),
+            ba.ContractTool("gate", uc.VerifyRequest, uc.VerificationResult, gate, stage_is("gate"), read_only=True,
+                            description="Syntax check of the staged test file; names each test with an error and "
+                                        "the compiler's message [A3-CL15]."),
             ba.ContractTool("harness", uc.HarnessRequest, uc.HarnessFiles, self._harness_work, read_only=True,
                             description="The harness sources, delivered next to the generated tests."),
             ba.ContractTool("oracle_check", uc.OracleRequest, uc.OracleResult, self._oracle_work, oracle_pre,
@@ -3009,6 +3054,8 @@ class CompilationAgent(ba.AgentCore):
                            route="stop", diagnostic=exc.message)])
         self._prune_runs()
         repo = self._stage(layout, req, run_dir)
+        if req.stage == "gate":                                                              # A3-CL15
+            return self._gate(layout, req, repo, run_dir, chain, base)
         base.update(host_notes=self._host_notes(layout, repo))                       # A3-HW2..HW4
         # ORC-10: the version of the SUT this run tested - as given (or as Agent4's patch gives it), never the host
         # adaptation of its staged copy (target keywords and assembly replaced, A3-HW2, A3-HW3)
@@ -3415,7 +3462,8 @@ class CompilationAgent(ba.AgentCore):
             out = obj / f"{index:02d}_{src.stem}.o"
             cmd = [compiler, *(["-x", "c++"] if as_cpp else []), "-c", str(src), "-o", str(out), "-g", "-O0", "-w",
                    *chain.compile_flags(cpp_unit), *flags,
-                   *self.cfg.extra_flags, *(chain.coverage_flags() if instrument else [])]
+                   *self.cfg.extra_flags, *(chain.coverage_flags() if instrument else []),
+                   *(no_error_limit(compiler) if role == "test" else [])]                       # A3-CL12
             commands.append(cmd)
             if role == "test" and suite_path and path == suite_path:                         # CA-14
                 parts = None
@@ -3676,6 +3724,57 @@ class CompilationAgent(ba.AgentCore):
             original = next(a.content for a in req.bundle.actions if a.path == path)
             self._write_new(repo / path, original.encode("utf-8"))
         return build, []
+
+    def _gate(self, layout: uc.LayoutProfile, req: uc.VerifyRequest, repo: Path, run_dir: Path, chain: Toolchain,
+              base: dict[str, Any]) -> uc.VerificationResult:
+        """A3-CL15: the compile gate - the staged test file compiled with the syntax check only (no object, no link,
+        every error at once), each error named with the test it lies in. Nothing is run or asserted."""
+        is_cpp = layout.language == "cpp"
+        sut_flags = self.sut_flags(layout, repo)
+        std = [] if any(f.startswith("-std=") for f in sut_flags) else \
+            [f"-std={self.cfg.cxx_std}" if is_cpp else f"-std={self.cfg.c_std}"]
+        test_incs = [f"-I{run_dir / 'harness'}", f"-I{repo / layout.writable_stub_dir}", f"-I{repo / layout.writable_test_dir}",
+                     f"-iquote{repo / Path(layout.sut_file).parent}", *project_stub_includes(layout, repo)]
+        suites = [a for a in (req.bundle.actions if req.bundle else []) if a.role == "testsuite"]
+        texts = {a.path: (repo / a.path).read_text(encoding="utf-8", errors="replace") for a in suites
+                 if (repo / a.path).is_file()}
+        diagnostics: list[uc.Diagnostic] = []
+        per_test: dict[str, uc.Failure] = {}
+        outside: list[str] = []
+        for a in suites:
+            src = repo / a.path
+            if not src.is_file():
+                continue
+            cpp_unit = src.suffix.lower() in (".cpp", ".cc", ".cxx", ".c++")
+            compiler = chain.cxx if cpp_unit else chain.cc
+            cmd = [compiler, "-fsyntax-only", "-w", *chain.compile_flags(cpp_unit), *sut_flags, *std, *test_incs,
+                   *self.cfg.extra_flags, *no_error_limit(compiler), str(src)]
+            code, text = _run(cmd, repo, self.cfg.compile_timeout, chain.env())
+            if code in (-126, -127):
+                return uc.VerificationResult(**base, decision="environment_error", reason=text.strip()[-300:] or
+                                             "the compiler did not start")
+            for d in parse_compiler_output(text, "test"):
+                if d.severity not in ("error", "fatal error", "fatal"):
+                    continue
+                d.role = self._role_of(d.file, "test", layout)
+                diagnostics.append(d)
+                f = uc.Failure(failure_id=f"gate-{len(diagnostics)}", kind="compile",
+                               classification="test_generation_defect", route="agent1", file=d.file, line=d.line,
+                               symbol=d.symbol, diagnostic=d.message)
+                where = self._tests_of(f, texts, layout)
+                if not where:
+                    outside.append(f"{Path(d.file).name}:{d.line}: {d.message}"[:300])
+                for path, name in where:
+                    if name not in per_test:
+                        per_test[name] = f.model_copy(update={
+                            "affected_test": name, "file": path,
+                            "diagnostic": f"{name} does not compile: line {d.line}: {d.message}"[:1000],
+                            "evidence": ["syntax check of the staged test file [A3-CL15]"]})
+        reason = (f"{len(per_test)} test(s) with compile errors" if per_test else "no compile error in the tests") + \
+            (f"; {len(outside)} error(s) outside every test: " + " | ".join(outside[:3]) if outside else "")
+        return uc.VerificationResult(**base, build_ok=not diagnostics, diagnostics=diagnostics[:200],
+                                     quarantined=list(per_test.values()),
+                                     decision="complete" if not diagnostics else "failures", reason=reason[:1000])
 
     @staticmethod
     def _tests_of(f: uc.Failure, texts: dict[str, str], layout: uc.LayoutProfile) -> list[tuple[str, str]]:
@@ -4127,8 +4226,8 @@ class CompilationAgent(ba.AgentCore):
         return errors
 
     @staticmethod
-    def _apply_edits(bundle: uc.FileActionBundle, repair: BuildRepair, facts: "uc.PlatformFacts | None" = None
-                     ) -> tuple[uc.FileActionBundle | None, str]:
+    def _apply_edits(bundle: uc.FileActionBundle, repair: BuildRepair, facts: "uc.PlatformFacts | None" = None,
+                     layout: uc.LayoutProfile | None = None) -> tuple[uc.FileActionBundle | None, str]:
         """The bundle with the brain's edits, or the reason they are refused: only generated files, a fragment
         that occurs once, and no change to what a test asserts, observes or is called [A3-CL14, A3-85a]."""
         actions = {a.path: a for a in bundle.actions}
@@ -4152,6 +4251,14 @@ class CompilationAgent(ba.AgentCore):
                 return None, f"{path}: a UT_EXPECT / UT_OBSERVE line or a test name would change [A3-CL14]"
         if not changed:
             return None, "no edit"
+        if layout is not None:                                                                # A3-CL14b
+            for path, text in changed.items():
+                added = set(re.findall(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', text, re.M)) - \
+                    set(re.findall(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', actions[path].content, re.M))
+                missing = [h for h in sorted(added) if not include_exists(h, layout, bundle)]
+                if missing:
+                    return None, (f"{path}: includes {', '.join(missing)}, which exists neither in the repository nor "
+                                  "among the generated files nor in the include folders of the build [A3-CL14b]")
         return bundle.model_copy(update={"actions": [a.model_copy(update={"content": changed[a.path]})
                                                      if a.path in changed else a for a in bundle.actions]}), ""
 
@@ -4368,7 +4475,7 @@ class CompilationAgent(ba.AgentCore):
             trial: dict[str, Any] = {}
 
             async def build_with(repair: BuildRepair) -> str:
-                candidate, problem = self._apply_edits(bundle, repair, self.toolchain().facts)
+                candidate, problem = self._apply_edits(bundle, repair, self.toolchain().facts, req.layout)
                 if candidate is None:
                     return problem
                 attempt = await asyncio.to_thread(self.execute, req.model_copy(update={"bundle": candidate}))

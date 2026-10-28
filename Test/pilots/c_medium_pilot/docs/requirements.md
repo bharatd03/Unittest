@@ -1,0 +1,27 @@
+# Climate control requirements
+
+- CLM-1: a sensor reading below 50 or above 4000 counts is invalid; the cabin, outside and evaporator temperatures use only valid readings
+- CLM-2: a raw reading converts to deci-degrees C along the points 50 -> -400, 500 -> -150, 1500 -> 100, 2500 -> 300, 3500 -> 600 and 4000 -> 850, linearly between them
+- CLM-3: a fault becomes active after 3 failed reports in a row and inactive after 5 passed reports in a row; every change is told to the registered fault callback
+- CLM-4: the diagnosis register has one bit per active fault, bit n for fault n
+- MOD-1: ON switches OFF to AUTO; OFF switches every mode off; MANUAL is accepted in every mode but OFF
+- MOD-2: DEFROST toggles: it remembers the mode before it and returns to it; a defrost ends after 600000 ms, in AUTO when it was started from OFF
+- MOD-3: ECO is accepted from AUTO and MANUAL; after 1800000 ms with the engine running it returns to AUTO
+- MOD-4: without the engine running, MANUAL falls back to AUTO
+- CMP-1: the compressor starts only on request, above 2.0 degrees C outside, with a pressure between 150 and 3000 kPa and after at least 120000 ms off
+- CMP-2: a start takes 3000 ms; a pressure out of range during a start or while running, or an evaporator below 2.0 degrees C, is a protection
+- CMP-3: the third protection locks the compressor and reports the compressor fault
+- BLW-1: the blower is off in OFF and at 100 % in DEFROST; in MANUAL, fan level n gives n * 100 / 7 %
+- BLW-2: otherwise the blower follows the temperature error: 0 -> 20 %, 20 -> 30 %, 50 -> 45 %, 100 -> 70 %, 200 -> 100 %
+- BLW-3: ECO limits the blower to the stored ECO maximum; without the engine running the blower is limited to 40 %
+- MIX-1: the mix door opens 50 % plus half the error in deci-degrees, 0 to 100 %; strong sun (above 50 %) closes the front doors by one fifth of the excess
+- MIX-2: with the rear zones disabled, the rear doors follow the driver's door
+- ZON-1: a set-point between 16.0 and 30.0 degrees C is accepted; when synchronised, only the driver's set-point is accepted and it is copied to every zone
+- REC-1: the recirculation request closes the fresh air; defrost always opens it
+- REC-2: without a request, fine dust above 120 closes the fresh air automatically and below 60 opens it again
+- REC-3: recirculation ends after 900000 ms and the timer restarts
+- RDF-1: each press of the rear defrost button toggles it; it ends after 900000 ms or when the supply falls below 11500 mV
+- CAN-1: a request frame has 8 bytes, a CRC-8 (polynomial 0x1D, start 0xFF, final XOR 0xFF) of bytes 0 to 6 in byte 7, and an alive counter in the low nibble of byte 6 that changes from frame to frame
+- CAN-2: the set-point is bytes 0 and 1 (little endian), the fan level byte 2 (0 to 7), recirculation bit 0 and A/C bit 1 of byte 3
+- CAN-3: the status frame carries the blower, the two front mix doors, the outputs, the mode, the compressor state, an alive counter and the CRC-8
+- PAR-1: stored parameters are used only with version 2, a valid CRC-8 and values in range; otherwise the defaults are used: 22.0 degrees C and an ECO blower maximum of 60 %

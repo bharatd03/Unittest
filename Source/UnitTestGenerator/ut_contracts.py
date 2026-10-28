@@ -243,9 +243,22 @@ class EnumInfo(Contract):
 
 
 class StateVar(Contract):
-    """A1-DA15: a variable of the SUT file that the SUT can change."""
+    """A1-DA15: a variable of the SUT file that the SUT can change. An array or a structure carries its length and
+    fields, so that a test sets one element or field of it through a generated setter (structured scenario)."""
     name: str
     type: str = ""
+    array_len: int = 0
+    fields: list["FieldInfo"] = Field(default_factory=list)
+
+
+class MemberInfo(Contract):
+    """A data member of a class of the SUT (C++), private ones included: a test sets it through a generated accessor
+    (structured scenario). ``type`` is spelled so that a test file can name it; only scalar, enumeration and
+    std::array / std::vector of scalar members are listed."""
+    class_name: str
+    name: str
+    type: str
+    static: bool = False
 
 
 _SETTABLE = re.compile(r"(?:(?:unsigned|signed)\s+)?(?:char|short|int|long|long long|long int|short int)|unsigned|signed|"
@@ -255,6 +268,79 @@ _SETTABLE = re.compile(r"(?:(?:unsigned|signed)\s+)?(?:char|short|int|long|long 
 def state_setter_name(var: StateVar) -> str:
     """A2-21z: the setter of a SUT state variable - one name for Agent1's offer, Agent2's file and its checks."""
     return "ut_state_set_" + safe_name(var.name)
+
+
+SCALAR_FIELD_KINDS = ("int", "bool", "enum", "float")
+
+
+def element_setters(layout: "LayoutProfile") -> list[tuple[str, "StateVar", bool, str, str]]:
+    """Structured scenarios: the setters of single elements and fields of SUT state that has no setter of its own - an
+    array, a structure, an array of structures: (setter name, variable, indexed, field path, field kind). The access
+    file defines them, the test calls them, e.g. ut_state_set_s_faults__active(1, 1) for s_faults[1].active = 1."""
+    out: list[tuple[str, StateVar, bool, str, str]] = []
+    settable = {v.name for v in settable_state(layout)}
+    for v in layout.sut_state:
+        if v.name in settable:
+            continue
+        indexed = v.array_len > 0
+        base = "ut_state_set_" + safe_name(v.name)
+        if indexed and not v.fields:
+            if re.search(r"\b(struct|union|class)\b|\(\*|\]\s*\[", v.type):
+                continue
+            out.append((base + "__at", v, True, "", "int"))
+            continue
+        todo = [(f, f.name) for f in v.fields]
+        while todo:
+            f, path = todo.pop(0)
+            if f.kind in SCALAR_FIELD_KINDS:
+                out.append((base + "__" + path.replace(".", "_"), v, indexed, path, f.kind))
+            elif f.kind == "struct" and path.count(".") < 2:
+                todo += [(g, f"{path}.{g.name}") for g in f.fields]
+    return out[:400]
+
+
+def stub_output(ptype: str) -> bool:
+    """Structured scenario: a stub parameter the stub may write into - a pointer or reference to something that is
+    not const (not a function pointer, not a string literal parameter)."""
+    t = re.sub(r"\s+", " ", ptype).strip()
+    if "(" in t or "..." in t:
+        return False
+    if t.endswith("&") and not t.endswith("&&"):
+        return not re.match(r"^const\b", t)
+    if t.rstrip().endswith("*") or re.search(r"\*\s*const$", t):
+        core = re.sub(r"\*\s*const$", "*", t)
+        return not re.match(r"^(const\b|.*\bconst\s*\*$)", core) and core.count("*") == 1
+    return False
+
+
+def stub_pointee(ptype: str) -> str:
+    """The type a stub output parameter points to, as a test declares it (void becomes unsigned char)."""
+    t = re.sub(r"\*\s*const$", "*", re.sub(r"\s+", " ", ptype).strip()).rstrip("&*").strip()
+    t = re.sub(r"\b(volatile|restrict|__restrict)\b", "", t).strip()
+    return "unsigned char" if t in ("void", "") else t
+
+
+def member_tag(m: "MemberInfo") -> str:
+    """Structured scenario (C++): the tag type of the accessor of a data member, ut_tag_<class>__<member>."""
+    return "ut_tag_" + safe_name(m.class_name.replace("(anonymous namespace)::", "")) + "__" + m.name
+
+
+def member_access_source(members: list["MemberInfo"]) -> list[str]:
+    """Structured scenario (C++): accessors of data members - private ones included - by the explicit instantiation
+    of a template with a pointer to the member (an explicit instantiation does not check access [temp.spec]). A test
+    writes ut_obj.*ut_member(ut_tag_<class>__<member>{}) = value."""
+    if not members:
+        return []
+    rows = ["/* data members of the SUT's classes a structured scenario sets (explicit instantiation) */",
+            "template <typename Tag, typename Tag::type M> struct ut_member_access {",
+            "    friend typename Tag::type ut_member(Tag) { return M; }", "};"]
+    for m in members:
+        tag = member_tag(m)
+        cls = m.class_name.replace("(anonymous namespace)::", "")
+        ptr = f"{m.type} *" if m.static else f"{m.type} {cls}::*"
+        rows += [f"struct {tag} {{ using type = {ptr}; friend type ut_member({tag}); }};",
+                 f"template struct ut_member_access<{tag}, &{cls}::{m.name}>;"]
+    return rows
 
 
 def state_getter_name(var: StateVar) -> str:
@@ -730,6 +816,7 @@ class LayoutProfile(Contract):
     dependencies: DependencyPlan | None = None
     enums: list[EnumInfo] = Field(default_factory=list)
     sut_state: list[StateVar] = Field(default_factory=list)      # A1-DA15, A2-21s
+    class_members: list[MemberInfo] = Field(default_factory=list)   # C++ data members a test may set (structured)
     local_statics: list[StateVar] = Field(default_factory=list)  # "function::variable" [A1-DA18, A3-45c]
     interfaces: list[InterfaceInfo] = Field(default_factory=list)   # injected interfaces [A1-DA17, A2-21aa]
     header_sut: bool = False                                     # the SUT is a header [A1-DA19]
@@ -940,7 +1027,7 @@ class Finding(Contract):
 
 class VerificationResult(Contract):
     run_id: str
-    stage: Literal["probe", "build_check", "verify", "observe"]
+    stage: Literal["probe", "build_check", "verify", "observe", "gate"]
     sut_sha256: str
     suite_sha256: str
     compiler: str = ""
@@ -1114,6 +1201,8 @@ class UTPlan(Contract):
     kinds_available: list[str] = Field(default_factory=list)   # answer kinds an available brain may give [BP-3, BP-9]
     rules_only: bool = False          # the rule round: no brain writes a test; the scenarios are facts [A1-PL1]
     deferred: list[str] = Field(default_factory=list)          # functions left for a later brain round [A1-PL16]
+    # macros and enumerators only the SUT file defines: a test cannot name them, it writes the value [A1-PL2a]
+    internal_values: dict[str, str] = Field(default_factory=dict)
 
 
 class FuzzResult(Contract):
@@ -1356,12 +1445,15 @@ class FinalizeRequest(Contract):
     observed: dict[str, str]
     test_items: dict[str, list[str]] = Field(default_factory=dict)
     crashed: dict[str, str] = Field(default_factory=dict)   # tests that crashed or hung in the observe run [A2-21f]
+    # the tests that ran in the observe run; None: unknown. A test that did not run did not crash [A2-21f]
+    ran: list[str] | None = None
+    build_message: str = ""                                  # why the observe build failed, when it did
 
 
 # ============================================================================ Agent3 requests
 class VerifyRequest(Contract):
     layout: LayoutProfile
-    stage: Literal["probe", "build_check", "verify", "observe"]
+    stage: Literal["probe", "build_check", "verify", "observe", "gate"]
     measure_tests: list[str] | None = None    # observe: the tests to measure alone; None = all [A3-OBS5, LA-10]
     targets: dict[str, str] = Field(default_factory=dict)     # COV-1 per metric ("100", ">95"); empty = 100
     bundle: FileActionBundle | None = None
@@ -1732,6 +1824,7 @@ class PipelineResult(Contract):
     token_use: list[str] = Field(default_factory=list)         # brain calls per step [ARCH-15]
     cache_use: list[str] = Field(default_factory=list)         # what each cache saved in this run [CA-1]
     brain_answers: list[str] = Field(default_factory=list)     # per brain step: accepted, fixed, refused [KB-25]
+    brain_rates: list[str] = Field(default_factory=list)       # refusal and rejection rates per step and cause [ORC-12b]
     defect_candidates: list[DefectCandidate] = Field(default_factory=list)   # [A1-37f]
     open_summary: str = ""                     # open items per final status and root cause [LA-3a]
     knowledge_packs: list[str] = Field(default_factory=list)   # name, version, SHA-256 [KP-7]
@@ -2707,6 +2800,16 @@ def norm_quote(text: str) -> str:
     """A1-PL4 b), COV-12: a quote and its evidence compared without white space, comment markers (//, ///, /*, *)
     and a leading @tag, in either; the words themselves must stay the same."""
     return re.sub(r"\s+", " ", _QUOTE_NOISE.sub(" ", text or "")).strip().lower()
+
+
+def with_values(text: str, values: dict[str, str]) -> str:
+    """A1-PL2a: the names only the SUT file defines replaced by their values, outside string and character literals
+    and never as a member (.x, ->x). Unchanged when there is nothing to replace."""
+    if not values or not text or not any(n in text for n in values):
+        return text
+    pattern = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|(?<!\.)(?<!->)\b(' +
+                         "|".join(re.escape(n) for n in sorted(values, key=len, reverse=True)) + r")\b")
+    return pattern.sub(lambda m: values[m.group(1)] if m.group(1) else m.group(0), text)
 
 
 def scenario_signature(sc: Any) -> str:

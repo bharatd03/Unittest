@@ -147,6 +147,10 @@ class PipelineConfig(BaseModel):
     interactive_wait_seconds: float = Field(default=600.0, ge=5.0)
     trials_per_iteration: int = Field(default=10, ge=0, le=100)     # NC-7: items refused only by predictions
     recipe_candidate_uses: int = Field(default=3, ge=2, le=50)      # NC-3
+    compile_gate: bool = True                                       # A3-CL15: syntax check of a round's new tests
+    gate_rewrites: int = Field(default=1, ge=0, le=3)               # A3-CL15: brain rewrites per round
+    unbuilt_rounds: int = Field(default=2, ge=1, le=10)             # LA-5: rounds without a built test, then counted
+    rate_target: float = Field(default=5.0, ge=0.0, le=100.0)       # ORC-12b: percent
 
 
 class ViewerConfig(BaseModel):
@@ -493,6 +497,8 @@ class Orchestrator:
         result.token_use, result.knowledge_packs = uc.token_summary(self.token_log)     # ORC-12
         result.cache_use = self._cache_use(out, state)                                       # CA-1
         result.brain_answers = self._brain_answer_counts(out, state)                         # KB-25
+        with contextlib.suppress(Exception):                     # a record of the run: never a reason to fail
+            result.brain_rates = self._brain_rates(out, state, result)                       # ORC-12b
         result.escalations = list(dict.fromkeys(ba.Escalation(**e).text() for e in self.escalation_log))   # ARCH-22
         brains = set()
         for made in state.made.values():                                     # "brain/model kind; object: brain setup"
@@ -830,8 +836,6 @@ class Orchestrator:
                     if not plan.scenarios and not plan.repairs and self._settled(s, last):     # LA-7 b
                         return await self._stop(s, "every open item has a final status: no further attempt can change "
                                                    "it [LA-6, LA-7]", last)
-                    for item in [g for sc in attempted for g in sc.gap_ids] + [r.item_id for r in plan.repairs]:
-                        s.attempts[item] = s.attempts.get(item, 0) + 1
                     for sc in plan.scenarios:                    # what a planning example is made of [KB-23]
                         if sc.made_by.startswith("brain:") and sc.scenario_id:
                             s.brain_scenarios[sc.scenario_id] = sc
@@ -840,7 +844,6 @@ class Orchestrator:
                             s.tried_scenarios.add(uc.scenario_signature(sc))                    # A1-PL4 g
                             for g in sc.gap_ids:
                                 s.item_brains.setdefault(g, set()).add(sc.made_by.split(":", 1)[1].split("/")[0])
-                    self._next_attempts(s, plan, asked_third)                                  # LA-5, LA-6
                     bundle = await self._generate(s, plan, journal=journal)
                     generated_suite = uc.suite_of(bundle)                     # before tests are left out [LA-2]
                     s.made.update(bundle.made)                                                    # BP-7
@@ -866,6 +869,8 @@ class Orchestrator:
                         elif t.status == "passed":
                             s.failed_tests.pop(t.name, None)
                     bundle = await self._drop_quarantined(s, bundle, result, iteration)        # A3-CL12
+                    self._count_attempts(s, plan, attempted, generated_suite, result)          # LA-5: after the run
+                    self._next_attempts(s, plan, asked_third)                                  # LA-5, LA-6
                     if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
                         before = set(last.coverage.covered_items) if last.coverage else set()
                         result.newly_covered = len(set(result.coverage.covered_items) - before)
@@ -1224,7 +1229,9 @@ class Orchestrator:
 
     # ---------------------------------------------------------------- CA-10: the result of Stage A
     STAGE_A_FIELDS = ("build", "compile_flags", "build_flags_source", "dependencies", "functions", "enums", "sut_state",
-                      "local_statics", "interfaces", "typedefs", "private_types", "requirement_links", "include_dirs")
+                      "local_statics", "interfaces", "typedefs", "private_types", "requirement_links", "include_dirs",
+                      "class_members")
+    STAGE_A_VERSION = "2"             # 2: state with its elements and fields, class members (structured scenarios)
 
     def _stage_a_key(self, s: "RunState") -> str:
         """CA-10: the SUT's version, the discover result, the run's build description, the toolchain, the
@@ -1235,7 +1242,7 @@ class Orchestrator:
         manifest = uc.manifest_path(self.config_path)
         chain = manifest.read_text(encoding="utf-8", errors="replace") if manifest.is_file() else ""
         settings = {k: v for k, v in self.raw.items() if k not in ("cache", "viewer", "_comment")}
-        return uc.RunCache.key("stage_a", self.layout.sut_sha256, uc.HARNESS_VERSION,
+        return uc.RunCache.key("stage_a", self.STAGE_A_VERSION, self.layout.sut_sha256, uc.HARNESS_VERSION,
                                uc.unrooted(self.layout.model_dump_json(), root),
                                uc.unrooted(s.build.model_dump_json() if s.build else "", root),
                                uc.sha256_bytes(chain.encode("utf-8")), json.dumps(settings, sort_keys=True, default=str))
@@ -2122,6 +2129,9 @@ class Orchestrator:
             plan=plan, guidance=guidance, existing_suite=self.suite, journal=journal or {},
             item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
         self.check_bundle(bundle)
+        if isinstance(getattr(s, "written", None), set):                                       # ORC-12b
+            s.written |= {n for n in bundle.new_tests if n in bundle.made}
+        bundle = await self._compile_gate(s, plan, bundle, journal or {}, guidance)            # A3-CL15
         if bundle.trial:                                                                   # NC-7
             bundle = await self._trial(s, bundle)
         if observe and bundle.observations:                            # A2-21f, A3-OBS1
@@ -2136,10 +2146,188 @@ class Orchestrator:
                 known = {n: items for n, items in s.test_items.items() if n in set(bundle.tests)}   # A3-OBS5
                 crashed = {t.name: f"{t.status}: {t.message}"[:200] for t in obs.tests          # A2-21f
                            if t.status in ("crashed", "timeout")}
+                ran = [t.name for t in obs.tests] if obs.link_ok else []   # a build failure is not a crash [A2-21f]
+                before = set(bundle.tests)
                 bundle = await self.call("generator", "finalize", uc.FinalizeRequest(
-                    bundle=bundle, observed=obs.observed, test_items=known, crashed=crashed), uc.FileActionBundle)
+                    bundle=bundle, observed=obs.observed, test_items=known, crashed=crashed, ran=ran,
+                    build_message="" if obs.link_ok else obs.reason[:400]), uc.FileActionBundle)
                 self.check_bundle(bundle)
+                if isinstance(getattr(s, "lost", None), dict):                                 # ORC-12b
+                    for name in before - set(bundle.tests):
+                        s.lost.setdefault(name, "crashed or not observed" if obs.link_ok
+                                          else "the observe build failed")
         return await self._oracle_checks(s, bundle)
+
+    async def _compile_gate(self, s: "RunState", plan: uc.UTPlan, bundle: uc.FileActionBundle,
+                            journal: dict[str, str], guidance: uc.KBGuidance) -> uc.FileActionBundle:
+        """A3-CL15: the round's new tests are checked with the compiler's syntax check before any build. A test the
+        brain planned or wrote that has an error goes back to Agent2 in the same round with the compiler's message and
+        its scenario (A2-21p, LA-4); what still does not compile - and a rule-based test with an error - is left out
+        with its message for the journal (LA-3) and the knowledge base. An error outside every test is left to the
+        build (A3-CL12)."""
+        new = set(bundle.new_tests)
+        if not getattr(self.cfg, "compile_gate", True) or not new or plan.stage != "coverage":
+            return bundle
+
+        async def check(b: uc.FileActionBundle) -> dict[str, str]:
+            try:
+                res = await self.call("compilation", "gate", uc.VerifyRequest(
+                    layout=self.layout, stage="gate", bundle=b), uc.VerificationResult)
+            except Exception as exc:                 # the gate is a shortcut, never a judge: the build decides
+                LOG.warning("compile gate unavailable: %s", exc)
+                return {}
+            if res.decision == "environment_error":
+                return {}
+            return {f.affected_test: f.diagnostic for f in res.quarantined if f.affected_test}
+
+        failing = {n: d for n, d in (await check(bundle)).items() if n in new}
+        if not failing:
+            return bundle
+        sources = uc.test_sources(uc.suite_of(bundle))
+        ids = {n: set(SCENARIO_ID.findall(sources.get(n, ""))) for n in failing}
+        redo = [sc for sc in plan.scenarios if not sc.inputs and any(sc.scenario_id in i for i in ids.values())
+                and (sc.made_by.startswith("brain:") or not sc.checked)] \
+            if not plan.rules_only and getattr(self.cfg, "gate_rewrites", 1) > 0 else []
+        note = (f"{len(failing)} new test(s) did not compile in the gate [A3-CL15]: "
+                + "; ".join(d[:160] for d in list(failing.values())[:4]))[:1200]
+        base = uc.without_tests(bundle, sorted(failing), note)
+        rewritten: dict[str, str] = {}
+        if redo:
+            again_journal = dict(journal)
+            for sc in redo:
+                names = [n for n, i in ids.items() if sc.scenario_id in i]
+                lesson = "\n".join(f"- COMPILE GATE (this round): {n}, written from scenario {sc.scenario_id}, does "
+                                   f"not compile - {failing[n][:400]}\n{sources.get(n, '')[:900]}" for n in names[:2])
+                for key in {sc.function, sc.function.split("::")[-1]}:
+                    again_journal[key] = (again_journal.get(key, "") + "\n" + lesson).strip()
+            replan = plan.model_copy(update={
+                "scenarios": [sc.model_copy(update={"kind": "test", "trial": []}) for sc in redo],
+                "repairs": [], "drop_tests": []})
+            self._stage(f"{len(failing)} new test(s) did not compile; the brain writes {len(redo)} of them again "
+                        "with the compiler's message [A3-CL15]")
+            try:
+                again = await self.call("generator", "generate", uc.GenerationRequest(
+                    plan=replan, guidance=guidance, existing_suite=uc.suite_of(base), journal=again_journal,
+                    item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
+                self.check_bundle(again)
+            except Exception as exc:                                 # the tests left out stay left out
+                LOG.warning("gate rewrite failed: %s", exc)
+                again = None
+            if again is not None:
+                fresh = [n for n in again.new_tests if n not in set(base.tests)]
+                still = {n: d for n, d in (await check(again)).items() if n in set(fresh)}
+                if still:
+                    again = uc.without_tests(again, sorted(still), f"{len(still)} rewritten test(s) still did not "
+                                             "compile and were left out [A3-CL15]")
+                    failing.update(still)
+                again = again.model_copy(update={
+                    "new_tests": list(dict.fromkeys(base.new_tests + [n for n in fresh if n not in still])),
+                    "trial": {**base.trial, **again.trial},
+                    "trial_targets": {**base.trial_targets, **again.trial_targets},
+                    "made": {**base.made, **again.made}, "recipes": {**base.recipes, **again.recipes},
+                    "needs_kind": {**base.needs_kind, **again.needs_kind},
+                    "crashed_calls": list(dict.fromkeys(base.crashed_calls + again.crashed_calls)),
+                    "expectation_changes": base.expectation_changes + again.expectation_changes,
+                    "notes": list(dict.fromkeys(base.notes + again.notes))})
+                rewritten = {n: "" for n in fresh if n not in still}
+                if isinstance(getattr(s, "written", None), set):
+                    s.written |= {n for n in rewritten if n in again.made}
+                base = again
+        gone = [n for n in failing if n not in base.tests]
+        for n in gone:                                     # the journal's facts [LA-3, LA-4] and the rates [ORC-12b]
+            s.quarantine[n] = (failing[n], sources.get(n, ""))
+            if isinstance(getattr(s, "lost", None), dict):
+                s.lost.setdefault(n, "did not compile (gate)")
+        for n in gone[:3]:
+            with contextlib.suppress(Rejected, ba.AgentFault):
+                await self.call("kb", "learn", uc.LearningEvent(
+                    kind="negative", language=self.layout.language, framework=self.layout.framework,
+                    category="test_generation_defect", snippet=sources.get(n, failing[n])[:4000],
+                    reason=failing[n][:1000]), uc.LearnAck)
+        s.notes.append(note + (f"; {len(rewritten)} written again by the brain and compiled" if rewritten else ""))
+        self._stage(f"compile gate: {len(gone)} new test(s) left out, {len(rewritten)} written again [A3-CL15]")
+        return base
+
+    def _count_attempts(self, s: "RunState", plan: uc.UTPlan, attempted: list[uc.Scenario], suite: str,
+                        result: uc.VerificationResult) -> None:
+        """LA-5: an attempt is counted after Agent3's run, for the items of a scenario whose test was built and run. A
+        function none of whose planned tests was built counts its attempts only after unbuilt_rounds such rounds, so
+        that an item that never gets a test still reaches its final status (LA-6)."""
+        ran = {t.name for t in result.tests}
+        by_scenario: dict[str, list[str]] = {}
+        for name, source in uc.test_sources(suite).items():
+            for sid in set(SCENARIO_ID.findall(source)):
+                by_scenario.setdefault(sid, []).append(name)
+        counted: list[str] = []
+        per_fn: dict[str, list[uc.Scenario]] = {}
+        for sc in attempted:
+            per_fn.setdefault(sc.function, []).append(sc)
+        for fn, scenarios in per_fn.items():
+            built = [sc for sc in scenarios if any(n in ran for n in by_scenario.get(sc.scenario_id, []))]
+            if built:
+                counted += [g for sc in built for g in sc.gap_ids]
+                continue
+            s.unbuilt[fn] = s.unbuilt.get(fn, 0) + 1
+            if s.unbuilt[fn] >= getattr(self.cfg, "unbuilt_rounds", 2):
+                counted += [g for sc in scenarios for g in sc.gap_ids]
+                s.notes.append(f"{fn}: no planned test was built and run in {s.unbuilt[fn]} round(s); its items count "
+                               "the attempt [LA-5]")
+        for item in dict.fromkeys(counted + [r.item_id for r in plan.repairs]):
+            s.attempts[item] = s.attempts.get(item, 0) + 1
+
+    def _brain_rates(self, out: Path, s: "RunState", result: uc.PipelineResult) -> list[str]:
+        """ORC-12b: the refusal rate per brain step and cause - what the checks refused out of what the brain gave -
+        and the rejection rate of the tests written from the brain's answers - what the run did not keep."""
+        target = float(getattr(self.cfg, "rate_target", 5.0))
+        scenarios: dict[str, int] = {}
+        causes: dict[str, int] = {}
+        answers: dict[str, dict[str, int]] = {}
+        with contextlib.suppress(OSError):
+            for line in (out / "brain_answers.jsonl").read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(ValueError):
+                    rec = json.loads(line)
+                    step, kind = str(rec.get("step", "?")), rec.get("kind", "")
+                    if kind == "scenario":
+                        outcome = str(rec.get("outcome", ""))
+                        scenarios[outcome] = scenarios.get(outcome, 0) + 1
+                        if outcome in ("refused", "trial"):
+                            for c in rec.get("causes") or ["other"]:
+                                causes[str(c)] = causes.get(str(c), 0) + 1
+                    elif kind in ("answer", "decision", "refused") and step != "A1.plan":
+                        row = answers.setdefault(step, {})
+                        key = "refused" if kind == "refused" else "answered"
+                        row[key] = row.get(key, 0) + 1
+
+        def mark(rate: float) -> str:
+            return f" - ABOVE THE TARGET OF {target:g} %" if rate > target else ""
+        rows = []
+        given = sum(v for k, v in scenarios.items() if k != "duplicate")
+        if given:
+            refused = scenarios.get("refused", 0) + scenarios.get("trial", 0)
+            rate = 100.0 * refused / given
+            top = ", ".join(f"{c} {n}" for c, n in sorted(causes.items(), key=lambda x: -x[1])[:6])
+            rows.append(f"A1.plan refusal rate: {rate:.1f} % ({refused} of {given} scenarios refused"
+                        + (f"; by cause: {top}" if top else "") + f"){mark(rate)}")
+        for step, row in sorted(answers.items()):
+            total = row.get("refused", 0) + row.get("answered", 0)
+            if total:
+                rate = 100.0 * row.get("refused", 0) / total
+                rows.append(f"{step} refusal rate: {rate:.1f} % ({row.get('refused', 0)} of {total} answers refused)"
+                            f"{mark(rate)}")
+        bundle = s.best_bundle or s.bundle
+        kept = set(bundle.tests) if bundle else set()
+        written = set(getattr(s, "written", set()))
+        if written:
+            lost = written - kept
+            by: dict[str, int] = {}
+            for n in lost:
+                why = s.lost.get(n, "failing, redundant or replaced")
+                by[why] = by.get(why, 0) + 1
+            rate = 100.0 * len(lost) / len(written)
+            top = ", ".join(f"{c} {n}" for c, n in sorted(by.items(), key=lambda x: -x[1]))
+            rows.append(f"brain tests rejection rate: {rate:.1f} % ({len(lost)} of {len(written)} tests written from the "
+                        f"brain's answers not kept" + (f"; {top}" if top else "") + f"){mark(rate)}")
+        return rows
 
     async def _drop_quarantined(self, s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult,
                                 iteration: int = 0) -> uc.FileActionBundle:
@@ -2150,6 +2338,9 @@ class Orchestrator:
             return bundle
         names = sorted({f.affected_test for f in result.quarantined if f.affected_test})
         tests = uc.test_sources(uc.suite_of(bundle))
+        if isinstance(getattr(s, "lost", None), dict):                                         # ORC-12b
+            for name in names:
+                s.lost.setdefault(name, "did not compile (build)")
         for f in result.quarantined:                                     # the journal's facts [LA-2, LA-4]
             if f.affected_test:
                 s.quarantine[f.affected_test] = (f.diagnostic, tests.get(f.affected_test, ""))
@@ -2836,6 +3027,9 @@ class RunState:
         self.no_fix_functions: set[str] = set()               # functions Agent4 found no change for [A4-23j]
         self.failed_tests: dict[str, str] = {}                # test -> why it failed in this run [A1-PL8]
         self.crashed_calls: list[str] = []                    # rule-based inputs that crashed or hung [A2-21f]
+        self.unbuilt: dict[str, int] = {}                     # function -> rounds with no test of it built [LA-5]
+        self.written: set[str] = set()                        # tests written from the brain's answers [ORC-12b]
+        self.lost: dict[str, str] = {}                        # such a test -> why the run did not keep it [ORC-12b]
         self.unmeasured = 0                                   # iterations in a row not measured [A3-60b]
         self.declarations_dropped: list[str] = []             # the brain's declarations that did not build [A1-PL14]
         self.replaced_dependencies: dict[str, uc.Dependency] = {}   # what a proposed declaration replaced
@@ -3130,6 +3324,8 @@ def report(r: uc.PipelineResult) -> str:
     rows += [f"- Reason: {r.reason}", f"- Compiler: {r.compiler or '-'}; harness: {r.framework}",
             f"- Tests: {r.total_tests} total, {r.passed} passed, {r.failed} failed; "
             f"{r.characterization_tests} characterization-only (E8)", ""]
+    if r.brain_rates:                                                                    # ORC-12b
+        rows += ["Refusal and rejection rates of the brain's work [ORC-12b]:", ""] + [f"- {x}" for x in r.brain_rates] + [""]
     if r.unfinished_tests:                                                               # A3-45a, A3-29d
         rows += [f"Tests that did not finish ({len(r.unfinished_tests)}) [A3-45a, A3-45b]:", ""]
         rows += [f"- {line}" for line in r.unfinished_tests[:40]]
@@ -4281,7 +4477,8 @@ async def benchmark(config_path: Path, only: list[str] | None = None, knowledge:
                                      "tokens": sum(p.get("used_input_tokens", 0) + p.get("used_output_tokens", 0)
                                                    for p in answered),
                                      "fixes": [f.rationale[:200] for f in fixes], "output": result.output_dir,
-                                     "answers": _answer_counts(result.brain_answers)})                 # KB-25
+                                     "answers": _answer_counts(result.brain_answers),                 # KB-25
+                                     "rates": list(result.brain_rates)})                               # ORC-12b
                 print(f"[{case['id']}, knowledge {variant}] {outcome}; {result.final_state}", flush=True)
             seeded = [r for r in variant_rows if r.get("find")]
             controls = [r for r in variant_rows if not r.get("find")]
