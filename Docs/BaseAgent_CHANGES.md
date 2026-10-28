@@ -1,5 +1,13 @@
 # BaseAgent changes
 
+## 2026-10-28: brain calls and tokens per file on the live page (VIEW-5)
+
+On a page with several files (`pilot-small`: 23 files), the tiles "Brain calls" and "Tokens" showed the totals of
+the whole page under the name of the file shown (130 calls and 431,577 tokens on `dispatcher.cpp`, which made none).
+Each `brain_answer` event already names its file (`run`). Now the page counts per file too: the tiles show the file
+shown, with the page's totals in the note ("this file, answered x of y · all files n"). A page with one file is
+unchanged.
+
 ## 2026-10-27 (afternoon): answers that cannot run away (from the pilot-large run)
 
 **Why.** In the pilot-large run, 14 of 34 planning answers of Qwen3 were cut at their token limit: answers of about

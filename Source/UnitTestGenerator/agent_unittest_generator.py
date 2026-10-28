@@ -357,8 +357,11 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
                                  f"{definition} = {spec.initializer or '{0}'};")
             else:
                 def_lines.append(f"{definition};")
+                full = spec.qualified_name or spec.function
                 if not re.search(r"\b(class|std::)", definition):
-                    reset.append(f"    memset((void *)&{target}, 0, sizeof {target});")
+                    reset.append(f"    memset((void *)&{full}, 0, sizeof {full});")
+            if ns:                                  # defined inside its namespace, as it is declared [A2-21ad]
+                def_lines[f0:] = [f"namespace {ns} {{", *def_lines[f0:], "}"]
             continue
         names = stub_names(spec)
         ret = re.sub(r"\b(extern|static|inline|virtual|explicit)\b", "", spec.return_type).strip()
@@ -483,9 +486,12 @@ def _fake_bases(iface: uc.InterfaceInfo) -> list[str]:
     return [_ident(n) if names.count(n) == 1 else f"{_ident(n)}_{k}" for k, n in enumerate(names)]
 
 
-def fake_supported(iface: uc.InterfaceInfo) -> bool:
-    """A fake can return a value of every method: no reference results."""
-    return bool(iface.methods) and not any("&" in m.return_type for m in iface.methods)
+def fake_supported(iface: uc.InterfaceInfo, layout: uc.LayoutProfile) -> bool:
+    """A fake can return a value of every method: a reference result refers to the fake's own member, so only a
+    reference to an interface (an abstract class the fake cannot hold) is left out."""
+    abstract = {i.name.split("::")[-1] for i in layout.interfaces}
+    return bool(iface.methods) and not any("&" in m.return_type and re.sub(
+        r"\b(const|volatile|virtual)\b|&", "", m.return_type).strip().split("::")[-1] in abstract for m in iface.methods)
 
 
 def render_fakes(layout: uc.LayoutProfile) -> tuple[list[str], list[str]]:
@@ -496,7 +502,7 @@ def render_fakes(layout: uc.LayoutProfile) -> tuple[list[str], list[str]]:
         return [], []
     headers, rows = [], []
     for iface in layout.interfaces:
-        if not fake_supported(iface):
+        if not fake_supported(iface, layout):
             continue
         if iface.header and not SOURCE_FILE.search(iface.header):
             headers.append(include_name(iface.header, layout))
@@ -504,7 +510,7 @@ def render_fakes(layout: uc.LayoutProfile) -> tuple[list[str], list[str]]:
                  f"class {fake_name(iface)} : public {iface.name} {{", "public:"]
         for m, base in zip(iface.methods, _fake_bases(iface)):
             ret = re.sub(r"\b(virtual|inline)\b", "", m.return_type).strip() or "void"
-            storage = re.sub(r"^const\s+", "", ret).strip()
+            storage = re.sub(r"^const\s+", "", ret.replace("&", "")).strip()   # a reference: to the member
             seq = ret != "void" and sequence_type(storage, layout)
             if ret != "void":
                 rows.append(f"    mutable {storage} {base}_return{{}};")
@@ -540,7 +546,7 @@ def render_fakes(layout: uc.LayoutProfile) -> tuple[list[str], list[str]]:
 def _fake_options(p: uc.ParamInfo, i: int, layout: uc.LayoutProfile, values: list[int], tag: str = ""):
     """Choices for an interface parameter: a fake object with the return values of its methods [A2-21aa]."""
     iface = next((f for f in layout.interfaces if f.name == p.base or f.name.split("::")[-1] == p.base.split("::")[-1]), None)
-    if iface is None or not fake_supported(iface):
+    if iface is None or not fake_supported(iface, layout):
         return None
     var = f"ut_{tag}f{i}"
     small = sorted(set(values), key=lambda v: (abs(v), v))[:6]
@@ -1524,11 +1530,15 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
             opts = [([f"{base} ut_v{i}[{POINTEE_ELEMENTS}] = {{{cast}{v}}};"], f"ut_v{i}",
                      [] if "const" in p.type.split("*")[0] else [f'{observe}("@_o{i}", ut_v{i}[0]);']) for v in small]
         return opts + ([([], null, [])] if p.nullable and not p.by_ref else [])
+    # the parameter's own character type: C++ converts no string literal or char array to unsigned char *
+    plain_char = re.fullmatch(r"(const\s+)?char\s*\*", p.type.strip())
     if p.kind == "cstring":
-        return [([], s, []) for s in ('""', '"a"', '"ABCDEFGHIJKLMNOPQRSTUVWXYZ"')] + \
+        cast = "" if plain_char or not p.type.strip().endswith("*") else f"({p.type.strip()})"
+        return [([], cast + s, []) for s in ('""', '"a"', '"ABCDEFGHIJKLMNOPQRSTUVWXYZ"')] + \
             ([([], null, [])] if p.nullable else [])
     if p.kind == "buffer":
-        return [([f"char ut_b{i}[256] = {{0}};"], f"ut_b{i}", [])]
+        element = "char" if plain_char or not p.type.strip().endswith("*") else p.type.strip()[:-1].strip()
+        return [([f"{element} ut_b{i}[256] = {{0}};"], f"ut_b{i}", [])]
     if p.kind in ("struct", "ptr_struct") and p.fields:
         own = {f.name: field_values(f.name, body, macros or {}) for f in p.fields}           # A2-21r
         # A2-21ad: a pointer field points to a zeroed local object of its pointee (a handle's Instance)
@@ -1986,26 +1996,27 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
     fn = uc.function_of(sc.function, layout, sc.function_line)                          # overloads [NC-4]
     if fn is None or (fn.is_static and not fn.from_frontend):
         return None
-    recipe = block or (uc.object_recipe(fn, layout) if fn.member else None)             # A2-21ae, NC-1
-    if fn.member and recipe is None and not uc.static_member(fn, layout):
+    ctor = fn.member and fn.qualified_name.split("::")[-1] == uc.class_of(fn).split("::")[-1]   # a constructor
+    recipe = block or (uc.object_recipe(fn, layout, sc.object_args) if fn.member and not ctor else None)  # A2-21ae
+    if fn.member and recipe is None and not ctor and not uc.static_member(fn, layout):
         return None
     given = {a.name: a.value for a in sc.args}
     names = param_names(fn)
     if names is None or set(given) != set(names):
         return None
-    stubs: dict[str, uc.StubSpec] = {}
-    for s in plan.stubs:
-        stubs[s.function] = s
-        stubs[s.qualified_name or s.function] = s
+    stubs: dict[str, list[uc.StubSpec]] = {}
+    for s in plan.stubs:                             # a name of several overloads sets every one of them [A1-DA4]
+        for key in dict.fromkeys((s.function, s.qualified_name or s.function)):
+            stubs.setdefault(key, []).append(s)
     lines = list(recipe[0]) if recipe else []                   # the object and its named arguments first [A2-21ae]
     for sv in sc.stub_values:
-        spec = stubs.get(sv.stub)
-        if spec is None or not sv.returns:
+        if not stubs.get(sv.stub) or not sv.returns:
             return None
-        controls = stub_names(spec)
-        if len(sv.returns) == 1:
-            lines.append(f"{controls['return']} = {sv.returns[0]};")
-        else:
+        for spec in stubs[sv.stub]:
+            controls = stub_names(spec)
+            if len(sv.returns) == 1:
+                lines.append(f"{controls['return']} = {sv.returns[0]};")
+                continue
             storage = re.sub(r"^const\s+", "", re.sub(r"\b(extern|static|inline|virtual)\b", "",
                                                        spec.return_type).strip().rstrip("&").strip())
             if not sequence_type(storage, layout) or len(sv.returns) > 16:
@@ -2027,6 +2038,18 @@ def assemble_scenario(sc: uc.Scenario, plan: uc.UTPlan, name: str,
                   if re.search(re.escape(reg) + r"\s*(\|=|=)[^;]*\b" + re.escape(mask) + r"\b", given_setup)}
         lines += wait_setup(waits, preset)
     lines += list(sc.calls_before)                    # the earlier calls that build up the state [BP-2]
+    if ctor:            # the object is what the constructor makes: its stated exception, or the object itself
+        made = f"{uc.instantiated_class(uc.class_of(fn), layout)} ut_obj({', '.join(given[n] for n in names)})"
+        wrapped = f"([&] {{ {made}; }}())"            # one macro argument, even with a template's commas
+        if not sc.characterization and sc.expected_exception:
+            lines.append(f"UT_EXPECT_THROW({wrapped}, {sc.expected_exception});")
+        elif sc.characterization and throws(body, layout):                                   # A3-45e
+            lines.append(f'UT_OBSERVE_THROW("{name}_x", {wrapped});')
+        else:
+            lines.append(f"{made};")
+            if not sc.characterization:
+                lines += [_assert_value(c.expr, c.value) for c in sc.expected_after]
+        return "\n".join(lines)
     target = recipe[1] if recipe else (f"{uc.class_of(fn)}::{fn.qualified_name.split('::')[-1]}" if fn.member
                                        else callee_of(fn))
     call = f"{target}({', '.join(given[n] for n in names)})"
@@ -2237,12 +2260,14 @@ def auto_class_tests(plan: uc.UTPlan, cap: int, existing: set[str]) -> list[tupl
             continue                       # a class of the SUT file itself: no test can name it
         ctor = next((f for f in members if f.qualified_name.endswith(f"{short}::{short}")), None)
         ctor_body = "\n".join(sut_lines[ctor.line_start - 1: ctor.line_end]) if ctor else ""
+        declared = None if ctor else uc.constructor_of(cls, layout)          # declared in a header, inline too
         mapping = _template_args(plan, cls)                                                    # A1-DA19
         if mapping:
             members = [f.model_copy(update={"params": [_instantiate_param(p, mapping) for p in f.params]})
                        for f in members]
             ctor = next((f for f in members if f.qualified_name.endswith(f"{short}::{short}")), None)
             cls = uc.instantiated_class(cls, layout)                                       # A1-DA19
+        ctor = ctor or declared
         for fn in members:
             if fn is ctor or fn.name not in wanted or fn.qualified_name.split("::")[-1].startswith("~"):
                 continue
@@ -2678,14 +2703,13 @@ class GeneratorAgent(ba.AgentCore):
         made, pending, lines = "", [], []
         short = fn.qualified_name.split("::")[-1]
         cls = uc.class_of(fn)
-        ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
-                 .endswith(f"{cls.split('::')[-1]}::{cls.split('::')[-1]}")]
-        ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
+        ctors = uc.constructors_of(cls, layout)
+        ctor = uc.constructor_of(cls, layout)
         # stub: a fake of an injected interface the rules cannot fake (a reference result) [A2-21aa, BP-2]
         for p in (ctor.params if ctor else []):
             base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
             iface = next((f for f in layout.interfaces if f.name.split("::")[-1] == base.split("::")[-1]), None)
-            if iface is None or fake_supported(iface):
+            if iface is None or fake_supported(iface, layout):
                 continue
             fake_sig = f"fake of the interface {iface.name}"
             recipe = self._recipe("stub", fake_sig, {})

@@ -34,6 +34,52 @@
           "door_step(0);"
         ]
       }
+    ],
+    "structured": [
+      {
+        "function": "door_step",
+        "answer": {
+          "args": [
+            {
+              "name": "event",
+              "value": "1"
+            }
+          ],
+          "state": [
+            {
+              "variable": "g_state",
+              "index": -1,
+              "field": "",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "g_state = 0;"
+        ]
+      },
+      {
+        "function": "door_step",
+        "answer": {
+          "args": [
+            {
+              "name": "event",
+              "value": "0"
+            }
+          ],
+          "calls": [
+            {
+              "function": "door_step",
+              "args": [
+                "2"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "g_state = 2;"
+        ]
+      }
     ]
   }
 }

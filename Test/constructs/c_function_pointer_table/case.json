@@ -35,6 +35,44 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "dispatch",
+        "answer": {
+          "args": [
+            {
+              "name": "cmd",
+              "value": "1"
+            },
+            {
+              "name": "x",
+              "value": "5"
+            }
+          ]
+        },
+        "reaches": [
+          "return table[cmd](x);"
+        ]
+      },
+      {
+        "function": "dispatch",
+        "answer": {
+          "args": [
+            {
+              "name": "cmd",
+              "value": "5"
+            },
+            {
+              "name": "x",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "return -1;"
+        ]
+      }
     ]
   }
 }

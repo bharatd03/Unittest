@@ -819,6 +819,7 @@ class LayoutProfile(Contract):
     enums: list[EnumInfo] = Field(default_factory=list)
     sut_state: list[StateVar] = Field(default_factory=list)      # A1-DA15, A2-21s
     class_members: list[MemberInfo] = Field(default_factory=list)   # C++ data members a test may set (structured)
+    constructors: list[FunctionInfo] = Field(default_factory=list)  # declared ones, inline too: how objects are built
     local_statics: list[StateVar] = Field(default_factory=list)  # "function::variable" [A1-DA18, A3-45c]
     interfaces: list[InterfaceInfo] = Field(default_factory=list)   # injected interfaces [A1-DA17, A2-21aa]
     header_sut: bool = False                                     # the SUT is a header [A1-DA19]
@@ -1162,6 +1163,7 @@ class Scenario(Contract):
     quotes: list[Quote] = Field(default_factory=list)
     linked: bool = False               # rests on evidence linked by the brain [A1-PL13]
     calls_before: list[str] = Field(default_factory=list)   # earlier calls that build up the state [BP-2 call_sequence]
+    object_args: list[str] = Field(default_factory=list)    # values of the object's constructor ("" = built) [A2-21ae]
     kind: str = "scenario"             # the answer kind it was asked for [BP-2, BP-3]
     trial: list[str] = Field(default_factory=list)          # refused only by predictions: the tool decides [NC-7]
     function_line: int = 0             # first line of the function: tells overloads apart (0 = the first) [NC-4]
@@ -2898,9 +2900,24 @@ def fake_name_of(interface: str) -> str:
     return "ut_fake_" + re.sub(r"\W", "_", interface.split("::")[-1])
 
 
-def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str], str] | None:
+def constructors_of(cls: str, layout: "LayoutProfile") -> list["FunctionInfo"]:
+    """The constructors of a class: defined in the SUT or declared in a header (inline too)."""
+    short = cls.split("::")[-1]
+    return [f for f in layout.functions + layout.constructors if f.member and
+            f.qualified_name.replace("(anonymous namespace)::", "").endswith(f"{short}::{short}")]
+
+
+def constructor_of(cls: str, layout: "LayoutProfile") -> "FunctionInfo | None":
+    """The constructor a test builds the object with (the fewest parameters), as the tests instantiate it."""
+    ctors = constructors_of(cls, layout)
+    return instantiated(min(ctors, key=lambda f: len(f.params)), layout) if ctors else None   # A1-DA19
+
+
+def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile", values: list[str] | None = None) \
+        -> tuple[list[str], str] | None:
     """A2-21ae: how a test builds the object a member function is called on - every argument a named object
-    declared before (never a temporary bound to a reference) - and the expression to call it with. None for a
+    declared before (never a temporary bound to a reference) - and the expression to call it with. ``values``: the
+    constructor's values a structured scenario gives (a value parameter takes its value, "" or none: {}). None for a
     free function, a static member or a member no test can name."""
     if not fn.member or static_member(fn, layout) or internal_member(fn, layout):
         return None
@@ -2908,10 +2925,7 @@ def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str
     short = cls.split("::")[-1]
     if fn.qualified_name.split("::")[-1] in (short, "~" + short):
         return None
-    ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
-             .endswith(f"{short}::{short}")]
-    ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
-    ctor = instantiated(ctor, layout) if ctor else None           # A1-DA19: the instantiation the tests use
+    ctor = constructor_of(cls, layout)
     lines, args = [], []
     for i, p in enumerate(ctor.params if ctor else []):
         base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
@@ -2926,7 +2940,7 @@ def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[list[str
             lines.append(f"{base or 'int'} ut_dep{i}{{}};")
             args.append(f"&ut_dep{i}")
         else:
-            args.append("{}")
+            args.append(values[i] if values and i < len(values) and values[i] else "{}")
     lines.append(f"{instantiated_class(cls, layout)} ut_obj{('(' + ', '.join(args) + ')') if args else ''};")
     return lines, f"ut_obj.{fn.qualified_name.split('::')[-1]}"
 
@@ -3551,8 +3565,7 @@ def construct_of(fn: "FunctionInfo", layout: "LayoutProfile") -> tuple[str, dict
         return "", {}
     cls = class_of(fn)
     short = cls.split("::")[-1]
-    ctors = [f for f in layout.functions if f.member and f.qualified_name.replace("(anonymous namespace)::", "")
-             .endswith(f"{short}::{short}")]
+    ctors = constructors_of(cls, layout)
     ctor = min(ctors, key=lambda f: len(f.params)) if ctors else None
     params = {"cls": cls, "method": fn.qualified_name.split("::")[-1]}
     shapes = []

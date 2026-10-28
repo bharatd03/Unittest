@@ -6,5 +6,47 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "crc8",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "elements": [
+                "0x01",
+                "0x02"
+              ]
+            },
+            {
+              "name": "len",
+              "value": "2"
+            }
+          ]
+        },
+        "reaches": [
+          "crc = (unsigned char)(crc ^ data[i]);"
+        ]
+      },
+      {
+        "function": "crc8",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "value": "NULL"
+            },
+            {
+              "name": "len",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "return 0;"
+        ]
+      }
+    ]
+  }
 }

@@ -3430,8 +3430,10 @@ class CompilationAgent(ba.AgentCore):
             host = [f for f in self._host.get(str(repo), {}).get("defines", []) if f not in flags]   # A3-HW2, HW3
             units.append((path, "real_dependency", False, flags + host))
         tests = [a for a in actions if a.role in ("testsuite", "stub", "helper")]
-        units += [(a.path, "test" if a.role == "testsuite" else a.role, False, sut_flags + std + test_incs) for a in tests
-                  if a.path.endswith((".c", ".cpp", ".cc", ".cxx"))]
+        # a header SUT's inline functions are compiled into the tests too: instrumented there as well, so the copy
+        # the linker keeps is measured whichever it is [A1-DA19]
+        units += [(a.path, "test" if a.role == "testsuite" else a.role, layout.header_sut and a.role == "testsuite",
+                   sut_flags + std + test_incs) for a in tests if a.path.endswith((".c", ".cpp", ".cc", ".cxx"))]
         # The project's own stub files that the dependency plan reuses [A1-DA7, A1-10, A3-FZ13]
         units += [(path, "stub", False, sut_flags + std + test_incs) for path in reused_stub_sources(layout, actions, repo)]
         units += [(p, "test", False, sut_flags + std + test_incs) for p in layout.executable_tests

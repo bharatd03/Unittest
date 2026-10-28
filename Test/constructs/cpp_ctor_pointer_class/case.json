@@ -15,6 +15,22 @@
         ],
         "call": "ut_obj.log"
       }
+    ],
+    "structured": [
+      {
+        "function": "Logger::log",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "return 0;"
+        ]
+      }
     ]
   }
 }

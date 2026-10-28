@@ -1,0 +1,39 @@
+{
+  "construct": "C++ class template declared in a header, its methods defined in the .cpp SUT",
+  "sut": "src/moving_average.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "MovingAverage::value",
+        "answer": {
+          "args": []
+        },
+        "reaches": [
+          "return T{};"
+        ]
+      },
+      {
+        "function": "MovingAverage::value",
+        "answer": {
+          "args": [],
+          "calls": [
+            {
+              "function": "MovingAverage::add",
+              "args": [
+                "4"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "sum += buf_[i];"
+        ]
+      }
+    ]
+  }
+}

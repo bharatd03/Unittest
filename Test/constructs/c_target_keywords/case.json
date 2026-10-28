@@ -6,5 +6,24 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "irqsafe_inc",
+        "answer": {
+          "state": [
+            {
+              "variable": "g_counter",
+              "index": -1,
+              "field": "",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "g_counter = g_counter + 1;"
+        ]
+      }
+    ]
+  }
 }

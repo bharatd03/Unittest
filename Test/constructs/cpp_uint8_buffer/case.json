@@ -1,0 +1,53 @@
+{
+  "construct": "C++ function taking a const std::uint8_t * buffer and its length",
+  "sut": "src/bits.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "count_set",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "elements": [
+                "0x00",
+                "0x7F",
+                "0xFF"
+              ]
+            },
+            {
+              "name": "len",
+              "value": "3"
+            }
+          ]
+        },
+        "reaches": [
+          "++n;"
+        ]
+      },
+      {
+        "function": "count_set",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "value": "nullptr"
+            },
+            {
+              "name": "len",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "return 0;"
+        ]
+      }
+    ]
+  }
+}

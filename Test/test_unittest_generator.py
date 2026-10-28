@@ -39,6 +39,7 @@ import unittest
 import types
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 # Repository layout: Source/UnitTestGenerator (the application), Source/BaseAgent, Test (this file and
@@ -622,8 +623,8 @@ int limit(int request, int top)
                                        [uc.EvidenceRef(evidence_id="EV-brake_step-1", evidence_class="E2",
                                                        source="include/brk.h", line=2, text="x")], self.stubs)
         schema = json.dumps(ba.llm_schema(model.model_json_schema()))
-        for listed in ('["EVIDENCE:brake_step", "LC:brake_step:9"]', '["in", "state"]', '["ticks"]',
-                       '["EV-brake_step-1"]'):
+        for listed in ('["EVIDENCE:brake_step", "LC:brake_step:9"]', '"enum": ["in"]', '"enum": ["state"]',
+                       '["ticks"]', '["EV-brake_step-1"]'):          # one entry per parameter, typed by its type
             self.assertIn(listed, schema)                         # log_event returns nothing: not a choice
         parsed = model.model_validate({"scenarios": [self.planned(gap_ids=["XX"]).model_dump()]})
         self.assertEqual(parsed.scenarios[0].gap_ids, ["XX"])      # still parsed: the check is the judge [ARCH-20]
@@ -1909,8 +1910,13 @@ class EmbeddedRuleTests(unittest.TestCase):
         self.assertIn(["ut_fake_IEncoder ut_f0;", "ut_f0.position_return = 0;", "ut_f0.fault_return = false;"],
                       [o[0] for o in options])
         self.assertTrue(all(o[1] == "ut_f0" for o in options))                   # passed by reference
-        ref = uc.InterfaceInfo(name="IBus", methods=[uc.InterfaceMethod(name="buf", return_type="int &")])
-        self.assertFalse(a2.fake_supported(ref))                                 # no fake for reference results
+        ref = uc.InterfaceInfo(name="IBus", methods=[uc.InterfaceMethod(name="buf", return_type="const int &")])
+        held = layout.model_copy(update={"interfaces": [ref]})
+        self.assertTrue(a2.fake_supported(ref, held))                            # a reference to the fake's member
+        self.assertIn("const int & buf() override {", "\n".join(a2.render_fakes(held)[1]))
+        self.assertIn("mutable int buf_return{};", "\n".join(a2.render_fakes(held)[1]))
+        abstract = uc.InterfaceInfo(name="IHub", methods=[uc.InterfaceMethod(name="bus", return_type="IBus &")])
+        self.assertFalse(a2.fake_supported(abstract, held))                       # an interface cannot be held
 
     def test_class_templates_of_a_header_sut_are_instantiated_as_the_repository_uses_them(self):   # A1-DA19
         layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(self.CPP), sut_file="include/ring_buffer.hpp"))
@@ -3379,6 +3385,27 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertIn("test_thermostat_command_sensor_error: FAILED in this run (crashed: signal 11 (SIGSEGV))",
                       contexts[0])
 
+    def test_unchanged_facts_are_not_asked_again_after_nothing_was_accepted(self):
+        """A1-PL18: the facts are the code, its open targets and the evidence. A round whose brain call gave no
+        accepted scenario is not asked again while they stay the same - also when only the record of the earlier
+        answers (failed tests, journal, tried) changed; changed targets are asked again."""
+        calls = []
+
+        def nothing(context):
+            calls.append(context)
+            return []
+        agent = a1.AnalyzerAgent()
+        with brain(UTBrain(plans={"thermostat_command": nothing})):
+            run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps), iteration=2)))
+            first = len(calls)
+            plan = run(agent.plan(uc.PlanRequest(
+                layout=self.layout, last=measured(self.layout, self.gaps), iteration=3,
+                failed_tests={"test_thermostat_command_x": "failed"})))                  # only the record changed
+            self.assertEqual(len(calls), first, "asked again with the same facts")
+            self.assertTrue(any("facts unchanged since its last brain call" in p for p in plan.planning), plan.planning)
+            run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps[:1]), iteration=4)))
+        self.assertGreater(len(calls), first, "changed targets are asked again")
+
     def test_without_a_next_brain_the_same_brain_is_asked_again(self):
         """COV-6: the next AVAILABLE brain; when the brain that planned last is the only one, it is asked again
         with the facts of what was tried, and the run goes on."""
@@ -4687,6 +4714,310 @@ class CorpusAnswerTests(unittest.TestCase):
                     self.assertEqual(([x.name for x in parsed.tests], trial), ([test["name"]], {}), name)
                     checked += 1
         self.assertGreaterEqual(checked, 12)
+
+
+def corpus_lines(layout: uc.LayoutProfile, function: str, texts: list[str]) -> list[str]:
+    """The line items (LC:<line>, as per-test coverage names them) of the lines of a function that contain these
+    texts."""
+    fn = function if isinstance(function, uc.FunctionInfo) else uc.function_of(function, layout)
+    lines = (Path(layout.repo_root) / layout.sut_file).read_text(encoding="utf-8").splitlines()
+    out = []
+    for text in texts:
+        hit = next((n for n in range(fn.line_start, fn.line_end + 1) if text in lines[n - 1]), None)
+        if hit is None:
+            raise AssertionError(f"{function}: no line contains {text!r}")
+        out.append(f"LC:{hit}")                                   # per-test items name the line only
+    return out
+
+
+VALUE_FORMS_HEADER = """#pragma once
+#include <cstddef>
+#include <cstdint>
+enum class Mode : std::uint8_t { Off, On };
+struct Rec { int a; std::uint8_t b; };
+namespace dev { extern int g_level; int read(); }
+int f_i8(std::int8_t v);
+int f_u8(std::uint8_t v);
+int f_i16(std::int16_t v);
+int f_u32(std::uint32_t v);
+int f_i64(long long v);
+int f_bool(bool v);
+int f_float(float v);
+int f_double(double v);
+int f_enum(Mode m);
+int f_ref(const std::int32_t &v);
+int f_out(std::int32_t &v);
+int f_buf(const std::uint8_t *d, std::size_t n);
+int f_rec(const Rec *r);
+int f_state();
+int f_dep();
+class Box {
+public:
+    explicit Box(int start);
+    int get() const;
+private:
+    std::int16_t value_;
+};
+"""
+VALUE_FORMS_SOURCE = """#include "forms.hpp"
+static std::uint16_t s_count;
+static Mode s_mode;
+int f_i8(std::int8_t v) { return v > 0 ? 1 : 0; }
+int f_u8(std::uint8_t v) { return v > 0U ? 1 : 0; }
+int f_i16(std::int16_t v) { return v > 0 ? 1 : 0; }
+int f_u32(std::uint32_t v) { return v > 0U ? 1 : 0; }
+int f_i64(long long v) { return v > 0 ? 1 : 0; }
+int f_bool(bool v) { return v ? 1 : 0; }
+int f_float(float v) { return v > 0.0f ? 1 : 0; }
+int f_double(double v) { return v > 0.0 ? 1 : 0; }
+int f_enum(Mode m) { return m == Mode::On ? 1 : 0; }
+int f_ref(const std::int32_t &v) { return v > 0 ? 1 : 0; }
+int f_out(std::int32_t &v) { v += 1; return 0; }
+int f_buf(const std::uint8_t *d, std::size_t n) { return (d != nullptr && n > 0U) ? d[0] : -1; }
+int f_rec(const Rec *r) { return r != nullptr ? r->a + r->b : 0; }
+int f_state() { return s_count > 10U ? (s_mode == Mode::On ? 2 : 1) : 0; }
+int f_dep() { return dev::g_level > 0 ? dev::read() : -1; }
+Box::Box(int start) : value_(static_cast<std::int16_t>(start)) {}
+int Box::get() const { return value_; }
+"""
+
+
+C_FORM_FUNCTIONS = {"f_i8", "f_u8", "f_i16", "f_u32", "f_i64", "f_bool", "f_float", "f_double", "f_enum", "f_buf",
+                    "f_rec", "f_state", "f_dep"}
+VALUE_FORMS_C_HEADER = """#ifndef FORMS_H
+#define FORMS_H
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+typedef enum { Off, On } Mode;
+typedef struct { int a; uint8_t b; } Rec;
+extern int g_level;
+int read(void);
+int f_i8(int8_t v);
+int f_u8(uint8_t v);
+int f_i16(int16_t v);
+int f_u32(uint32_t v);
+int f_i64(long long v);
+int f_bool(bool v);
+int f_float(float v);
+int f_double(double v);
+int f_enum(Mode m);
+int f_buf(const uint8_t *d, size_t n);
+int f_rec(const Rec *r);
+int f_state(void);
+int f_dep(void);
+#endif
+"""
+VALUE_FORMS_C_SOURCE = """#include "forms.h"
+static uint16_t s_count;
+static Mode s_mode;
+int f_i8(int8_t v) { return v > 0 ? 1 : 0; }
+int f_u8(uint8_t v) { return v > 0U ? 1 : 0; }
+int f_i16(int16_t v) { return v > 0 ? 1 : 0; }
+int f_u32(uint32_t v) { return v > 0U ? 1 : 0; }
+int f_i64(long long v) { return v > 0 ? 1 : 0; }
+int f_bool(bool v) { return v ? 1 : 0; }
+int f_float(float v) { return v > 0.0f ? 1 : 0; }
+int f_double(double v) { return v > 0.0 ? 1 : 0; }
+int f_enum(Mode m) { return m == On ? 1 : 0; }
+int f_buf(const uint8_t *d, size_t n) { return (d != NULL && n > 0U) ? d[0] : -1; }
+int f_rec(const Rec *r) { return r != NULL ? r->a + r->b : 0; }
+int f_state(void) { return s_count > 10U ? (s_mode == On ? 2 : 1) : 0; }
+int f_dep(void) { return g_level > 0 ? read() : -1; }
+"""
+
+
+def value_forms(lo: int, hi: int) -> list[str]:
+    """Every integer literal form of C and C++ whose value lies in lo..hi."""
+    forms = [("0", 0), ("1", 1), ("-1", -1), ("+5", 5), ("0u", 0), ("1U", 1), ("0uL", 0), ("1UL", 1), ("0ull", 0),
+             ("1LL", 1), ("0x0", 0), ("0x1F", 31), ("0X1fu", 31), ("07", 7), ("'a'", 97), ("(1 + 2)", 3),
+             ("1 << 2", 4), ("100", 100)]
+    return [f for f, v in forms if lo <= v <= hi]
+
+
+def value_form_entries() -> list[dict]:
+    """The structured answers of the value-form check: one per form and target."""
+    out = []
+
+    def add(function: str, **answer):
+        out.append({"function": function, "answer": answer, "reaches": []})
+    for fn, lo, hi in (("f_i8", -128, 127), ("f_u8", 0, 255), ("f_i16", -32768, 32767), ("f_u32", 0, 2 ** 32 - 1),
+                       ("f_i64", -2 ** 63, 2 ** 63 - 1), ("f_ref", -2 ** 31, 2 ** 31 - 1), ("f_out", -2 ** 31, 2 ** 31 - 1)):
+        for v in value_forms(lo, hi):
+            add(fn, args=[{"name": "v", "value": v}])
+    for v in ("true", "false", "0", "1"):
+        add("f_bool", args=[{"name": "v", "value": v}])
+    for fn in ("f_float", "f_double"):
+        for v in ("0", "1", "-1", "1.0", "1.0f", "-2.5", "1e3", "0.5F", ".5", "2.", "1.5e-3"):
+            add(fn, args=[{"name": "v", "value": v}])
+    for v in ("Off", "On", "Mode::On", "Mode::Off"):
+        add("f_enum", args=[{"name": "m", "value": v}])
+        add("f_state", args=[], state=[{"variable": "s_mode", "index": -1, "field": "", "value": v}])
+    for v in value_forms(0, 255):
+        add("f_buf", args=[{"name": "d", "elements": [v, v]}, {"name": "n", "value": "2"}])
+        add("f_rec", args=[{"name": "r", "fields": [{"field": "a", "value": v}, {"field": "b", "value": v}]}])
+        add("f_state", args=[], state=[{"variable": "s_count", "index": -1, "field": "", "value": v}])
+        add("f_dep", args=[], variables=[{"name": "g_level", "value": v}],
+            stubs=[{"stub": "dev::read", "returns": [v, v]}])
+        add("f_dep", args=[], variables=[{"name": "dev::g_level", "value": v}],
+            stubs=[{"stub": "read", "returns": [v]}])
+        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v]}])
+        add("Box::get", args=[], members=[{"member": "value_", "value": v}])
+    return out
+
+
+def schema_problems(node: Any, value: Any, where: str = "") -> list[str]:
+    """Where a value breaks the answer schema the brain is given (its enums, lengths and list bounds; a missing
+    field is not checked): a correct answer must fit it, or a constrained decoder could never write it."""
+    if not isinstance(node, dict):
+        return []
+    if "anyOf" in node:
+        branches = [schema_problems(b, value, where) for b in node["anyOf"]]
+        return [] if any(not b for b in branches) else min(branches, key=len)
+    if "enum" in node and value not in node["enum"]:
+        return [f"{where}: {value!r} is not one of {node['enum'][:8]}"]
+    if isinstance(value, str) and isinstance(node.get("maxLength"), int) and len(value) > node["maxLength"]:
+        return [f"{where}: {value!r} is longer than {node['maxLength']}"]
+    if isinstance(value, list):
+        out = [f"{where}: {len(value)} items, at most {node['maxItems']}"] \
+            if isinstance(node.get("maxItems"), int) and len(value) > node["maxItems"] else []
+        return out + [x for k, v in enumerate(value) for x in schema_problems(node.get("items"), v, f"{where}[{k}]")]
+    if isinstance(value, dict):
+        props = node.get("properties") or {}
+        return [x for k, v in value.items() for x in
+                (schema_problems(props[k], v, f"{where}.{k}") if k in props else [f"{where}.{k}: not in the schema"])]
+    return []
+
+
+def check_corpus_case(name: str, folder: Path, spec: dict, d: str) -> list[str]:
+    """The structured answers of one construct (answers.structured), as Qwen gives them: Agent1 accepts each (no
+    refusal, no trial), the generator builds a test from it, the test compiles, runs, passes, and reaches the lines
+    the case names. No brain is asked. Returns the problems ("" none)."""
+    entries = (spec.get("answers") or {}).get("structured") or []
+    if not entries:
+        return []
+    repo = Path(d) / name
+    shutil.copytree(folder, repo)
+    layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=spec["sut"]))
+    comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(d) / "w")), router=ba.BrainRouter([DownBrain()], 0.0))
+    layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(
+        layout=layout, build=comp.capture(uc.CaptureRequest(layout=layout)))))
+    agent = a1.AnalyzerAgent()
+    stubs = agent._stubs(layout, None)
+    constants, known = agent._constants_for_values(layout), agent._known_names(layout, stubs)
+    problems, scenarios, wanted = [], [], {}
+    for k, entry in enumerate(entries, 1):
+        fn = uc.function_of(entry["function"], layout)
+        if fn is not None and entry.get("overload"):                      # the n-th overload of the name, by line
+            fn = sorted(uc.overloads(fn, layout), key=lambda f: f.line_start)[entry["overload"] - 1]
+        if fn is None:
+            problems.append(f"{name}: {entry['function']} is not a function of the layout")
+            continue
+        evidence = {e["evidence_id"]: uc.EvidenceRef(**e) for e in entry.get("evidence", [])}
+        answer = {**dict(gap_ids=["LC:corpus"], name=f"test_corpus_{k}", purpose="the construct", args=[], stubs=[],
+                         variables=[], expected_return="", expected_after=[], evidence_ids=[], quotes=[],
+                         classification="characterization_gap", conflict="", information_sought=""),
+                  **entry["answer"]}
+        sut_text = (repo / spec["sut"]).read_text(encoding="utf-8", errors="replace")
+        schema = ba.bound_schema(ba.llm_schema(agent._plan_model(                # what a brain is allowed to write
+            fn, {"LC:corpus"}, list(evidence.values()), stubs, None, 3,
+            agent._structured_lists(fn, layout, stubs, sut_text)).model_json_schema()))
+        problems += [f"{name}: {entry['function']}: the schema refuses it: {x}"
+                     for x in schema_problems(schema, {"scenarios": [answer]})]
+        scenario, reasons = agent._check_planned(a1.PlannedScenario.model_validate(answer), fn, {"LC:corpus"}, set(),
+                                                 evidence, stubs, constants, known, layout)
+        if scenario is None or scenario.trial:
+            problems.append(f"{name}: {entry['function']}: refused: {reasons or scenario.trial}")
+            continue
+        scenario.scenario_id, scenario.function_line = f"S-corpus-{k}", fn.line_start
+        scenarios.append(scenario)
+        wanted[answer["name"]] = (corpus_lines(layout, fn, entry.get("reaches", [])),
+                                  entry.get("contains", []))
+    if not scenarios:
+        return problems
+
+    async def no_brains(*a, **kw):
+        return []
+    gen = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic", max_auto_tests_per_function=0))
+    async def no_values(*a, **kw):
+        return {}
+    gen._brain_values = no_values
+    with mock.patch.object(uc, "brains_for", no_brains):
+        bundle = run(gen.generate_bundle(uc.GenerationRequest(plan=uc.UTPlan(
+            plan_id="corpus", layout=layout, stage="coverage", scenarios=scenarios, stubs=stubs))))
+    sources = uc.test_sources(uc.suite_of(bundle))
+    for test, (_, contains) in wanted.items():
+        if test not in sources:
+            problems.append(f"{name}: {test}: not built - {'; '.join(n for n in bundle.notes if 'not built' in n)[:300]}")
+        for text in contains:
+            if test in sources and text not in sources[test]:
+                problems.append(f"{name}: {test}: the test does not contain {text!r}: {sources[test][-400:]}")
+    gate = comp.execute(uc.VerifyRequest(layout=layout, stage="gate", bundle=bundle))
+    for f in gate.quarantined:
+        problems.append(f"{name}: {f.affected_test or 'suite'}: does not compile: {f.diagnostic[:300]}")
+    if any(p.startswith(f"{name}:") and "compile" in p for p in problems):
+        return problems
+    obs = comp.execute(uc.VerifyRequest(layout=layout, stage="observe", bundle=bundle,
+                                        measure_tests=[t for t in wanted if t in sources]))
+    status = {t.name: t for t in obs.tests}
+    for test, (lines, _) in wanted.items():
+        if test not in sources:
+            continue
+        t = status.get(test)
+        if t is None or t.status != "passed":
+            problems.append(f"{name}: {test}: {t.status if t else 'did not run'} {t.message[:200] if t else obs.reason[:200]}")
+            continue
+        missing = [i for i in lines if i not in set(obs.test_items.get(test, []))]
+        if missing:
+            problems.append(f"{name}: {test}: does not reach {missing} (it reached {sorted(obs.test_items.get(test, []))[:12]})")
+    return problems
+
+
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+class CorpusStructuredTests(unittest.TestCase):
+    """The construct corpus in the form Qwen answers in (structured): every construct is built, compiled, run and
+    reaches its lines - without a brain, in minutes. A pipeline failure is first reduced to a construct: covered here,
+    it is the brain's choice; not covered, it gets a case here first (the rule of Test/constructs/README.md).
+    UT_CORPUS=name1,name2 runs only those cases."""
+
+    def test_every_construct_is_built_compiled_and_run(self):
+        only = [x for x in os.environ.get("UT_CORPUS", "").split(",") if x]
+        problems, covered, missing = [], [], []
+        for name, folder, spec in up.corpus_cases(only or None):
+            if not (spec.get("answers") or {}).get("structured"):
+                missing.append(name)
+                continue
+            with tmpdir() as d:
+                found = check_corpus_case(name, folder, spec, d)
+            problems += found
+            covered.append(name + (" - FAILS" if found else ""))
+        print("\nConstruct corpus, structured: " + ", ".join(covered) + (
+            ("\nwithout a structured answer: " + ", ".join(missing)) if missing else ""))
+        self.assertEqual(problems, [], "\n" + "\n".join(problems))
+        self.assertEqual(missing, [], "every construct has a structured answer")
+
+    def test_every_value_form_of_every_target_is_accepted(self):
+        """A check must never refuse a correct value: every C/C++ literal form within the target's range, for every
+        kind of target (argument, reference, buffer element, field, state, member, constructor value, stub return,
+        stub variable), is accepted, built and compiled - checked by the grammar, not by the cases one meets."""
+        with tmpdir() as d:
+            folder = Path(d) / "src_forms"
+            folder.joinpath("include").mkdir(parents=True)
+            folder.joinpath("src").mkdir()
+            folder.joinpath("include/forms.hpp").write_text(VALUE_FORMS_HEADER, encoding="utf-8")
+            folder.joinpath("src/forms.cpp").write_text(VALUE_FORMS_SOURCE, encoding="utf-8")
+            spec = {"sut": "src/forms.cpp", "answers": {"structured": value_form_entries()}}
+            problems = check_corpus_case("value_forms", folder, spec, d)
+            folder = Path(d) / "src_forms_c"                                 # and C: its own types and forms
+            folder.joinpath("include").mkdir(parents=True)
+            folder.joinpath("src").mkdir()
+            folder.joinpath("include/forms.h").write_text(VALUE_FORMS_C_HEADER, encoding="utf-8")
+            folder.joinpath("src/forms.c").write_text(VALUE_FORMS_C_SOURCE, encoding="utf-8")
+            c_only = [json.loads(json.dumps(e).replace("dev::", "")) for e in value_form_entries()
+                      if e["function"] in C_FORM_FUNCTIONS and "Mode::" not in json.dumps(e)]
+            problems += check_corpus_case("value_forms_c", folder, {"sut": "src/forms.c",
+                                                                    "answers": {"structured": c_only}}, d)
+        self.assertEqual(problems, [], "\n" + "\n".join(problems))
 
 
 @full_run
@@ -6477,6 +6808,37 @@ class TypedValueTests(unittest.TestCase):
                                      members=[{"member": "max_rate_", "value": "1" + "0" * 30}])
         self.assertIsNone(scenario)                                         # a member's value against its type
         self.assertTrue(any("members max_rate_" in n and "range" in n for n in notes), notes)
+
+    def test_constructors_and_injected_interfaces_are_built(self):
+        """From the pilot-small run of 2026-10-28: a requirement of a constructor (STR-1: a rate of 0 is refused with
+        an exception) could not be built, so the brain was asked for it round after round; an injected interface
+        parameter refused every value, the fake's name too."""
+        layout = self.layouts["cpp_medium_pilot"]
+        ev = uc.EvidenceRef(evidence_id="EV-steer-1", evidence_class="E1", source="docs/requirements.md", line=9,
+                            text="STR-1: the steering request is limited to the rate given at construction, per second; a "
+                                 "rate of 0 or below is refused with an exception")
+        agent = a1.AnalyzerAgent()
+        fn = uc.function_of("vehicle::chassis::SteerLimiter::SteerLimiter", layout)
+        planned = a1.PlannedScenario.model_validate(dict(
+            gap_ids=["LC:1"], name="test_steer_limiter_refuses_a_zero_rate", purpose="p",
+            args=[{"name": "max_rate_per_s", "value": "0"}], stubs=[], variables=[], expected_return="",
+            expected_exception="std::invalid_argument", expected_after=[], evidence_ids=["EV-steer-1"],
+            quotes=[{"evidence_id": "EV-steer-1", "text": "a rate of 0 or below is refused with an exception"}],
+            classification="confirmed_gap", conflict="", information_sought=""))
+        stubs = agent._stubs(layout, None)
+        scenario, notes = agent._check_planned(planned, fn, {"LC:1"}, set(), {"EV-steer-1": ev}, stubs,
+                                               agent._constants_for_values(layout), agent._known_names(layout, stubs),
+                                               layout)
+        self.assertEqual(scenario.expected_exception, "std::invalid_argument", notes)
+        plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", scenarios=[scenario], stubs=stubs)
+        self.assertIn("UT_EXPECT_THROW(([&] { vehicle::chassis::SteerLimiter ut_obj(0); }()), std::invalid_argument);",
+                      a2.assemble_scenario(scenario, plan, "test_steer_limiter_refuses_a_zero_rate"))
+        scenario, notes = self.check("cpp_medium_pilot", "vehicle::chassis::BrakeBlender::BrakeBlender",
+                                     args=[{"name": "diag", "value": "ut_dep0", "elements": ["x"]}])
+        self.assertIsNotNone(scenario, notes)
+        self.assertIn("ut_fake_IDiagSink ut_diag;", scenario.setup)                 # the type decides: a fake
+        plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", scenarios=[scenario], stubs=stubs)
+        self.assertIn("vehicle::chassis::BrakeBlender ut_obj(ut_diag);", a2.assemble_scenario(scenario, plan, "t"))
 
 
 class ReadOnceTests(unittest.TestCase):

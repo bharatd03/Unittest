@@ -35,6 +35,58 @@
           "button_sample(1);"
         ]
       }
+    ],
+    "structured": [
+      {
+        "function": "button_sample",
+        "answer": {
+          "args": [
+            {
+              "name": "input",
+              "value": "1"
+            }
+          ],
+          "state": [
+            {
+              "variable": "g_count",
+              "index": -1,
+              "field": "",
+              "value": "2"
+            }
+          ]
+        },
+        "reaches": [
+          "g_pressed = 1;"
+        ]
+      },
+      {
+        "function": "button_sample",
+        "answer": {
+          "args": [
+            {
+              "name": "input",
+              "value": "1"
+            }
+          ],
+          "calls": [
+            {
+              "function": "button_sample",
+              "args": [
+                "1"
+              ]
+            },
+            {
+              "function": "button_sample",
+              "args": [
+                "1"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "g_pressed = 1;"
+        ]
+      }
     ]
   }
 }

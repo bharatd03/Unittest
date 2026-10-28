@@ -28,6 +28,22 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "timer_done",
+        "answer": {
+          "registers": [
+            {
+              "address": "0x40000010",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "TIMER_SR = 0u;"
+        ]
+      }
     ]
   }
 }

@@ -1,0 +1,35 @@
+{
+  "construct": "C: a timer accumulated in SUT state beyond the range of the parameter that feeds it",
+  "sut": "src/timer.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "timer_tick",
+        "answer": {
+          "args": [
+            {
+              "name": "dt_ms",
+              "value": "20"
+            }
+          ],
+          "state": [
+            {
+              "variable": "g_elapsed_ms",
+              "index": -1,
+              "field": "",
+              "value": "599990"
+            }
+          ]
+        },
+        "reaches": [
+          "g_elapsed_ms = 0;"
+        ]
+      }
+    ]
+  }
+}

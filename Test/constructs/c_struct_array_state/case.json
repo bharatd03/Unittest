@@ -1,0 +1,35 @@
+{
+  "construct": "C: SUT state that is an array of structures, one element's field set",
+  "sut": "src/channels.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "channel_level",
+        "answer": {
+          "args": [
+            {
+              "name": "index",
+              "value": "2"
+            }
+          ],
+          "state": [
+            {
+              "variable": "g_channels",
+              "index": 2,
+              "field": "level",
+              "value": "150"
+            }
+          ]
+        },
+        "reaches": [
+          "return 100;"
+        ]
+      }
+    ]
+  }
+}

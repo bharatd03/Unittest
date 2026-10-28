@@ -6,5 +6,36 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "operator+",
+        "answer": {
+          "args": [
+            {
+              "name": "a",
+              "fields": [
+                {
+                  "field": "cents",
+                  "value": "999999"
+                }
+              ]
+            },
+            {
+              "name": "b",
+              "fields": [
+                {
+                  "field": "cents",
+                  "value": "2"
+                }
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "r.cents = 1000000;"
+        ]
+      }
+    ]
+  }
 }

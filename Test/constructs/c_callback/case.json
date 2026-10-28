@@ -6,5 +6,22 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "events_raise",
+        "answer": {
+          "args": [
+            {
+              "name": "code",
+              "value": "3"
+            }
+          ]
+        },
+        "reaches": [
+          "return 0;"
+        ]
+      }
+    ]
+  }
 }

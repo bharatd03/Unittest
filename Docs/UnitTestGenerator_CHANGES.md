@@ -3,6 +3,155 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (8): refusals the code caused - false refusals, the schema without the type facts, repeated questions
+
+### Why
+
+The pilot-small run of 17:35 (commit 2cefff3, with the structured implementation) refused 57 brain answers. That is
+above 5 % on 12 of 23 files, while coverage was 100 % on all but `ctrl.c`. By cause:
+
+| Cause | Refusals | Whose |
+|---|---|---|
+| A check refused a correct answer | 14 | ours |
+| A runaway number (`1000…`, 120 digits) | 16 | the model |
+| The same scenario again, with unchanged facts | 15 | ours (asked again) and the model's |
+| A wrong form (a structure as one text, a sentence as a value) | 8 | the model |
+| An answer stopped (too long, a repeated block) | 4 | the model |
+
+The 14 false refusals:
+* `ring_buffer.hpp`: `0uL` for a `const std::int32_t &` was refused 8 times with "give its value".
+* `motor_ctrl.cpp`: the injected interface was refused 6 times (already fixed in (6)).
+
+### Change: three fixes, all independent of the model
+
+* **A check never refuses a correct value.**
+  * A reference to a scalar (`const T &`, `T &`) becomes a named variable with its value.
+  * In C++ a scoped enumerator is cast for the state setter, which takes `long long`.
+  * New test `test_every_value_form_of_every_target_is_accepted`, in C and C++. Every literal form within the type's
+    range must be accepted, built and compiled for every kind of target: argument, reference, buffer element, field,
+    state, member, constructor value, stub return, stub variable. The forms: `0`, `-1`, `+5`, `0u`, `1UL`, `0ull`,
+    `1LL`, `0x1F`, `0X1fu`, `07`, `'a'`, `(1 + 2)`, `1 << 2`, true/false, floats, enumerators with every
+    qualification. The check is tested by the grammar, not by the cases a run happens to meet.
+* **The answer schema carries the type facts (`value_schema`).** It is sent as `response_format: json_schema`, so a
+  server that supports it holds the model to it while it writes.
+  * An argument entry per parameter:
+    * an enumeration takes one of its enumerators, in every qualification;
+    * a boolean takes `true`/`false`/`0`/`1`;
+    * a number takes at most 32 characters (was 120);
+    * a structure, buffer, pointer or injected interface takes no value, only its fields or elements (`NULL` when
+      it may be NULL).
+  * Object members the same way.
+  * The corpus check now also requires that every correct answer fits the schema: a constrained decoder must be able
+    to write it. That found five places where the schema was narrower than the checks:
+    * nested and indexed fields (`bits.ready` of an unnamed struct in a union, `samples[1]`);
+    * the class's own methods were not offered as calls;
+    * a register given by base + offset (`PERIPH_BASE + 0x04u`) was not offered;
+    * the qualified name of a stub or a stub variable;
+    * a partly qualified enumerator.
+* **No question with unchanged facts (A1-PL18).** The guard existed, but its fingerprint was the whole prompt. The
+  prompt includes the record of the brain's own earlier answers (tried, refused, attempts, journal), which changes
+  after every answer, so the guard never fired. The facts are now: the SUT version, the function, its open items,
+  the evidence, the names it may use and the brains to avoid.
+  * New test `test_unchanged_facts_are_not_asked_again_after_nothing_was_accepted`. It fails with the old
+    fingerprint.
+
+### Checked
+
+* The pilot-small run's 112 recorded A1.plan answers, replayed through today's checks: 88 accepted, 24 refused (at
+  run time: 57 refused, the repeats included).
+  * `ring_buffer.hpp` 8 of 8 and `motor_ctrl.cpp` 16 of 16 are accepted now.
+  * 23 of the 24 refused answers hold a value the schema no longer allows. A constrained decoder cannot write them as
+    they were.
+  * The 6 structures written as one text (`klist.c`, `ring.c`) can no longer be written that way: the schema allows
+    only fields.
+  * This does not make the other 17 right. A runaway number (`rate_limiter.cpp`, `ctrl.c`, `steering_monitor.cpp`)
+    is cut at 32 characters and is still outside the type's range. These are the model's and stay refused, now with
+    fewer tokens.
+* The repeats cannot be replayed (they depend on the rounds); the next pilot-small run measures them.
+* `corpus`: 39 cases and the value forms pass, every answer within the schema.
+* The component tests here: 315 run; the 5 that fail need LangGraph or fail without this change too.
+
+## 2026-10-28 (7): the construct corpus in the structured form, and one rule for every failure
+
+### Why
+
+Until now a failure was found in a pilot run and fixed for what that run showed. That is a chain without an end:
+every run finds the next file-specific symptom. The construct corpus (`Test/constructs`) already held one minimal case
+per construct, but its answers were in the older free-code form, so it no longer tested what Qwen answers.
+
+### Change: the corpus answers like Qwen, one generic check, one rule
+
+* Every case got `answers.structured`: the structured answers (the planning schema) that reach its construct.
+* `CorpusStructuredTests` (one test, no brain, about 20 s here) takes each answer through Agent1's check, Agent2's
+  assembly and Agent3's build and run. Each answer must be accepted, built, compile, pass and reach the lines the case
+  names. `UT_CORPUS=a,b` runs only those cases.
+* New command `corpus [CASES]` in both entry files and the README.
+* The rule, in `Test/constructs/README.md`: a failure of a run is first reduced to its construct.
+  * Covered (`corpus` passes): it is the brain's choice; no code change.
+  * Not covered: add a minimal case with its correct answer first (it must fail), then teach the generator the
+    construct once, by the facts of the code, never by the names of one file.
+
+### What the corpus found, and the construct fixes
+
+Of 32 cases, 26 passed at first. Seven new cases from the constructs of the medium pilots then found three more gaps.
+Each fix is for a construct, not for a file:
+
+| Construct (cases) | Cause | Fix |
+|---|---|---|
+| Constructor defined inline in a header (`cpp_ctor_pointer_class`, `cpp_ctor_ref_interface`, `cpp_interface_reference_result`, `cpp_nested_class`) | Only the SUT's functions were searched for constructors, so the object was `Logger ut_obj;`. | `layout.constructors`: the public constructors the classes declare (front end; copy and move left out). One helper, `constructor_of`, for the object rule, the rule-based tests and the recipe key. Their parameter types count for the injected interfaces too. |
+| An interface method that returns a reference (`cpp_interface_reference_result`) | No fake was written (A2-21aa: "not generated"), so only a brain could write one. | The fake returns a reference to its own `<method>_return` member. Only a reference to another interface (an abstract class) is still left out. *Deviation from A2-21aa, to go into the requirements.* |
+| A `.hpp` header-only SUT with C-compatible content (`cpp_header_only`) | It was taken as C (by its content), and its inline functions were not measured: the linker kept the test file's uninstrumented copy. | `.hpp`, `.hh`, `.hxx`, `.ipp`, `.tpp` are C++ by name; `.h` and `.inl` are still decided by content. For a header SUT the test suite is instrumented too, so whichever copy the linker keeps is measured. |
+| C code built as C++, `unsigned char *` (`c_as_cpp`) | The rule tests passed `""` and `char[256]`, which C++ does not convert. | The literal is cast to the parameter's type, and the buffer has the parameter's element type. |
+| One name, two overloaded stubs (`cpp_overloaded_dependency`) | The stub value set only the last overload. | A stub name sets every overload of that name. |
+| A struct parameter with an array field (`c_struct_param_array_field`, new) | `samples[1]` was refused: "not a field". | A field path may index an array field within its length (`samples[1]`, `pts[0].x`); an index out of range is refused. |
+| A stubbed variable of a namespace (`cpp_namespaced_enum_stub_variable`, new) | It was defined and reset outside its namespace, so it did not link. | Defined inside its namespace and reset by its full name. |
+| A constructor that validates its arguments (`cpp_ctor_throws`, new; `SteerLimiter` of chassis_ctrl) | The object was always built with `{}`, so every method test threw at construction. | The class's constructor is listed in CALLABLE FUNCTIONS. Named in `calls`, its values build the object (`SteerLimiter ut_obj(30)`, typed like every value). |
+
+The other new cases passed without a change:
+* `cpp_uint8_buffer`
+* `cpp_template_out_of_line`
+* `c_struct_array_state`
+* `c_accumulated_timer`
+
+STAGE_A_VERSION 4: cached Stage A results without `constructors` are computed again.
+
+### Checked
+
+* `corpus`: 39 of 39 cases built, compiled, run and reaching their lines (27 s).
+* The component tests here: 313 run; the 5 that fail need LangGraph or fail without this change too.
+* `test_a_fake_implements_an_injected_interface` updated (a reference result is faked; a reference to an
+  interface is not).
+
+## 2026-10-28 (6): constructors and injected interfaces in structured scenarios - from the pilot-small run
+
+In the pilot-small run (23 files, 27 min 56 s), the brain calls went almost all to one place: the requirement
+checks (`EVIDENCE:<function>`) of files that already had 100 % coverage after their first round. That round is
+intended: it checks the documented behaviour (A1-25y, within `after_target_seconds`). But many of its questions
+could never become a test:
+* **Constructors** (`MotorCtrl::MotorCtrl`, `RateLimiter::RateLimiter`, `TorqueMap::TorqueMap`,
+  `SteeringMonitor::SteeringMonitor`): 18 of about 90 planning calls on those four files. The generator built no
+  scenario of a constructor (it built objects only to call a method on them). So the plan was asked again until its
+  attempts were used.
+* **An injected interface parameter** (`IEncoder& enc`): every value was refused, the name of the generator's fake
+  (`ut_dep0`) too. That was 6 of `motor_ctrl.cpp`'s 12 refusals.
+
+Change:
+* A constructor scenario is built: `Class ut_obj(args);`, with the class template's instance (`test_instances`).
+  * A stated exception becomes `UT_EXPECT_THROW(([&] { Class ut_obj(args); }()), type);` (STR-1 of the chassis
+    pilot: a rate of 0 is refused with `std::invalid_argument`). The lambda in parentheses keeps a template's commas
+    in one macro argument.
+  * A characterization scenario of a constructor that throws observes the exception (A3-45e).
+  * A normative one asserts its `expected_after` on the object.
+* An injected interface parameter takes the generator's fake (the type decides, like every value):
+  `ut_fake_<Interface> ut_<param>;`, passed by reference or address.
+
+Checked:
+* `test_constructors_and_injected_interfaces_are_built` (`SteerLimiter(0)` throws; `BrakeBlender` gets
+  `ut_fake_IDiagSink`).
+* The C++ answers of the pilot-medium run, replayed: every accepted scenario is built now (55, none left out; before,
+  4 were not built), and 2 do not compile (values the checks marked as predictions).
+* 30 test classes pass except the one that fails in this container without the change too.
+
 ## 2026-10-28 (5): every structured value is checked by the type of what it sets - from the pilot-medium run
 
 ### What the run showed (13:21, commit 328430c)

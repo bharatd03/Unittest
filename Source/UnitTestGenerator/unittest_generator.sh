@@ -6,6 +6,8 @@
 #    ./unittest_generator.sh check             show the tools, Python packages and brains in use
 #    ./unittest_generator.sh test              the component tests (a few minutes), results in test_results.txt
 #    ./unittest_generator.sh test-full         every test incl. whole pipeline runs, in parallel (release validation)
+#    ./unittest_generator.sh corpus [CASES]    the construct corpus in Qwen's structured answer form, no brain (about a
+#                                              minute): every construct built, compiled, run; CASES = name1,name2 [NC-4]
 #    ./unittest_generator.sh pilot-c | pilot-cpp | pilot-deps | pilot-embedded | pilot-embedded-cpp | pilot-realrepo
 #                                              every SUT file of a pilot, one live viewer page for all
 #    ./unittest_generator.sh pilot-medium      the two medium pilots (about 700 lines each; the C++ file calls into
@@ -53,7 +55,7 @@ PILOTS="$TESTS/pilots"
 export BASEAGENT_QWEN_MODEL="${BASEAGENT_QWEN_MODEL:-qwen3:8b}"
 ACTION="${1:-}"
 if [ -z "$ACTION" ]; then
-  echo "Usage: $0 setup|check|test|test-full|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-medium|pilot-large|pilot-all|pilot-small|pilot-ordered|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
+  echo "Usage: $0 setup|check|test|test-full|corpus [CASES]|baseagent-test|pilot-c|pilot-cpp|pilot-deps|pilot-embedded|pilot-embedded-cpp|pilot-realrepo|pilot-medium|pilot-large|pilot-all|pilot-small|pilot-ordered|benchmark|calibrate BRAIN|view RUN_FOLDER|run REPO SUT [options]"
   exit 2
 fi
 shift
@@ -129,7 +131,7 @@ fi
 [ "$ACTION" = setup ] && exit 0
 
 # ---------------------------------------------------------------- Ollama (Qwen3 8B, the fallback brain)
-if [ "$ACTION" != test ] && [ "$ACTION" != check ] && command -v ollama >/dev/null 2>&1; then
+if [ "$ACTION" != test ] && [ "$ACTION" != corpus ] && [ "$ACTION" != check ] && command -v ollama >/dev/null 2>&1; then
   if ! ollama list >/dev/null 2>&1; then
     echo "Starting Ollama ..."
     (ollama serve >/dev/null 2>&1 &)
@@ -165,6 +167,12 @@ case "$ACTION" in
     fi
     echo "Full results: $RESULTS"
     exit $RC ;;
+  corpus)
+    # NC-4: every construct of Test/constructs in Qwen's structured form, no brain. The rule for every failure of a
+    # run: reduce it to a construct - covered here, it is the brain's choice and no code changes; not covered, it
+    # gets a case here first, then the generator learns it once (Test/constructs/README.md)
+    (cd "$TESTS" && UT_CORPUS="${1:-}" "$PY" -u -m unittest test_unittest_generator.CorpusStructuredTests)
+    exit $? ;;
   pilot-c) pilot c_pilot src/thermostat.c "$@" ;;
   pilot-cpp) pilot cpp_pilot src/rate_limiter.cpp src/steering_monitor.cpp src/torque_map.cpp "$@" ;;
   pilot-deps) pilot c_deps_pilot src/ctrl.c src/brake_ctrl.c src/steer_assist.c "$@" ;;

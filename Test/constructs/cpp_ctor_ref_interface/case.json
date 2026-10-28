@@ -25,6 +25,22 @@
         "body": "ut_fake_ISensor s;\ns.read_return = 10;\nHeater h(s);\nUT_OBSERVE_INT(\"test_heater_demand_below_set_point_1\", h.demand(20));",
         "evidence_class": "E8"
       }
+    ],
+    "structured": [
+      {
+        "function": "Heater::demand",
+        "answer": {
+          "args": [
+            {
+              "name": "set_point",
+              "value": "20"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
     ]
   }
 }

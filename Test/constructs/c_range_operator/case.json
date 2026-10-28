@@ -5,5 +5,23 @@
   "expect": {
     "final_state": "incomplete",
     "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "level_valid",
+        "answer": {
+          "args": [
+            {
+              "name": "d",
+              "value": "5000"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
+    ]
   }
 }

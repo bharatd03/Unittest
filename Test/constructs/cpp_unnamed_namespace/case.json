@@ -31,6 +31,22 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "filter_add",
+        "answer": {
+          "args": [
+            {
+              "name": "sample",
+              "value": "500"
+            }
+          ]
+        },
+        "reaches": [
+          "return g_window.add(sample);"
+        ]
+      }
     ]
   }
 }

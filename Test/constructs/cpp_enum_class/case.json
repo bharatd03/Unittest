@@ -31,6 +31,36 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "gear_limit",
+        "answer": {
+          "args": [
+            {
+              "name": "g",
+              "value": "Gear::Reverse"
+            }
+          ]
+        },
+        "reaches": [
+          "return 10;"
+        ]
+      },
+      {
+        "function": "gear_limit",
+        "answer": {
+          "args": [
+            {
+              "name": "g",
+              "value": "Drive"
+            }
+          ]
+        },
+        "reaches": [
+          "return 130;"
+        ]
+      }
     ]
   }
 }

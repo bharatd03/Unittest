@@ -6,5 +6,30 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "stats_span",
+        "answer": {
+          "args": [
+            {
+              "name": "a",
+              "value": "1"
+            },
+            {
+              "name": "b",
+              "value": "5"
+            },
+            {
+              "name": "c",
+              "value": "3"
+            }
+          ]
+        },
+        "reaches": [
+          "return m.span();"
+        ]
+      }
+    ]
+  }
 }

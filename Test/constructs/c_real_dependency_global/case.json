@@ -28,6 +28,15 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "fan_needed",
+        "answer": {},
+        "reaches": [
+          "return 0;"
+        ]
+      }
     ]
   }
 }

@@ -1,0 +1,75 @@
+{
+  "construct": "C++: an enum class of a namespace as argument, a stubbed variable and function of another namespace",
+  "sut": "src/supervisor.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "app::supervise",
+        "answer": {
+          "args": [
+            {
+              "name": "mode",
+              "value": "Service"
+            }
+          ]
+        },
+        "reaches": [
+          "return 2;"
+        ]
+      },
+      {
+        "function": "app::supervise",
+        "answer": {
+          "args": [
+            {
+              "name": "mode",
+              "value": "Mode::Run"
+            }
+          ],
+          "variables": [
+            {
+              "name": "g_supply_mv",
+              "value": "8000"
+            }
+          ]
+        },
+        "reaches": [
+          "return -1;"
+        ]
+      },
+      {
+        "function": "app::supervise",
+        "answer": {
+          "args": [
+            {
+              "name": "mode",
+              "value": "app::Mode::Run"
+            }
+          ],
+          "variables": [
+            {
+              "name": "board::g_supply_mv",
+              "value": "12000"
+            }
+          ],
+          "stubs": [
+            {
+              "stub": "board::read_temp",
+              "returns": [
+                "95"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return -2;"
+        ]
+      }
+    ]
+  }
+}

@@ -5,5 +5,32 @@
   "expect": {
     "final_state": "any",
     "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "door_fl_receive",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "elements": [
+                "0xA1",
+                "0x03",
+                "0",
+                "0"
+              ]
+            },
+            {
+              "name": "len",
+              "value": "4"
+            }
+          ]
+        },
+        "reaches": [
+          "fl_errors++;"
+        ]
+      }
+    ]
   }
 }

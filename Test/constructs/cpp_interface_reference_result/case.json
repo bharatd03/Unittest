@@ -12,6 +12,22 @@
       {
         "code": "class ut_fake_ITable : public ITable { public: mutable Route lookup_return{}; mutable int lookup_calls = 0; const Route& lookup(int dest) const override { (void)dest; ++lookup_calls; return lookup_return; } };"
       }
+    ],
+    "structured": [
+      {
+        "function": "Router::port_for",
+        "answer": {
+          "args": [
+            {
+              "name": "dest",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "return -1;"
+        ]
+      }
     ]
   }
 }

@@ -5723,6 +5723,11 @@ function finalPanel(d){var f=document.getElementById("final");f.innerHTML="";f.c
  var s=[];if(d.seconds!=null)s.push("time "+Math.round(d.seconds)+" s");if(d.delivery)s.push(d.delivery);if(s.length)f.appendChild(h("div",s.join(" · "),"sub"));
  [["Action needed",d.action_needed],["Suggested source changes",d.suggestions]].forEach(function(p){if(p[1]&&p[1].length){f.appendChild(h("div",p[0],"sub"));var ul=h("ul");p[1].forEach(function(x){ul.appendChild(h("li",x))});f.appendChild(ul)}})}
 // VIEW-12: several runs (SUT files) on one page - each keeps its title, metrics and final state
+function brainTiles(){   // VIEW-5: the file shown; with several files the whole page's totals in the note
+ var r=S.runs[S.cur]||{},n=function(x){return (x||0).toLocaleString("en-US")},all=many();
+ setMetric("__calls",{value:all?(r.calls||0):S.calls,note:all?("this file, answered "+n(r.answered)+" of "+n(r.calls)+" · all files "+n(S.calls)):
+  ("answered "+n(S.answered)+" of "+n(S.calls)+" sent")});
+ setMetric("__tokens",{value:all?(r.tokens||0):S.tokens,note:all?("this file · all files "+n(S.tokens)):""})}
 function runOf(ev){var id=ev.run||"";var r=S.runs[id];
  if(!r){r=S.runs[id]={id:id,title:"",subtitle:"",decl:[],values:{},state:"running",final:null,start:ev.time||0,end:0,orch:null};S.runOrder.push(id)}return r}
 function short(id){id=id||"";var k=id.indexOf(": "),pre=k>0?id.slice(0,k+2):"",f=k>0?id.slice(k+2):id;
@@ -5741,7 +5746,7 @@ function orchOf(r){if(!r||!r.orch)return;if(!S.orch){S.orch=r.orch;return}   // 
 function show(force){var id=choose();if(id==null)return;var r=S.runs[id];
  if(force||id!==S.cur){S.cur=id;document.getElementById("title").textContent=r.title||"Pipeline";document.title=r.title||"Pipeline";
   document.getElementById("subtitle").textContent=r.subtitle||"";metricsInit(r.decl);
-  Object.keys(r.values).forEach(function(m){setMetric(m,r.values[m])});setMetric("__calls",{value:S.calls,note:"answered "+(S.answered||0)+" of "+S.calls+" sent"});setMetric("__tokens",{value:S.tokens});
+  Object.keys(r.values).forEach(function(m){setMetric(m,r.values[m])});brainTiles();
   orchOf(r)
   var f=document.getElementById("final");if(r.final)finalPanel(r.final);else f.classList.remove("show");if(S.view==null)overview()}
  var st=document.getElementById("status"),done=!running().length&&!S.pending;
@@ -5768,9 +5773,11 @@ function apply1(ev){var k=ev.kind,d=ev.data||{};S.now=ev.time||0;
   fly(ev.agent,ev.to,famOf(ev.agent),true,1000);feed(ev,ev.summary||(labelOf(ev.agent)+" → "+labelOf(ev.to)),famOf(ev.agent));return}
  if(k==="brain_call"){fly(ev.agent,"brain",famOf(ev.agent),false,800);return}
  if(k==="brain_answer"){if(d.model){S.model=d.model;if(S.brainText)S.brainText.textContent=d.model}
-  if(d.outcome!=="cached"&&d.outcome!=="no brain"){S.calls+=(d.requests!=null?d.requests:1);S.tokens+=(d.tokens||0)}   // VIEW-5: every request
-  if(d.outcome==="answered"){S.answered=(S.answered||0)+1;fly("brain",ev.agent,"purple",false,800)}
-  setMetric("__calls",{value:S.calls,note:"answered "+(S.answered||0)+" of "+S.calls+" sent"});setMetric("__tokens",{value:S.tokens});
+  var rb=ev.run&&S.runs[ev.run];   // VIEW-5: counted for the file it belongs to, and for the whole page
+  if(d.outcome!=="cached"&&d.outcome!=="no brain"){var nq=(d.requests!=null?d.requests:1);S.calls+=nq;S.tokens+=(d.tokens||0);
+   if(rb){rb.calls=(rb.calls||0)+nq;rb.tokens=(rb.tokens||0)+(d.tokens||0)}}
+  if(d.outcome==="answered"){S.answered=(S.answered||0)+1;if(rb)rb.answered=(rb.answered||0)+1;fly("brain",ev.agent,"purple",false,800)}
+  brainTiles();
   feed(ev,ev.summary||(labelOf(ev.agent)+": brain "+(d.outcome||"")),"purple");return}
  if(k==="program"){var ap=S.agents[ev.agent];if(ap){ap.programs=ap.programs||{};ap.programs[d.program]=(ap.programs[d.program]||0)+(d.runs||1)}
   if(d.outcome&&d.outcome!=="ok")feed(ev,tag(ev,ev.summary||(labelOf(ev.agent)+" ran "+(d.program||""))),d.outcome==="tests_failed"?"gray":famOf(ev.agent));return}

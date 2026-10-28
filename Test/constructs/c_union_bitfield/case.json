@@ -6,5 +6,50 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "status_eval",
+        "answer": {
+          "args": [
+            {
+              "name": "s",
+              "fields": [
+                {
+                  "field": "bits.error",
+                  "value": "1"
+                }
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return 2;"
+        ]
+      },
+      {
+        "function": "status_eval",
+        "answer": {
+          "args": [
+            {
+              "name": "s",
+              "fields": [
+                {
+                  "field": "bits.ready",
+                  "value": "1"
+                },
+                {
+                  "field": "bits.code",
+                  "value": "3"
+                }
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
+    ]
+  }
 }

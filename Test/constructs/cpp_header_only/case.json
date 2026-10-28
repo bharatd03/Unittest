@@ -39,6 +39,30 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "clamp_to",
+        "answer": {
+          "args": [
+            {
+              "name": "v",
+              "value": "-5"
+            },
+            {
+              "name": "lo",
+              "value": "0"
+            },
+            {
+              "name": "hi",
+              "value": "10"
+            }
+          ]
+        },
+        "reaches": [
+          "return lo;"
+        ]
+      }
     ]
   }
 }

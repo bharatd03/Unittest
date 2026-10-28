@@ -14,6 +14,22 @@
         ],
         "call": "ut_obj.kind"
       }
+    ],
+    "structured": [
+      {
+        "function": "Parser::Token::kind",
+        "answer": {
+          "members": [
+            {
+              "member": "c_",
+              "value": "'5'"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
     ]
   }
 }

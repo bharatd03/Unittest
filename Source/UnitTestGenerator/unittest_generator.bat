@@ -7,6 +7,8 @@ rem    unittest_generator.bat setup             check every tool again and insta
 rem    unittest_generator.bat check             show the tools, Python packages and brains in use
 rem    unittest_generator.bat test              the component tests (a few minutes), results in test_results.txt
 rem    unittest_generator.bat test-full         every test incl. whole pipeline runs, in parallel (release validation)
+rem    unittest_generator.bat corpus [CASES]    the construct corpus in Qwen's structured answer form, no brain (about a
+rem                                             minute): every construct built, compiled, run; CASES = name1,name2 [NC-4]
 rem    unittest_generator.bat pilot-c           full pipeline on the C pilot
 rem    unittest_generator.bat pilot-cpp         full pipeline on the C++ pilot (three SUT files)
 rem    unittest_generator.bat pilot-deps        full pipeline on the CMake pilot with dependencies (three SUT files)
@@ -124,6 +126,7 @@ if /i "%ACTION%"=="run" if not "%~4"=="" set EXTRA=%4 %5 %6 %7 %8 %9
 set "KNOWLEDGE=on"
 if /i "%ACTION%"=="benchmark" if not "%~2"=="" set "KNOWLEDGE=%~2"
 if /i "%ACTION%"=="calibrate" set "CALBRAIN=%~2"
+if /i "%ACTION%"=="corpus" set "CORPUS=%~2"
 if /i "%ACTION%"=="view" set "VIEWDIR=%~2"
 if /i "%ACTION:~0,6%"=="pilot-" if not "%~2"=="" set EXTRA=%2 %3
 rem  LA-9: a run started from the menu may ask at a decision point; a run from the command line asks only with --interactive.
@@ -191,6 +194,7 @@ if /i "%ACTION%"=="setup" goto end
 rem ---------------------------------------------------------------- Ollama (Qwen3 8B, the fallback brain)
 if /i "%ACTION%"=="test" goto dispatch
 if /i "%ACTION%"=="test-full" goto dispatch
+if /i "%ACTION%"=="corpus" goto dispatch
 if /i "%ACTION%"=="check" goto dispatch
 where ollama >nul 2>&1
 if errorlevel 1 goto dispatch
@@ -212,6 +216,7 @@ rem ---------------------------------------------------------------- actions
 if /i "%ACTION%"=="check" goto check
 if /i "%ACTION%"=="test" goto run_tests
 if /i "%ACTION%"=="test-full" goto run_tests
+if /i "%ACTION%"=="corpus" goto corpus
 if /i "%ACTION%"=="pilot-c" goto pilot_c
 if /i "%ACTION%"=="pilot-cpp" goto pilot_cpp
 if /i "%ACTION%"=="pilot-deps" goto pilot_deps
@@ -226,7 +231,7 @@ if /i "%ACTION%"=="pilot-ordered" goto pilot_ordered
 if /i "%ACTION%"=="benchmark" goto benchmark
 if /i "%ACTION%"=="calibrate" goto calibrate
 if /i "%ACTION%"=="run" goto run_repo
-echo Unknown option "%ACTION%". Use: setup, check, test, test-full, baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-medium, pilot-large, pilot-all, pilot-small, pilot-ordered, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
+echo Unknown option "%ACTION%". Use: setup, check, test, test-full, corpus [CASES], baseagent-test, pilot-c, pilot-cpp, pilot-deps, pilot-embedded, pilot-embedded-cpp, pilot-realrepo, pilot-medium, pilot-large, pilot-all, pilot-small, pilot-ordered, benchmark, calibrate BRAIN, view RUN_FOLDER or run REPO SUT.
 set "UT_EXIT=2"
 goto end
 
@@ -273,6 +278,24 @@ if /i "%ACTION%"=="test-full" findstr /b /c:"Summary:" "%RESULTS%"
 if /i not "%ACTION%"=="test-full" findstr /r /c:"^Ran [0-9]* test" /c:"^OK" /c:"^FAILED" "%RESULTS%"
 echo Full results: %RESULTS%
 if not "%UT_EXIT%"=="0" echo Some tests failed. Send test_results.txt to Claude.
+goto end
+
+:corpus
+rem  NC-4: every construct of Test\constructs in the structured form Qwen answers in - no brain, about a minute.
+rem  The rule for every failure of a run: reduce it to a construct. Covered here, it is the brain's choice and no
+rem  code changes; not covered, it gets a case here first, then the generator learns it once (Test\constructs\README.md).
+set "UT_TMP=%~dp0ut_tmp"
+if not exist "%UT_TMP%" mkdir "%UT_TMP%"
+set "TMP=%UT_TMP%"
+set "TEMP=%UT_TMP%"
+set "TMPDIR=%UT_TMP%"
+set "UT_CORPUS=%CORPUS%"
+echo.
+echo Building, compiling and running every construct of the corpus ...
+pushd "%TESTS%"
+"%PY%" -u -m unittest test_unittest_generator.CorpusStructuredTests
+set "UT_EXIT=%errorlevel%"
+popd
 goto end
 
 :baseagent_tests

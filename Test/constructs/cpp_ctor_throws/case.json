@@ -1,0 +1,103 @@
+{
+  "construct": "C++ constructor that throws on an invalid argument; a method of the class needs a valid object",
+  "sut": "src/steer_limiter.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "chassis::SteerLimiter::SteerLimiter",
+        "answer": {
+          "args": [
+            {
+              "name": "max_deg",
+              "value": "0"
+            }
+          ],
+          "expected_exception": "std::invalid_argument",
+          "classification": "confirmed_gap",
+          "evidence_ids": [
+            "EV-SteerLimiter-1"
+          ],
+          "quotes": [
+            {
+              "evidence_id": "EV-SteerLimiter-1",
+              "text": "throws std::invalid_argument when max_deg is not positive"
+            }
+          ]
+        },
+        "evidence": [
+          {
+            "evidence_id": "EV-SteerLimiter-1",
+            "evidence_class": "E2",
+            "source": "include/steer_limiter.hpp",
+            "line": 9,
+            "text": "throws std::invalid_argument when max_deg is not positive"
+          }
+        ],
+        "reaches": [
+          "throw std::invalid_argument"
+        ],
+        "contains": [
+          "UT_EXPECT_THROW("
+        ]
+      },
+      {
+        "function": "chassis::SteerLimiter::limit",
+        "answer": {
+          "args": [
+            {
+              "name": "deg",
+              "value": "100"
+            }
+          ],
+          "calls": [
+            {
+              "function": "chassis::SteerLimiter::SteerLimiter",
+              "args": [
+                "30"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return max_deg_;"
+        ],
+        "contains": [
+          "ut_obj(30)"
+        ]
+      },
+      {
+        "function": "chassis::SteerLimiter::limit",
+        "answer": {
+          "args": [
+            {
+              "name": "deg",
+              "value": "-100"
+            }
+          ],
+          "calls": [
+            {
+              "function": "chassis::SteerLimiter::SteerLimiter",
+              "args": [
+                "5"
+              ]
+            }
+          ],
+          "members": [
+            {
+              "member": "max_deg_",
+              "value": "30"
+            }
+          ]
+        },
+        "reaches": [
+          "return -max_deg_;"
+        ]
+      }
+    ]
+  }
+}

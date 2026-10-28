@@ -6,5 +6,34 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "encode",
+        "answer": {
+          "args": [
+            {
+              "name": "small",
+              "value": "1"
+            },
+            {
+              "name": "wide",
+              "value": "2"
+            }
+          ],
+          "stubs": [
+            {
+              "stub": "hw::write",
+              "returns": [
+                "1"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "++done;"
+        ]
+      }
+    ]
+  }
 }

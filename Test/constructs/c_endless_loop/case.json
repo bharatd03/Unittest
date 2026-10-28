@@ -6,5 +6,54 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "wait_ready",
+        "answer": {
+          "args": [
+            {
+              "name": "max",
+              "value": "5"
+            }
+          ],
+          "stubs": [
+            {
+              "stub": "flag_ready",
+              "returns": [
+                "0",
+                "0",
+                "1"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return polls;"
+        ]
+      },
+      {
+        "function": "wait_ready",
+        "answer": {
+          "args": [
+            {
+              "name": "max",
+              "value": "1"
+            }
+          ],
+          "stubs": [
+            {
+              "stub": "flag_ready",
+              "returns": [
+                "0"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return -1;"
+        ]
+      }
+    ]
+  }
 }

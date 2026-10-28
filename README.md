@@ -71,6 +71,7 @@ Run without a command, the `.bat` shows a menu.
 | `check` | tools, Python packages and available brains |
 | `test` | the component tests, a few minutes; results in `test_results.txt` |
 | `test-full` | every test, including whole pipeline runs, in parallel processes (release validation) |
+| `corpus [CASES]` | the construct corpus (`Test/constructs`) in the structured form Qwen answers in, without a brain, in about a minute: every construct is built, compiled, run and reaches its lines; `CASES` = `name1,name2` runs only those. The first step for any failure of a run (see `Test/constructs/README.md`) |
 | `pilot-c`, `pilot-cpp`, `pilot-deps` | the full pipeline on a pilot project, with the live viewer |
 | `pilot-embedded`, `pilot-embedded-cpp` | the full pipeline on the embedded pilots: registers, register polling, a superloop, interrupt flags, target keywords and assembly; an injected interface, exceptions, a static object in a function and a header-only template |
 | `pilot-realrepo` | the full pipeline on patterns found in real repositories: a header that needs its configuration header first, `T * const` parameters, a header next to the source only, `_Atomic` and callback fields, a handle whose `Instance` points to registers, C++ namespaces |

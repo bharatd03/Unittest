@@ -6,5 +6,30 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "ticket_next",
+        "answer": {
+          "calls": [
+            {
+              "function": "ticket_next",
+              "args": []
+            },
+            {
+              "function": "ticket_next",
+              "args": []
+            },
+            {
+              "function": "ticket_next",
+              "args": []
+            }
+          ]
+        },
+        "reaches": [
+          "n = 1;"
+        ]
+      }
+    ]
+  }
 }

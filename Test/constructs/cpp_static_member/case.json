@@ -16,6 +16,26 @@
         "body": "UT_OBSERVE_INT(\"test_math_util_sat_add_limits_1\", MathUtil::sat_add(900, 200));",
         "evidence_class": "E8"
       }
+    ],
+    "structured": [
+      {
+        "function": "MathUtil::sat_add",
+        "answer": {
+          "args": [
+            {
+              "name": "a",
+              "value": "600"
+            },
+            {
+              "name": "b",
+              "value": "600"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1000;"
+        ]
+      }
     ]
   }
 }

@@ -1,0 +1,36 @@
+{
+  "construct": "C: a structure parameter with an array field, one element set",
+  "sut": "src/window.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "window_peak",
+        "answer": {
+          "args": [
+            {
+              "name": "w",
+              "fields": [
+                {
+                  "field": "count",
+                  "value": "2"
+                },
+                {
+                  "field": "samples[1]",
+                  "value": "7"
+                }
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "peak = w->samples[i];"
+        ]
+      }
+    ]
+  }
+}

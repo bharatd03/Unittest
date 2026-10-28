@@ -16,6 +16,67 @@
         "body": "UT_OBSERVE_THROW(\"test_checked_div_by_zero_throws_1\", checked_div(1, 0));",
         "evidence_class": "E8"
       }
+    ],
+    "structured": [
+      {
+        "function": "checked_div",
+        "answer": {
+          "args": [
+            {
+              "name": "a",
+              "value": "1"
+            },
+            {
+              "name": "b",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "throw std::invalid_argument"
+        ]
+      },
+      {
+        "function": "checked_div",
+        "answer": {
+          "args": [
+            {
+              "name": "a",
+              "value": "1"
+            },
+            {
+              "name": "b",
+              "value": "0"
+            }
+          ],
+          "expected_exception": "std::invalid_argument",
+          "classification": "confirmed_gap",
+          "evidence_ids": [
+            "EV-checked_div-1"
+          ],
+          "quotes": [
+            {
+              "evidence_id": "EV-checked_div-1",
+              "text": "throws std::invalid_argument for b == 0"
+            }
+          ]
+        },
+        "evidence": [
+          {
+            "evidence_id": "EV-checked_div-1",
+            "evidence_class": "E2",
+            "source": "include/checked.hpp",
+            "line": 2,
+            "text": "@return a / b; throws std::invalid_argument for b == 0"
+          }
+        ],
+        "reaches": [
+          "throw std::invalid_argument"
+        ],
+        "contains": [
+          "UT_EXPECT_THROW("
+        ]
+      }
     ]
   }
 }

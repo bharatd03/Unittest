@@ -9,11 +9,21 @@
   "answers": {
     "scenarios": [
       {
-        "gap_ids": ["LC:height_distance_mm:30"],
+        "gap_ids": [
+          "LC:height_distance_mm:30"
+        ],
         "name": "test_height_distance_mm_in_range",
         "purpose": "an echo of 8746 us is 1500 mm, inside the range",
-        "args": [{"name": "mm", "value": "&out"}],
-        "setup": ["int32_t out = 0;", "sim_set_echo_us(8746u);"],
+        "args": [
+          {
+            "name": "mm",
+            "value": "&out"
+          }
+        ],
+        "setup": [
+          "int32_t out = 0;",
+          "sim_set_echo_us(8746u);"
+        ],
         "stubs": [],
         "variables": [],
         "expected_return": "",
@@ -23,6 +33,24 @@
         "classification": "characterization_gap",
         "conflict": "",
         "information_sought": ""
+      }
+    ],
+    "structured": [
+      {
+        "function": "height_distance_mm",
+        "answer": {
+          "args": [
+            {
+              "name": "mm",
+              "elements": [
+                "0"
+              ]
+            }
+          ]
+        },
+        "reaches": [
+          "return HEIGHT_ERR_NO_ECHO;"
+        ]
       }
     ]
   }

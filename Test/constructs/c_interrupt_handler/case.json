@@ -28,6 +28,38 @@
         "conflict": "",
         "information_sought": ""
       }
+    ],
+    "structured": [
+      {
+        "function": "uart_poll",
+        "answer": {
+          "state": [
+            {
+              "variable": "g_rx",
+              "index": -1,
+              "field": "",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "g_rx = 0;"
+        ]
+      },
+      {
+        "function": "uart_poll",
+        "answer": {
+          "calls": [
+            {
+              "function": "uart_rx_isr",
+              "args": []
+            }
+          ]
+        },
+        "reaches": [
+          "g_rx = 0;"
+        ]
+      }
     ]
   }
 }

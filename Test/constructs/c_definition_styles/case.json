@@ -6,5 +6,50 @@
     "final_state": "any",
     "statuses": {}
   },
-  "answers": {}
+  "answers": {
+    "structured": [
+      {
+        "function": "Com_Clamp",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "150"
+            }
+          ]
+        },
+        "reaches": [
+          "return 100;"
+        ]
+      },
+      {
+        "function": "Com_Scale",
+        "answer": {
+          "args": [
+            {
+              "name": "v",
+              "value": "3"
+            }
+          ]
+        },
+        "reaches": [
+          "return v * 2;"
+        ]
+      },
+      {
+        "function": "com_internal",
+        "answer": {
+          "args": [
+            {
+              "name": "x",
+              "value": "1"
+            }
+          ]
+        },
+        "reaches": [
+          "return x + Com_Scale(x);"
+        ]
+      }
+    ]
+  }
 }

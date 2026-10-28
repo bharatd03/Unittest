@@ -16,6 +16,22 @@
         "body": "UT_OBSERVE_INT(\"test_sum_n_limits_large_sums_1\", sum_n(2, 900, 500));",
         "evidence_class": "E8"
       }
+    ],
+    "structured": [
+      {
+        "function": "sum_n",
+        "answer": {
+          "args": [
+            {
+              "name": "n",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "return s;"
+        ]
+      }
     ]
   }
 }
