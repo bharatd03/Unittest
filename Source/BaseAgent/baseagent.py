@@ -56,8 +56,8 @@ class AgentFault(Exception):
         self.code, self.message, self.retryable = code, message, retryable
 
 
-def _inspect_json(value: Any, depth: int = 0) -> None:
-    if depth > MAX_DEPTH:
+def _inspect_json(value: Any, depth: int = 0, limit: int = MAX_DEPTH) -> None:
+    if depth > limit:
         raise AgentFault("INVALID_JSON", "JSON nesting exceeds the allowed limit.")
     if value is None or type(value) in (bool, str, int):
         return
@@ -67,21 +67,24 @@ def _inspect_json(value: Any, depth: int = 0) -> None:
         return
     if type(value) is list:
         for item in value:
-            _inspect_json(item, depth + 1)
+            _inspect_json(item, depth + 1, limit)
         return
     if type(value) is dict:
         for key, item in value.items():
             if type(key) is not str:
                 raise AgentFault("INVALID_JSON", "Object keys must be strings.")
-            _inspect_json(item, depth + 1)
+            _inspect_json(item, depth + 1, limit)
         return
     raise AgentFault("INVALID_JSON", "Unsupported JSON value type.")
 
 
-def json_dumps(value: Any, *, max_bytes: int = MAX_WIRE_BYTES, sort_keys: bool = True) -> str:
+def json_dumps(value: Any, *, max_bytes: int = MAX_WIRE_BYTES, sort_keys: bool = True,
+               max_depth: int = MAX_DEPTH) -> str:
     """Canonical (sorted) by default for hashes/storage. Brain payloads pass
-    sort_keys=False: the order of choice options and score levels is data."""
-    _inspect_json(value)
+    sort_keys=False: the order of choice options and score levels is data. ``max_depth``: a request
+    this process builds itself (a brain request with its answer schema) may nest deeper than JSON
+    received from outside."""
+    _inspect_json(value, 0, max_depth)
     try:
         result = json.dumps(value, ensure_ascii=False, allow_nan=False,
                             sort_keys=sort_keys, separators=(",", ":"))
@@ -2097,6 +2100,8 @@ def _version_tuple(text: str) -> tuple[int, ...]:
 class OllamaHTTP:
     """Minimal JSON client for the LOCAL Ollama server: loopback only, never via a proxy."""
     MAX_REQUEST_BYTES = 256 * 1024
+    # a request with an answer schema: llm_schema allows 24 levels, the request object around it a few more
+    MAX_REQUEST_DEPTH = 32
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024       # thinking text and /api/show can be large
     LABEL = "Local Ollama server"
 
@@ -2134,8 +2139,11 @@ class OllamaHTTP:
         data = None
         if body is not None:
             try:
-                data = json_dumps(body, max_bytes=self.MAX_REQUEST_BYTES, sort_keys=False).encode()
+                data = json_dumps(body, max_bytes=self.MAX_REQUEST_BYTES, sort_keys=False,
+                                  max_depth=self.MAX_REQUEST_DEPTH).encode()
             except AgentFault as exc:
+                if exc.code != "PAYLOAD_TOO_LARGE":            # not a size: never reported as one
+                    raise AgentFault("CONFIGURATION_ERROR", f"The request cannot be sent: {exc.message}") from exc
                 raise AgentFault("CONTEXT_BUDGET_EXCEEDED", "Request is too large for the local model.") from exc
         try:
             reader = (lambda: self._stream(path, data, timeout, idle, watch)) if idle else \

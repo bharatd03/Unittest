@@ -3384,6 +3384,7 @@ class BrainPlanningTests(unittest.TestCase):
                             for p in plan.planning), plan.planning)
         self.assertIn("test_thermostat_command_sensor_error: FAILED in this run (crashed: signal 11 (SIGSEGV))",
                       contexts[0])
+        self.assertEqual(len(contexts), 1)        # the answer repeated what failed: not asked again [A1-PL18]
 
     def test_unchanged_facts_are_not_asked_again_after_nothing_was_accepted(self):
         """A1-PL18: the facts are the code, its open targets and the evidence. A round whose brain call gave no
@@ -4753,10 +4754,11 @@ int f_state();
 int f_dep();
 class Box {
 public:
-    explicit Box(int start);
+    Box(int start, int step);
     int get() const;
 private:
     std::int16_t value_;
+    int step_;
 };
 """
 VALUE_FORMS_SOURCE = """#include "forms.hpp"
@@ -4777,8 +4779,8 @@ int f_buf(const std::uint8_t *d, std::size_t n) { return (d != nullptr && n > 0U
 int f_rec(const Rec *r) { return r != nullptr ? r->a + r->b : 0; }
 int f_state() { return s_count > 10U ? (s_mode == Mode::On ? 2 : 1) : 0; }
 int f_dep() { return dev::g_level > 0 ? dev::read() : -1; }
-Box::Box(int start) : value_(static_cast<std::int16_t>(start)) {}
-int Box::get() const { return value_; }
+Box::Box(int start, int step) : value_(static_cast<std::int16_t>(start)), step_(step) {}
+int Box::get() const { return value_ + step_; }
 """
 
 
@@ -4861,7 +4863,8 @@ def value_form_entries() -> list[dict]:
             stubs=[{"stub": "dev::read", "returns": [v, v]}])
         add("f_dep", args=[], variables=[{"name": "dev::g_level", "value": v}],
             stubs=[{"stub": "read", "returns": [v]}])
-        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v]}])
+        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v, v]}])
+        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v]}])   # a value not given: {}
         add("Box::get", args=[], members=[{"member": "value_", "value": v}])
     return out
 
@@ -4924,6 +4927,12 @@ def check_corpus_case(name: str, folder: Path, spec: dict, d: str) -> list[str]:
             agent._structured_lists(fn, layout, stubs, sut_text)).model_json_schema()))
         problems += [f"{name}: {entry['function']}: the schema refuses it: {x}"
                      for x in schema_problems(schema, {"scenarios": [answer]})]
+        try:                                         # and the request that carries the schema can be sent
+            ba.json_dumps({"model": "m", "messages": [{"role": "user", "content": "x"}], "response_format": {
+                "type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}},
+                max_bytes=ba.OllamaHTTP.MAX_REQUEST_BYTES, sort_keys=False, max_depth=ba.OllamaHTTP.MAX_REQUEST_DEPTH)
+        except ba.AgentFault as exc:
+            problems.append(f"{name}: {entry['function']}: the request with its schema cannot be sent: {exc.message}")
         scenario, reasons = agent._check_planned(a1.PlannedScenario.model_validate(answer), fn, {"LC:corpus"}, set(),
                                                  evidence, stubs, constants, known, layout)
         if scenario is None or scenario.trial:

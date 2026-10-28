@@ -3,6 +3,38 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-28 (10): the pilot-small run of 20:31 - a request that could not be sent, constructor values, re-asks
+
+### What the run showed (commit c39dfab)
+
+Coverage was as before: 100 % on 22 files, `ctrl.c` incomplete. The brain was asked far less: 38 planning answers
+(17:35: 112), of which 20 were refused (17:35: 57).
+
+But part of the drop was a defect of (8). Every function with two or more parameters got no answer at all: the
+request with the new per-parameter schema was nested 18 levels deep. BaseAgent refuses more than 16 and reported it
+as "Request is too large for the local model" (`ctrl.c`: 14 items undetermined, never planned). Fixed in BaseAgent
+(see its CHANGES). The corpus check now also sends every schema through the same limit; with the old limit it fails
+on `c_as_cpp`.
+
+The 20 refusals:
+
+| Cause | Refusals | Fix |
+|---|---|---|
+| The same scenario as tried, or a test that failed, given again in the re-ask of the same round | 12 | A round's re-ask is skipped when every refusal of the answer was such a repeat: the facts are unchanged, and the re-ask only added "do not repeat" (6 of 6 such re-asks repeated again). |
+| The object's constructor named in `calls` with fewer values than parameters | 4 | A value not given is `{}`, as the CALLABLE FUNCTIONS row says. More values than parameters stay refused. Covered by the value-form check (`Box(v)` for `Box(int, int)`). |
+| A runaway number, now cut at 32 characters | 4 | none: the model's, still outside the range |
+
+Brain tests not kept (rejections): 10 of 17, on files the rule-based tests had already covered to 100 %:
+* failing, redundant or replaced: 7 (the category does not tell them apart);
+* did not compile: 2;
+* crashed: 1.
+
+### Checked
+
+* `corpus` (39 cases, the value forms, every schema sendable).
+* The component tests here: 315 run; the 5 that fail need LangGraph or fail without this change too.
+* The BaseAgent tests: the same failures as without the change (this container has no LangGraph).
+
 ## 2026-10-28 (9): no HTML coverage pages (paths over 260 characters on Windows)
 
 `llvm-cov show -format=html` wrote one page per source under `coverage/coverage/<the source's absolute path>.html`,

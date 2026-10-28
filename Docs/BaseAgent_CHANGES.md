@@ -1,5 +1,20 @@
 # BaseAgent changes
 
+## 2026-10-28 (evening): a request with a nested answer schema is sent, and a non-size failure is not reported as size
+
+In the pilot-small run of 20:31, every planning call for a function with two or more parameters failed with
+`CONTEXT_BUDGET_EXCEEDED: Request is too large for the local model`, also for the 3-parameter `control` of a 17-line
+file. The request was small (about 6 KB). The cause was its nesting: the answer schema with one entry per parameter
+(`anyOf`) is 14 levels deep, 18 with the request object around it. `json_dumps` refuses JSON nested more than 16
+levels (`MAX_DEPTH`, a guard for JSON received from outside), and `OllamaHTTP.call` reported every refusal of
+`json_dumps` as size.
+
+* `json_dumps(..., max_depth=)`; `OllamaHTTP.MAX_REQUEST_DEPTH = 32` for the requests the process builds itself
+  (`llm_schema` already allows schemas of 24 levels). JSON received from outside keeps the limit of 16.
+* Only `PAYLOAD_TOO_LARGE` becomes `CONTEXT_BUDGET_EXCEEDED`. Any other refusal is `CONFIGURATION_ERROR` with its
+  own message, so it is no longer taken for a context to shorten.
+* The unit-test generator's corpus check now sends every corpus answer's schema through the same limit.
+
 ## 2026-10-28: brain calls and tokens per file on the live page (VIEW-5)
 
 On a page with several files (`pilot-small`: 23 files), the tiles "Brain calls" and "Tokens" showed the totals of

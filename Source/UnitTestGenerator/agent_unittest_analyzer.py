@@ -4497,13 +4497,14 @@ class AnalyzerAgent(ba.AgentCore):
                  or f.name.split("::")[-1] == c.function.split("::")[-1]), None)
             if made is not None and c.function.replace("(anonymous namespace)::", "").split("::")[-2:] == \
                     made.qualified_name.replace("(anonymous namespace)::", "").split("::")[-2:]:
-                if len(c.args) != len(made.params) or planned.object_args:   # the object's constructor [A2-21ae]
+                if len(c.args) > len(made.params) or planned.object_args:   # the object's constructor [A2-21ae]
                     problems.append(f"calls: the constructor {c.function} takes {len(made.params)} argument(s), "
                                     f"given {len(c.args)}" if not planned.object_args else
                                     f"calls: the constructor {c.function} is named twice")
                     continue
+                given = list(c.args) + [""] * (len(made.params) - len(c.args))   # a value not given: {} as listed
                 values = [typed(f"calls {c.function}.{p.name}", x, p) if p.kind in ("int", "enum", "bool", "float")
-                          else "" for x, p in zip(c.args, made.params)]
+                          and x.strip() else "" for x, p in zip(given, made.params)]
                 if all(v is not None for v in values):
                     planned.object_args = values
                     fixes.append(f"calls: {c.function} builds the object [structured]")
@@ -5548,13 +5549,14 @@ class AnalyzerAgent(ba.AgentCore):
             if not book.allows(used.get("brain", ""), "call_sequence"):      # BP-3: never taken from a brain whose
                 for planned in answer.scenarios:                            # profile does not allow the kind
                     planned.calls_before, planned.calls = [], []
-            problems, sought, before = [], [], len(accepted)
+            problems, sought, before, repeats = [], [], len(accepted), 0
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
                 if planned.name in req.failed_tests:                         # A1-PL8: not again unchanged
                     self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, outcome="refused",
                                     causes=["failed before"])                                       # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name}): its test {req.failed_tests[planned.name]} "
                                     "earlier in this run; plan other inputs or set-up under another name")
+                    repeats += 1
                     continue
                 tfix = expand_targets(planned, by_tid)                                            # A1-PL3a
                 answered = planned.model_dump(mode="json")                                         # A1-PL17
@@ -5594,6 +5596,7 @@ class AnalyzerAgent(ba.AgentCore):
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): the same inputs and "
                                     "set-up were tried in an earlier iteration and did not reach the items (see "
                                     "JOURNAL): plan different values, set-up or a sequence of calls")
+                    repeats += 1
                     continue
                 scenario.made_by = brain
                 scenario.required_conditions = [c for g in gaps if g.gap_id in scenario.gap_ids
@@ -5642,6 +5645,10 @@ class AnalyzerAgent(ba.AgentCore):
                     break                                         # no other brain is available
                 limit += self.cfg.max_brain_calls_per_function
             elif not (problems or found) and accepted or not remaining or calls >= limit:
+                break
+            elif problems and repeats == len(problems) and not found and len(accepted) == before:
+                plan_notes["planning"].append(f"{fn.name}: the answer repeated what was tried - not asked again with "
+                                              "the same facts [A1-PL18]")
                 break
             extra = ("\n\nYOUR PREVIOUS ANSWER WAS CHECKED. Scenarios already accepted reach the targets: "
                      + (", ".join(done_targets) or "none") + ". Plan only these targets now: " + ", ".join(remaining)
