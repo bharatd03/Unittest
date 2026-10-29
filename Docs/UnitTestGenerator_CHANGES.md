@@ -3,6 +3,73 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-29 (15): the medium run - four defects of ours behind most of the C++ refusals and every gate failure
+
+### What the run showed (commit of (14))
+
+`climate_ctrl.c`:
+* MC/DC rose from 53.4 % to 69.3 %.
+* Refusals: 33 % of the coverage answers. 26 of the 46 were repeats of a scenario tried before, 9 a timer value
+  outside `uint16_t`.
+* Rejections for a fault: 4.2 % of the coverage answers.
+
+`chassis_ctrl.cpp`:
+* MC/DC stayed at 39 %.
+* Refusals: 69 % of the coverage answers.
+* Rejections for a fault: 47 % of the coverage answers. All 14 were tests that did not compile.
+
+Reduced to constructs, the C++ causes were ours, and none of them is specific to the model:
+
+| Construct | What happened | Corpus case |
+|---|---|---|
+| Two dependencies of one short name (`using hal::adc::read;` then `read(3)`, and `hal::gpio::read`) | The schema offered the short name `read` for the whole file, and the check matched it to `gpio::read` (bool). 16 correct pressure values were refused as "outside the range of bool". Every stub was also offered to every function: 8 supply voltages were written as `gpio::read` values for a function that calls no stub. | `cpp_same_name_stubs` |
+| Arguments of a call made before | They were plain strings, while `args` are objects. The model wrote the object into the string 38 times (`'{"name": "value", "value": "0"}'`), and an empty value became a call with too few arguments (6 tests that did not compile). | `cpp_call_struct_arg` |
+| A stub of a namespace writes a structure of that namespace (`drv::can::read(Frame &)`) | The test declared `Frame` without its namespace: 4 tests did not compile. | `cpp_stub_out_namespaced_struct` |
+| A parameter that is an object of a class of the SUT (`const SpeedEstimator &`) | The schema offered free text: `SpeedEstimator{speed_: 1234}` did not compile. The rule tests asked the brain to write its set-up code: 28 tests used an invented `ut_rSpeedEstimator`. | `cpp_object_param` |
+
+Each case failed before the change.
+
+### Change
+
+* **The stubs of a scenario are the stubs its function calls.** This covers the function itself and the SUT
+  functions it calls, three levels deep.
+  * The front end records the qualified name of every function a function calls, as the compiler resolved it (a
+    using-declaration included). `FunctionInfo.calls` carries the short and the qualified names.
+  * A stub is offered by its qualified name. Its short name is offered only when no other stub that function calls
+    has it.
+  * A function that calls no stub gets no `stubs` field.
+  * Each stub's return values are typed by its return type (a `bool` stub takes `true`, `false`, `0` or `1`), the
+    same way as the arguments.
+  * The check uses the same names. A name that is not one of them is refused with the list it may use.
+  * The Stage A cache version is now 5.
+* **The arguments of a call made before take the form of `args`:** one entry per parameter, by name, with only the
+  slot its type takes. A structure is given by its fields, a buffer by its elements, and a structure given without
+  fields is zeroed. The call under test and the calls made before use one lowering function. Arguments in the
+  older plain form (a list of values) are still read, in order.
+* **What a stub writes is declared with a type named where the stub is declared.** The stubs header defines
+  `typedef <pointee> ut_stub_<stub>_<param>_out_t;` inside the stub's namespace and exports it, the same way as
+  the other controls.
+* **An object of a class of the SUT is built by its constructor:** the constructor with the fewest parameters,
+  value parameters `{}`, objects it needs declared before it. `uc.class_recipe` is the recipe the object under test
+  already used, now shared.
+  * The schema offers no value for such a parameter.
+  * Its rules give the same object, so the brain is no longer asked to write its set-up code.
+* The corpus answers with `calls` are written in the new form. The corpus schema check now also refuses a plain
+  value where the schema has an object.
+
+### Checked
+
+* `corpus`: 44 cases and the value forms. The 4 new cases and their 3 unit tests fail without the change.
+* Replay of the chassis answers against the new check (offline, the answers the model gave under the old schema):
+  * the 16 pressure values are no longer refused for a range;
+  * an ambiguous `read` is refused with the names it may use;
+  * the schema no longer offers that name;
+  * `receive_mode`, which calls only `drv::can::read`, may still say `read`.
+* The climate answers through the new check: 10 of 162 refused, all for the model's own values (timer ranges, one
+  missing value). As before.
+* The component tests here: 320 run; the 5 that fail need LangGraph or fail without these changes too.
+* The medium pilots on the PC are not rerun yet.
+
 ## 2026-10-28 (14): the run of 23:08 - coverage answers without a fault; two more defects
 
 ### What the run showed (commit 76ff90a)

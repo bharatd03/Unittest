@@ -1231,7 +1231,7 @@ class Orchestrator:
     STAGE_A_FIELDS = ("build", "compile_flags", "build_flags_source", "dependencies", "functions", "enums", "sut_state",
                       "local_statics", "interfaces", "typedefs", "private_types", "requirement_links", "include_dirs",
                       "class_members", "constructors")
-    STAGE_A_VERSION = "4"             # 4: declared constructors; 3: std:: integer types as builtins; 2: state elements
+    STAGE_A_VERSION = "5"             # 5: qualified callees; 4: declared constructors; 3: std:: integer types as builtins; 2: state elements
                                       # and fields, class members
 
     def _stage_a_key(self, s: "RunState") -> str:

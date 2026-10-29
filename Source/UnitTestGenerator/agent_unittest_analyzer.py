@@ -1335,6 +1335,16 @@ class FrontEnd:
                                  "name": cls.split("::")[-1], "type": ctor, "class": cls})
         return refs
 
+    def callee_name(self, ref: dict) -> str:
+        """The qualified name of a function a reference names, as the dependency plan names it (a using-declaration
+        or a namespace the call omits resolved by the compiler: read(3) after using hal::adc::read is
+        hal::adc::read); "" when it is not known."""
+        if ref.get("kind") == "CXXConstructorDecl" and ref.get("class"):
+            return f"{ref['class']}::{ref['class'].split('::')[-1]}"
+        node = self.ast.nodes.get(ref.get("id", ""), {})
+        name = self.ast.qualified_name(node) if node else ""
+        return name if name and name != ref.get("name") else ""
+
     def _find_ctor(self, cls: str, ctor_type: str) -> str:
         for nid, node in self.ast.nodes.items():
             if node.get("kind") == "CXXConstructorDecl" and not node.get("isImplicit") and \
@@ -2323,8 +2333,17 @@ class PlannedState(BaseModel):
 class PlannedCall(BaseModel):
     """Structured scenario: a call made before the call under test, to build up state."""
     function: str = Field(description="a function from CALLABLE FUNCTIONS")
-    args: list[Annotated[str, Field(json_schema_extra=VALUE)]] = Field(
-        default_factory=list, description="its argument values in order", json_schema_extra=_most(8))
+    args: list[PlannedArgValue] = Field(default_factory=list, json_schema_extra=_most(8), description=(
+        "one entry per parameter, by parameter name, in the form of the scenario's args"))
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def _plain_values(cls, value: Any) -> Any:
+        """Argument values given in the plain form (a list of values, in order) are read as unnamed entries."""
+        if isinstance(value, list):
+            return [{"name": "", "value": str(v)} if isinstance(v, (str, int, float)) else
+                    v.model_dump() if isinstance(v, BaseModel) else v for v in value]
+        return value
 
 
 class PlannedWrite(BaseModel):
@@ -2394,7 +2413,7 @@ class PlannedScenario(BaseModel):
     writes: list[PlannedWrite] = Field(default_factory=list, description="what stubs write into output parameters")
     registers: list[PlannedRegister] = Field(default_factory=list, description="register values before the call")
     members: list[PlannedMember] = Field(default_factory=list, description="C++: object members before the call")
-    stubs: list[PlannedStub]
+    stubs: list[PlannedStub] = Field(default_factory=list, description="return values of the stubs it calls")
     variables: list[PlannedValue] = Field(description="stub variables (STUB VARIABLES) to set before the call")
     expected_return: str = Field(description="the return value the EVIDENCE states; empty when it states none",
                                  json_schema_extra=ITEM)
@@ -2453,7 +2472,8 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                   target_ids: Any = None, per_scenario: int = 3, state: Any = (), fields: Any = (),
                   callables: Any = (), outputs: Any = (), registers: Any = (), members: Any = (),
                   exceptions: Any = (), member_kinds: dict[str, uc.ParamInfo] | None = None,
-                  call_params: dict[str, list[uc.ParamInfo]] | None = None) -> type[BaseModel]:
+                  call_params: dict[str, list[uc.ParamInfo]] | None = None, objects: Any = (),
+                  stub_returns: dict[str, uc.ParamInfo] | None = None) -> type[BaseModel]:
     """ARCH-20a, A1-PL3: the answer of one planning call with the lists of this function - its targets (A1-PL3a; its
     open items when it has none), its evidence, its parameters, the stubs whose return value a test can set and the
     stub variables. With targets the brain never writes the items out (ARCH-20d)."""
@@ -2462,23 +2482,31 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
     params = list(params)
     names = [p.name if isinstance(p, uc.ParamInfo) else p for p in params]
 
-    def arg_of(k: int, p: uc.ParamInfo | None) -> type[BaseModel]:
+    objects = set(objects or ())
+
+    def arg_of(k: int, p: uc.ParamInfo | None, ps: list[str] | None = None, prefix: str = "PlannedArg") \
+            -> type[BaseModel]:
         """One parameter's entry: its name, and only the slot its type takes (a fact) - a value for a scalar, elements
-        for a buffer or pointer, fields for a structure; None: any parameter name, every slot."""
+        for a buffer or pointer, fields for a structure, nothing for an object the generator builds (a class of the
+        SUT); None: any parameter name, every slot. ``ps``, ``prefix``: the parameters and the model name of a
+        call made before - its arguments take the same form."""
         if p is None:
-            return create_model("PlannedArg", __base__=PlannedArgValue,
-                                name=(_listed(names), Field(description="a parameter name from PARAMETERS")),
+            return create_model(prefix, __base__=PlannedArgValue,
+                                name=(_listed(ps if ps is not None else names),
+                                      Field(description="a parameter name from PARAMETERS")),
                                 fields=(list[field], Field(default_factory=list, json_schema_extra=_most(32),
                                                            description="a structure parameter: its fields")))
         record = p.kind in ("struct", "ptr_struct") or (p.by_ref and bool(p.fields))
         listed = p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring") and not p.by_ref
+        built = p.kind == "object" and p.name in objects
         hidden = SkipJsonSchema
         return create_model(
-            f"PlannedArg{k}", __base__=PlannedArgValue,
+            f"{prefix}{k}", __base__=PlannedArgValue,
             name=(_listed([p.name]), Field(description="a parameter name from PARAMETERS")),
-            value=(Annotated[str, Field(json_schema_extra=value_schema(p))],
-                   Field(default="", description="its value" + (": empty - give its fields or elements"
-                                                                 if record or (listed and p.kind != "cstring") else ""))),
+            value=(Annotated[str, Field(json_schema_extra={"enum": [""]} if built else value_schema(p))],
+                   Field(default="", description="its value" + (
+                       ": empty - the generator builds the object with its class's constructor" if built else
+                       ": empty - give its fields or elements" if record or (listed and p.kind != "cstring") else ""))),
             elements=((list[Annotated[str, Field(json_schema_extra=ITEM)]], Field(
                 default_factory=list, json_schema_extra=_most(64),
                 description="the values it points to, in order (the test declares the buffer)"))
@@ -2491,16 +2519,17 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
     call_params = call_params or {}
 
     def call_of(k: int, name: str) -> type[BaseModel]:
-        """One function a scenario may call before: its argument values, as many as it has, typed like arguments."""
+        """One function a scenario may call before: one argument entry per parameter, in the form of the scenario's
+        args - its name and only the slot its type takes."""
         ps = call_params[name]
         made = "::" in name and name.split("::")[-1] == name.split("::")[-2]   # a constructor: a value not given is {}
-        kinds = {json.dumps(value_schema(q), sort_keys=True) for q in ps}
-        item = value_schema(ps[0]) if len(kinds) == 1 else dict(SCALAR_VALUE) if all(
-            q.kind in ("int", "enum", "bool", "float") or (q.kind == "ptr_scalar" and q.by_ref) for q in ps) else VALUE
+        models = [arg_of(j, q, prefix=f"PlannedCall{k}Arg") for j, q in enumerate(ps)] or \
+            [arg_of(0, None, [], prefix=f"PlannedCall{k}Arg")]
+        item = models[0] if len(models) == 1 else Union[tuple(models)]
         return create_model(f"PlannedCall{k}", __base__=PlannedCall,
                             function=(_listed([name]), Field(description="a function from CALLABLE FUNCTIONS")),
-                            args=(list[Annotated[str, Field(json_schema_extra=item)]], Field(
-                                default_factory=list, description="its argument values in order",
+                            args=(list[item], Field(
+                                default_factory=list, description="one entry per parameter, by parameter name",
                                 json_schema_extra={"minItems": 0 if made else len(ps), "maxItems": len(ps)})))
     call_ms = [call_of(k, c) for k, c in enumerate(sorted(callables)) if c in call_params]
     state_m = create_model("PlannedStateChoice", __base__=PlannedState,
@@ -2545,8 +2574,16 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
         expected_exception=((_listed(["", *exceptions]), Field(default="", description=(
             "C++: the exception type from EXCEPTIONS the EVIDENCE says the call throws; empty when none")))
             if exceptions else (hidden[str], Field(default=""))))
-    stub = create_model("PlannedStubChoice", __base__=PlannedStub,
-                        stub=(_listed(stubs), Field(description="function name of a stub listed under STUBS")))
+    stubs, stub_returns = sorted(set(stubs)), stub_returns or {}
+    stub_ms = [create_model(f"PlannedStub{k}", __base__=PlannedStub,          # its return values typed by its type
+                            stub=(_listed([n]), Field(description="a stub listed under STUBS")),
+                            returns=(list[Annotated[str, Field(json_schema_extra=value_schema(stub_returns[n]))]], Field(
+                                description="return value per call, in call order; the last one stays",
+                                json_schema_extra=_most(16))))
+               for k, n in enumerate(stubs) if n in stub_returns]
+    stub = stub_ms[0] if len(stub_ms) == 1 else Union[tuple(stub_ms)] if stub_ms and len(stub_ms) == len(stubs) \
+        else create_model("PlannedStubChoice", __base__=PlannedStub,
+                          stub=(_listed(stubs), Field(description="function name of a stub listed under STUBS")))
     var = create_model("PlannedVariable", __base__=PlannedValue,
                        name=(_listed(variables), Field(description="a stub variable from STUB VARIABLES")))
     quote = create_model("PlannedQuoteChoice", __base__=PlannedQuote, evidence_id=(_listed(evidence_ids), ...))
@@ -2562,7 +2599,8 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
         "PlannedScenarioChoice", __base__=PlannedScenario, **listed, **structured,
         args=(list[arg], Field(description="one entry per parameter, by parameter name",   # a fact: its parameters
                                json_schema_extra={"minItems": len(names), "maxItems": len(names)})),
-        stubs=(list[stub], Field(json_schema_extra=_most(max(1, len(list(stubs)))))),
+        stubs=((list[stub], Field(default_factory=list, json_schema_extra=_most(len(stubs))))
+               if stubs else (SkipJsonSchema[list[PlannedStub]], Field(default_factory=list))),   # it calls none
         variables=(list[var], Field(description="stub variables to set before the call",
                                     json_schema_extra=_most(max(1, len(list(variables)))))),
         evidence_ids=(list[_listed(evidence_ids)], Field(json_schema_extra=_most(4))),
@@ -2732,15 +2770,15 @@ def plan_forms(fn: uc.FunctionInfo, lists: dict[str, Any]) -> str:
         rows.append('- A structure parameter or a pointer to one: fields, for example {"name": "cfg", "fields": '
                     '[{"field": "limit", "value": "5"}]}.\n')
     if lists.get("callables") and not lists.get("state"):
-        rows.append("- calls: earlier calls of CALLABLE FUNCTIONS with their argument values, only when a target "
-                    "needs state that calls build up.\n")
+        rows.append("- calls: earlier calls of CALLABLE FUNCTIONS, only when a target needs state that calls build "
+                    "up; their args take the form of args, one entry per parameter by name.\n")
     if lists.get("state"):
         rows.append('- state: SUT STATE to set before the call - the variable, for an array its index (else -1), for '
                     'a structure its field (else ""), and the value, for example {"variable": "tbl", "index": 1, '
                     '"field": "count", "value": "3"}.\n')
         if lists.get("callables"):
-            rows.append("- calls: earlier calls of CALLABLE FUNCTIONS with their argument values, only when a target "
-                        "needs state that calls build up.\n")
+            rows.append("- calls: earlier calls of CALLABLE FUNCTIONS, only when a target needs state that calls "
+                        "build up; their args take the form of args, one entry per parameter by name.\n")
     if lists.get("outputs"):
         rows.append("- writes: what a stub of STUB OUTPUTS writes into its output parameter (elements or fields).\n")
     if lists.get("registers"):
@@ -3697,7 +3735,8 @@ class AnalyzerAgent(ba.AgentCore):
             ret = qt[: qt.index("(")].strip() if "(" in qt and node["kind"] not in ("CXXConstructorDecl",
                                                                                      "CXXDestructorDecl") else ""
             params = [fe.param_info(p, enums, body_text) for p in node.get("inner", []) if p.get("kind") == "ParmVarDecl"]
-            calls = sorted({r["name"] for r in fe.references(node) if r["kind"] != "VarDecl"})
+            refs = [r for r in fe.references(node) if r["kind"] != "VarDecl"]
+            calls = sorted({r["name"] for r in refs} | {q for r in refs for q in [fe.callee_name(r)] if q})
             name = qualified if "::" in qualified else node.get("name", qualified)
             nodes[node["id"]] = node
             out.append(uc.FunctionInfo(
@@ -4225,6 +4264,7 @@ class AnalyzerAgent(ba.AgentCore):
             base = f"ut_stub_{uc.stub_base(s)}"
             names |= {f"{base}_{p[1]}_out" for p in s.params if p[1] and uc.stub_output(p[0])}
             names |= {f"{base}_{p[1]}_out_len" for p in s.params if p[1] and uc.stub_output(p[0])}
+            names |= {f"{base}_{p[1]}_out_t" for p in s.params if p[1] and uc.stub_output(p[0])}
         names |= {"ut_static_" + re.sub(r"\W", "_", f.name.replace("(anonymous namespace)::", ""))
                   for f in layout.functions if f.is_static and f.from_frontend}
         return names
@@ -4236,9 +4276,11 @@ class AnalyzerAgent(ba.AgentCore):
         """ARCH-20a: the lists of this function for the brain's schema; its targets instead of its items (A1-PL3a);
         ``lists``: the names of the structured scenario - state, fields, callable functions, stub outputs, registers
         and object members (the brain names them, the generator writes the code)."""
-        settable = [n for s in stubs if s.kind not in ("variable", "constructor") and
-                    re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", s.return_type).strip()
-                    not in ("", "void") for n in {s.function, s.qualified_name or s.function}]   # both names pass
+        lists = lists or {}
+        settable = list(lists["stub_returns"]) if "stub_returns" in lists else [     # the stubs it calls
+            n for s in stubs if s.kind not in ("variable", "constructor") and
+            re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", s.return_type).strip()
+            not in ("", "void") for n in {s.function, s.qualified_name or s.function}]
         variables = [n for s in stubs if s.kind == "variable" and not s.is_const
                      for n in {s.function, s.qualified_name or s.function}]
         lists = lists or {}
@@ -4246,7 +4288,8 @@ class AnalyzerAgent(ba.AgentCore):
                              settable, variables, targets, per_scenario, lists.get("state", []),
                              lists.get("fields", []), lists.get("callables", []), lists.get("outputs", []),
                              lists.get("registers", []), lists.get("members", []), lists.get("exceptions", []),
-                             lists.get("member_kinds"), lists.get("call_params"))
+                             lists.get("member_kinds"), lists.get("call_params"), lists.get("objects", ()),
+                             lists.get("stub_returns"))
 
     # ---------------------------------------------------------------- structured scenario: the brain says what
     def _structured_lists(self, fn: uc.FunctionInfo, layout: uc.LayoutProfile, stubs: list[uc.StubSpec],
@@ -4313,10 +4356,14 @@ class AnalyzerAgent(ba.AgentCore):
             call_rows.append(f"- {name}({', '.join(p.type for p in made.params)}) - the constructor of the object: "
                              "name it first to build the object with these values (else each value is {})")
         outputs, output_rows = [], []
-        called = {c.split("::")[-1] for c in fn.calls}
-        for s in stubs:
-            if s.kind == "variable" or s.function.split("::")[-1] not in called:
-                continue
+        called = uc.stubs_called(fn, layout, stubs)               # the stubs it calls, by the names that pass
+        stub_returns = {}
+        for n, s in called.items():
+            ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", s.return_type).strip()
+            if s.kind != "constructor" and ret not in ("", "void"):
+                stub_returns[n] = uc.ParamInfo(name=f"{n}()", type=ret, kind="other") if ret.endswith(("*", "&")) \
+                    else target_param(f"{n}()", ret, layout)
+        for s in {id(s): s for s in called.values()}.values():
             for ptype, pname in s.params:
                 if pname and stub_output(ptype):
                     outputs.append(f"{s.qualified_name or s.function}.{pname}")
@@ -4348,7 +4395,9 @@ class AnalyzerAgent(ba.AgentCore):
                         else target_param(m.name, m.type, layout)
         return {"state": state_names, "fields": sorted(fields), "callables": callables[:40],
                 "outputs": outputs, "registers": registers, "members": members, "exceptions": exceptions,
-                "member_kinds": member_kinds, "call_params": call_params,
+                "member_kinds": member_kinds, "call_params": call_params, "stub_returns": stub_returns,
+                "objects": [p.name for p in text_params(fn) if p.kind == "object" and uc.sut_class(p.base or p.type,
+                                                                                                   layout)],
                 "rows": {"state": state_rows, "callables": call_rows[:40], "outputs": output_rows,
                          "registers": reg_rows, "members": member_rows,
                          "exceptions": [f"- {e}" for e in exceptions]}}
@@ -4428,65 +4477,79 @@ class AnalyzerAgent(ba.AgentCore):
                     return None
                 rows.append(f"{var}.{path} = {v};")
             return rows
-        for a in planned.args:
-            p = params.get(a.name)
-            if p is None:
-                continue
+        def lower_arg(a: "PlannedArgValue", p: uc.ParamInfo, var: str, where: str) -> bool:
+            """One argument - of the call under test or of a call made before, the same form for both: the value
+            its type takes, or the object the generator declares and fills (a buffer, a structure, a reference to a
+            scalar, an injected interface's fake, an object of a class of the SUT) and passes in the right form.
+            False when it is refused (the problem is recorded)."""
             if p.kind == "enum" and a.value:                                     # the enumerator in full [A2-21ai]
                 full = next((k for k in p.enum_values if k.split("::")[-1] == fix_value(a.value).split("::")[-1]), None)
                 a.value = full or a.value
-            var = f"ut_{re.sub(r'[^A-Za-z0-9_]', '_', a.name)}"
             base = pointee(p) or re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
             iface = next((i for i in layout.interfaces if i.name.split("::")[-1] == base.split("::")[-1]), None)
             if p.kind == "interface" or iface is not None:   # an injected interface: the generator's fake [A2-21aa]
                 decls.append(f"{uc.fake_name_of(iface.name if iface else base)} {var};")
                 a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
                 a.elements, a.fields = [], []
-                fixes.append(f"args.{a.name}: an injected {base} - the generator's fake {var} [structured]")
-                continue
-            record = p.kind in ("ptr_struct", "struct")
+                fixes.append(f"{where}: an injected {base} - the generator's fake {var} [structured]")
+                return True
             value = fix_value(a.value)
+            cls = uc.sut_class(p.base or p.type, layout) if p.kind == "object" else ""
+            if cls and not ("*" in p.type and not p.by_ref and value in NULLS):
+                lines, obj = uc.class_recipe(cls, layout, var, declared=base)   # its constructor builds it [A2-21ae]
+                decls.extend(lines)
+                if value or a.elements or a.fields:
+                    fixes.append(f"{where}: an object of {cls} takes no value - built by its constructor [structured]")
+                a.value = obj if p.by_ref or "*" not in p.type else f"&{obj}"
+                a.elements, a.fields = [], []
+                fixes.append(f"{where}: an object of {cls} built by its constructor, passed as {a.value} [structured]")
+                return True
+            record = p.kind in ("ptr_struct", "struct")
             if record and not (a.elements or a.fields) and (not value or value not in NULLS and (  # no field given:
                     eval_int(value, constants) is not None or value.startswith("{"))):          # a zeroed structure
                 init = value if value.startswith("{") and not uc.c_form_problem(value) else "{" + ("" if cpp else "0") + "}"
                 decls.append(f"{base} {var} = {init};")    # a structure is its initializer; no field given: zero
                 a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
-                fixes.append(f"args.{a.name}: a {base} declared {'with ' + init if init != value else 'zeroed'} "
+                fixes.append(f"{where}: a {base} declared {'with ' + init if init != value else 'zeroed'} "
                              f"and passed as {a.value} [structured]")
-                continue
+                return True
             if p.kind == "ptr_scalar" and p.by_ref:     # a reference to a scalar: a named variable with its value
-                v = typed(f"args.{a.name}", value or (a.elements[0] if a.elements else ""),
-                          target_param(a.name, base, layout))
-                if v is not None:
-                    decls.append(f"{base} {var} = {v};")
-                    a.value, a.elements, a.fields = var, [], []
-                    fixes.append(f"args.{a.name}: a {p.type} - {var} declared with {v} and passed [structured]")
-                continue
+                v = typed(where, value or (a.elements[0] if a.elements else ""), target_param(a.name, base, layout))
+                if v is None:
+                    return False
+                decls.append(f"{base} {var} = {v};")
+                a.value, a.elements, a.fields = var, [], []
+                fixes.append(f"{where}: a {p.type} - {var} declared with {v} and passed [structured]")
+                return True
             if not (a.elements or a.fields):
-                continue
+                return True
             scalar = p.kind in ("int", "enum", "bool", "float")
             if scalar and value and not uc.c_expression_problem(value, braces=False):
-                fixes.append(f"args.{a.name}: a {p.type} takes its value; elements and fields left out [structured]")
+                fixes.append(f"{where}: a {p.type} takes its value; elements and fields left out [structured]")
                 a.elements, a.fields = [], []          # the type is a fact: one value, so the list is form noise
-                continue
+                return True
             if a.elements and p.kind in ("buffer", "ptr_scalar", "ptr_void", "cstring") and not p.by_ref:
-                given = all_typed(f"args.{a.name}", list(a.elements[:256]), target_param("", base, layout))
+                given = all_typed(where, list(a.elements[:256]), target_param("", base, layout))
                 if given is None:
-                    continue
+                    return False
                 decls.append(f"{base or 'unsigned char'} {var}[{max(len(given), 1)}] = {{{', '.join(given)}}};")
                 a.value = var
             elif a.fields and record:
-                rows = fields_of(var, f"args.{a.name}", a.fields, p.fields)
+                rows = fields_of(var, where, a.fields, p.fields)
                 if rows is None:
-                    continue
-                decls += [f"{base} {var} = {{{'' if cpp else '0'}}};", *rows]
+                    return False
+                decls.extend([f"{base} {var} = {{{'' if cpp else '0'}}};", *rows])
                 a.value = var if p.by_ref or "*" not in p.type else f"&{var}"
             else:
-                problems.append(f"{a.name}: elements are for a buffer or pointer, fields for a structure parameter"
+                problems.append(f"{where}: elements are for a buffer or pointer, fields for a structure parameter"
                                 f" (its type is {p.type})")
-                continue
-            fixes.append(f"args.{a.name}: declared and filled by the generator, passed as {a.value} [structured]")
+                return False
+            fixes.append(f"{where}: declared and filled by the generator, passed as {a.value} [structured]")
             a.elements, a.fields = [], []
+            return True
+        for a in planned.args:
+            if a.name in params:
+                lower_arg(a, params[a.name], f"ut_{re.sub(r'[^A-Za-z0-9_]', '_', a.name)}", f"args.{a.name}")
         alias = self._state_aliases(layout)
         scalars = {uc.state_setter_name(v)[len("ut_state_set_"):]: v for v in uc.settable_state(layout)}
         elements: dict[tuple[str, str], tuple[str, bool, uc.StateVar]] = {}
@@ -4523,6 +4586,19 @@ class AnalyzerAgent(ba.AgentCore):
             if v is not None:
                 stmts.append(f"{name}({str(s.index) + ', ' if indexed else ''}{v});")
         made = uc.constructor_of(uc.class_of(fn), layout) if fn.member and uc.object_recipe(fn, layout) else None
+
+        def by_param(c: "PlannedCall", ps: list[uc.ParamInfo]) -> list["PlannedArgValue"] | None:
+            """The arguments of a call made before, one per parameter: by name when they are named, else in order."""
+            named = [x for x in c.args if x.name]
+            if named and len(named) == len(c.args):
+                wrong = [x.name for x in named if x.name not in {p.name for p in ps}]
+                if wrong or len({x.name for x in named}) != len(named):
+                    problems.append(f"calls {c.function}: name each parameter once - its parameters: "
+                                    f"{', '.join(p.name for p in ps) or 'none'}")
+                    return None
+                return [next((x for x in named if x.name == p.name), PlannedArgValue(name=p.name)) for p in ps]
+            return [x.model_copy(update={"name": p.name}) for x, p in zip(c.args, ps)] + \
+                [PlannedArgValue(name=p.name) for p in ps[len(c.args):]]
         for c in planned.calls:
             g = uc.function_of(c.function, layout) or next(
                 (f for f in layout.functions if f.qualified_name.replace("(anonymous namespace)::", "") == c.function
@@ -4534,9 +4610,11 @@ class AnalyzerAgent(ba.AgentCore):
                                     f"given {len(c.args)}" if not planned.object_args else
                                     f"calls: the constructor {c.function} is named twice")
                     continue
-                given = list(c.args) + [""] * (len(made.params) - len(c.args))   # a value not given: {} as listed
-                values = [typed(f"calls {c.function}.{p.name}", x, p) if p.kind in ("int", "enum", "bool", "float")
-                          and x.strip() else "" for x, p in zip(given, made.params)]
+                given = by_param(c, made.params)                                   # a value not given: {} as listed
+                if given is None:
+                    continue
+                values = [typed(f"calls {c.function}.{p.name}", x.value, p) if p.kind in ("int", "enum", "bool", "float")
+                          and x.value.strip() else "" for x, p in zip(given, made.params)]
                 if all(v is not None for v in values):
                     planned.object_args = values
                     fixes.append(f"calls: {c.function} builds the object [structured]")
@@ -4557,23 +4635,21 @@ class AnalyzerAgent(ba.AgentCore):
                 callee = "ut_static_" + re.sub(r"\W", "_", g.name.replace("(anonymous namespace)::", ""))
             else:
                 callee = g.qualified_name.replace("(anonymous namespace)::", "")
+            given = by_param(c, list(g.params))
+            if given is None:
+                continue
             args = []
-            for i, (x, p) in enumerate(zip(c.args, g.params)):
+            for i, (x, p) in enumerate(zip(given, g.params)):           # the same form as the call under test's
                 where = f"calls {c.function}.{p.name}"
-                if p.kind in ("int", "enum", "bool", "float"):
-                    args.append(typed(where, x, p))
-                elif p.kind == "ptr_scalar" and p.by_ref:          # a reference to a scalar: a named variable
-                    base = pointee(p) or re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
-                    v = typed(where, x, target_param(p.name, base, layout))
-                    var = f"ut_c{len(planned.calls_before)}_{i}"
-                    if v is not None:
-                        decls.append(f"{base} {var} = {v};")
-                    args.append(var if v is not None else None)
+                if not lower_arg(x, p, f"ut_c{len(planned.calls_before)}_{i}", where):
+                    args.append(None)
+                elif p.kind in ("int", "enum", "bool", "float"):
+                    args.append(typed(where, x.value, p))
                 else:                                              # any other: one C expression at least
-                    v = fix_value(x)
-                    problem = uc.c_expression_problem(v)
+                    v = fix_value(x.value)
+                    problem = uc.c_expression_problem(v) if v else "no value"
                     if problem:
-                        problems.append(f"{where}: {v[:40]!r} is {problem}")
+                        problems.append(f"{where}: {v[:40]!r} is {problem}" if v else f"{where}: no value")
                     args.append(None if problem else v)
             if any(x is None for x in args):
                 continue
@@ -4592,13 +4668,13 @@ class AnalyzerAgent(ba.AgentCore):
                 given = all_typed(f"writes {w.stub}.{w.param}", list(w.elements[:256]), target_param("", base, layout))
                 if given is None:
                     continue
-                stmts.append(f"{{ {base} ut_w[] = {{{', '.join(given)}}}; memcpy({ctrl}, ut_w, sizeof ut_w); "
+                stmts.append(f"{{ {ctrl}_t ut_w[] = {{{', '.join(given)}}}; memcpy({ctrl}, ut_w, sizeof ut_w); "
                              f"{ctrl}_len = (int)sizeof ut_w; }}")
             elif w.fields:
                 rows = fields_of("ut_w", f"writes {w.stub}.{w.param}", w.fields, record_fields(base, layout))
                 if rows is None:
                     continue
-                stmts.append(f"{{ {base} ut_w = {{{'' if cpp else '0'}}}; " + " ".join(rows)
+                stmts.append(f"{{ {ctrl}_t ut_w = {{{'' if cpp else '0'}}}; " + " ".join(rows)
                              + f" memcpy({ctrl}, &ut_w, sizeof ut_w); {ctrl}_len = (int)sizeof ut_w; }}")
         variables = {s.function: s for s in stubs if s.kind == "variable"} | {
             s.qualified_name: s for s in stubs if s.kind == "variable" and s.qualified_name}
@@ -5003,10 +5079,7 @@ class AnalyzerAgent(ba.AgentCore):
                 problem = self._value_problem(by_name[name], value, fn, constants, local, known, layout)
                 if problem:
                     reasons.append(problem)
-        stub_specs = {}
-        for s in stubs:
-            stub_specs[s.function] = s
-            stub_specs[s.qualified_name or s.function] = s
+        stub_specs = uc.stubs_called(fn, layout, stubs)                 # the stubs it calls, by the names that pass
         void = [sv.stub for sv in planned.stubs if sv.stub in stub_specs and stub_specs[sv.stub].kind != "variable" and (
             stub_specs[sv.stub].kind == "constructor" or re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "",
                                                                  stub_specs[sv.stub].return_type).strip() in ("", "void"))]
@@ -5015,8 +5088,9 @@ class AnalyzerAgent(ba.AgentCore):
             self.last_fixes.append(f"stubs: {', '.join(void)} return nothing - their entries dropped [A1-PL4]")
         for sv in planned.stubs:                                                           # d)
             spec = stub_specs.get(sv.stub)
-            if spec is None or spec.kind == "variable":
-                reasons.append(f"{sv.stub} is not a stubbed function of the dependency plan")
+            if spec is None:
+                reasons.append(f"{sv.stub} is not a stub this function calls (STUBS: "
+                               f"{', '.join(sorted({s.qualified_name or s.function for s in stub_specs.values()}))[:200] or 'none'})")
                 continue
             ret = re.sub(r"\b(const|volatile|static|inline|extern|virtual)\b", "", spec.return_type).strip()
             if not ret or ret == "void" or spec.kind == "constructor":
@@ -5265,9 +5339,8 @@ class AnalyzerAgent(ba.AgentCore):
                                     tg.conditions, fn, layout)) else "")                        # A1-PL2b
                                 + (f" | open: {'; '.join(tg.details)}" if tg.details else "")
                                 + (f" | TRIED {tried} time(s) without reaching it" if tried else ""))
-        called = [s for s in stubs if s.kind != "variable" and (s.function in fn.calls or
-                                                                  (s.qualified_name or s.function) in fn.calls)]
-        stub_rows = [f"- {s.function} - {s.declaration or s.return_type + ' ' + s.function + '(...)'}"
+        called = list({id(s): s for s in uc.stubs_called(fn, layout, stubs).values()}.values())
+        stub_rows = [f"- {s.qualified_name or s.function} - {s.declaration or s.return_type + ' ' + s.function + '(...)'}"
                      + (f" - suggested return values: {', '.join(suggested[s.function + '()'])}"
                         if s.function + "()" in suggested else "") for s in called]
         var_rows = [f"- {s.function}: {s.var_type}" for s in stubs if s.kind == "variable" and not s.is_const]
@@ -5349,7 +5422,7 @@ class AnalyzerAgent(ba.AgentCore):
                + "\n".join(structured["rows"]["state"])] if structured and structured["rows"]["state"] else
               ["SUT STATE (only the SUT file sees these variables: never name one, use its setter and getter) "
                "[A2-21z, A2-21aj]:\n" + ("\n".join(f"- {x}" for x in setters) or "- none")]),
-            *(["CALLABLE FUNCTIONS (calls: earlier calls that build up state, with their argument values):\n"
+            *(["CALLABLE FUNCTIONS (calls: earlier calls that build up state; their args in the form of args):\n"
                + "\n".join(structured["rows"]["callables"])] if structured and structured["rows"]["callables"] else []),
             *(["STUB OUTPUTS (writes: what the stub writes into this parameter when it is called - elements or "
                "fields):\n" + "\n".join(structured["rows"]["outputs"])]
@@ -5371,7 +5444,7 @@ class AnalyzerAgent(ba.AgentCore):
         if sequence:                                                                         # BP-2, BP-3
             facts.append(f"CALL SEQUENCE: the gaps {', '.join(sorted(sequence)[:6])} need state that only earlier calls "
                          "build up (see JOURNAL). For them give calls: the earlier calls of CALLABLE FUNCTIONS, in "
-                         "order, with their argument values; then the call of args.")
+                         "order, each with its args in the form of args; then the call of args.")
         dep_code = uc.dependency_code(fn, layout)                               # what the real code computes
         examples = req.examples.get(fn.qualified_name) or req.examples.get(fn.name, "")          # KB-25
         return [uc.part("facts", "\n\n".join(facts)),

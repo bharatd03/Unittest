@@ -402,7 +402,10 @@ def render_stubs(plan: uc.UTPlan) -> tuple[str, str, str]:
                 stores.append(f"    (void){pname};")
             if uc.stub_output(ptype):         # structured: what the stub writes into an output parameter
                 out = f"ut_stub_{uc.stub_base(spec)}_{pname}_out"
-                decl_lines += [f"extern unsigned char {out}[UT_STUB_OUT];", f"extern int {out}_len;"]
+                # the type it points to, named where the stub is declared: a test names it through this alias, so
+                # a type of the stub's namespace resolves as in the declaration (drv::can::Frame written Frame)
+                decl_lines += [f"typedef {uc.stub_pointee(ptype)} {out}_t;",
+                               f"extern unsigned char {out}[UT_STUB_OUT];", f"extern int {out}_len;"]
                 def_lines += [f"unsigned char {out}[UT_STUB_OUT];", f"int {out}_len;"]
                 reset.append(f"    {out}_len = 0;")
                 address = f"&{pname}" if ptype.strip().endswith("&") else pname
@@ -1469,7 +1472,7 @@ def _options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[int], la
     opts = _param_options(fn, i, p, values, layout, body, macros)
     if opts is None or not tag:
         return opts
-    rename = re.compile(r"\but_(v|b|f)" + str(i) + r"\b")
+    rename = re.compile(r"\but_(v|b|f)" + str(i) + r"(?![0-9A-Za-z])")      # ut_v0 and ut_v0_dep0
     return [([rename.sub(lambda m: f"ut_{tag}{m.group(1)}{i}", x) for x in s_], rename.sub(lambda m: f"ut_{tag}{m.group(1)}{i}", a),
              [rename.sub(lambda m: f"ut_{tag}{m.group(1)}{i}", x) for x in o]) for s_, a, o in opts]
 
@@ -1569,6 +1572,12 @@ def _param_options(fn: uc.FunctionInfo, i: int, p: uc.ParamInfo, values: list[in
         if (p.callback_return or "void").strip() == "void":
             return [([], base, [])] + ([([], null, [])] if p.nullable else [])
         return [([f"{base}_return = {v};"], base, []) for v in (0, 1, -1)] + ([([], null, [])] if p.nullable else [])
+    cls = uc.sut_class(p.base or p.type, layout) if p.kind == "object" else ""
+    if cls:                              # an object of a class of the SUT: built by its constructor [A2-21ae]
+        lines, var = uc.class_recipe(cls, layout, f"ut_v{i}",
+                                     declared=re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip())
+        pointer = "*" in p.type and not p.by_ref
+        return [(lines, f"&{var}" if pointer else var, [])] + ([([], null, [])] if pointer and p.nullable else [])
     return None
 
 

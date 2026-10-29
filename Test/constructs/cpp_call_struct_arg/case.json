@@ -1,0 +1,29 @@
+{
+  "construct": "C++: earlier calls that build up state, each with a structure argument given by its fields",
+  "sut": "src/speed.cpp",
+  "language": "cpp",
+  "expect": {"final_state": "any", "statuses": {}},
+  "answers": {
+    "structured": [
+      {
+        "function": "car::Estimator::update",
+        "answer": {
+          "args": [{"name": "wheels", "fields": [{"field": "fl", "value": "100"}, {"field": "fr", "value": "200"}]}],
+          "calls": [
+            {"function": "car::Estimator::update", "args": [{"name": "wheels", "fields": [{"field": "fl", "value": "100"}, {"field": "fr", "value": "200"}]}]},
+            {"function": "car::Estimator::update", "args": [{"name": "wheels", "fields": [{"field": "fl", "value": "100"}, {"field": "fr", "value": "200"}]}]}
+          ]
+        },
+        "reaches": ["return speed_;"]
+      },
+      {
+        "function": "car::Estimator::update",
+        "answer": {
+          "args": [{"name": "wheels", "fields": [{"field": "fl", "value": "100"}, {"field": "fr", "value": "100"}]}],
+          "calls": [{"function": "car::Estimator::update", "args": [{"name": "wheels", "value": ""}]}]
+        },
+        "reaches": ["bad_ = 0;"]
+      }
+    ]
+  }
+}

@@ -2300,17 +2300,51 @@ def project_controls(fn: "FunctionInfo", layout: "LayoutProfile") -> list[tuple[
     plan = layout.dependencies
     if plan is None or not plan.project_stubs:
         return []
+    reach = calls_reached(fn, layout)
+    return [(p, c) for p in plan.project_stubs if reach & set(p.serves) for c in p.controls]
+
+
+def calls_reached(fn: "FunctionInfo", layout: "LayoutProfile", levels: int = 3) -> set[str]:
+    """The names the function calls and those the SUT functions it calls call, ``levels`` deep (the front end's
+    calls carry the short and the qualified name)."""
     names = {f.name: f for f in layout.functions} | {f.qualified_name: f for f in layout.functions}
     reach, todo = set(fn.calls), [(c, 1) for c in fn.calls]
     while todo:
         name, depth = todo.pop()
         callee = names.get(name)
-        if callee is not None and depth < 3:
+        if callee is not None and callee is not fn and depth < levels:
             for c in callee.calls:
                 if c not in reach:
                     reach.add(c)
                     todo.append((c, depth + 1))
-    return [(p, c) for p in plan.project_stubs if reach & set(p.serves) for c in p.controls]
+    return reach
+
+
+def stubs_called(fn: "FunctionInfo", layout: "LayoutProfile", stubs: list["StubSpec"]) -> dict[str, "StubSpec"]:
+    """The stubbed functions this function calls (itself or through the SUT functions it calls), by the names a
+    scenario may give them: the qualified name, and the short name where no other stub it calls has it (in a
+    function that calls hal::adc::read and hal::gpio::read, neither is "read"). A call the front end resolved
+    matches by its qualified name only; a call known by its short name alone (no front end) matches every stub of
+    that name."""
+    reach = calls_reached(fn, layout)
+    called = []
+    for s in stubs:
+        if s.kind == "variable":
+            continue
+        full, short = s.qualified_name or s.function, s.function.split("::")[-1]
+        resolved = any(c != short and c.split("::")[-1] == short for c in reach)
+        if full in reach or (not resolved and short in reach):
+            called.append(s)
+    shorts: dict[str, set[str]] = {}                         # overloads share one name: it stays unambiguous
+    for s in called:
+        shorts.setdefault(s.function.split("::")[-1], set()).add(s.qualified_name or s.function)
+    out: dict[str, StubSpec] = {}
+    for s in called:
+        out.setdefault(s.qualified_name or s.function, s)
+        if len(shorts[s.function.split("::")[-1]]) == 1:
+            out.setdefault(s.function.split("::")[-1], s)
+            out.setdefault(s.function, s)
+    return out
 
 
 def item_parts(item: str) -> tuple[str, str, int, str]:
@@ -2929,24 +2963,50 @@ def object_recipe(fn: "FunctionInfo", layout: "LayoutProfile", values: list[str]
     short = cls.split("::")[-1]
     if fn.qualified_name.split("::")[-1] in (short, "~" + short):
         return None
+    return class_recipe(cls, layout, "ut_obj", values)[0], f"ut_obj.{fn.qualified_name.split('::')[-1]}"
+
+
+def class_recipe(cls: str, layout: "LayoutProfile", var: str, values: list[str] | None = None,
+                 declared: str = "") -> tuple[list[str], str]:
+    """A2-21ae: the lines that build an object of a class of the SUT with the constructor a test uses (the fewest
+    parameters) - its arguments named objects declared before, a value parameter its value from ``values`` ("" or
+    none: {}) - and the object's name. ``declared``: the type as the test names it (a parameter's own spelling, with
+    its template arguments); else the class as the tests instantiate it."""
     ctor = constructor_of(cls, layout)
+    dep = "ut_dep" if var == "ut_obj" else f"{var}_dep"
     lines, args = [], []
     for i, p in enumerate(ctor.params if ctor else []):
         base = re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", p.base or p.type).strip()
         iface = next((f for f in layout.interfaces if f.name.split("::")[-1] == base.split("::")[-1]), None)
         if iface is not None or p.kind == "interface":
-            lines.append(f"{fake_name_of(iface.name if iface else base)} ut_dep{i};")
-            args.append(f"ut_dep{i}" if p.by_ref or "&" in p.type else f"&ut_dep{i}")
+            lines.append(f"{fake_name_of(iface.name if iface else base)} {dep}{i};")
+            args.append(f"{dep}{i}" if p.by_ref or "&" in p.type else f"&{dep}{i}")
         elif p.by_ref or "&" in p.type:
-            lines.append(f"{base or 'int'} ut_dep{i}{{}};")
-            args.append(f"ut_dep{i}")
+            lines.append(f"{base or 'int'} {dep}{i}{{}};")
+            args.append(f"{dep}{i}")
         elif "*" in p.type:
-            lines.append(f"{base or 'int'} ut_dep{i}{{}};")
-            args.append(f"&ut_dep{i}")
+            lines.append(f"{base or 'int'} {dep}{i}{{}};")
+            args.append(f"&{dep}{i}")
         else:
             args.append(values[i] if values and i < len(values) and values[i] else "{}")
-    lines.append(f"{instantiated_class(cls, layout)} ut_obj{('(' + ', '.join(args) + ')') if args else ''};")
-    return lines, f"ut_obj.{fn.qualified_name.split('::')[-1]}"
+    empty = "" if var == "ut_obj" else "{}"                  # a parameter's object: its members value-initialized
+    lines.append(f"{declared or instantiated_class(cls, layout)} {var}{('(' + ', '.join(args) + ')') if args else empty};")
+    return lines, var
+
+
+def sut_class(type_text: str, layout: "LayoutProfile") -> str:
+    """The class of the SUT a parameter type names (const Estimator &, ns::Estimator *, Avg<int, 4>), by the facts:
+    the classes with members or member functions in the SUT; "" for any other type."""
+    plain = re.sub(r"<.*>", "", re.sub(r"\b(const|volatile|struct|class)\b|[&*]", " ", type_text)).strip()
+    if not plain or layout.language != "cpp":
+        return ""
+    classes = {m.class_name.replace("(anonymous namespace)::", "") for m in layout.class_members} | {
+        class_of(f).replace("(anonymous namespace)::", "") for f in layout.functions + layout.constructors if f.member}
+    exact = [c for c in classes if c == plain.lstrip(":")]
+    if exact:
+        return exact[0]
+    short = [c for c in classes if c.split("::")[-1] == plain.split("::")[-1]]
+    return short[0] if len(short) == 1 else ""
 
 
 def call_form(fn: "FunctionInfo", layout: "LayoutProfile") -> str:

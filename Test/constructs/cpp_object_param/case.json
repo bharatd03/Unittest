@@ -1,0 +1,20 @@
+{
+  "construct": "C++: a parameter that is an object of a class of the SUT (no value can be written for it: the generator builds it with the class's constructor)",
+  "sut": "src/status.cpp",
+  "language": "cpp",
+  "expect": {"final_state": "any", "statuses": {}},
+  "answers": {
+    "structured": [
+      {
+        "function": "car::send_status",
+        "answer": {"args": [{"name": "estimator", "value": ""}, {"name": "mode", "value": "1"}]},
+        "reaches": ["return estimator.speed() + mode;"]
+      },
+      {
+        "function": "car::report",
+        "answer": {"args": [{"name": "limiter", "value": ""}]},
+        "reaches": ["return limiter.rate();"]
+      }
+    ]
+  }
+}

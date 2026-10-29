@@ -71,7 +71,10 @@
             {
               "function": "door_step",
               "args": [
-                "2"
+                {
+                  "name": "event",
+                  "value": "2"
+                }
               ]
             }
           ]

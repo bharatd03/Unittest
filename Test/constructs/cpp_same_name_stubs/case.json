@@ -1,0 +1,26 @@
+{
+  "construct": "C++: two dependencies of one short name in different namespaces (one named through a using-declaration); a function that calls no dependency reads a dependency's variable",
+  "sut": "src/pump.cpp",
+  "language": "cpp",
+  "expect": {"final_state": "any", "statuses": {}},
+  "answers": {
+    "structured": [
+      {
+        "function": "pump_step",
+        "answer": {
+          "args": [{"name": "request", "value": "true"}],
+          "stubs": [{"stub": "hal::adc::read", "returns": ["1799"]}, {"stub": "hal::gpio::read", "returns": ["1"]}]
+        },
+        "reaches": ["g_on = true;"]
+      },
+      {
+        "function": "derate",
+        "answer": {
+          "args": [{"name": "duty", "value": "500"}],
+          "variables": [{"name": "hal::g_supply_mv", "value": "8000"}]
+        },
+        "reaches": ["return 0;"]
+      }
+    ]
+  }
+}

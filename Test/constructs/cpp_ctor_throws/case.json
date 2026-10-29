@@ -58,7 +58,10 @@
             {
               "function": "chassis::SteerLimiter::SteerLimiter",
               "args": [
-                "30"
+                {
+                  "name": "max_deg",
+                  "value": "30"
+                }
               ]
             }
           ]
@@ -83,7 +86,10 @@
             {
               "function": "chassis::SteerLimiter::SteerLimiter",
               "args": [
-                "5"
+                {
+                  "name": "max_deg",
+                  "value": "5"
+                }
               ]
             }
           ],

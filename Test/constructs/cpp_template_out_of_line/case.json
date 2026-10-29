@@ -25,7 +25,10 @@
             {
               "function": "MovingAverage::add",
               "args": [
-                "4"
+                {
+                  "name": "v",
+                  "value": "4"
+                }
               ]
             }
           ]

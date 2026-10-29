@@ -72,13 +72,19 @@
             {
               "function": "button_sample",
               "args": [
-                "1"
+                {
+                  "name": "input",
+                  "value": "1"
+                }
               ]
             },
             {
               "function": "button_sample",
               "args": [
-                "1"
+                {
+                  "name": "input",
+                  "value": "1"
+                }
               ]
             }
           ]

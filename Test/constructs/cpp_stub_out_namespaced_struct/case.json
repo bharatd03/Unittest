@@ -1,0 +1,19 @@
+{
+  "construct": "C++: a stub in a namespace writes a structure of that namespace into its reference parameter",
+  "sut": "src/rx.cpp",
+  "language": "cpp",
+  "expect": {"final_state": "any", "statuses": {}},
+  "answers": {
+    "structured": [
+      {
+        "function": "receive",
+        "answer": {
+          "args": [],
+          "stubs": [{"stub": "drv::can::read", "returns": ["true"]}],
+          "writes": [{"stub": "drv::can::read", "param": "frame", "fields": [{"field": "id", "value": "0x2B4"}, {"field": "len", "value": "7"}]}]
+        },
+        "reaches": ["return -3;"]
+      }
+    ]
+  }
+}

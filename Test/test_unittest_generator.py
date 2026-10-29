@@ -3198,7 +3198,7 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertEqual(s.stub_values[0].returns, ["SENSOR_ERROR"])
         notes = " ".join(plan.planning)
         self.assertIn("outside the range of int", notes)                               # A1-PL4 e)
-        self.assertIn("write_display is not a stubbed function", notes)                 # A1-PL4 d)
+        self.assertIn("write_display is not a stub this function calls", notes)                 # A1-PL4 d)
         self.assertIn("word for word", notes)                                           # A1-PL4 b)
         self.assertEqual(len([t for t in b.generate_calls if "function thermostat_command " in t]), 3)   # A1-PL9
         self.assertIn("at most 2 scenarios", b.generate_calls[0])                        # two targets [A1-PL3a]
@@ -4875,10 +4875,10 @@ def value_form_entries() -> list[dict]:
             stubs=[{"stub": "dev::read", "returns": [v, v]}])
         add("f_dep", args=[], variables=[{"name": "dev::g_level", "value": v}],
             stubs=[{"stub": "read", "returns": [v]}])
-        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v, v]}])
-        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [v]}])   # a value not given: {}
+        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [{"name": "start", "value": v}, {"name": "step", "value": v}]}])
+        add("Box::get", args=[], calls=[{"function": "Box::Box", "args": [{"name": "start", "value": v}]}])   # a value not given: {}
         add("Box::get", args=[], members=[{"member": "value_", "value": v}])
-        add("Box::get", args=[], calls=[{"function": "Box::add", "args": [v]}])    # a const reference: its value
+        add("Box::get", args=[], calls=[{"function": "Box::add", "args": [{"name": "d", "value": v}]}])    # a const reference: its value
     return out
 
 
@@ -4892,6 +4892,8 @@ def schema_problems(node: Any, value: Any, where: str = "") -> list[str]:
         return [] if any(not b for b in branches) else min(branches, key=len)
     if "enum" in node and value not in node["enum"]:
         return [f"{where}: {value!r} is not one of {node['enum'][:8]}"]
+    if isinstance(value, str) and node.get("type") == "object":
+        return [f"{where}: {value!r} is a value where the schema has an object"]
     if isinstance(value, str) and isinstance(node.get("maxLength"), int) and len(value) > node["maxLength"]:
         return [f"{where}: {value!r} is longer than {node['maxLength']}"]
     if isinstance(value, list):
@@ -4932,7 +4934,7 @@ def check_corpus_case(name: str, folder: Path, spec: dict, d: str) -> list[str]:
             problems.append(f"{name}: {entry['function']} is not a function of the layout")
             continue
         evidence = {e["evidence_id"]: uc.EvidenceRef(**e) for e in entry.get("evidence", [])}
-        answer = {**dict(gap_ids=["LC:corpus"], name=f"test_corpus_{k}", purpose="the construct", args=[], stubs=[],
+        answer = {**dict(gap_ids=["LC:corpus"], name=f"test_corpus_{k}", purpose="the construct", args=[],
                          variables=[], expected_return="", expected_after=[], evidence_ids=[], quotes=[],
                          classification="characterization_gap", conflict="", information_sought=""),
                   **entry["answer"]}
@@ -5045,6 +5047,83 @@ class CorpusStructuredTests(unittest.TestCase):
             problems += check_corpus_case("value_forms_c", folder, {"sut": "src/forms.c",
                                                                     "answers": {"structured": c_only}}, d)
         self.assertEqual(problems, [], "\n" + "\n".join(problems))
+
+    @staticmethod
+    def corpus_layout(name: str, d: str) -> tuple[uc.LayoutProfile, list[uc.StubSpec], str]:
+        """The layout of one construct, with its dependency plan, as check_corpus_case builds it."""
+        folder, spec = next((f, s) for n, f, s in up.corpus_cases([name]) if n == name)
+        repo = Path(d) / name
+        shutil.copytree(folder, repo)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file=spec["sut"]))
+        comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(d) / "w")),
+                                   router=ba.BrainRouter([DownBrain()], 0.0))
+        layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(
+            layout=layout, build=comp.capture(uc.CaptureRequest(layout=layout)))))
+        return layout, a1.AnalyzerAgent()._stubs(layout, None), (repo / spec["sut"]).read_text(encoding="utf-8")
+
+    def test_a_stub_is_offered_by_a_name_that_names_only_it_and_only_where_it_is_called(self):
+        """Two dependencies of one short name (hal::adc::read, named read through a using-declaration, and
+        hal::gpio::read) are offered by their qualified names only, each with the values of its own return type;
+        a function that calls no dependency is offered no stub (chassis: 16 correct pressure values refused as
+        "outside the range of bool", 8 supply voltages written as a gpio read)."""
+        with tmpdir() as d:
+            layout, stubs, sut_text = self.corpus_layout("cpp_same_name_stubs", d)
+            agent = a1.AnalyzerAgent()
+
+            def schema(name):
+                fn = uc.function_of(name, layout)
+                return fn, ba.llm_schema(agent._plan_model(fn, {"LC:x"}, [], stubs, None, 3, agent._structured_lists(
+                    fn, layout, stubs, sut_text)).model_json_schema())
+            fn, pump = schema("pump_step")
+            self.assertIn("hal::adc::read", fn.calls)                       # the compiler's resolution, a fact
+            offered = {b["properties"]["stub"]["enum"][0]: b["properties"]["returns"]["items"] for b in
+                       pump["properties"]["scenarios"]["items"]["properties"]["stubs"]["items"]["anyOf"]}
+            self.assertEqual(sorted(offered), ["hal::adc::read", "hal::gpio::read"])
+            self.assertEqual(sorted(offered["hal::gpio::read"]["enum"]), ["0", "1", "false", "true"])
+            self.assertNotIn("enum", offered["hal::adc::read"])                 # a number: its range is checked
+            planned = a1.PlannedScenario.model_validate(dict(
+                gap_ids=["LC:x"], name="test_pump_on", purpose="p", args=[{"name": "request", "value": "true"}],
+                stubs=[{"stub": "read", "returns": ["1799"]}], variables=[], expected_return="", expected_after=[],
+                evidence_ids=[], quotes=[], classification="characterization_gap", conflict="", information_sought=""))
+            _, reasons = agent._check_planned(planned, fn, {"LC:x"}, set(), {}, stubs, agent._constants_for_values(
+                layout), agent._known_names(layout, stubs), layout)
+            self.assertTrue(any("not a stub this function calls" in r and "hal::adc::read" in r for r in reasons), reasons)
+            _, derate = schema("derate")
+            self.assertNotIn("stubs", derate["properties"]["scenarios"]["items"]["properties"])
+
+    def test_the_arguments_of_a_call_made_before_take_the_form_of_args(self):
+        """A call made before gives one entry per parameter, as args does - a structure by its fields, an object
+        of the SUT's class built by its constructor; values in the plain older form (cached answers) still read."""
+        call = a1.PlannedCall.model_validate({"function": "f", "args": ["1", 2]})
+        self.assertEqual([(a.name, a.value) for a in call.args], [("", "1"), ("", "2")])
+        with tmpdir() as d:
+            layout, stubs, sut_text = self.corpus_layout("cpp_call_struct_arg", d)
+            agent = a1.AnalyzerAgent()
+            fn = uc.function_of("car::Estimator::update", layout)
+            text = json.dumps(ba.llm_schema(agent._plan_model(fn, {"LC:x"}, [], stubs, None, 3, agent._structured_lists(
+                fn, layout, stubs, sut_text)).model_json_schema()))
+            calls = json.loads(text)["properties"]["scenarios"]["items"]["properties"]["calls"]["items"]
+            arg = calls["properties"]["args"]["items"]["properties"]
+            self.assertEqual(arg["name"]["enum"], ["wheels"])
+            self.assertEqual(arg["fields"]["items"]["properties"]["field"]["enum"], ["fl", "fr"])
+
+    def test_an_object_parameter_of_a_class_of_the_sut_is_built_by_its_constructor(self):
+        """No value can be written for an object of a class with private members: the schema offers none, the rule
+        tests build it with the class's constructor and no brain is asked to write its set-up (chassis: 28 rule tests
+        with an invented ut_rSpeedEstimator did not compile)."""
+        with tmpdir() as d:
+            layout, stubs, sut_text = self.corpus_layout("cpp_object_param", d)
+            agent = a1.AnalyzerAgent()
+            for name, expect in (("car::send_status", "car::Estimator ut_v0{};"),
+                                 ("car::report", "car::Limiter ut_v0({});")):
+                fn = uc.function_of(name, layout)
+                schema = ba.llm_schema(agent._plan_model(fn, {"LC:x"}, [], stubs, None, 3, agent._structured_lists(
+                    fn, layout, stubs, sut_text)).model_json_schema())
+                self.assertIn('"enum": [""]', json.dumps(schema))
+                options = a2._options(fn, 0, fn.params[0], [0, 1], layout)
+                self.assertIsNotNone(options, name)
+                self.assertIn(expect, options[0][0], name)
+                self.assertEqual(options[0][1], "ut_v0")
 
 
 @full_run
