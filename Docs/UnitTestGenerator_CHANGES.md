@@ -3,6 +3,31 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-29 (18): a search program the virus scanner stops
+
+In the medium run of 14:09, the virus scanner on the PC stopped `ut_search.exe`, the program the coverage search
+builds from the SUT and the stubs. The pipeline told this apart only from an application-control policy: its
+message pointed at Smart App Control. Each function's search program was built and run again, so the scanner was
+triggered once per function. A program the scanner removed right after its build ran as "tool not found".
+
+### Change
+
+* `blocked_hint(code, text, program)` says why Windows did not run a program the pipeline built:
+  * the virus scanner: WinError 225, or the program no longer exists right after its build. The message names the
+    work folder to exclude.
+  * an application-control policy: WinError 4551, 4556 or 1260, or the policy's text, as before.
+
+  The test program, the mutant runs and the search use it.
+* After the first stopped search program, no other search program is built and run in that run. The other
+  functions are reported once as "not searched", with the reason. The run goes on without the search; nothing is
+  worked around (TP-9, TP-9a).
+
+### Checked
+
+* A test with the scanner's answer for `ut_search`: one run, the reason with the folder, the other functions not
+  searched. Without the change, every function's program was run.
+* The component tests here: 325 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-29 (17): coverage lost between iterations; the search for class methods; the medium run of 12:11
 
 ### What the run showed (commit of (16))

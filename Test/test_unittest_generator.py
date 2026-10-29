@@ -2427,6 +2427,35 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertIn("BC:control:13:9:T", result.inputs[0].covers)
         self.assertTrue(any(line.startswith("STATUS_REG = ") for line in result.inputs[0].setup))
 
+    def test_a_search_the_virus_scanner_stops_is_reported_once(self):                  # TP-9a
+        """The virus scanner stops the search program the pipeline built (WinError 225): the report says so and names
+        the work folder to exclude; no other search program is built and run in this run - one alert, not one per
+        function (the medium run of 14:09)."""
+        real, runs = a3._run, []
+
+        def scanner(cmd, cwd, timeout, env=None, quiet=False):
+            if Path(str(cmd[0])).stem == "ut_search":
+                runs.append(cmd)
+                return -126, (f"{cmd[0]}: [WinError 225] Operation did not complete successfully because the file "
+                              "contains a virus or potentially unwanted software")
+            return real(cmd, cwd, timeout, env, quiet)
+        repo = copy_pilot("c_deps_pilot", self.d)
+        with brain(DownBrain()):
+            _, layout = self.analyze(repo, "src/ctrl.c")
+        plan = run(self.a1.plan(uc.PlanRequest(layout=layout)))
+        stub_path, stub_src, stub_h = a2.render_stubs(plan)
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[
+            uc.FileAction(path=stub_path, action="create", role="stub", content=stub_src),
+            uc.FileAction(path=stub_path[:-2] + ".h", action="create", role="helper", content=stub_h)])
+        names = [f.name for f in layout.functions if f.from_frontend][:3]
+        self.assertGreater(len(names), 1)
+        chain = self.a3.toolchain()
+        with mock.patch.object(a3, "_run", scanner), mock.patch.object(chain.tools, "fuzzer", False):
+            result = self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=names, seconds=3))
+        self.assertEqual(len(runs), 1, result.unsupported)
+        self.assertTrue(any("virus scanner" in u and "Exclude the tool's work folder" in u for u in result.unsupported))
+        self.assertTrue(any("not searched" in u for u in result.unsupported), result.unsupported)
+
     @full_run
     def test_fuzzer_finds_inputs_for_gaps(self):
         """[A3-FZ1..A3-FZ4, A3-FZ11] coverage-guided search returns readable inputs that reach a gap - with
