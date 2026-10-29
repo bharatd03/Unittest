@@ -6031,13 +6031,24 @@ class PilotRunFixesTests(unittest.TestCase):
         layout = self.layout(language="c", repo_root=tmp.name, sut_file="a.c", suite_file="t.c", functions=[fn])
         bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(path="t.c", action="create",
                                                                                          role="testsuite", content="")])
-        with mock.patch.object(comp, "execute", execute), \
+        runs = []
+
+        def mutant_runs(layout_, bundle_, tests, todo, deadline, workers):
+            runs.append((tests, [m for m, _ in todo]))
+            return {m: len(runs) == 2 or k % 2 == 0 for k, (m, _) in enumerate(todo)}   # changed: detects them too
+        with mock.patch.object(comp, "execute", execute), mock.patch.object(comp, "_mutant_runs", mutant_runs), \
                 mock.patch.object(a3.ba, "emit_event", lambda kind, **kw: seen.append(kw)):
             result = comp.oracle_check(uc.OracleRequest(layout=layout, function="f", test="t", original_suite="",
                                                         changed_suite="", bundle=bundle))
         self.assertTrue(result.mutants)
         self.assertTrue(asked and all(m == [] for m in asked))                     # no per-test measurement
         self.assertEqual(len([s for s in seen if "mutants" in s.get("summary", "")]), 1)
+        # the mutants run as the fault check runs them (one build per worker, the SUT file recompiled per mutant),
+        # for the test that changed; the changed test only on what the reference detects
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0][0], ["t"])
+        self.assertEqual(runs[1][1], [m for k, m in enumerate(runs[0][1]) if k % 2 == 0])
+        self.assertEqual(result.decision, "accepted")
 
 
 class LargeFileRoundTests(unittest.TestCase):

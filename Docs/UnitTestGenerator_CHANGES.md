@@ -3,6 +3,40 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-29 (16): the oracle-strength check runs its mutants the way the fault check does
+
+### What the run showed (commit of (15), stopped by the user in iteration 3)
+
+`climate_ctrl.c` stood at 44 % for over an hour. Two changed tests of `clim_can_parse` were each checked against
+20 mutants (A3-85a .. A3-85k): 26 and 31 minutes. The model's calls took about 9 minutes of the whole run.
+
+The cause: each of the 40 runs (20 mutants, for the reference and for the changed test) was a whole verify
+run. It staged the project, built the full test program with coverage instrumentation and ran every test: about
+40 s each on the PC.
+
+### Change
+
+* `_oracle_check` runs its mutants with the fault check's `_mutant_runs` (COV-19):
+  * the test program is built once per worker;
+  * each mutant only recompiles the SUT file (no coverage instrumentation), links with the objects already built
+    and runs;
+  * a mutant that does not build, crashes, times out or fails the changed test is detected, as before.
+* The changed test runs only on the mutants the reference detects. A weakening is exactly such a mutant that the
+  changed test misses, so the decision is the same with fewer runs.
+* Each suite has the fault check's time limit (`fault_check_seconds`, 120 s). A check cut by the limit is
+  undetermined, so the original test is kept (A3-85f), and it is not stored (CA-12).
+* An operator that occurs twice on one line gave two mutants with one id. The second one now gets `#2`.
+  `_mutant_runs` needs one id per mutant.
+* `_mutant_runs` takes the layout, the bundle and the tests, instead of a fault-check request.
+
+### Checked
+
+* Here, on `climate_ctrl.c` with 967 rule tests:
+  * the old way: about 1.5 s per mutant run, 40 runs per check;
+  * the new way: 5.8 s for the whole check of 20 mutants.
+* The oracle and fault-check tests pass, and the mutant-run test now checks the two runs.
+* The component tests here: 320 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-29 (15): the medium run - four defects of ours behind most of the C++ refusals and every gate failure
 
 ### What the run showed (commit of (14))

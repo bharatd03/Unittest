@@ -27,6 +27,7 @@ Run as an MCP server:  python agent_unittest_compilation.py serve [--config ut_c
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import itertools
@@ -5026,33 +5027,39 @@ class CompilationAgent(ba.AgentCore):
         # Reference form [A3-85b]: the original test with expected values replaced by observed ones.
         observed = self._observe_failures(req, req.original_suite)
         reference = rewrite_expectations(req.original_suite, observed)
-        killed_ref, killed_new = set(), set()
         suite_path = req.layout.suite_file
-        mutants = self.mutants(sut_source, fn)
+        mutants, seen = [], collections.Counter()
+        for mutant_id, source in self.mutants(sut_source, fn):    # one id each: an operator twice on a line
+            seen[mutant_id] += 1
+            mutants.append((mutant_id if seen[mutant_id] == 1 else f"{mutant_id}#{seen[mutant_id]}", source))
         total, started = len(mutants), time.monotonic()
-
-        def run(mutant_source: str, suite: str) -> bool:
-            """True when the mutant is detected. Only the tests run: no per-test measurement [A3-85k]."""
-            bundle = _replace_suite(req.bundle, suite_path, suite)
-            res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle, measure_tests=[],
-                                                source_overrides={req.layout.sut_file: mutant_source}))
-            shutil.rmtree(res.run_dir, ignore_errors=True)               # mutant builds are not kept
-            outcome = next((t.status for t in res.tests if t.name == req.test), "crashed")
-            return outcome != "passed" or not res.link_ok
-        jobs = [(mutant_id, which, lambda m=mutant_source, s=suite: run(m, s))
-                for mutant_id, mutant_source in mutants
-                for which, suite in (("ref", reference), ("new", req.changed_suite))]
-        for (mutant_id, which, _), detected in zip(jobs, _in_parallel([j[2] for j in jobs], self.cfg.parallel_runs)):
-            if detected:
-                (killed_ref if which == "ref" else killed_new).add(mutant_id)
-        if total:                                                                                  # VIEW-14
-            ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",
-                          data={"program": "mutation check", "outcome": "ok", "runs": 2 * total,
-                                "seconds": round(time.monotonic() - started, 2)},
-                          summary=f"UT-Compilation checked {req.test} against {total} mutants of {fn.name} "
-                                  f"({round(time.monotonic() - started)} s)")
         if not total:
             return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", reason="no mutants")
+        # The way the fault check runs mutants [COV-19]: the test program is built once per worker, then each
+        # mutant only recompiles the SUT file (no coverage instrumentation) and runs - not a whole build each
+        # (climate_ctrl.c: 40 whole builds, 26 and 31 minutes for one changed test). Only the reference's
+        # detections are run on the changed test: a weakening is a mutant the reference detects and it does not.
+        workers = self.cfg.fault_check_workers or max(1, (os.cpu_count() or 2) - 1)
+        limit = self.cfg.fault_check_seconds                         # per suite: each is built once per worker
+        try:
+            ref = self._mutant_runs(req.layout, _replace_suite(req.bundle, suite_path, reference), [req.test],
+                                    mutants, time.monotonic() + limit, workers)
+            killed_ref = {m for m, hit in (ref or {}).items() if hit}
+            new = self._mutant_runs(req.layout, _replace_suite(req.bundle, suite_path, req.changed_suite),
+                                    [req.test], [m for m in mutants if m[0] in killed_ref], time.monotonic() + limit,
+                                    workers) if ref is not None else None
+        except ba.AgentFault as exc:
+            return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", mutants=total,
+                                   reason=f"the test program could not be built for the check: {exc.message}")
+        ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",       # VIEW-14
+                      data={"program": "mutation check", "outcome": "ok" if new is not None else "time limit",
+                            "runs": total + len(killed_ref), "seconds": round(time.monotonic() - started, 2)},
+                      summary=f"UT-Compilation checked {req.test} against {total} mutants of {fn.name} "
+                              f"({round(time.monotonic() - started)} s)")
+        if new is None:
+            return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", mutants=total,
+                                   reason=f"the time limit of {limit:g} s per suite was reached [COV-19]")
+        killed_new = {m for m, hit in new.items() if hit}
         weaker = killed_ref - killed_new
         decision = "oracle_weakening" if weaker else "accepted"
         return uc.OracleResult(test=req.test, decision=decision, mutants=total, killed_by_reference=len(killed_ref),
@@ -5154,11 +5161,11 @@ class CompilationAgent(ba.AgentCore):
         known = self._fault_baseline.setdefault(key, {})
         todo = [(mid[id(site)], site[4]) for _, site, _ in compared if mid[id(site)] not in known]
         try:
-            ran = self._mutant_runs(req, todo, deadline, workers)
+            ran = self._mutant_runs(req.layout, req.bundle, req.tests, todo, deadline, workers)
             if ran is not None:
                 known.update(ran)
                 need = [(mid[id(site)], partner[4]) for _, site, partner in compared if known[mid[id(site)]]]
-                after = self._mutant_runs(req, need, deadline, workers) if need else {}
+                after = self._mutant_runs(req.layout, req.bundle, req.tests, need, deadline, workers) if need else {}
             else:
                 after = None
         except ba.AgentFault as exc:
@@ -5186,30 +5193,29 @@ class CompilationAgent(ba.AgentCore):
                                    reason=("the tests no longer detect " + ", ".join(missed[:5])) if missed else
                                    "every compared mutant detected before is still detected")
 
-    def _mutant_runs(self, req: uc.FaultCheckRequest, todo: list[tuple[str, str]], deadline: float,
-                     workers: int) -> dict[str, bool] | None:
+    def _mutant_runs(self, layout: uc.LayoutProfile, bundle: uc.FileActionBundle | None, tests: list[str],
+                     todo: list[tuple[str, str]], deadline: float, workers: int) -> dict[str, bool] | None:
         """COV-19: is each mutant detected? The test program is built once per worker; for each mutant only
         the SUT translation unit is compiled again (no coverage instrumentation), linked with the objects
-        already built and run. A mutant is detected when a test of ``req.tests`` does not pass, the program
+        already built and run. A mutant is detected when a test of ``tests`` does not pass, the program
         crashes or times out, or the mutant does not build. None: the time limit was reached."""
         if not todo:
             return {}
         import concurrent.futures
         import threading
         chain = self.toolchain()
-        layout = req.layout
         root = Path(self.cfg.work_dir) / ("fault-" + time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
         count = max(1, min(workers, len(todo)))
         stop = threading.Event()
         results: dict[str, bool] = {}
         lock = threading.Lock()
         queue = list(reversed(todo))
-        wanted = set(req.tests)
+        wanted = set(tests)
         sut_name = layout.sut_file
 
         def prepare(index: int) -> tuple[Path, list[str], list[str], Path]:
             run_dir = root / f"w{index}"
-            vreq = uc.VerifyRequest(layout=layout, stage="observe", bundle=req.bundle)
+            vreq = uc.VerifyRequest(layout=layout, stage="observe", bundle=bundle)
             repo = self._stage(layout, vreq, run_dir)
             build = self._build(layout, vreq, repo, run_dir, chain)
             if not build["linked"]:
