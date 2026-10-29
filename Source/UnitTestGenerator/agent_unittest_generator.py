@@ -2136,7 +2136,8 @@ def fuzz_tests(plan: uc.UTPlan, existing: set[str]) -> list[tuple[str, str, str]
             name = f"test_{uc.function_stem(fn, layout)}_fuzz_{k}"
             existing.add(name)
             observe = _observer(fn.return_type, layout)
-            call = f"{callee_of(fn)}({', '.join(inp.args)})"
+            method = fn.member and not uc.static_member(fn, layout)      # the setup built ut_obj [A3-FZ2, A2-21ae]
+            call = f"{'ut_obj.' + fn.qualified_name.split('::')[-1] if method else callee_of(fn)}({', '.join(inp.args)})"
             body = inp.setup + [_observe_call(observe or "", f"{name}_r", _enum_value(fn.return_type, layout, call))]
             body.append(f"/* reaches: {', '.join(inp.covers[:6])} */")
             out.append((name, render_test(name, "\n".join(body), "E8"), "E8"))

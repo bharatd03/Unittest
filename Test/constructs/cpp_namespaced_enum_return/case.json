@@ -1,0 +1,24 @@
+{
+  "construct": "C++: the expected return value of a function of a namespace is an enumerator of that namespace, named without the namespace",
+  "sut": "src/mode.cpp",
+  "language": "cpp",
+  "expect": {"final_state": "any", "statuses": {}},
+  "answers": {
+    "structured": [
+      {
+        "function": "car::select_mode",
+        "answer": {
+          "args": [{"name": "current", "value": "Mode::Comfort"}, {"name": "button", "value": "2"}, {"name": "stopped", "value": "1"}],
+          "expected_return": "Mode::Service",
+          "classification": "confirmed_gap",
+          "evidence_ids": ["EV-select_mode-1"],
+          "quotes": [{"evidence_id": "EV-select_mode-1", "text": "a long press selects Service only at standstill"}]
+        },
+        "evidence": [{"evidence_id": "EV-select_mode-1", "evidence_class": "E2", "source": "include/mode.hpp", "line": 5,
+                      "text": "a long press selects Service only at standstill; a short press switches Comfort and Sport"}],
+        "reaches": ["return stopped ? Mode::Service : current;"],
+        "contains": ["car::Mode::Service"]
+      }
+    ]
+  }
+}

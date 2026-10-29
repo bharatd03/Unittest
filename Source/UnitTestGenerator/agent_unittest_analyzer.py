@@ -2473,7 +2473,8 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
                   callables: Any = (), outputs: Any = (), registers: Any = (), members: Any = (),
                   exceptions: Any = (), member_kinds: dict[str, uc.ParamInfo] | None = None,
                   call_params: dict[str, list[uc.ParamInfo]] | None = None, objects: Any = (),
-                  stub_returns: dict[str, uc.ParamInfo] | None = None) -> type[BaseModel]:
+                  stub_returns: dict[str, uc.ParamInfo] | None = None,
+                  returns: uc.ParamInfo | None = None) -> type[BaseModel]:
     """ARCH-20a, A1-PL3: the answer of one planning call with the lists of this function - its targets (A1-PL3a; its
     open items when it has none), its evidence, its parameters, the stubs whose return value a test can set and the
     stub variables. With targets the brain never writes the items out (ARCH-20d)."""
@@ -2571,6 +2572,10 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
         members=((list[member_m], Field(default_factory=list, description="object members before the call",
                                         json_schema_extra=_most(16)))
                  if members else (hidden[list[PlannedMember]], Field(default_factory=list))),
+        **({"expected_return": (Annotated[str, Field(json_schema_extra={"enum": ["", *value_schema(returns)["enum"]]})],
+                                Field(default="", description="the return value the EVIDENCE states; empty when it "
+                                                              "states none"))}     # an enumeration or a boolean
+           if returns is not None and returns.kind in ("enum", "bool") and "enum" in value_schema(returns) else {}),
         expected_exception=((_listed(["", *exceptions]), Field(default="", description=(
             "C++: the exception type from EXCEPTIONS the EVIDENCE says the call throws; empty when none")))
             if exceptions else (hidden[str], Field(default=""))))
@@ -4289,7 +4294,7 @@ class AnalyzerAgent(ba.AgentCore):
                              lists.get("fields", []), lists.get("callables", []), lists.get("outputs", []),
                              lists.get("registers", []), lists.get("members", []), lists.get("exceptions", []),
                              lists.get("member_kinds"), lists.get("call_params"), lists.get("objects", ()),
-                             lists.get("stub_returns"))
+                             lists.get("stub_returns"), lists.get("returns"))
 
     # ---------------------------------------------------------------- structured scenario: the brain says what
     def _structured_lists(self, fn: uc.FunctionInfo, layout: uc.LayoutProfile, stubs: list[uc.StubSpec],
@@ -4396,6 +4401,8 @@ class AnalyzerAgent(ba.AgentCore):
         return {"state": state_names, "fields": sorted(fields), "callables": callables[:40],
                 "outputs": outputs, "registers": registers, "members": members, "exceptions": exceptions,
                 "member_kinds": member_kinds, "call_params": call_params, "stub_returns": stub_returns,
+                "returns": target_param("", re.sub(r"\b(const|volatile|static|inline)\b", "", return_type_of(fn)).strip(),
+                                        layout),
                 "objects": [p.name for p in text_params(fn) if p.kind == "object" and uc.sut_class(p.base or p.type,
                                                                                                    layout)],
                 "rows": {"state": state_rows, "callables": call_rows[:40], "outputs": output_rows,
@@ -4719,6 +4726,13 @@ class AnalyzerAgent(ba.AgentCore):
             v = typed(f"members {m.member}", m.value, target_param("", info.type, layout))
             if v is not None:
                 stmts.append(f"({ref}) = {v};")
+        expected = planned.expected_return.strip()
+        ret = target_param("", re.sub(r"\b(const|volatile|static|inline)\b", "", return_type_of(fn)).strip(), layout)
+        if expected and ret.kind == "enum":            # its enumerator in full, as an argument's [A2-21ai]
+            full = next((k for k in ret.enum_values if k.split("::")[-1] == expected.split("::")[-1]), None)
+            if full and full != expected:
+                planned.expected_return = full
+                fixes.append(f"expected_return: {expected!r} -> {full!r} (the enumerator in full) [structured]")
         if decls or stmts:
             planned.setup = decls + list(planned.setup) + stmts
             fixes.append(f"structured: {len(decls) + len(stmts)} statement(s) written by the generator")

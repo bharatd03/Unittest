@@ -3,6 +3,87 @@
 The requirements file (`unittest_generator_requirments.txt`) is not updated until the core works. Changes are
 recorded here and will go into the requirements file afterwards. New code cites no new requirement IDs.
 
+## 2026-10-29 (17): coverage lost between iterations; the search for class methods; the medium run of 12:11
+
+### What the run showed (commit of (16))
+
+| | `climate_ctrl.c` | `chassis_ctrl.cpp` |
+|---|---|---|
+| MC/DC | 70.45 % | 46.34 % (39.02 % before (15)) |
+| Refusals, coverage | 27.5 % (28 of 102), all repeats | 18.3 % (13 of 71; 69.2 % before) |
+| Rejections for a fault, coverage | 0 % (0 of 74) | 6.7 % (4 of 60; 46.7 % before) |
+| Rejections for a fault, requirement checks | 0 % (0 of 10) | 14.3 % (1 of 7) |
+
+The strength check of a changed test took 1.3 minutes instead of 26 to 31 minutes.
+
+Four defects of ours remained.
+
+1. **Coverage lost and found again from one iteration to the next.**
+   * Covered items disappeared while every test passed and the number of tests grew. In iteration 3,
+     `clim_fault_count_confirmed` went from 10 covered lines to 0.
+   * With function-local statics, every test runs in a process of its own on Windows (A3-45c). Each process wrote
+     `run-<process id>.profraw`.
+   * Windows gives a new process the id of one that ended, so the later profile replaced the earlier one. In the
+     run folder there were 825 profiles for 1149 runs and 928 for 1163: the coverage of a quarter of the tests was
+     lost.
+   * An item a test reached was reported open, the model was asked for it again, and its answer was refused as a
+     repeat.
+2. **No class method was searched (A3-FZ).**
+   * A method of a class with a constructor was left out ("a class method needs an object").
+   * A method of a class without one was called without an object, so the target did not build.
+   * An object parameter and a reference to an enumeration "cannot be generated".
+   * The 88 items reported as "pipeline limitation" were those of the methods the search could not reach.
+3. **The strength check of a changed test was given no function.** The function was taken from the test's name
+   (`f.name in test`); `test_update_spread_limit_exceeded_2` names no `vehicle::chassis::SpeedEstimator::update`.
+   The check answered "unknown function" and the original test was kept.
+4. **An expected return value that is an enumerator of a namespace was written without it** (`Mode::Service` for
+   `vehicle::chassis::Mode::Service`), so the requirement check did not compile.
+
+### Change
+
+* **Every run of the test program alone writes its own profile,** named by its place (`alone-<n>.profraw`), not by
+  its process id. The run of the whole program keeps `run-%p`.
+* **The search builds the object of a method** with the constructor a test uses (`uc.object_recipe`):
+  * per input, the constructor's value parameters are searched too;
+  * the fakes of injected interfaces come from the stubs header;
+  * a throwing constructor or method ends that input, not the search.
+* **A function that keeps state** (a member, function-local statics, or SUT state it reads) is called up to four
+  times in a row per input, each call with its own values. The input becomes a test with the same object, the same
+  earlier calls and the last call checked; for a method the test calls `ut_obj.<method>`.
+* An object parameter of a class of the SUT is built by its constructor (`uc.class_recipe`). A reference to an
+  enumeration is one of its enumerators.
+* `FuzzPlan.param` decodes one parameter for the target, `FuzzPlan._arg` writes it back. `_is_method` was removed:
+  the front end's `member` is the fact.
+* **The function of a changed test comes from the test** (`Orchestrator._function_of_test`): the scenario it was
+  written from, else the last function of the SUT it calls. A short name counts only where it names one function.
+* **The expected return value is typed by the return type:**
+  * an enumerator in full;
+  * the schema offers the enumerators (or `true`, `false`, `0`, `1`) for an enumeration or a boolean return.
+
+Corpus case `cpp_namespaced_enum_return` (it failed before).
+
+### Checked
+
+Each of the following tests fails without the change:
+* the profile test: one profile for five runs with the same process id;
+* the search of `car::Estimator::update`: the target did not build;
+* the search of `car::send_status`: the parameter "cannot be generated";
+* the function of a changed test.
+
+The search of `chassis_ctrl.cpp` here, 60 s:
+* searched now: `MovingAverage::value`, `MovingAverage::push` (the class template's parameter with its argument),
+  `SpeedEstimator::update`, `BrakeBlender::blend` (with the fake of `IDiagSink`), `TractionControl::torque_limit`,
+  `SteerLimiter::limit`, `LevelControl::step`, `send_status`, `receive_mode`;
+* 22 inputs reach uncovered items, among them `SpeedEstimator::update` lines 137, 142 and 143, which the run of 12:11
+  listed as a pipeline limitation.
+
+Here, in the new form:
+* the search reaches `return speed_;` of `cpp_call_struct_arg` (three implausible updates in a row);
+* the test written from that input reaches it;
+* `cpp_object_param` is searched and its test reaches its line;
+* `corpus`: 45 cases and the value forms pass.
+* The component tests here: 324 run; the 5 that fail need LangGraph or fail without these changes too.
+
 ## 2026-10-29 (16): the oracle-strength check runs its mutants the way the fault check does
 
 ### What the run showed (commit of (15), stopped by the user in iteration 3)

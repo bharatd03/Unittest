@@ -2393,6 +2393,8 @@ class FuzzPlan:
         self.body = ""                                  # the function's source: which fields it checks for NULL
         self.size = 0
         self.problem = ""
+        self.method, self.calls, self.callee = False, 1, fn.qualified_name    # set by build()
+        self.params = list(uc.instantiated(fn, layout).params)       # a class template's: with its arguments
         self.controls = [(n, r) for n, t in controls for r in [self._resolve(_plain(t))]
                          if SCALAR.match(r) and r != "void"]
 
@@ -2471,15 +2473,81 @@ class FuzzPlan:
         else:
             self.prints.append(f'printf("%lld", (long long)({expr}));')
 
+    CALLS_PER_INPUT = 4     # a function that keeps state: up to this many calls in a row per input [A1-PL2]
+
+    def param(self, p: uc.ParamInfo, suffix: str) -> str | None:
+        """Decodes one parameter (its label and variable end in ``suffix``) and returns the argument; None and
+        ``problem`` when its type cannot be generated."""
+        var, t = f"ut_a{suffix}", _plain(p.type)
+        base = _plain(p.base or "")
+        enum = p.enum_values or next((list(e.values) for e in self.layout.enums if base and (
+            e.name == base or e.name.split("::")[-1] == base.split("::")[-1])), [])
+        if p.kind in ("int", "float", "bool"):
+            ctype = "unsigned char" if p.kind == "bool" else t
+            self.take(var, ctype)
+            if p.kind == "float":
+                self.sanitize_float(var)
+            self.print_scalar(f"A{suffix}", f"({var} & 1)" if p.kind == "bool" else var,
+                              "bool" if p.kind == "bool" else ctype)
+            return var if p.kind != "bool" else f"({var} & 1)"
+        if p.kind == "enum" and p.enum_values:
+            self.take(f"{var}_k", "unsigned char")
+            self.lines.append(f"    unsigned {var}_i = {var}_k % {len(p.enum_values)}u;")
+            self.prints.append(f'printf("|E{suffix}=%u", {var}_i);')
+            self.lines.append(f"    static const {t} {var}_t[] = {{{', '.join(p.enum_values)}}};")
+            return f"{var}_t[{var}_i]"
+        if p.kind == "ptr_scalar" and enum and not p.nullable:     # a reference or pointer to an enumeration
+            self.take(f"{var}_k", "unsigned char")
+            self.lines.append(f"    unsigned {var}_i = {var}_k % {len(enum)}u;")
+            self.prints.append(f'printf("|E{suffix}=%u", {var}_i);')
+            self.lines.append(f"    static const {base} {var}_t[] = {{{', '.join(enum)}}};")
+            self.lines.append(f"    {base} {var}_v = {var}_t[{var}_i];")
+            return f"{var}_v" if p.by_ref else f"&{var}_v"
+        if p.kind == "ptr_scalar" and SCALAR.match(self._resolve(base)):
+            self.take(f"{var}_v", "unsigned char" if "bool" in base else base)
+            if FLOAT_T.search(base):
+                self.sanitize_float(f"{var}_v")
+            self.print_scalar(f"P{suffix}", f"{var}_v", base)
+            if p.by_ref:
+                return f"{var}_v"
+            if p.nullable:
+                self.take(f"{var}_z", "unsigned char")
+                self.prints.append(f'printf("|N{suffix}=%d", ({var}_z % 8u) == 0);')
+                return (f"(({var}_z % 8u) == 0 ? {'nullptr' if self.cpp else 'NULL'} : ({base} *)&{var}_v)"
+                        if "bool" not in base else f"(({var}_z % 8u) == 0 ? 0 : &{var}_v)")
+            return f"({base} *)&{var}_v" if "bool" not in base else f"&{var}_v"
+        if p.kind in ("struct", "ptr_struct") and p.fields:
+            base = _plain(p.base or p.type)
+            self.lines.append(f"    {base} {var}; ut_take(&{var}, sizeof {var});")
+            self.size += 64
+            self.prints.append(f'printf("|T{suffix}=");')
+            if not self.fields(var, p.fields, f"T{suffix}"):
+                return None
+            return f"&{var}" if p.kind == "ptr_struct" and not p.by_ref else var
+        if p.kind == "cstring":
+            self.lines.append(f"    char {var}[33]; ut_take({var}, 32); {var}[32] = 0;")
+            self.size += 32
+            self.prints.append(f'printf("|C{suffix}="); ut_print_str({var});')
+            return var
+        cls = uc.sut_class(p.base or p.type, self.layout) if p.kind == "object" else ""
+        if cls:                                     # an object of a class of the SUT: its constructor [A2-21ae]
+            declared = re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
+            self.lines += ["    " + x for x in uc.class_recipe(cls, self.layout, var, declared=declared)[0]]
+            return f"&{var}" if "*" in p.type and not p.by_ref else var
+        self.problem = f"parameter {p.name} ({p.type}) cannot be generated"
+        return None
+
     def build(self, sut: Path) -> str | None:
         fn = self.fn
-        if "::" in fn.qualified_name and fn.qualified_name.count("::") > 0 and self._is_method():
-            self.problem = "a class method needs an object"
-            return None
         if not fn.from_frontend:
             self.problem = "no parameter types from the compiler front end"
             return None
-        args = []
+        cls = uc.class_of(fn)
+        if fn.member and fn.qualified_name.split("::")[-1] in (cls.split("::")[-1], "~" + cls.split("::")[-1]):
+            self.problem = "a constructor or destructor: searched through the methods of its class"
+            return None
+        self.method = fn.member and not uc.static_member(fn, self.layout)
+        callee, objects = fn.qualified_name, []
         for i, (lvalue, ctype) in enumerate(self.controls):
             boolean = "bool" in ctype
             self.take(f"ut_s{i}", "unsigned char" if boolean else ctype)
@@ -2488,56 +2556,46 @@ class FuzzPlan:
             value = f"(ut_s{i} & 1)" if boolean else f"ut_s{i}"
             self.lines.append(f"    {lvalue[:-2]}({value});" if lvalue.endswith("()") else f"    {lvalue} = {value};")
             self.print_scalar(f"S:{lvalue}", value, ctype)                    # name(): a project stub control [A2-21ak]
-        for i, p in enumerate(fn.params):
-            var = f"ut_a{i}"
-            t = _plain(p.type)
-            if p.kind in ("int", "float", "bool"):
-                ctype = "unsigned char" if p.kind == "bool" else t
-                self.take(var, ctype)
-                if p.kind == "float":
-                    self.sanitize_float(var)
-                self.print_scalar(f"A{i}", f"({var} & 1)" if p.kind == "bool" else var, "bool" if p.kind == "bool" else ctype)
-                args.append(var if p.kind != "bool" else f"({var} & 1)")
-            elif p.kind == "enum" and p.enum_values:
-                self.take(f"{var}_k", "unsigned char")
-                names = p.enum_values
-                self.lines.append(f"    unsigned {var}_i = {var}_k % {len(names)}u;")
-                self.prints.append(f'printf("|E{i}=%u", {var}_i);')
-                table = ", ".join(names)
-                self.lines.append(f"    static const {t} {var}_t[] = {{{table}}};")
-                args.append(f"{var}_t[{var}_i]")
-            elif p.kind == "ptr_scalar" and SCALAR.match(self._resolve(_plain(p.base))):
-                base = _plain(p.base)
-                self.take(f"{var}_v", "unsigned char" if "bool" in base else base)
-                if FLOAT_T.search(base):
-                    self.sanitize_float(f"{var}_v")
-                self.print_scalar(f"P{i}", f"{var}_v", base)
-                if p.nullable:
-                    self.take(f"{var}_z", "unsigned char")
-                    self.prints.append(f'printf("|N{i}=%d", ({var}_z % 8u) == 0);')
-                    args.append(f"(({var}_z % 8u) == 0 ? {'nullptr' if self.cpp else 'NULL'} : "
-                                f"({base} *)&{var}_v)" if "bool" not in base else f"(({var}_z % 8u) == 0 ? 0 : &{var}_v)")
-                else:
-                    args.append(f"({base} *)&{var}_v" if "bool" not in base else f"&{var}_v")
-            elif p.kind in ("struct", "ptr_struct") and p.fields:
-                base = _plain(p.base or p.type)
-                self.lines.append(f"    {base} {var}; ut_take(&{var}, sizeof {var});")
-                self.size += 64
-                self.prints.append(f'printf("|T{i}=");')
-                if not self.fields(var, p.fields, f"T{i}"):
+        if self.method:      # the object, built per input by the constructor a test uses, its values searched too
+            made = uc.constructor_of(cls, self.layout)
+            values = []
+            for j, p in enumerate(made.params if made else []):
+                scalar = p.kind in ("int", "float", "bool", "enum") and not p.by_ref and "*" not in p.type
+                values.append((self.param(p, f"O{j}") or "") if scalar else "")
+                if self.problem:
                     return None
-                args.append(f"&{var}" if p.kind == "ptr_struct" else var)
-            elif p.kind == "cstring":
-                self.lines.append(f"    char {var}[33]; ut_take({var}, 32); {var}[32] = 0;")
-                self.size += 32
-                self.prints.append(f'printf("|C{i}="); ut_print_str({var});')
-                args.append(var)
-            else:
-                self.problem = f"parameter {p.name} ({p.type}) cannot be generated"
+            recipe = uc.object_recipe(fn, self.layout, values)
+            if recipe is None:
+                self.problem = "a method of a class no test can name"
                 return None
-        call = f"{fn.qualified_name}({', '.join(args)})"
+            objects, callee = ["    " + x for x in recipe[0]], recipe[1]
+        state = [v.name.replace("(anonymous namespace)::", "").split("::")[-1] for v in self.layout.sut_state]
+        self.calls = self.CALLS_PER_INPUT if uc.keeps_state(fn, self.layout) or any(
+            re.search(r"\b" + re.escape(v) + r"\b", self.body) for v in state) else 1
+        sets = []
+        for c in range(self.calls):                 # a state built by earlier calls: each call its own values
+            args = []
+            for i, p in enumerate(self.params):
+                arg = self.param(p, f"{i}" if self.calls == 1 else f"{c}_{i}")
+                if arg is None:
+                    return None
+                args.append(arg)
+            sets.append(args)
+        if self.calls > 1:
+            self.take("ut_nk", "unsigned char")
+            self.lines.append(f"    unsigned ut_n = 1u + ut_nk % {self.calls}u;")
+            self.prints.append('printf("|N=%u", ut_n);')
+        self.callee = callee
+        cast = "(void)" if fn.return_type.strip() != "void" else ""
+        calls = [f"    if (ut_n > {self.calls - 1 - c}u) {cast}{callee}({', '.join(args)});"
+                 for c, args in enumerate(sets[:-1])] + [f"    {cast}{callee}({', '.join(sets[-1])});"]
+        if self.method and self.cpp:               # a throwing constructor or method ends this input, not the search
+            calls = ["    try {", *objects, *calls, "    } catch (...) {}"]
+        else:
+            calls = objects + calls
         include_stubs = (f'#include "{uc.stub_names(self.layout)[1]}"\n'                       # A2-21af
-                         if any(n.startswith("ut_stub_") for n, _ in self.controls) else "")
+                         if any(n.startswith("ut_stub_") for n, _ in self.controls) or self.method or
+                         any("ut_fake_" in x for x in self.lines + calls) else "")
         for ps in (self.layout.dependencies.project_stubs if self.layout.dependencies else []):    # A2-21ak
             if any(n[:-2] in {c.name for c in ps.controls} for n, _ in self.controls if n.endswith("()")):
                 include_stubs += (f'#include "{Path(ps.header).name}"\n' if ps.header else "".join(
@@ -2573,50 +2631,75 @@ class FuzzPlan:
             "    ut_sut_reset();" if uc.reset_state(self.layout) else "",
             *self.lines,
             "    if (getenv(\"UT_FUZZ_PRINT\")) { printf(\"UT_FUZZ\"); " + " ".join(self.prints) + " printf(\"\\n\"); fflush(stdout); }",
-            f"    (void){call};" if fn.return_type.strip() != "void" else f"    {call};",
+            *calls,
             "    return 0;", "}", ""])
 
-    def _is_method(self) -> bool:
-        owner = self.fn.qualified_name.rsplit("::", 1)[0]
-        return any(f.qualified_name.startswith(owner + "::") and f.name.split("::")[-1] == owner.split("::")[-1]
-                   for f in self.layout.functions) or bool(re.search(r"\)\s*const\s*$", self.fn.signature))
-
     def to_input(self, printed: str) -> tuple[list[str], list[str]]:
-        """'UT_FUZZ|A0=5|P1=3|...' -> (args, setup statements) as C/C++ source."""
+        """'UT_FUZZ|A0=5|P1=3|...' -> (args, setup statements) as C/C++ source: the controls, the object of a method
+        with its constructor values, the earlier calls of a function that keeps state, then the last call's args."""
         values = dict(item.split("=", 1) for item in printed.split("|")[1:] if "=" in item)
-        setup, args = [], []
-        null = "nullptr" if self.cpp else "NULL"
+        setup = []
         for key, value in values.items():
             if key.startswith("S:") and key.endswith("()"):                               # A2-21ak
                 setup.append(f"{key[2:-2]}({value});")
             elif key.startswith("S:"):
                 setup.append(f"{key[2:]} = {value};")
-        for i, p in enumerate(self.fn.params):
-            t = _plain(p.type)
-            if p.kind in ("int", "float"):
-                v = values.get(f"A{i}", "0")
-                args.append(v if t in ("int", "double") else f"({t})({v})")
-            elif p.kind == "bool":
-                v = values.get(f"A{i}", "0")
-                args.append(("true" if v == "1" else "false") if self.cpp or "bool" in t else v)
-            elif p.kind == "enum":
-                args.append(p.enum_values[int(values.get(f"E{i}", "0")) % max(len(p.enum_values), 1)])
-            elif p.kind == "ptr_scalar":
-                base = _plain(p.base)
-                if values.get(f"N{i}") == "1":
-                    args.append(null)
-                else:
-                    setup.append(f"{base} ut_v{i} = {values.get(f'P{i}', '0')};")
-                    args.append(f"&ut_v{i}")
-            elif p.kind in ("struct", "ptr_struct"):
-                base = _plain(p.base or p.type)
-                setup += self.pointees.get(f"T{i}", [])                                    # A3-FZ2, A2-21ad
-                setup.append(f"{base} ut_v{i} = {values.get(f'T{i}', '{0}')};")
-                args.append(f"&ut_v{i}" if p.kind == "ptr_struct" else f"ut_v{i}")
-            elif p.kind == "cstring":
-                args.append(values.get(f"C{i}", '""'))
-        return args, setup
+        if self.method:
+            made = uc.constructor_of(uc.class_of(self.fn), self.layout)
+            given = []
+            for j, p in enumerate(made.params if made else []):
+                scalar = p.kind in ("int", "float", "bool", "enum") and not p.by_ref and "*" not in p.type
+                given.append(self._arg(p, f"O{j}", values, [])[0] if scalar else "")
+            recipe = uc.object_recipe(self.fn, self.layout, given)
+            setup += recipe[0] if recipe else []
+        n = int(values.get("N", "1")) if self.calls > 1 else 1
+        last: list[str] = []
+        for c in range(self.calls):
+            if c < self.calls - 1 and not n > self.calls - 1 - c:
+                continue                                                  # not called by this input
+            args = [self._arg(p, f"{i}" if self.calls == 1 else f"{c}_{i}", values, setup)[0]
+                    for i, p in enumerate(self.params)]
+            if c < self.calls - 1:
+                setup.append(f"{self.callee}({', '.join(args)});")
+            else:
+                last = args
+        return last, setup
 
+    def _arg(self, p: uc.ParamInfo, suffix: str, values: dict[str, str], setup: list[str]) -> tuple[str, list[str]]:
+        """The argument of one decoded parameter as C/C++ source; the objects it needs go into ``setup``."""
+        t, null = _plain(p.type), "nullptr" if self.cpp else "NULL"
+        base = _plain(p.base or "")
+        enum = p.enum_values or next((list(e.values) for e in self.layout.enums if base and (
+            e.name == base or e.name.split("::")[-1] == base.split("::")[-1])), [])
+        if p.kind in ("int", "float"):
+            v = values.get(f"A{suffix}", "0")
+            return (v if t in ("int", "double") else f"({t})({v})"), setup
+        if p.kind == "bool":
+            v = values.get(f"A{suffix}", "0")
+            return (("true" if v == "1" else "false") if self.cpp or "bool" in t else v), setup
+        if p.kind == "enum":
+            return p.enum_values[int(values.get(f"E{suffix}", "0")) % max(len(p.enum_values), 1)], setup
+        if p.kind == "ptr_scalar" and enum and not p.nullable:
+            setup.append(f"{base} ut_v{suffix} = {enum[int(values.get(f'E{suffix}', '0')) % len(enum)]};")
+            return (f"ut_v{suffix}" if p.by_ref else f"&ut_v{suffix}"), setup
+        if p.kind == "ptr_scalar":
+            if values.get(f"N{suffix}") == "1":
+                return null, setup
+            setup.append(f"{base} ut_v{suffix} = {values.get(f'P{suffix}', '0')};")
+            return (f"ut_v{suffix}" if p.by_ref else f"&ut_v{suffix}"), setup
+        if p.kind in ("struct", "ptr_struct"):
+            decl = _plain(p.base or p.type)
+            setup += self.pointees.get(f"T{suffix}", [])                                   # A3-FZ2, A2-21ad
+            setup.append(f"{decl} ut_v{suffix} = {values.get(f'T{suffix}', '{0}')};")
+            return (f"&ut_v{suffix}" if p.kind == "ptr_struct" and not p.by_ref else f"ut_v{suffix}"), setup
+        if p.kind == "cstring":
+            return values.get(f"C{suffix}", '""'), setup
+        cls = uc.sut_class(p.base or p.type, self.layout) if p.kind == "object" else ""
+        if cls:
+            declared = re.sub(r"\b(const|volatile)\b|[&*]", "", p.base or p.type).strip()
+            setup += uc.class_recipe(cls, self.layout, f"ut_v{suffix}", declared=declared)[0]
+            return (f"&ut_v{suffix}" if "*" in p.type and not p.by_ref else f"ut_v{suffix}"), setup
+        return "0", setup
 
 
 class CompilationAgent(ba.AgentCore):
@@ -3852,6 +3935,13 @@ class CompilationAgent(ba.AgentCore):
         prof = run_dir / "prof"
         prof.mkdir(exist_ok=True)
         env = chain.env(LLVM_PROFILE_FILE=str(prof / "run-%p.profraw"))
+        runs = itertools.count(1)
+
+        def alone() -> dict[str, str]:
+            """The profile of one run of the program alone, named by its place, not by its process id: Windows
+            gives a new process the id of one that ended, and the second profile replaced the first (climate_ctrl.c,
+            one run per test: 1149 runs, 825 profiles - the coverage of 324 tests lost)."""
+            return chain.env(LLVM_PROFILE_FILE=str(prof / f"alone-{next(runs)}.profraw"))
         one_by_one = isolate and ONE_BY_ONE
         if one_by_one:
             code, text = 0, ""
@@ -3884,10 +3974,10 @@ class CompilationAgent(ba.AgentCore):
                             _exit_text(code, text, getattr(chain, "facts", None)), len(names))
             results = []
             if not names:                  # no test to run alone: one run of the program writes the profile [A3-60]
-                c, t = _run([str(binary)], run_dir, self.cfg.test_timeout, env, quiet=True)
+                c, t = _run([str(binary)], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                 outputs.append(t)
             for name in names:
-                c, t = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, env, quiet=True)
+                c, t = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                 outputs.append(t)
                 single, obs, summ = parse_run_output(t)
                 observed.update(obs)
@@ -3903,7 +3993,7 @@ class CompilationAgent(ba.AgentCore):
                     timed_out = "UT_TIMEOUT" in t
                     if not timed_out and uc.program_outcome(c, t, facts) == "unknown":
                         # NC-12: an end the facts do not describe - once more alone, to tell a fluke from a property
-                        c2, t2 = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, env, quiet=True)
+                        c2, t2 = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                         outputs.append(t2)
                         again, obs2, summ2 = parse_run_output(t2)
                         again_done = next((r for r in again if r.name == name), None)

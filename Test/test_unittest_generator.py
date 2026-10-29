@@ -5107,6 +5107,58 @@ class CorpusStructuredTests(unittest.TestCase):
             self.assertEqual(arg["name"]["enum"], ["wheels"])
             self.assertEqual(arg["fields"]["items"]["properties"]["field"]["enum"], ["fl", "fr"])
 
+    def search_and_test(self, name: str, function: str, line_text: str, seconds: int = 20):
+        """The coverage search of one function of a construct, its inputs turned into tests, run and measured:
+        (search result, covered items, the line's LC item)."""
+        with tmpdir() as d:
+            layout, stubs, sut_text = self.corpus_layout(name, d)
+            fn = uc.function_of(function, layout)
+            line = next(k for k, text in enumerate(sut_text.splitlines(), 1) if line_text in text)
+            item = f"LC:{fn.qualified_name}:{line}"
+            plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", stubs=stubs)
+            stub_path, stub_src, stub_h = a2.render_stubs(plan)
+            bundle = uc.FileActionBundle(bundle_id="b", actions=[
+                uc.FileAction(path=stub_path, action="create", role="stub", content=stub_src),
+                uc.FileAction(path=str(Path(stub_path).with_name(uc.stub_names(layout)[1])).replace("\\", "/"),
+                              action="create", role="helper", content=stub_h)])
+            comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(d) / "w")),
+                                       router=ba.BrainRouter([DownBrain()], 0.0))
+            gap = uc.GapItem(gap_id=item, function=fn.qualified_name, metric="LC", line=line)
+            found = comp.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=[fn.qualified_name], gaps=[gap],
+                                             seconds=seconds))
+            if not found.inputs:
+                return found, [], item
+            plan = plan.model_copy(update={"scenarios": [uc.Scenario(
+                scenario_id="S-fuzz", function=fn.name, function_line=fn.line_start, description="search",
+                inputs=found.inputs)]})
+            gen = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic", max_auto_tests_per_function=0))
+
+            async def no_brains(*a, **kw):
+                return []
+            with mock.patch.object(uc, "brains_for", no_brains):
+                tests = run(gen.generate_bundle(uc.GenerationRequest(plan=plan)))
+            result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=tests))
+            self.assertTrue(result.link_ok, [x.message for x in result.diagnostics][:3])
+            return found, result.coverage.covered_items if result.coverage else [], f"LC:{line}"
+
+    def test_the_search_reaches_a_state_built_by_calls_of_a_method(self):
+        """The coverage search of a class method: the object is built per input by its constructor, a method that
+        keeps state is called several times in a row, a structure argument is decoded; the input becomes a test
+        that builds the same object, makes the same calls and reaches the line (chassis: no method was searched -
+        "a class method needs an object" or a target that called the method without an object)."""
+        found, covered, item = self.search_and_test("cpp_call_struct_arg", "car::Estimator::update", "return speed_;")
+        self.assertIn("car::Estimator::update", found.functions, found.unsupported)
+        self.assertTrue(found.inputs, found.reason)
+        self.assertIn(item, covered)
+
+    def test_the_search_builds_an_object_parameter(self):
+        """A free function that takes an object of a class of the SUT is searched: the object is built by its
+        constructor (chassis send_status: "parameter estimator cannot be generated")."""
+        found, covered, item = self.search_and_test("cpp_object_param", "car::send_status",
+                                                    "return estimator.speed() + mode;")
+        self.assertIn("car::send_status", found.functions, found.unsupported)
+        self.assertIn(item, covered)
+
     def test_an_object_parameter_of_a_class_of_the_sut_is_built_by_its_constructor(self):
         """No value can be written for an object of a class with private members: the schema offers none, the rule
         tests build it with the class's constructor and no brain is asked to write its set-up (chassis: 28 rule tests
@@ -6007,6 +6059,55 @@ class PilotRunFixesTests(unittest.TestCase):
         self.assertIn("ut_state_set_g_last", how)
         _, how = a3.state_facts(layout, src, "step", "step(50); UT_EXPECT_EQ_INT(step(100), 55);")
         self.assertIn("1 earlier call", how)
+
+    def test_the_strength_check_of_a_changed_test_knows_its_function(self):          # A3-85a
+        """The function a changed test checks comes from the test, not from its name: chassis checked
+        test_update_spread_limit_exceeded_2 against no function ("unknown function"), so its change was never
+        judged and the original test was kept."""
+        def fn(q, start):
+            return uc.FunctionInfo(name=q, qualified_name=q, signature=f"int {q}(int x)", file="a.cpp", line_start=start,
+                                   line_end=start + 1, member="::" in q, from_frontend=True)
+        layout = uc.LayoutProfile(repo_root=".", sut_file="a.cpp", language="cpp", component_root=".",
+                                  writable_test_dir="t", writable_stub_dir="t", suite_file="t/x.cpp", sut_sha256="0" * 64,
+                                  functions=[fn("ns::SpeedEstimator::update", 1), fn("ns::Level::step", 5),
+                                             fn("ns::pump_step", 9), fn("ns::Other::step", 13)])
+        o = types.SimpleNamespace(layout=layout)
+        state = types.SimpleNamespace(brain_scenarios={"S-brain-ns__Level__step-2-1": uc.Scenario(
+            scenario_id="S-brain-ns__Level__step-2-1", function="ns::Level::step", function_line=5, description="d")})
+        pick = lambda src: up.Orchestrator._function_of_test(o, state, src)
+        self.assertEqual(pick("UT_TEST(test_update_spread_limit_exceeded_2)\n{\n    ns::SpeedEstimator ut_obj;\n"
+                              "    ut_obj.update(ut_w);\n}"), "ns::SpeedEstimator::update")
+        self.assertEqual(pick("UT_TEST(t)\n{\n    /* S-brain-ns__Level__step-2-1: x */\n    ut_obj.step(1);\n}"),
+                         "ns::Level::step")                                     # the scenario it was written from
+        self.assertEqual(pick("UT_TEST(t)\n{\n    ns::SpeedEstimator::update(1);\n    UT_EXPECT_EQ_INT(ns::pump_step(2), 1);\n}"),
+                         "ns::pump_step")                                       # the last function it calls
+        self.assertEqual(pick("UT_TEST(t)\n{\n    ut_obj.step(1);\n}"), "")    # step names two functions: no guess
+
+    def test_every_run_alone_keeps_its_own_coverage_profile(self):                   # A3-45c, A3-45a, A3-60a
+        """Tests run one per process (Windows with function-local statics, or after an abnormal end): Windows gives
+        a new process the id of one that ended, so a profile named by the process id replaced the one before
+        (climate_ctrl.c: 1149 runs, 825 profiles - coverage lost and found again from one iteration to the next).
+        Here every process gets the same id; each run must still leave its own profile."""
+        names = [f"t{k}" for k in range(1, 6)]
+        with tmpdir() as d:
+            run_dir = Path(d)
+
+            def fake_run(cmd, cwd, timeout, env=None, quiet=False):
+                path = (env or {}).get("LLVM_PROFILE_FILE", "")
+                if path:
+                    Path(path.replace("%p", "4242")).write_bytes(b"profile")          # the reused process id
+                if "--list" in cmd:
+                    return 0, "".join(f"UT_LIST|{n}\n" for n in names)
+                name = cmd[cmd.index("--only") + 1]
+                return 0, f"UT_START|{name}\nUT_RESULT|{name}|PASS\nUT_SUMMARY|1|1|0\n"
+            comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(run_dir / "w")))
+            chain = mock.Mock()
+            chain.env = lambda **kw: dict(kw)
+            chain.facts = None
+            with mock.patch.object(a3, "_run", fake_run), mock.patch.object(a3, "ONE_BY_ONE", True):
+                tests, _, _, _ = comp._execute(run_dir / "ut_runner.exe", run_dir, chain, isolate=True)
+            self.assertEqual([t.status for t in tests], ["passed"] * len(names))
+            self.assertEqual(len(list((run_dir / "prof").glob("*.profraw"))), len(names))
 
     def test_mutants_run_in_parallel_without_per_test_measurement(self):           # A3-85k, A3-OBS5, VIEW-14
         order, seen = [], []

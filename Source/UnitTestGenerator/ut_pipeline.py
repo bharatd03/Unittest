@@ -2402,6 +2402,25 @@ class Orchestrator:
         self._stage(f"{len(names)} generated test(s) did not compile; the others were run and measured [A3-CL12]")
         return uc.without_tests(bundle, names, note)
 
+    def _function_of_test(self, s: "RunState", source: str) -> str:
+        """The function a test checks, by the facts of the test: the scenario it was written from, else the last
+        function of the SUT it calls (a brain's test name is no fact: test_update_... of SpeedEstimator::update)."""
+        for sid in SCENARIO_ID.findall(source[:600]):
+            sc = getattr(s, "brain_scenarios", {}).get(sid)
+            fn = uc.function_of(sc.function, self.layout, sc.function_line) if sc is not None else None
+            if fn is not None:
+                return fn.name
+        called, code = [], uc.c_masked(source)
+        shorts = [f.qualified_name.replace("(anonymous namespace)::", "").split("::")[-1] for f in self.layout.functions]
+        for f, short in zip(self.layout.functions, shorts):
+            forms = [re.escape(f.qualified_name.replace("(anonymous namespace)::", "")),
+                     r"ut_static_" + re.escape(re.sub(r"\W", "_", f.name.replace("(anonymous namespace)::", "")))]
+            if shorts.count(short) == 1:                      # a short name only where it names one function
+                forms += [r"ut_obj\s*\.\s*" + re.escape(short), re.escape(short)]
+            for m in re.finditer(r"(?<![\w:.])(?:" + "|".join(forms) + r")\s*\(", code):
+                called.append((m.start(), f.name))
+        return max(called)[1] if called else ""
+
     async def _oracle_checks(self, s: "RunState", bundle: uc.FileActionBundle) -> uc.FileActionBundle:
         """Declared expectation changes are accepted only when they do not weaken the test
         [A3-85a..85j]; a weakening change is rejected and the original test kept [A3-85f]."""
@@ -2410,7 +2429,7 @@ class Orchestrator:
         old_tests = uc.test_sources(self.suite)
         for change in bundle.expectation_changes:
             new_suite = uc.suite_of(bundle)
-            function = next((f.name for f in self.layout.functions if f.name in change.test), "")
+            function = self._function_of_test(s, uc.test_sources(new_suite).get(change.test, ""))
             try:
                 verdict = await self.call("compilation", "oracle_check", uc.OracleRequest(
                     layout=self.layout, test=change.test, function=function, original_suite=self.suite,
