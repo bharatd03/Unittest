@@ -29,11 +29,19 @@ was checked using a mocked transport.
 | Component suite | 333 tests: 293 passed, 40 skipped |
 | BaseAgent suite (unchanged; previous recovery run) | 227 tests: 212 passed, 15 skipped |
 | Full release checks | 377 test invocations: 376 passed, 0 failed, 0 errors, 1 skipped |
+| Follow-up of the skipped Make check | 1 test executed and passed, 0 skipped |
 | Full-pipeline construct corpus | All 45 cases passed their existing expectations |
 
 The component skips comprise 39 whole-pipeline tests and one Make-manifest check. BaseAgent skips optional live
 model and browser checks. The full run skips the Make-manifest check. Corpus expectations include explicit
 incomplete/unsupported outcomes: passing the corpus does not mean every construct reached 100% coverage.
+
+The seven formerly failing tests were executed and passed in the full run; none was skipped there. The Make
+check was subsequently enabled by registering the installed GNU Make 4.4.1 through `ut_setup.py ensure --repo`
+for a Makefile project. `CaptureAndDependencyTests.test_make_dry_run_is_captured` then executed its real build
+capture assertions and passed in a separate run with zero skips. Thus all 377 selected release-check invocations
+have successful execution evidence across the full run and this follow-up. The original full-run result above
+is preserved, including its one skip; it has not been rewritten as a zero-skip full run.
 
 The seven release tests retain their original outcome and coverage assertions. The release run uses unchanged search budgets. The corpus's
 single serial method was invoked separately for each case, in four worker processes, alongside the other release
