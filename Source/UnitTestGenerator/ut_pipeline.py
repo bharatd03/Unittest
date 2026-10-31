@@ -780,7 +780,8 @@ class Orchestrator:
                     journal = s.journal.excerpt(widest * 3)              # each agent cuts it to its brain's [BP-5]
                     examples = await self._planning_examples(s, last, iteration)                    # KB-24, KB-25
                     planning = self.call("analyzer", "plan", uc.PlanRequest(
-                        layout=self.layout, last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
+                        layout=self.layout, execution_context=uc.execution_context(self.layout, s.bundle),
+                        last=last, iteration=iteration, attempts=s.attempts, existing_suite=self.suite,
                         fuzz=fuzz, test_items=s.test_items, disputed_evidence=sorted(s.disputed),
                         avoid_brains=sorted(s.avoid_brains), failed_tests=dict(s.failed_tests),
                         refused={fn: lines[-6:] for fn, lines in s.rejected.items()},           # A1-PL2, A1-PL8
@@ -841,7 +842,6 @@ class Orchestrator:
                             s.brain_scenarios[sc.scenario_id] = sc
                     for sc in attempted:
                         if sc.made_by.startswith("brain:"):
-                            s.tried_scenarios.add(uc.scenario_signature(sc))                    # A1-PL4 g
                             for g in sc.gap_ids:
                                 s.item_brains.setdefault(g, set()).add(sc.made_by.split(":", 1)[1].split("/")[0])
                     bundle = await self._generate(s, plan, journal=journal)
@@ -869,7 +869,7 @@ class Orchestrator:
                         elif t.status == "passed":
                             s.failed_tests.pop(t.name, None)
                     bundle = await self._drop_quarantined(s, bundle, result, iteration)        # A3-CL12
-                    self._count_attempts(s, plan, attempted, generated_suite, result)          # LA-5: after the run
+                    self._count_attempts(s, plan, attempted, generated_suite, result, bundle)  # REC-2: after execution
                     self._next_attempts(s, plan, asked_third)                                  # LA-5, LA-6
                     if result.coverage is not None:                  # progress against the last run [A3-109..A3-111]
                         before = set(last.coverage.covered_items) if last.coverage else set()
@@ -1604,9 +1604,7 @@ class Orchestrator:
             for i in open_items)
 
     def _next_attempts(self, s: "RunState", plan: uc.UTPlan, asked_third: set[str]) -> None:
-        """LA-5, LA-6: an item with its attempts used goes once to a brain of another model; an item that got no
-        scenario although that was asked - no other model is available - or whose third attempt is used has a final
-        status and is not planned again."""
+        """REC-3: one bounded recovery attempt, preferably with another model; final after it is exhausted."""
         n = self.cfg.attempts_per_item
         planned = {g for sc in plan.scenarios for g in sc.gap_ids}
         for item in asked_third - planned:
@@ -2270,11 +2268,12 @@ class Orchestrator:
         return base
 
     def _count_attempts(self, s: "RunState", plan: uc.UTPlan, attempted: list[uc.Scenario], suite: str,
-                        result: uc.VerificationResult) -> None:
+                        result: uc.VerificationResult, bundle: uc.FileActionBundle | None = None) -> None:
         """LA-5: an attempt is counted after Agent3's run, for the items of a scenario whose test was built and run. A
         function none of whose planned tests was built counts its attempts only after unbuilt_rounds such rounds, so
         that an item that never gets a test still reaches its final status (LA-6)."""
-        ran = {t.name for t in result.tests}
+        ran = {t.name for t in result.tests if t.status in ("passed", "failed", "crashed", "timeout")}
+        execution_context = uc.execution_context(plan.layout, bundle)
         by_scenario: dict[str, list[str]] = {}
         for name, source in uc.test_sources(suite).items():
             for sid in set(SCENARIO_ID.findall(source)):
@@ -2286,6 +2285,8 @@ class Orchestrator:
         for fn, scenarios in per_fn.items():
             built = [sc for sc in scenarios if any(n in ran for n in by_scenario.get(sc.scenario_id, []))]
             if built:
+                s.tried_scenarios.update(uc.scenario_signature(sc, execution_context) for sc in built)
+                s.unbuilt[fn] = 0
                 counted += [g for sc in built for g in sc.gap_ids]
                 continue
             s.unbuilt[fn] = s.unbuilt.get(fn, 0) + 1
@@ -2803,6 +2804,7 @@ class Journal:
         self.just_closed: list[uc.JournalEntry] = []                 # closed by the last iteration [LA-8]
         self.earlier: dict[str, list[str]] = {}       # rows of earlier runs of unchanged functions [CA-8]
         self.earlier_rows: list[dict[str, Any]] = []
+        self.coverage_items: dict[str, str] = {}       # REC-1: explicit measured item that resolves each gap
 
     # ---------------------------------------------------------------- recording
     @staticmethod
@@ -2838,6 +2840,8 @@ class Journal:
         """LA-2, LA-3: the deviations of one iteration with their root cause, decided by rules from the tools'
         results. Returns True when a new root cause appeared (progress, LA-7)."""
         open_now = {g.gap_id for fc in (result.coverage.functions if result.coverage else []) for g in fc.gaps}
+        for gap in plan.gaps + [g for fc in (result.coverage.functions if result.coverage else []) for g in fc.gaps]:
+            self.coverage_items[gap.gap_id] = uc.gap_item(gap)
         sources = uc.test_sources(suite)
         for name, (_, source) in quarantined.items():
             sources.setdefault(name, source)
@@ -2856,6 +2860,9 @@ class Journal:
             missed = any(n in quarantined for n in tests) or not tests or any(
                 status[n].status in ("failed", "crashed", "timeout") for n in tests if n in status)
             items = [g for g in sc.gap_ids if g in open_now or (g.startswith("EVIDENCE:") and missed)]
+            # REC-1: coverage by another test cannot resolve this candidate's compile/assertion failure.
+            items += [f"test:{n}" for n in tests if n in quarantined or
+                      (n in status and status[n].status in ("failed", "crashed", "timeout"))]
             if not items:
                 continue
             fn = functions.get(sc.function)
@@ -2885,7 +2892,7 @@ class Journal:
                     # LA-3: the items are still open, so the test did not reach them - its values miss the path
                     # conditions, whatever its assertion says; only a check of stated behaviour (EVIDENCE:) that
                     # fails is a wrong expectation
-                    unreached = any(not g.startswith("EVIDENCE:") for g in items)
+                    unreached = any(g.startswith(("LC:", "SC:", "BC:", "DC:", "MCDC:")) for g in items)
                     cause = "wrong_inputs" if t.status != "failed" or unreached else "wrong_expectation"
                     message = (f"{t.name} failed: expected {t.expected}, actual {t.actual}" if t.status == "failed"
                                else f"{t.name} {t.status}: {t.message}")
@@ -2934,19 +2941,30 @@ class Journal:
                 if not any(g.gap_id in e.items and e.cause == "unreachable" for e in self.entries):
                     new |= self._entry(g.function, [g.gap_id], "unreachable", g.detail[:300], iteration=iteration,
                                        strategy="deterministic analysis", final_status="proven_unreachable")
-        self.close(open_now | {f"test:{n}" for n in failing}, failed_evidence={
-            g for e in self.entries if e.iteration == iteration for g in e.items if g.startswith("EVIDENCE:")})
+        # REC-1: absence is not evidence. A dropped test and an unmeasured gap remain unresolved.
+        passed = {t.name for t in result.tests if t.status == "passed"} - set(quarantined)
+        resolved = {f"test:{name}" for name in passed}
+        valid_coverage = (result.coverage is not None and result.coverage.measured
+                          and result.decision != "environment_error" and result.sut_sha256 == layout.sut_sha256)
+        if valid_coverage:
+            covered = set(result.coverage.covered_items)
+            resolved.update(item for item, measured in self.coverage_items.items()
+                            if measured in covered and item not in open_now)
+        for sc in plan.scenarios:
+            tests = by_scenario.get(sc.scenario_id, [])
+            if tests and set(tests) <= passed and not sc.characterization:
+                resolved.update(g for g in sc.gap_ids if g.startswith("EVIDENCE:"))
+        self.close(resolved)
         return new
 
-    def close(self, open_now: set[str], failed_evidence: set[str] = frozenset()) -> list[uc.JournalEntry]:
-        """Items covered since: removed from their entries; an entry without open items is closed (LA-2)."""
+    def close(self, resolved: set[str]) -> list[uc.JournalEntry]:
+        """REC-1: close only with explicit resolution evidence for every item of an entry."""
         closed = []
         self.just_closed = closed
         for e in self.entries:
             if e.status != "open":
                 continue
-            still = [i for i in e.items if i in open_now or i in failed_evidence]
-            if not still:
+            if e.items and set(e.items) <= resolved:
                 e.status, e.final_status = "closed", "covered"
                 closed.append(e)
         return closed
@@ -3106,7 +3124,7 @@ class RunState:
         self.journal = Journal(req.sut_file, out / "journal")                          # LA-2
         self.quarantine: dict[str, tuple[str, str]] = {}      # test -> (compiler message, source) of this iteration
         self.tried_scenarios: set[str] = set()                # signatures of earlier scenarios [A1-PL4 g]
-        self.other_model_items: set[str] = set()              # LA-5: a third attempt by another model only
+        self.other_model_items: set[str] = set()              # REC-3: bounded third attempt, prefer another model
         self.final_items: set[str] = set()                    # LA-6: no further attempt
         self.item_brains: dict[str, set[str]] = {}            # item -> brains that attempted it [LA-5]
         self.suggested: dict[str, str] = {}                   # item -> cause of a shown suggestion [COV-12, LA-6]

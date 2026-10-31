@@ -5,7 +5,7 @@
     "qwen_remote": {"base_url": "https://llm.openroute-ai.com/v1", "model": "qwen3-8b", "api_key_env": "QWEN_REMOTE_API_KEY",
                     "max_concurrency": 2, "stream": true, "stream_idle": 90, "shared_slots": true,
                     "gateway_retries": 3, "gateway_pause": 15, "slot_wait": 1800,
-                    "think_steps": ["A3.repair", "A1.declaration"],
+                    "think": false, "think_steps": [],
                     "generate_temperature": 0.7, "top_p": 0.8, "top_k": 20, "think_temperature": 0.6, "think_top_p": 0.95},
     "qwen": {"model": "qwen3:8b", "adaptive": true, "windows": [4096, 8192, 12288, 16384], "max_num_predict": 8192,
              "generate_num_ctx": 16384, "generate_num_predict": 4096, "generate_timeout": 900, "max_concurrency": 1,

@@ -5588,18 +5588,15 @@ class AnalyzerAgent(ba.AgentCore):
             return []                                                        # nothing to plan [ARCH-16]
         limit = self.cfg.max_brain_calls_per_function
         available, family = await self._available_brains()
-        third = open_ids & set(req.other_model_items)          # LA-5: a third attempt only by another model
+        third = open_ids & set(req.other_model_items)          # REC-3: prefer another model, retain one-model recovery
         if third:
             used = {family.get(b, b) for b in req.avoid_brains}
             others = [b for b in available if family.get(b, b) not in used]
-            if not others or third != open_ids:
-                open_ids = open_ids - third
-                gaps = [g for g in gaps if g.gap_id not in third]
-                if not open_ids:
-                    plan_notes["planning"].append(f"{fn.name}: no brain of another model for a third attempt at "
-                                                  f"{', '.join(sorted(third)[:4])} [LA-5]")
-                    return []
+            if not others:
+                plan_notes["planning"].append(f"{fn.name}: no other model available; bounded recovery with the "
+                                              "same model and prior diagnostics [REC-3]")
         tried_before = set(req.tried_scenarios)                # A1-PL4 g, LA-4
+        execution_context = req.execution_context or uc.execution_context(layout)
         targets = make_targets(fn, gaps, sut_text, layout) + [Target(tid=g, items=[g], function=fn.name)
                                                               for g in sorted(open_ids) if g.startswith("EVIDENCE:")]
         by_tid = {tg.tid: tg for tg in targets}                                                # A1-PL3a
@@ -5626,8 +5623,7 @@ class AnalyzerAgent(ba.AgentCore):
             failed = {family.get(b, b) for b in tried}
             avoid = {family.get(b, b) for b in req.avoid_brains}
             pool = [b for b in available if family.get(b, b) not in failed]
-            if third and third == open_ids:                       # LA-5: never the same model a third time
-                return [b for b in pool if family.get(b, b) not in avoid]
+            # REC-3: prefer a different family, but the sole model may use the bounded recovery attempt.
             return [b for b in pool if family.get(b, b) not in avoid] or pool
         digest = ""
         while calls < limit:
@@ -5638,12 +5634,15 @@ class AnalyzerAgent(ba.AgentCore):
             context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence, profile, sequence,
                                   targets=shown, structured=lists)
             if calls == 1:                       # A1-PL18: the same facts give the same answer - not asked again
-                # the facts are the code, its open items, the evidence and the names it may use - not the record of
-                # what was said and tried before (attempts, refusals, journal), which changes after every answer
+                # REC-4: diagnostic evidence is part of the question; iteration numbers and call IDs are not.
                 digest = uc.sha256_bytes(json.dumps([
                     layout.sut_sha256, fn.qualified_name, fn.line_start, sorted(open_ids), sorted(req.avoid_brains),
                     sorted(f"{e.evidence_id} {e.text}" for e in evidence),
-                    {k: v for k, v in lists.items() if k not in ("rows", "member_kinds")}],
+                    {k: v for k, v in lists.items() if k not in ("rows", "member_kinds")},
+                    execution_context, req.failed_tests, req.journal, req.refused, req.lessons,
+                    sorted(req.tried_scenarios), req.test_items,
+                    [t.model_dump(mode="json", include={"name", "status", "message", "expected", "actual"})
+                     for t in req.last.tests] if req.last else []],
                     sort_keys=True, default=str).encode("utf-8"))
                 earlier = self._asked.get(fn.qualified_name)
                 checks_only = all(g.startswith("EVIDENCE:") for g in open_ids)
@@ -5708,13 +5707,7 @@ class AnalyzerAgent(ba.AgentCore):
                 aimed = [str(t) for t in (planned.targets or planned.gap_ids)] or sorted(open_ids)
                 purpose = "requirement check" if aimed and all(t.startswith("EVIDENCE:") for t in aimed) \
                     else "coverage"                                   # the rates of the two apart [ORC-12b]
-                if planned.name in req.failed_tests:                         # A1-PL8: not again unchanged
-                    self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="refused",
-                                    causes=["failed before"])                                       # ORC-12b
-                    problems.append(f"- scenario {k} ({planned.name}): its test {req.failed_tests[planned.name]} "
-                                    "earlier in this run; plan other inputs or set-up under another name")
-                    repeats += 1
-                    continue
+                # REC-2: preserve the logical name during repair; compare executed semantic inputs below.
                 tfix = expand_targets(planned, by_tid)                                            # A1-PL3a
                 answered = planned.model_dump(mode="json")                                         # A1-PL17
                 scenario, reasons = self._check_planned(planned, fn, open_ids, infeasible, ev_map, stubs, constants,
@@ -5737,15 +5730,16 @@ class AnalyzerAgent(ba.AgentCore):
                                     causes=refusal_causes(scenario.trial))                         # ORC-12b
                     problems.append(f"- scenario {k} ({planned.name or planned.purpose[:40]}): "
                                     + "; ".join(scenario.trial))
-                    sig = uc.scenario_signature(scenario)
-                    if sig not in tried_before and all(sig != uc.scenario_signature(x) for x in pending_trials):
+                    sig = uc.scenario_signature(scenario, execution_context)
+                    if sig not in tried_before and all(sig != uc.scenario_signature(x, execution_context)
+                                                       for x in pending_trials):
                         scenario.made_by = brain
                         pending_trials.append(scenario)                                         # NC-7
                     continue
                 kinds = [req.item_kinds.get(g, "") for g in scenario.gap_ids]
                 wider = [k2 for k2 in uc.KIND_LADDER if k2 in kinds and k2 in ("setup", "stub", "test", "suite_part")]
                 scenario.kind = wider[-1] if wider else ("call_sequence" if scenario.calls_before else "scenario")
-                if uc.scenario_signature(scenario) in tried_before:           # A1-PL4 g, LA-4
+                if uc.scenario_signature(scenario, execution_context) in tried_before:  # REC-2
                     self.log_answer("A1.plan", "refused", function=fn.name, scenario=k,
                                     reasons=["the same scenario was tried in an earlier iteration"])
                     self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="refused",
@@ -5763,7 +5757,7 @@ class AnalyzerAgent(ba.AgentCore):
                 if any(s.model_dump(include=set(same)) == same for s in accepted):
                     continue                                                  # the re-ask repeated it
                 self.log_answer("A1.plan", "scenario", function=fn.name, scenario=k, purpose=purpose, outcome="accepted")   # ORC-12b
-                self._tried_text.setdefault(fn.name, {})[uc.scenario_signature(scenario)] = brief(scenario,
+                self._tried_text.setdefault(fn.name, {})[uc.scenario_signature(scenario, execution_context)] = brief(scenario,
                                                                                                     by_tid)  # A1-PL18
                 accepted.append(scenario)
                 if kept is not None:                                                            # A1-PL17

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -1284,6 +1285,7 @@ class ItemStatus(Contract):
 
 class PlanRequest(Contract):
     layout: LayoutProfile
+    execution_context: str = ""         # REC-2: source/build/fixture identity for executed scenarios
     last: VerificationResult | None = None
     iteration: int = 0
     attempts: dict[str, int] = Field(default_factory=dict)
@@ -2856,7 +2858,7 @@ def with_values(text: str, values: dict[str, str]) -> str:
     return pattern.sub(lambda m: values[m.group(1)] if m.group(1) else m.group(0), text)
 
 
-def scenario_signature(sc: Any) -> str:
+def scenario_signature(sc: Any, execution_context: str = "") -> str:
     """A1-PL4 g), LA-4: what makes two scenarios the same attempt - the function, its targets, the inputs and the
     set-up, with white space normalised."""
     norm = lambda v: re.sub(r"\s+", " ", str(v)).strip()
@@ -2868,7 +2870,32 @@ def scenario_signature(sc: Any) -> str:
     before = getattr(sc, "calls_before", [])
     if before:                                       # a call sequence is another attempt [BP-2]
         parts.append(";".join(norm(x) for x in before))
+    if execution_context:
+        parts.append(execution_context)
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def execution_context(layout: LayoutProfile, bundle: FileActionBundle | None = None) -> str:
+    """REC-2: repeat suppression follows executable facts, excluding changing test lists and timestamps."""
+    facts = layout.model_dump(mode="json", include={
+        "sut_sha256", "language", "compile_flags", "defines", "include_dirs", "typedefs"})
+    facts["harness_version"] = HARNESS_VERSION
+    if layout.dependencies is not None:
+        facts["dependencies"] = layout.dependencies.model_dump(mode="json", exclude={
+            "notes": True, "entries": {"__all__": {"attempts", "reason", "decided_by"}}})
+    if layout.build is not None:
+        facts["build"] = layout.build.model_dump(mode="json", exclude={"duration_s", "reused", "notes"})
+    paths = set(layout.headers + layout.stub_files + layout.extra_sources)
+    if layout.dependencies is not None:
+        paths.update(layout.dependencies.headers + layout.dependencies.real_sources)
+    fixtures = {a.path: sha256_bytes(a.content.encode()) for a in (bundle.actions if bundle else [])
+                if a.role != "testsuite"}
+    for rel in sorted(paths - fixtures.keys()):
+        path = Path(layout.repo_root) / rel
+        if path.is_file():
+            fixtures[rel] = sha256_bytes(path.read_bytes())
+    facts["fixtures"] = fixtures
+    return sha256_bytes(json.dumps(facts, sort_keys=True, default=str).encode())
 
 
 _HEADER_CACHE: dict[tuple, str] = {}
