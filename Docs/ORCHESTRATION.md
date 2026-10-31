@@ -2,6 +2,11 @@
 
 Requirement IDs in brackets refer to `unittest_generator_requirments.txt`.
 
+Baseline structural scenarios remain alongside checked model proposals until execution measures redundancy
+[REC-6]. A model rejection does not erase fixture controls or call sequences. Tests repaired under the existing
+observation/oracle policy retain their identity and inputs through coverage minimization [REC-7]. Compile-gate
+exclusions carry per-test compiler evidence in the same quarantine report as build-stage exclusions [REC-8].
+
 | Agent | Python file | Role |
 | --- | --- | --- |
 | Orchestrator | `ut_pipeline.py` | Runs the pipeline, the only MCP client of the agents [ORC-1] |
@@ -439,7 +444,8 @@ A repeated attempt with the same information gives the same answer, so every att
 4. **Attempts (LA-5).**
    - At most 2 per item, counted only for tests that were built and measured.
    - Items blocked by one cause share their attempts.
-   - A third attempt only by a brain of another model.
+   - A third bounded attempt prefers another model; with one model it carries the prior diagnostics and repairs the
+     candidate without repeating executed inputs (REC-2, REC-3).
 5. **Final status (LA-6).** Every item not covered at the stop is one of: covered, proven unreachable, needs a requirement, needs a source change, pipeline limitation, or undetermined. Each has a reason and an owner.
 6. **Stop (LA-7).** The loop continues while an iteration covers something or finds a new root cause. It stops when every item has a final status, at the safety ceiling that grows with the file, or after two iterations with nothing new. A verified, complete result is never lost by a later round: if a later round breaks the build or covers less, the best result is delivered and the later round is reported as left out (ORC-33).
 7. **Lessons (LA-8).** A cause that a verified test removed is stored in the knowledge base with the construct it occurred in. It goes to the next attempts, files and runs; a recurring one is proposed as a rule.
@@ -503,7 +509,8 @@ flowchart LR
 ```
 
 A step whose kind no available brain may give is never sent to a brain (BaseAgent's per-step gate). The attempts of
-LA-5 count over the ladder; the third goes to another model with the widest profile.
+LA-5 counts over the ladder; the third prefers another model with the widest profile, or uses the sole model with
+the prior diagnostics (REC-3). Profile restrictions and attempt limits remain in force.
 
 **Building blocks (NC-1 .. NC-3).** Agent2 builds the object of a member function and the fakes from a stored recipe
 first, then its rules, then the brain within its profile; Agent3's build decides. A block the compiler accepted is

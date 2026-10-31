@@ -846,7 +846,7 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
             source = ("UT_TEST(test_wait)\n{\n    /* S-brain-MotorCtrl_wait_update-2-1: x */\n"
                       "    MotorCtrl ctrl(ut_fake_IEncoder()); UT_EXPECT_TRUE(ctrl.wait_update(1));\n}\n")
             gap = uc.GapItem(gap_id="BC:MotorCtrl::wait_update:62:13:T", function="MotorCtrl::wait_update",
-                             metric="BC", line=62)
+                             metric="BC", line=62, column=13)
             result = uc.VerificationResult(run_id="r", stage="verify", sut_sha256="x", suite_sha256="",
                                            decision="gaps_remain", coverage=uc.CoverageReport(toolchain="t", definitions="d", functions=[
                                                uc.FunctionCoverage(name="MotorCtrl::wait_update", gaps=[gap])]))
@@ -854,7 +854,7 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
                                  result, {gap.gap_id: 1}, self.layout, [], set())
             self.assertTrue(new)                                                   # a new cause is progress [LA-7]
             entry = journal.entries[0]
-            self.assertEqual((entry.cause, entry.items), ("test_setup", [gap.gap_id]))
+            self.assertEqual((entry.cause, entry.items), ("test_setup", [gap.gap_id, "test:test_wait"]))
             excerpt = journal.excerpt()["MotorCtrl::wait_update"]
             self.assertIn("no matching constructor", excerpt)
             self.assertIn("build the object or argument as shown under OBJECT", excerpt)
@@ -862,7 +862,9 @@ class LearningBetweenAttemptsTests(unittest.TestCase):
                                             result, {gap.gap_id: 1}, self.layout, [], set()))     # nothing new
             status = journal.final_status(gap.gap_id, "MotorCtrl::wait_update", "", {})
             self.assertEqual((status.status, status.owner), ("pipeline_limitation", "the pipeline's developers"))
-            covered = result.model_copy(update={"coverage": uc.CoverageReport(toolchain="t", definitions="d")})
+            covered = result.model_copy(update={"sut_sha256": self.layout.sut_sha256,
+                "tests": [uc.TestResult(name="test_wait", status="passed")],
+                "coverage": uc.CoverageReport(toolchain="t", definitions="d", covered_items=["BC:62:13:T"])})
             journal.record(3, uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason=""), "", {}, covered, {},
                            self.layout, [], set())
             self.assertEqual([e.final_status for e in journal.just_closed], ["covered"])     # LA-2: closed
@@ -2596,7 +2598,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_c_pilot_reaches_full_coverage(self):
         repo = copy_pilot("c_pilot", self.d)
-        with brain(UTBrain()):
+        with writer_brain(UTBrain()):
             result = self.run_pipeline(repo, "src/thermostat.c")
         print("\n" + up.report(result))
         self.assertEqual(result.final_state, "verified_measured", result.reason)
@@ -2633,7 +2635,7 @@ class PipelineTests(unittest.TestCase):
                 shutil.rmtree(self.d / "r", ignore_errors=True)
                 repo = copy_pilot("c_pilot", self.d / "r")
                 scripted = UTBrain()
-                with brain(scripted):
+                with writer_brain(scripted):
                     results.append(run(up.Orchestrator(config).run(uc.PipelineRequest(
                         repo_root=str(repo), sut_file="src/thermostat.c"))))
                 calls.append(len(scripted.generate_calls) + scripted.decide_calls)
@@ -2652,7 +2654,7 @@ class PipelineTests(unittest.TestCase):
             shutil.rmtree(self.d / "r", ignore_errors=True)
             repo = copy_pilot("c_pilot", self.d / "r")
             scripted = UTBrain()
-            with brain(scripted):
+            with writer_brain(scripted):
                 third = run(up.Orchestrator(config).run(uc.PipelineRequest(repo_root=str(repo),
                                                                            sut_file="src/thermostat.c")))
         self.assertEqual(third.cache_use, [])
@@ -3139,6 +3141,130 @@ def measured(layout, gaps, decision="gaps_remain", tests=()):
 REMOTE_QWEN_ANSWERS = json.loads('[["select_mode", {"scenarios": [{"gap_ids": ["BC:select_mode:29:10:T"], "name": "Window open or unoccupied and no frost", "purpose": "Ensure the function returns MODE_ECO when the window is open or the house is unoccupied and frost protection is not active.", "args": [{"name": "window_open", "value": ":1"}, {"name": "occupied", "value": ":0"}, {"name": "frost", "value": ":0"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":1", "expected_after": [], "evidence_ids": ["EV-select_mode-1", "EV-select_mode-2"], "quotes": [{"evidence_id": "EV-select_mode-1", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}, {"evidence_id": "EV-select_mode-2", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}, {"gap_ids": ["LC:select_mode:30"], "name": "Window closed and occupied with frost", "purpose": "Ensure the function returns MODE_COMFORT when the window is closed, the house is occupied, and frost protection is active.", "args": [{"name": "window_open", "value": ":0"}, {"name": "occupied", "value": ":1"}, {"name": "frost", "value": ":1"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":2", "expected_after": [], "evidence_ids": [], "quotes": [], "classification": "characterization_gap", "conflict": "", "information_sought": ""}]}], ["select_mode", {"scenarios": [{"gap_ids": ["BC:select_mode:29:10:T"], "name": "Ensure the function returns MODE_ECO when window is open or nobody is home, and frost protection is not active", "purpose": "Ensure the function returns MODE_ECO when the condition (window_open || !occupied) is true and frost is not active.", "args": [{"name": "window_open", "value": ":1"}, {"name": "occupied", "value": ":0"}, {"name": "frost", "value": ":0"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":1", "expected_after": [], "evidence_ids": ["EV-select_mode-1"], "quotes": [{"evidence_id": "EV-select_mode-1", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}, {"gap_ids": ["LC:select_mode:30"], "name": "Ensure the function returns MODE_COMFORT when the condition is not met", "purpose": "Ensure the function returns MODE_COMFORT when the condition (window_open || !occupied) is false or frost is active.", "args": [{"name": "window_open", "value": ":0"}, {"name": "occupied", "value": ":1"}, {"name": "frost", "value": ":1"}], "setup": [], "stubs": [], "variables": [], "expected_return": ":2", "expected_after": [], "evidence_ids": ["EV-select_mode-2"], "quotes": [{"evidence_id": "EV-select_mode-2", "text": "REQ-TH-7: ECO when the window is open or nobody is home, unless frost protection is active."}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["thermostat_command", {"scenarios": [{"gap_ids": ["EV-thermostat_command-1"], "name": "Test thermostat_command when sensor returns error", "purpose": "Check the behaviour when the sensor returns an error.", "args": [{"name": "setpoint", "value": "20"}, {"name": "hysteresis", "value": "5"}], "setup": ["int t = SENSOR_ERROR;"], "stubs": [{"stub": "read_sensor", "returns": ["SENSOR_ERROR"]}], "variables": [], "expected_return": "-1", "expected_after": [], "evidence_ids": ["EV-thermostat_command-1"], "quotes": [{"evidence_id": "EV-thermostat_command-1", "text": "Heater command for the current room temperature. @param setpoint target temperature in degrees Celsius @param hysteresis allowed band below the setpoint, must be >= 0 @return 1 to heat, 0 to stay off, -1 when the sensor reports an error"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["thermostat_command", {"scenarios": [{"gap_ids": ["EV-thermostat_command-1"], "name": "Check the behaviour when the sensor returns an error", "purpose": "Verify that the function returns -1 when the sensor reports an error.", "args": [{"name": "setpoint", "value": "20"}, {"name": "hysteresis", "value": "5"}], "setup": ["int t = SENSOR_ERROR;"], "stubs": [{"stub": "read_sensor", "returns": ["SENSOR_ERROR"]}], "variables": [], "expected_return": "-1", "expected_after": [], "evidence_ids": ["EV-thermostat_command-1"], "quotes": [{"evidence_id": "EV-thermostat_command-1", "text": "Heater command for the current room temperature. @return 1 to heat, 0 to stay off, -1 when the sensor reports an error"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["clamp_percent", {"scenarios": [{"gap_ids": ["EVIDENCE:clamp_percent: check the behaviour the EVIDENCE states (results, error values, limits) with asserted expected values"], "name": "Test clamp_percent with value less than 0", "purpose": "Verify that the function returns 0 when the input value is less than 0.", "args": [{"name": "value", "value": "-5"}], "setup": [], "stubs": [], "variables": [], "expected_return": "0", "expected_after": [], "evidence_ids": ["EV-clamp_percent-1"], "quotes": [], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}], ["clamp_percent", {"scenarios": [{"gap_ids": ["EVIDENCE:clamp_percent"], "name": "Verify that the function returns 0 when value is negative", "purpose": "Check the behavior when the input value is negative, as specified in the evidence.", "args": [{"name": "value", "value": "-5"}], "setup": [], "stubs": [], "variables": [], "expected_return": "0", "expected_after": [], "evidence_ids": ["EV-clamp_percent-1"], "quotes": [{"evidence_id": "EV-clamp_percent-1", "text": "@return value limited to the range 0..100"}], "classification": "confirmed_gap", "conflict": "", "information_sought": ""}]}]]')
 
 
+class RecoveryEvidenceTests(unittest.TestCase):
+    """REC-1..REC-5: recovery bookkeeping is independent of source spellings and real model access."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.layout = uc.LayoutProfile(repo_root=self.temp.name, sut_file="unit.c", language="c", component_root=".",
+            writable_test_dir="tests", writable_stub_dir="stubs", suite_file="tests/test_unit.c", sut_sha256="source")
+        self.plan = uc.UTPlan(plan_id="p", layout=self.layout, stage="coverage", reason="")
+
+    def result(self, **changes):
+        return uc.VerificationResult(**dict(run_id="r", stage="verify", sut_sha256="source", suite_sha256="",
+                                            decision="gaps_remain", **changes))
+
+    def test_unrun_failed_tests_stay_open_until_a_passing_rerun(self):
+        journal = up.Journal("unit.c", Path(self.temp.name))
+        journal.record(1, self.plan, "", {}, self.result(tests=[uc.TestResult(name="test_unit_path", status="failed")]),
+                       {}, self.layout, [], set())
+        entry = journal.entries[0]
+        for tests in ([], [uc.TestResult(name="test_unit_other_name", status="passed")],
+                      [uc.TestResult(name="test_unit_path", status="skipped")]):
+            journal.record(2, self.plan, "", {}, self.result(tests=tests), {}, self.layout, [], set())
+            self.assertEqual(entry.status, "open")
+            self.assertTrue(journal.excerpt())
+        journal.record(3, self.plan, "", {}, self.result(tests=[uc.TestResult(name="test_unit_path", status="passed")]),
+                       {}, self.layout, [], set())
+        self.assertEqual((entry.status, entry.final_status), ("closed", "covered"))
+
+    def test_missing_gap_is_not_explicit_coverage_evidence(self):
+        gap = uc.GapItem(gap_id="LC:unit:17", function="unit", metric="LC", line=17)
+        plan = self.plan.model_copy(update={"gaps": [gap],
+            "planning": ["unit: no scenario this time - fixture needs a constructor"]})
+        journal = up.Journal("unit.c", Path(self.temp.name))
+        coverage = uc.CoverageReport(toolchain="llvm", definitions="d", functions=[
+            uc.FunctionCoverage(name="unit", gaps=[gap])])
+        journal.record(1, plan, "", {}, self.result(coverage=coverage), {}, self.layout, [], set())
+        self.assertTrue(journal.entries)
+        for missing in (None, uc.CoverageReport(toolchain="llvm", definitions="d"),
+                        uc.CoverageReport(toolchain="llvm", definitions="d", measured=False, covered_items=["LC:17"])):
+            journal.record(2, self.plan, "", {}, self.result(coverage=missing), {}, self.layout, [], set())
+            self.assertEqual(journal.entries[0].status, "open")
+        measured = uc.CoverageReport(toolchain="llvm", definitions="d", covered_items=["LC:17"])
+        journal.record(3, self.plan, "", {}, self.result(coverage=measured), {}, self.layout, [], set())
+        self.assertEqual(journal.entries[0].status, "closed")
+
+    def test_another_tests_coverage_does_not_resolve_a_failing_candidate(self):
+        sc = uc.Scenario(scenario_id="S-candidate", function="unit", description="", gap_ids=["LC:unit:17"],
+                         made_by="brain:qwen/model")
+        plan = self.plan.model_copy(update={"scenarios": [sc]})
+        suite = "UT_TEST(test_unit_path)\n{\n /* S-candidate */\n UT_EXPECT_EQ_INT(unit(7), 1);\n}\n"
+        coverage = uc.CoverageReport(toolchain="llvm", definitions="d", covered_items=["LC:17"])
+        journal = up.Journal("unit.c", Path(self.temp.name))
+        journal.record(1, plan, suite, {}, self.result(coverage=coverage,
+            tests=[uc.TestResult(name="test_unit_path", status="failed")]), {}, self.layout, [], set())
+        self.assertTrue(journal.entries)
+        journal.record(2, self.plan, "", {}, self.result(coverage=coverage), {}, self.layout, [], set())
+        self.assertTrue(all(e.status == "open" for e in journal.entries))
+
+    def test_only_executed_candidates_are_deduplicated(self):
+        orch = object.__new__(up.Orchestrator)
+        orch.cfg = up.PipelineConfig()
+        sc = uc.Scenario(scenario_id="S-new-candidate", function="unit", description="", gap_ids=["LC:unit:17"],
+                         made_by="brain:qwen/model", args=[uc.NamedValue(name="value", value="7")])
+        plan = self.plan.model_copy(update={"scenarios": [sc]})
+        suite = "UT_TEST(test_unit_path)\n{\n /* S-new-candidate */\n UT_OBSERVE_INT(unit(7));\n}\n"
+        state = types.SimpleNamespace(tried_scenarios=set(), unbuilt={}, attempts={}, notes=[])
+        orch._count_attempts(state, plan, [sc], suite, self.result())
+        self.assertEqual(state.tried_scenarios, set())
+        orch._count_attempts(state, plan, [sc], suite,
+                            self.result(tests=[uc.TestResult(name="test_unit_path", status="passed")]))
+        self.assertEqual(state.tried_scenarios, {uc.scenario_signature(sc, uc.execution_context(self.layout))})
+        changed = self.layout.model_copy(update={"compile_flags": ["-DFEATURE=1"]})
+        self.assertNotIn(uc.scenario_signature(sc, uc.execution_context(changed)), state.tried_scenarios)
+
+    def test_fixture_changes_invalidate_execution_identity(self):
+        helper = Path(self.temp.name) / "fixture.h"
+        helper.write_text("int read_value(void);\n")
+        self.layout.headers = ["fixture.h"]
+        before = uc.execution_context(self.layout)
+        helper.write_text("long read_value(void);\n")
+        self.assertNotEqual(before, uc.execution_context(self.layout))
+        build = uc.BuildDescription(duration_s=1)
+        self.layout.build = build
+        before = uc.execution_context(self.layout)
+        build.duration_s, build.reused = 99, True
+        self.assertEqual(before, uc.execution_context(self.layout))
+
+    def test_coverage_minimization_keeps_a_repaired_observation_and_its_inputs(self):
+        source = ('/* evidence: E8 */\nUT_TEST(test_reference)\n{ UT_EXPECT_EQ_INT(read_level(0), 0); }\n'
+                  '/* evidence: E8 */\nUT_TEST(test_repaired)\n{\n'
+                  '    set_level(18);\n    UT_OBSERVE_INT("repair_result", read_level(20));\n}\n')
+        change = uc.ExpectationChange(test="test_repaired", old="expected 1", new="observe result",
+                                      reason="existing classified repair policy", evidence="E2")
+        bundle = uc.FileActionBundle(bundle_id="b", tests=["test_reference", "test_repaired"],
+            new_tests=["test_repaired"], characterization_tests=["test_reference", "test_repaired"],
+            observations=["repair_result"], expectation_changes=[change], actions=[
+                uc.FileAction(path="tests/test_unit.c", action="create", role="testsuite", content=source)])
+        result = a2.finalize_bundle(bundle, {"repair_result": "0"},
+            test_items={"test_reference": ["LC:7"], "test_repaired": ["LC:7"]}, ran=bundle.tests)
+        self.assertIn("test_repaired", result.tests)
+        self.assertIn("set_level(18);", uc.suite_of(result))
+        self.assertIn("UT_EXPECT_EQ_INT(read_level(20), 0);", uc.suite_of(result))
+        self.assertEqual(result.expectation_changes, [change])
+
+    def test_remote_qwen_configuration_disables_all_thinking_steps(self):
+        raw = json.loads((SRC / "ut_config.json").read_text())
+        settings = ba.QwenRemoteSettings(**raw["brain"]["qwen_remote"])
+        engine = ba.QwenRemoteEngine(settings)
+        self.assertFalse(settings.think_steps)
+        for step in (False, True):
+            token = ba._THINK_STEP.set(step and "A3.repair" in settings.think_steps)
+            try:
+                self.assertFalse(engine.thinking())
+                self.assertIn("/no_think", engine._messages([{"role": "user", "content": "task"}])[0]["content"])
+                with mock.patch.object(engine, "_send", new=mock.AsyncMock(return_value=(200, {
+                        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}))) as send:
+                    run(engine._post_chat([{"role": "user", "content": "task"}], {}, 16384, 128, 1))
+                    body = send.call_args.args[0]
+                    self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+                    self.assertTrue(body["messages"][0]["content"].endswith("/no_think"))
+            finally:
+                ba._THINK_STEP.reset(token)
+
+
 class BrainPlanningTests(unittest.TestCase):
     """A1-PL1 .. A1-PL14: the brain suggests, Agent1 checks every scenario deterministically."""
     def setUp(self):
@@ -3214,7 +3340,7 @@ class BrainPlanningTests(unittest.TestCase):
         last = measured(self.layout, self.gaps)
         with brain(b):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=last, iteration=2)))
-        mine = [s for s in plan.scenarios if s.function == "thermostat_command"]
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and s.made_by.startswith("brain:")]
         self.assertEqual(len(mine), 2, plan.planning)                                   # A1-PL4: two dropped
         quoted = next(s for s in mine if s.test_name == "test_thermostat_command_quote")     # A1-PL4: bad quote left out
         self.assertTrue(quoted.characterization and not quoted.expected_return)          # -> characterization only
@@ -3235,7 +3361,7 @@ class BrainPlanningTests(unittest.TestCase):
         with brain(b):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                       iteration=2)))
-        s = next(s for s in plan.scenarios if s.function == "thermostat_command")
+        s = next(s for s in plan.scenarios if s.function == "thermostat_command" and s.made_by.startswith("brain:"))
         self.assertTrue(s.characterization)                                             # A1-25h, A1-PL4 c)
         self.assertEqual(s.expected_return, "")
 
@@ -3250,18 +3376,18 @@ class BrainPlanningTests(unittest.TestCase):
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                       iteration=1)))                   # no test measured yet
         self.assertTrue(b.generate_calls)
-        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
-        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")]
+        self.assertTrue(mine and all(s.checked for s in mine), plan.scenarios)
         tested = measured(self.layout, self.gaps, tests=[uc.TestResult(name="test_x_auto_1", status="passed")])
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=tested, iteration=1)))   # tests exist
-        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
-        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")]
+        self.assertTrue(mine and all(s.checked for s in mine), plan.scenarios)
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                       iteration=2)))                   # after the cheap tests
-        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
-        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")]
+        self.assertTrue(mine and all(s.checked for s in mine), plan.scenarios)
         with brain(DownBrain()):                                                       # a new agent, a new router
             with self.assertRaises(ba.AgentFault) as caught:
                 run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
@@ -3270,17 +3396,18 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertIn("ARCH-24", caught.exception.message)
 
     def test_a_function_without_a_usable_scenario_does_not_stop_the_others(self):
-        """A1-PL8: the function gets no scenario this time (never a rule plan); the other functions are planned."""
+        """A1-PL8: rejected model proposals remain rejected; baseline facts survive and other functions are planned."""
         clamp = planned(gap_ids=["LC:clamp_percent:19"], name="test_clamp_percent_negative", purpose="below 0",
                         args=[{"name": "value", "value": "-5"}])
         gaps = self.gaps + [uc.GapItem(gap_id="LC:clamp_percent:19", function="clamp_percent", metric="LC", line=19)]
         with brain(UTBrain(plans={"thermostat_command": [], "clamp_percent": [clamp]})):
             plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, gaps),
                                                               iteration=2)))
-        planned_fns = {s.function for s in plan.scenarios if not s.inputs}
+        planned_fns = {s.function for s in plan.scenarios if not s.inputs and s.made_by.startswith("brain:")}
         self.assertIn("clamp_percent", planned_fns)
         self.assertNotIn("thermostat_command", planned_fns)                                # no rule plan instead
-        self.assertTrue(all(s.made_by.startswith("brain:qwen") for s in plan.scenarios if s.function == "clamp_percent"))
+        self.assertTrue(any(s.checked and s.made_by.startswith("brain:qwen") for s in plan.scenarios if s.function == "clamp_percent"))
+        self.assertTrue(any(s.made_by == "rule" and s.function == "thermostat_command" for s in plan.scenarios))
         self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning),
                         plan.planning)
 
@@ -3301,7 +3428,7 @@ class BrainPlanningTests(unittest.TestCase):
             plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                               iteration=2)))
         self.assertTrue(any(s.made_by.startswith("brain:haiku") for s in plan.scenarios
-                            if s.function == "thermostat_command"), plan.planning)
+                            if s.function == "thermostat_command" and s.made_by.startswith("brain:")), plan.planning)
 
     def test_when_no_function_gets_a_scenario_the_run_goes_on(self):
         """A1-PL8, ORC-34: no function got a scenario that passed the check - no rule plan in the brain's place,
@@ -3403,8 +3530,8 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertIn('Expected form: every value exactly as C code, for example {"name": "window_open", "value": "1"}',
                       seen[1])
 
-    def test_a_scenario_whose_test_failed_is_not_accepted_again(self):
-        """A1-PL8: the brain sees the failed test among the facts; the same scenario again is refused by name."""
+    def test_a_failed_name_can_be_repaired_but_executed_inputs_are_not_repeated(self):
+        """REC-2: retain a logical test name; reject only previously executed semantic inputs."""
         contexts = []
 
         def again(context):
@@ -3414,17 +3541,22 @@ class BrainPlanningTests(unittest.TestCase):
                              failed_tests={"test_thermostat_command_sensor_error": "crashed: signal 11 (SIGSEGV)"})
         with brain(UTBrain(plans={"thermostat_command": again})):
             plan = run(a1.AnalyzerAgent().plan(req))
-        self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs])
-        self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") and "crashed: signal 11" in p
-                            for p in plan.planning), plan.planning)
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")]
+        self.assertTrue(mine, plan.planning)
         self.assertIn("test_thermostat_command_sensor_error: FAILED in this run (crashed: signal 11 (SIGSEGV))",
                       contexts[0])
-        self.assertEqual(len(contexts), 1)        # the answer repeated what failed: not asked again [A1-PL18]
+        req.tried_scenarios = [uc.scenario_signature(mine[0], uc.execution_context(self.layout))]
+        with brain(UTBrain(plans={"thermostat_command": again})):
+            repeated = run(a1.AnalyzerAgent().plan(req))
+        self.assertFalse([s for s in repeated.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")])
+        self.assertTrue(any("same inputs" in line for line in repeated.planning), repeated.planning)
+        repaired = self.good(args=[{"name": "setpoint", "value": "21"}, {"name": "hysteresis", "value": "2"}])
+        with brain(UTBrain(plans={"thermostat_command": [repaired]})):
+            retry = run(a1.AnalyzerAgent().plan(req))
+        self.assertTrue(any(s.test_name == self.good()["name"] for s in retry.scenarios), retry.planning)
 
     def test_unchanged_facts_are_not_asked_again_after_nothing_was_accepted(self):
-        """A1-PL18: the facts are the code, its open targets and the evidence. A round whose brain call gave no
-        accepted scenario is not asked again while they stay the same - also when only the record of the earlier
-        answers (failed tests, journal, tried) changed; changed targets are asked again."""
+        """REC-4: identical empty questions are suppressed; new diagnostic feedback permits replanning."""
         calls = []
 
         def nothing(context):
@@ -3435,14 +3567,23 @@ class BrainPlanningTests(unittest.TestCase):
             run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps), iteration=2)))
             first = len(calls)
             plan = run(agent.plan(uc.PlanRequest(
-                layout=self.layout, last=measured(self.layout, self.gaps), iteration=3,
-                failed_tests={"test_thermostat_command_x": "failed"})))                  # only the record changed
+                layout=self.layout, last=measured(self.layout, self.gaps), iteration=3)))
             self.assertEqual(len(calls), first, "asked again with the same facts")
             self.assertTrue(any("facts unchanged since its last brain call" in p for p in plan.planning), plan.planning)
             self.assertTrue(any(p.startswith("clamp_percent: facts unchanged") and "its requirement check" in p
                                 for p in plan.planning), plan.planning)      # a requirement check: asked once [A1-25y]
-            run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps[:1]), iteration=4)))
-        self.assertGreater(len(calls), first, "changed targets are asked again")
+            run(agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps), iteration=4,
+                journal={"thermostat_command": "compiler: fixture constructor requires an argument"})))
+            self.assertGreater(len(calls), first, "new diagnostic evidence must reach the model")
+
+    def test_a_third_attempt_can_use_the_only_model(self):
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})):
+            plan = run(a1.AnalyzerAgent().plan(uc.PlanRequest(
+                layout=self.layout, last=measured(self.layout, self.gaps), iteration=3,
+                attempts={g.gap_id: 2 for g in self.gaps}, other_model_items=[g.gap_id for g in self.gaps],
+                avoid_brains=["qwen"], journal={"thermostat_command": "prior fixture failed; repair the setup"})))
+        self.assertTrue(any(s.made_by.startswith("brain:qwen") for s in plan.scenarios), plan.planning)
+        self.assertTrue(any("bounded recovery" in p for p in plan.planning), plan.planning)
 
     def test_without_a_next_brain_the_same_brain_is_asked_again(self):
         """COV-6: the next AVAILABLE brain; when the brain that planned last is the only one, it is asked again
@@ -3463,7 +3604,7 @@ class BrainPlanningTests(unittest.TestCase):
         contexts = []
         with brain(UTBrain(plans={"thermostat_command": lambda ctx: contexts.append(ctx) or []})):
             plan = run(self.agent.plan(req))
-        self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs])
+        self.assertFalse([s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs and s.made_by.startswith("brain:")])
         self.assertTrue(any(p.startswith("thermostat_command: no scenario this time") for p in plan.planning))  # A1-PL8
         self.assertIn("TRIED 1 time(s)", contexts[0])                    # A1-PL12; a second attempt [LA-5]
         self.assertIn("reached: LC:6, LC:13, BC:7:9:F", contexts[0])                    # A1-PL7
@@ -3979,7 +4120,7 @@ class RepositoryTests(unittest.TestCase):
         fix = UTBrain(patch={"original_fragment": "return 2;", "corrected_fragment": "return 1;",
                              "rationale": "E2: @return 1 to heat"})
         with mock.patch.dict(os.environ, {"UT_TEST_PR_TOKEN": "s3cr3t-token", "NO_PROXY": "127.0.0.1",
-                                          "no_proxy": "127.0.0.1"}), brain(fix):
+                                          "no_proxy": "127.0.0.1"}), writer_brain(fix):
             result = self.run_repo(url, ["src/thermostat.c"], repositories=settings)
         server.shutdown()
         server.server_close()
@@ -6765,7 +6906,8 @@ class LargePilotFindingsTests(unittest.TestCase):
                     layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
                         uc.CaptureRequest(layout=layout)))))
                     last = comp.execute(uc.VerifyRequest(layout=layout, stage="probe"))
-                    plan = run(agent.plan(uc.PlanRequest(layout=layout, last=last, iteration=1)))
+                    # Exercise baseline rule tests, independently of the first-iteration LLM planner.
+                    plan = run(agent.plan(uc.PlanRequest(layout=layout)))
                     gen = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic"))
                     with mock.patch.object(gen, "_brain_values", return_value={}):
                         bundle = run(gen.generate_bundle(uc.GenerationRequest(plan=plan)))
@@ -6785,9 +6927,8 @@ class LargePilotFindingsTests(unittest.TestCase):
         comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(Path(tmp.name) / "w")))
         layout = run(agent.dependencies(uc.DependencyRequest(layout=layout, build=comp.capture(
             uc.CaptureRequest(layout=layout)))))
-        plan = run(agent.plan(uc.PlanRequest(layout=layout, last=comp.execute(uc.VerifyRequest(layout=layout,
-                                                                                               stage="probe")),
-                                             iteration=1)))
+        # This test exercises profile merging, using the model-free baseline suite.
+        plan = run(agent.plan(uc.PlanRequest(layout=layout)))
         bundle = run(a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic")).generate_bundle(
             uc.GenerationRequest(plan=plan)))
         result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
