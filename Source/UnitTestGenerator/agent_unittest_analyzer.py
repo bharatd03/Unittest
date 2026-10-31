@@ -6343,21 +6343,19 @@ class AnalyzerAgent(ba.AgentCore):
                 notes["planning"].append(f"{name}: only the carried scenarios this time - {result.message[:300]}")
                 result = ([], {k: [] for k in notes}, {k: 0 for k in notes})
             if isinstance(result, ba.AgentFault) and result.code == "BRAIN_PLAN_FAILED":
-                # A1-PL8: this function gets no scenario in this plan - never a rule plan; the other functions go on
+                # REC-6: no model scenario was accepted; retain structural facts and continue other functions.
                 notes["planning"].append(f"{name}: no scenario this time - {result.message[:400]}")
-                out = [s for s in out if not mine(s, fn) or s.inputs or s.scenario_id.startswith("S-solved-")]
+                # REC-6: a rejected proposal does not invalidate the baseline's structural facts.
                 continue
             if isinstance(result, BaseException):
                 raise result
             brain, own, before = result
             for key, lines in own.items():
                 notes.setdefault(key, []).extend(lines[before[key]:])
-            # The brain's plan replaces the rule scenarios of the function [A1-PL1]; a documented-behaviour check the
-            # brain did not plan stays, and Agent2's brain writes its test (A1-25y, A2-21n).
+            # REC-6: proposals are additive until Agent3 measures redundancy. Keep baseline controls and sequences.
             brain = own_carried + brain                                                     # A1-PL17
             behaviour = any(f"EVIDENCE:{name}" in s.gap_ids and not s.characterization for s in brain)
-            out = [s for s in out if not mine(s, fn) or s.inputs or s.scenario_id.startswith("S-solved-")   # A1-PL15
-                   or (s.scenario_id.startswith("S-evidence-") and not behaviour)] + brain
+            out = [s for s in out if not (mine(s, fn) and s.scenario_id.startswith("S-evidence-") and behaviour)] + brain
         return out
 
     def _carry(self, fn: uc.FunctionInfo, gaps: list[uc.GapItem], open_ids: set[str], entry: dict[str, Any],

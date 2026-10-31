@@ -2255,6 +2255,7 @@ class Orchestrator:
         gone = [n for n in failing if n not in base.tests]
         for n in gone:                                     # the journal's facts [LA-3, LA-4] and the rates [ORC-12b]
             s.quarantine[n] = (failing[n], sources.get(n, ""))
+            s.open_items.add(f"{n}: left out by the compile gate: {failing[n][:300]} [A3-CL12, A3-CL15]")
             if isinstance(getattr(s, "lost", None), dict):
                 s.lost.setdefault(n, "did not compile (gate)")
         for n in gone[:3]:

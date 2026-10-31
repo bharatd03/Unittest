@@ -3285,7 +3285,8 @@ def finalize_bundle(bundle: uc.FileActionBundle, observed: dict[str, str],
     """UT_OBSERVE_*("id", expr) -> a characterization assertion with the observed value [A2-21c].
     With per-test coverage from Agent3, new characterization tests that add nothing are dropped."""
     observed = dict(observed)
-    candidates = [t for t in bundle.new_tests if t in set(bundle.characterization_tests)]
+    repaired = {change.test for change in bundle.expectation_changes}  # REC-7: preserve the repair's witness
+    candidates = [t for t in bundle.new_tests if t in set(bundle.characterization_tests) and t not in repaired]
     bundle = drop_tests(bundle, redundant_tests(candidates, test_items or {}))
     out = bundle.model_copy(deep=True)
     macro = {"INT": "UT_EXPECT_EQ_INT({e}, {v})", "DBL": "UT_EXPECT_EQ_DBL({e}, {v}, 1e-9)",

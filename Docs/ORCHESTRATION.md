@@ -2,6 +2,11 @@
 
 Requirement IDs in brackets refer to `unittest_generator_requirments.txt`.
 
+Baseline structural scenarios remain alongside checked model proposals until execution measures redundancy
+[REC-6]. A model rejection does not erase fixture controls or call sequences. Tests repaired under the existing
+observation/oracle policy retain their identity and inputs through coverage minimization [REC-7]. Compile-gate
+exclusions carry per-test compiler evidence in the same quarantine report as build-stage exclusions [REC-8].
+
 | Agent | Python file | Role |
 | --- | --- | --- |
 | Orchestrator | `ut_pipeline.py` | Runs the pipeline, the only MCP client of the agents [ORC-1] |
