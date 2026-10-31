@@ -2778,10 +2778,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("values above 100 are limited to 100", suite)                      # A2-21q
         self.assertTrue(any("clamp_percent: 1 scenario(s) by qwen" in p for p in result.planning), result.planning)
 
-    def test_cheap_tests_first_and_the_search_during_the_planning(self):
-        """A1-PL1: with nothing measured, iteration 1 runs the rule-based tests and the search; the brain plans what
-        they left. ORC-5a: the search runs while the brain plans, its inputs join that plan (inputs only, no brain),
-        and the search of the run stays within its budget (A3-FZ3)."""
+    def test_first_iteration_brain_planning_and_search_overlap(self):
+        """A1-PL1: iteration 1 combines brain planning with deterministic tests. ORC-5a: after verification the search
+        runs while the next plan is formed; its inputs join that plan (inputs only, no brain), within one budget."""
         repo = copy_pilot("c_deps_pilot", self.d)
         if not (have_tool("cmake") and have_tool("ninja")):
             self.skipTest("cmake and ninja are not in the tool manifest")
@@ -2800,7 +2799,6 @@ class PipelineTests(unittest.TestCase):
         plans = [c for c in calls if c[0] == "plan" and c[3].iteration >= 1]
         first = [c for c in plans if c[3].iteration == 1 and not c[3].inputs_only]
         self.assertTrue(first, plans)
-        self.assertTrue(any(p.startswith("cheap tests first") for p in result.planning), result.planning)
         searches = [c for c in calls if c[0] == "fuzz"]
         self.assertTrue(searches, result.fuzzing)
         self.assertTrue(any(p[1] < s[2] and s[1] < p[2] for s in searches for p in plans if p[3].iteration > 1),
@@ -3241,18 +3239,19 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertTrue(s.characterization)                                             # A1-25h, A1-PL4 c)
         self.assertEqual(s.expected_return, "")
 
-    def test_first_plan_by_the_brain_and_without_a_brain_the_planning_stops(self):
-        """A1-PL1: before anything is measured the rules estimate the obligations; from the first coverage plan
-        on the brain plans. A1-PL8, ARCH-24: no brain answers -> NO_BRAIN_AVAILABLE, never a rule plan instead."""
+    def test_first_coverage_plan_uses_the_brain_and_without_a_brain_the_planning_stops(self):
+        """A1-PL1: the first coverage plan uses the brain even before generated tests are measured. A1-PL8, ARCH-24:
+        no brain answers -> NO_BRAIN_AVAILABLE, never a rule plan instead."""
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout)))          # nothing measured yet
         self.assertFalse(b.generate_calls)
         self.assertTrue(all(s.made_by == "rule" for s in plan.scenarios))
-        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:      # A1-PL1: cheap tests first
+        with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:      # first coverage iteration
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=measured(self.layout, self.gaps),
                                                       iteration=1)))                   # no test measured yet
-        self.assertFalse(b.generate_calls)
-        self.assertTrue(any(p.startswith("cheap tests first") for p in plan.planning), plan.planning)
+        self.assertTrue(b.generate_calls)
+        mine = [s for s in plan.scenarios if s.function == "thermostat_command" and not s.inputs]
+        self.assertTrue(mine and all(s.made_by.startswith("brain:") for s in mine), plan.scenarios)
         tested = measured(self.layout, self.gaps, tests=[uc.TestResult(name="test_x_auto_1", status="passed")])
         with brain(UTBrain(plans={"thermostat_command": [self.good()]})) as b:
             plan = run(self.agent.plan(uc.PlanRequest(layout=self.layout, last=tested, iteration=1)))   # tests exist

@@ -73,7 +73,6 @@ class AnalyzerConfig(BaseModel):
     requirement_files: list[str] = []        # glob patterns, relative to the repository [A1-25x]
     max_brain_calls_per_function: int = 2    # re-ask included [A1-PL9, ORC-7]
     max_brain_scenarios: int = 4             # per call: shorter answers, faster on a small brain [ORC-7]
-    rules_first: bool = True                 # no test measured yet: cheap tests first, then the brain [A1-PL1]
     brain_functions_per_round: int = 30      # functions planned with the brain per round, at least [A1-PL16, ORC-7]
     state_per_function: int = 40             # state variables listed per function [A2-21aj]
     long_function_lines: int = 150           # above: only the paths to the open items go to the brain [LA-10]
@@ -6005,12 +6004,9 @@ class AnalyzerAgent(ba.AgentCore):
         if req.inputs_only:                      # the search's inputs only, no brain [ORC-5a, A1-18c]
             return uc.UTPlan(**base, stage="coverage", stubs=stubs, scenarios=self._input_scenarios(layout, req),
                              reason="inputs found by the coverage-guided search [A1-18c]")
-        # The brain plans every gap; with nothing measured yet the cheap tests go first and their results are facts of
-        # the brain's first plan [A1-PL1, ARCH-24].
-        brain_ok = last is not None and not (self.cfg.rules_first and req.iteration <= 1 and not last.tests)
-        if not brain_ok and last is not None:
-            notes["planning"].append("cheap tests first: the rule-based tests and the coverage-guided search run in "
-                                     "this iteration; the brain plans every gap they leave [A1-PL1]")
+        # The first coverage iteration combines the cheap tests and search with brain planning. Later plans receive
+        # their measured coverage and journaled failures [A1-PL1].
+        brain_ok = last is not None
         if last is not None and last.decision == "complete":
             pending = self._evidence_scenarios(layout, req, disputed)
             if pending and brain_ok:                                       # A1-25y with the brain [A1-PL1]
