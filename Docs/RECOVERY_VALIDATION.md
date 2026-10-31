@@ -1,7 +1,7 @@
 # Recovery fixes: validation record
 
-Validated on Linux on 2026-10-31. The recovery implementation is commit `5bf330a`, based on incoming main
-`6c45292`. No live remote model was contacted. The tests use scripted brains; the remote thinking-off request
+Validated on Linux on 2026-10-31. The implementation commits are `5bf330a` and `cfec7a3`, based on incoming main
+`6c45292`. The latest component and release checks pass. No live remote model was contacted. The tests use scripted brains; the remote thinking-off request
 was checked using a mocked transport.
 
 ## Implemented
@@ -14,25 +14,32 @@ was checked using a mocked transport.
 - The bounded third attempt prefers another model but remains available with a single model family.
 - Remote Qwen thinking is disabled for every configured step. Model capabilities, evidence checks and existing
   iteration/attempt limits remain in force.
+- Baseline structural scenarios remain available alongside checked LLM proposals until measured redundancy.
+  Rejected proposals cannot erase working fixture controls and call sequences.
+- Coverage-only minimization preserves repaired observation tests and their inputs, identity and expectation-change
+  provenance. The existing classification and oracle checks remain required.
+- Compile-gate exclusions include the same per-test quarantine evidence as build-stage exclusions.
 
 ## Results
 
 | Check | Result |
 | --- | --- |
-| Targeted recovery/planning/learning tests | 40 tests, passed |
-| Component suite | 332 tests: 292 passed, 40 skipped |
-| BaseAgent suite | 227 tests: 212 passed, 15 skipped |
-| Full release checks | 376 test invocations: 368 passed, 7 failed, 1 skipped |
+| Formerly failing release tests | All 7 passed individually and in the full run |
+| Focused planner/repair-retention tests | 39 tests, passed |
+| Component suite | 333 tests: 293 passed, 40 skipped |
+| BaseAgent suite (unchanged; previous recovery run) | 227 tests: 212 passed, 15 skipped |
+| Full release checks | 377 test invocations: 376 passed, 0 failed, 0 errors, 1 skipped |
 | Full-pipeline construct corpus | All 45 cases passed their existing expectations |
 
 The component skips comprise 39 whole-pipeline tests and one Make-manifest check. BaseAgent skips optional live
 model and browser checks. The full run skips the Make-manifest check. Corpus expectations include explicit
 incomplete/unsupported outcomes: passing the corpus does not mean every construct reached 100% coverage.
 
-The release checks used the existing test methods and unchanged assertions and search budgets. The corpus's
+The seven release tests retain their original outcome and coverage assertions. The release run uses unchanged search budgets. The corpus's
 single serial method was invoked separately for each case, in four worker processes, alongside the other release
-tests. This adds 44 invocations to the usual 332-test count. An earlier serial validation attempt was interrupted
-to switch to this parallel run; it is not counted as a passing full-suite run.
+tests. This adds 44 invocations to the usual 333-test count. New regression coverage checks that repaired
+observation tests survive minimization despite overlapping coverage. Planner tests separately validate checked
+model proposals and retained baseline facts under the additive-planning contract (REC-6).
 
 Standard entry points, from the repository root:
 
@@ -42,10 +49,10 @@ bash Source/UnitTestGenerator/unittest_generator.sh baseagent-test
 UT_TEST_WORKERS=4 bash Source/UnitTestGenerator/unittest_generator.sh test-full
 ```
 
-## Existing release failures
+## Resolved release failures
 
-Each of these seven failing tests was also executed against an isolated archive of unchanged incoming main
-`6c45292`, with the same interpreter and compiler, and failed there too:
+Each of these seven tests failed against an isolated archive of unchanged incoming main `6c45292` with the same
+interpreter and compiler. All seven now pass:
 
 1. `PipelineTests.test_a_brain_test_that_does_not_compile_costs_no_iteration`
 2. `PipelineTests.test_a_second_run_reuses_what_the_first_verified`
@@ -55,9 +62,11 @@ Each of these seven failing tests was also executed against an isolated archive 
 6. `RepositoryTests.test_source_fix_opens_a_review_pull_request`
 7. `PipelineTests.test_real_repository_patterns_reach_their_targets_without_a_brain`
 
-The failures concern compile-gate reporting, verified-test cache reuse, expected writer/oracle execution,
-source-review routing, and unresolved coverage in the ring-buffer and real-repository list pilots. They remain
-open; their assertions were not disabled or relaxed to obtain a passing release result.
+The fixes cover compile-gate reporting, repaired-test retention, and baseline scenarios lost during LLM planning.
+The C pilot, verified-test cache and source-review fixtures now explicitly enable a whole-test writer profile,
+matching their existing assertions about whole-test generation. Minimum-profile planning remains covered
+separately; the template and real-repository pilots still run with their original minimum-profile fixture.
+No coverage targets, compiler checks, oracle checks or source-review assertions were disabled or lowered.
 
 The two compiler fixtures for sanitizer execution and damaged-profile merging now explicitly request the
 model-free baseline suite. They test those compiler subsystems independently of first-iteration LLM planning;
@@ -65,7 +74,7 @@ their sanitizer and measurement assertions are unchanged.
 
 ## Remaining scope
 
-The full release suite is not green. These changes address recovery control flow; they do not establish live
-Qwen convergence or guarantee 100% of all five coverage metrics within three rounds. Typed validation diagnostic
-routing and concolic/SMT-assisted generation remain follow-up architecture work. The existing release failures
-need separate diagnosis before treating this branch as release-ready.
+The automated release checks pass. This does not establish live Qwen convergence or guarantee 100% of all five
+coverage metrics within three rounds for arbitrary source code. Typed validation diagnostic routing and
+concolic/SMT-assisted generation remain follow-up architecture work. Live model and Windows validation were not
+performed in this Linux workspace.
