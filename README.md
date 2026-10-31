@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # UnitTest – evidence-gated unit-test generator for C and C++
 
 A multi-agent application built on **BaseAgent** that analyses C/C++ source, generates unit tests,
@@ -37,7 +36,7 @@ Nothing else needs to be installed by hand.
 Windows:
 
 ```bat
-git clone https://github.com/novaqtek-art/UnitTest.git
+git clone https://github.com/bharatd03/Unittest.git
 cd UnitTest
 Source\UnitTestGenerator\unittest_generator.bat check
 Source\UnitTestGenerator\unittest_generator.bat test
@@ -47,7 +46,7 @@ Source\UnitTestGenerator\unittest_generator.bat pilot-c
 Linux:
 
 ```sh
-git clone https://github.com/novaqtek-art/UnitTest.git
+git clone https://github.com/bharatd03/Unittest.git
 cd UnitTest
 Source/UnitTestGenerator/unittest_generator.sh check
 Source/UnitTestGenerator/unittest_generator.sh test
@@ -147,7 +146,3 @@ Windows: the pipeline compiles and runs test programs. Smart App Control, or a c
 Not in the repository (see `.gitignore`): the installed tools, `.venv`, run results, the
 knowledge-base database, test results, BaseAgent's local `demo` state with its client token, and
 the patent material.
-=======
-# Unittest
-I am trying to build a lite weight unittest platform with out the need of specific set of unittest frameworks like parasoft or GT
->>>>>>> origin/main
