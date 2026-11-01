@@ -86,3 +86,35 @@ The automated release checks pass. This does not establish live Qwen convergence
 coverage metrics within three rounds for arbitrary source code. Typed validation diagnostic routing and
 concolic/SMT-assisted generation remain follow-up architecture work. Live model and Windows validation were not
 performed in this Linux workspace.
+
+## Execution blocks and invalid model answers (REC-9)
+
+McAfee quarantine under `ut_work/fault-<run>/w<worker>/ut_runner.exe` corresponds to native mutation checks. Each worker builds changed source to verify that tests retain fault detection. A remote Qwen endpoint only moves inference; compilation, tests, mutation checking and fuzzing still execute on the local machine. Quarantine can prevent these checks, but does not by itself explain every remaining coverage gap or establish a false positive. The `ti!…` detection labels in the supplied screenshot do not establish the detection mechanism.
+
+Previously, oracle and suggestion fault checks could catch `ENVIRONMENT_BLOCKED` and return an undetermined/not-checked result. Search also treated a security denial as an unsupported function. This allowed later planning and new runners without resolving the execution environment. REC-9 propagates the block, stops remaining mutation work and shares a stop latch across source files and folders. Calls already in flight may finish. The report remains incomplete and retains the last verified result when available. A blocked execution is never a killed mutant, a resolved test or newly measured coverage.
+
+Do not disable antivirus, automatically restore quarantine, or rename executables to avoid detection. File exclusions do not scale to binaries whose content changes on each build, and a stable path or signing cannot guarantee acceptance. Submit detection details and an approved sample through the organization's security review. For deployment, use an IT-approved build/test worker with the required OS and toolchain; keep generated executables on that worker and return reports, coverage and viewer events. Windows-specific tests require a suitable Windows worker. Containers and WSL remain subject to host security policy. A remote execution service and viewer transport are architectural follow-up work, not implemented by this fix.
+
+`brain MODEL_OUTPUT_INVALID (A1.plan)` is a summary, not a diagnosis. BaseAgent already records the refusal's `reason`, `step`, `code` and, for cut answers, `ended` and output-token usage in the run's `brain_answers.jsonl`. Repeated summaries can concern different functions or fresh invalid answers. Historical events remain in the viewer after recovery; open journal items close only with verification evidence. An antivirus block and invalid JSON/schema output are separate failures.
+
+From `Source/UnitTestGenerator`, inspect the newest answer log in PowerShell:
+
+```powershell
+$answerLog = Get-ChildItem .\ut_output -Recurse -Filter brain_answers.jsonl |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$answerLog.FullName
+Get-Content $answerLog.FullName | ForEach-Object { $_ | ConvertFrom-Json } |
+    Where-Object { $_.step -eq 'A1.plan' -and $_.code -eq 'MODEL_OUTPUT_INVALID' } |
+    Select-Object time, agent, step, code, reason, ended, tokens | Format-List
+```
+
+Select the original medium-run log explicitly if a newer run exists. Review diagnostic text before sharing it; no API key is needed. Malformed JSON, schema violations and truncation need different fixes. The two supplied timestamps do not identify which occurred. Live Qwen recovery and McAfee acceptance require validation on the user's environment; neither is established by Linux regression tests.
+
+Validation for REC-9 in the cloud Linux environment:
+
+- Component run: 337 invocations, 297 passed, 40 deferred pipeline checks; no failures/errors. Four further checks added after this run's test-list snapshot passed in the focused run below.
+- Full release selection, using the existing parallel helper and unchanged construct expectations: 381 invocations, 381 passed, zero failures/errors/skips; all 45 construct cases passed. The component run's deferred checks executed here. This selection was captured before four further regression checks were added.
+- Final focused run: 11 passed, zero failures/errors/skips, including the four additional checks, blocked mutation propagation, queued per-test runs, successful-output versus startup-denial distinction, batch scheduling and preservation of an earlier 90% coverage measurement.
+- Python compilation and whitespace checks passed. These checks use scripted brains; real Qwen responses and Windows/McAfee acceptance were not tested.
+
+An initial sandboxed attempt stalled even on `asyncio.run(asyncio.to_thread(lambda: 1))`; those processes were terminated. The completed checks above ran with the cloud sandbox restriction lifted. No model endpoint was contacted and no assertion was relaxed to accommodate that environment limitation.

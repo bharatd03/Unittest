@@ -271,6 +271,7 @@ class Orchestrator:
         self.cfg = PipelineConfig.model_validate(self.raw.get("pipeline", {}))
         out = Path(self.cfg.output_dir)
         self.output_root = out if out.is_absolute() else (self.config_path.parent / out)
+        self.execution_block: dict[str, str] = {}                  # REC-9: shared across a repository batch
         self.clients: dict[str, ba.AgentClient] = {}
         self.ledger: Ledger | None = None
         self.layout: uc.LayoutProfile | None = None
@@ -336,7 +337,12 @@ class Orchestrator:
         sut = self.layout.sut_sha256 if self.layout else EMPTY_SHA
         return {"sut": sut, "test_suite": hashlib.sha256(self.suite.encode("utf-8")).hexdigest()}
 
+    def check_execution(self) -> None:
+        if self.execution_block:
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", self.execution_block["reason"])
+
     async def call(self, role: str, tool: str, payload: BaseModel, expect: type[BaseModel]) -> Any:
+        self.check_execution()                                              # REC-9: no further model calls
         if isinstance(payload, uc.VerifyRequest) and not payload.targets and self.targets:
             payload = payload.model_copy(update={"targets": dict(self.targets)})             # COV-1
         agent = AGENTS[role][0]
@@ -364,13 +370,21 @@ class Orchestrator:
                            **({"escalations": escalations} if escalations else {}))
         self.token_log.extend({**plan, "agent": AGENTS[role][0], "tool": tool} for plan in plans)
         self.escalation_log.extend(escalations)
+        self.check_execution()                                       # REC-9: a sibling may have blocked meanwhile
         if response.status == "rejected":
             raise Rejected(AGENTS[role][0], response.reason or "rejected")
         if response.status == "error":
+            if response.error.code == "ENVIRONMENT_BLOCKED":
+                self.execution_block["reason"] = response.error.message
             raise ba.AgentFault(response.error.code, f"{AGENTS[role][0]}.{tool}: {response.error.message}",
                                 response.error.retryable)
         try:
-            return expect.model_validate(response.data)            # postcondition: the schema [ARCH-4]
+            result = expect.model_validate(response.data)          # postcondition: the schema [ARCH-4]
+            if isinstance(result, uc.VerificationResult) and any(
+                    f.failure_id == "env-blocked" for f in result.failures):
+                self.execution_block["reason"] = result.reason
+                self.check_execution()
+            return result
         except ValidationError as exc:
             raise ba.AgentFault("CONTRACT_VIOLATION", f"{AGENTS[role][0]}.{tool} returned an invalid "
                                 f"{expect.__name__}: {ba.validation_summary(exc)}") from exc
@@ -453,9 +467,11 @@ class Orchestrator:
             os.environ.update(self.run_env)
         try:
             async with contextlib.AsyncExitStack() as stack:
+                self.check_execution()                                      # REC-9: queued SUTs do not start
                 await self.connect(stack, out / "logs")
                 await self._run_start(state)
                 result = await self._run(state)
+                self.check_execution()                                      # catches optional-check handlers
                 await self._requirement_status(state, result)                            # A1-RQ5
                 with contextlib.suppress(Exception):                     # a cache never fails a run [CA-1]
                     self._store_verified_tests(state)                                        # CA-4
@@ -466,7 +482,13 @@ class Orchestrator:
         except Rejected as exc:
             result = state.finish("incomplete", f"{exc.agent} refused: {exc.reason}")
         except ba.AgentFault as exc:
-            if exc.code in BRAIN_STOP:                 # no brain answered: stop, deliver what was verified [ORC-34]
+            if exc.code == "ENVIRONMENT_BLOCKED":                           # REC-9
+                self.execution_block["reason"] = exc.message
+                result = state.finish("incomplete", f"ENVIRONMENT_BLOCKED: {exc.message}; " +
+                                      ("retained the last verified result; " if state.best_result else
+                                       "nothing was verified yet; ") + "execution did not complete",
+                                      state.best_result)
+            elif exc.code in BRAIN_STOP:                 # no brain answered: stop, deliver what was verified [ORC-34]
                 result = state.stopped(f"stopped because no brain gave a usable answer ({exc.code}: {exc.message}) "
                                        "[ARCH-24, ORC-34]")
             else:
@@ -1925,6 +1947,8 @@ class Orchestrator:
                 tests=[t.name for t in trial.tests if t.status == "passed"],
                 functions=[sug.function] if sug.function else []), uc.FaultCheckResult)
         except (Rejected, ba.AgentFault) as exc:
+            if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                raise
             fault = uc.FaultCheckResult(suggestion_id=sug.suggestion_id, decision="not_checked",
                                         reason=f"the check did not run ({exc})"[:300])
         folder.mkdir(parents=True, exist_ok=True)
@@ -2033,6 +2057,8 @@ class Orchestrator:
                 layout=self.layout, bundle=s.bundle, functions=functions, gaps=gaps,
                 covered=result.coverage.covered_items, seconds=seconds), uc.FuzzResult)
         except (Rejected, ba.AgentFault) as exc:
+            if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                raise
             s.fuzzing.append(f"not run: {exc}")
             return None
         engine = fuzz.engine or "libFuzzer"                                                 # A3-FZ11
@@ -2437,6 +2463,8 @@ class Orchestrator:
                     layout=self.layout, test=change.test, function=function, original_suite=self.suite,
                     changed_suite=new_suite, bundle=bundle), uc.OracleResult)
             except (Rejected, ba.AgentFault) as exc:
+                if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
                 verdict = uc.OracleResult(test=change.test, decision="oracle_strength_undetermined", reason=str(exc))
             s.oracle_checks.append(verdict)
             if verdict.decision != "accepted" and change.test in old_tests:
@@ -3981,6 +4009,7 @@ class RepositoryRun:
                     results.append(result)
                     continue
                 try:
+                    self.orchestrator.check_execution()                      # REC-9: stop later folders
                     result = await (self._folder(req, out) if not is_link(req.repository) else self._repository(req, out))
                 except (ba.AgentFault, OSError) as exc:              # this folder only; the others go on
                     message = exc.message if isinstance(exc, ba.AgentFault) else str(exc)
@@ -4001,6 +4030,7 @@ class RepositoryRun:
 
     def _orchestrator(self) -> Orchestrator:
         orch = Orchestrator(self.config_path)
+        orch.execution_block = self.orchestrator.execution_block             # REC-9
         orch.hub = self.hub
         orch.progress = getattr(self, "progress", None)                                       # VIEW-11
         orch.view_prefix = getattr(self, "view_prefix", "")                                   # VIEW-12a
@@ -4074,6 +4104,7 @@ class RepositoryRun:
         async def one(r: SutRun) -> None:
             async with semaphore:
                 try:
+                    self.orchestrator.check_execution()                      # REC-9: stop queued worktrees
                     await asyncio.to_thread(cache.worktree, commit, r.workspace)
                     origin = {"repository": git.clean(req.repository), "branch": branch, "commit": commit,
                               "cache_key": key, "previous_review": self._previous(prs, previous.get(r.sut))}
