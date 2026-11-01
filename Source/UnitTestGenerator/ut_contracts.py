@@ -1187,6 +1187,7 @@ class RepairItem(Contract):
 
 class UTPlan(Contract):
     plan_id: str
+    iteration: int = 0                  # same-round recovery retains the planner's iteration [REC-11]
     stage: Literal["setup", "coverage", "done", "blocked"]
     layout: LayoutProfile
     create_suite: bool = False
@@ -1307,6 +1308,7 @@ class PlanRequest(Contract):
     iterations_left: int = 0                                      # after this one: the brain's rounds [A1-PL16]
     no_brain_declarations: list[str] = Field(default_factory=list)   # the brain's declaration did not build [A1-PL14]
     examples: dict[str, str] = Field(default_factory=dict)       # function -> planning examples of the KB [KB-25]
+    retry_scenarios: list[Scenario] = Field(default_factory=list)  # scoped compiler-feedback recovery [REC-11]
 
 
 class DependencyRequest(Contract):

@@ -5382,13 +5382,21 @@ class AnalyzerAgent(ba.AgentCore):
         suite = uc.test_sources(req.existing_suite) if req.existing_suite else {}
         status = {t.name: t.status for t in (req.last.tests if req.last else [])}
         short = fn.name.split("::")[-1]
-        for name, src in suite.items():
+        # REC-12: a growing suite must not hide the latest failed/state-building attempt behind its first tests.
+        recent = list(reversed(list(suite.items())))
+        recent.sort(key=lambda pair: pair[0] not in req.failed_tests and status.get(pair[0]) not in
+                    ("failed", "crashed", "timeout"))
+        targets_left = {uc.gap_item(g) for g in gaps}
+        for name, src in recent:
             if not re.search(r"\b" + re.escape(short) + r"\s*\(", src):
                 continue
             reached = items_in(req.test_items.get(name, []), fn.line_start, fn.line_end)
-            body = "\n".join(src.splitlines()[2:12])
-            tried_rows.append(f"- {name} ({status.get(name, 'not run')}; reached: {', '.join(reached[:12]) or 'unknown'})"
-                              f"\n{body}")
+            measured = name in req.test_items
+            reached_text = ', '.join(reached[:12]) or ('none' if measured else 'unknown: not measured per test')
+            missed = sorted(targets_left - set(req.test_items.get(name, []))) if measured else []
+            tried_rows.append(f"- {name} ({status.get(name, 'not run')}; reached: {reached_text})"
+                              + (f"; targets not reached: {', '.join(missed[:12])}" if missed else "")
+                              + f"\n{src[:1600]}")
             if len(tried_rows) >= 6:
                 break
         built = set(req.tried_scenarios)
@@ -5985,7 +5993,7 @@ class AnalyzerAgent(ba.AgentCore):
         root = Path(layout.repo_root)
         plan_id = f"plan-{req.iteration}-{uuid.uuid4().hex[:6]}"
         suite_exists = (root / layout.suite_file).is_file() or bool(req.existing_suite)
-        base = dict(plan_id=plan_id, layout=layout, create_suite=not suite_exists,
+        base = dict(plan_id=plan_id, iteration=req.iteration, layout=layout, create_suite=not suite_exists,
                     files_to_create=[] if suite_exists else [layout.suite_file],
                     files_to_edit=[layout.suite_file] if suite_exists else [])
         with contextlib.suppress(Exception):           # the test vocabulary for Agent2 too [A1-PL2a]
@@ -5995,6 +6003,32 @@ class AnalyzerAgent(ba.AgentCore):
         stubs = self._stubs(layout, last)
         disputed = set(req.disputed_evidence)
         notes: dict[str, list[str]] = {"planning": [], "conflicts": [], "lookups": []}
+        if req.retry_scenarios:                                              # REC-11, REC-12
+            source = uc.read_source(root / layout.sut_file)
+            scenarios, gaps = [], []
+            groups: dict[tuple[str, int], list[uc.Scenario]] = {}
+            for previous in req.retry_scenarios:
+                groups.setdefault((previous.function, previous.function_line), []).append(previous)
+            available_gaps = [g for f in last.coverage.functions for g in f.gaps] if last and last.coverage else []
+            for (name, line), previous in groups.items():
+                fn = uc.function_of(name, layout, line)
+                if fn is None:
+                    raise ba.AgentFault("INVALID_REQUEST", f"retry function is not in the layout: {name}:{line}")
+                wanted = {g for sc in previous for g in sc.gap_ids}
+                active = [g for g in available_gaps if g.gap_id in wanted]
+                evidence = [e for e in self.collect_evidence(layout, name).evidence
+                            if uc.evidence_key(e) not in disputed]
+                repaired = await self._brain_scenarios(fn, active, wanted, set(), layout, req, source,
+                                                      stubs, evidence, notes)
+                for sc in repaired:
+                    old = max(previous, key=lambda p: len(set(p.gap_ids) & set(sc.gap_ids)))
+                    sc.scenario_id += "-repair-" + uuid.uuid4().hex[:8]
+                    if old.test_name:
+                        sc.test_name = old.test_name
+                scenarios.extend(repaired)
+                gaps.extend(active)
+            return uc.UTPlan(**base, stage="coverage", stubs=stubs, scenarios=scenarios, gaps=gaps,
+                             reason="scoped replanning from compiler feedback [REC-11]", **notes)
         if req.inputs_only:                      # the search's inputs only, no brain [ORC-5a, A1-18c]
             return uc.UTPlan(**base, stage="coverage", stubs=stubs, scenarios=self._input_scenarios(layout, req),
                              reason="inputs found by the coverage-guided search [A1-18c]")

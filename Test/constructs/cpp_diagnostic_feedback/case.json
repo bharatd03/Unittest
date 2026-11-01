@@ -1,0 +1,36 @@
+{
+  "construct": "C++ compiler feedback: namespaced record and scoped enum in a generated test",
+  "sut": "src/decode.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "telemetry::decode",
+        "answer": {
+          "args": [
+            {
+              "name": "data",
+              "fields": [
+                {
+                  "field": "value",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "name": "kind",
+              "value": "telemetry::Encoding::Scaled"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
+    ]
+  }
+}

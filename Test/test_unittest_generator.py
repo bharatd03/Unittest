@@ -7420,6 +7420,270 @@ class ReadOnceTests(unittest.TestCase):
 
 
 # ============================================================================ the parallel runner [TP-20]
+@unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+class CompilerFeedbackTests(unittest.TestCase):
+    """REC-10..REC-12: compiler and execution judge model-proposed fixes, with no pilot-specific rewrite."""
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+        self.repo = self.d / "repo"
+        shutil.copytree(up.CONSTRUCTS / "c_diagnostic_feedback", self.repo)
+        self.agent = a1.AnalyzerAgent()
+        self.comp = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.d / "work")),
+                                         router=ba.BrainRouter([DownBrain()], 0.0))
+        self.layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/packet.c"))
+        self.layout = self.layout.model_copy(update={"compile_flags": ["-std=c23"]})
+        self.fn = uc.function_of("packet_probe", self.layout)
+        self.gap = uc.GapItem(gap_id="LC:packet_probe:5", function="packet_probe", metric="LC", line=5)
+
+    def scenario(self, value="&storage"):
+        return uc.Scenario(scenario_id="S-packet-initial", function="packet_probe", function_line=self.fn.line_start,
+            gap_ids=[self.gap.gap_id], description="reach the payload match", test_name="test_packet_payload",
+            made_by="brain:qwen_remote/scripted", checked=True, setup=["unsigned char storage[3] = {19, 0, 0};"],
+            args=[uc.NamedValue(name="payload", value=value), uc.NamedValue(name="length", value="3")])
+
+    def bundle(self, value="&storage", late=False):
+        text = '#include "ut_harness.h"\n#include "packet.h"\n'
+        text += 'UT_TEST(test_existing) { UT_EXPECT_EQ_INT(packet_probe(0, 0), -1); }\n'
+        if late:
+            text += "/* earlier generated content */\n" * 11000
+        text += ('/* evidence: E8 */\nUT_TEST(test_packet_payload) {\n    /* S-packet-initial: reach payload match */\n'
+                 '    unsigned char storage[3] = {19, 0, 0};\n'
+                 f'    UT_OBSERVE_INT("packet_observed", packet_probe({value}, 3));\n}}\n'
+                 'UT_SUITE_BEGIN\nUT_CASE(test_existing)\nUT_CASE(test_packet_payload)\nUT_SUITE_END\n')
+        return uc.FileActionBundle(bundle_id="bad", tests=["test_existing", "test_packet_payload"],
+            new_tests=["test_packet_payload"], actions=[uc.FileAction(path=self.layout.suite_file,
+                action="create", role="testsuite", content=text), uc.FileAction(
+                path="tests/stubs/feedback_hook.c", action="create", role="stub",
+                content="void ut_before_each(void) {}\n")])
+
+    def test_compiler_checks_model_repair_before_quarantine_in_a_large_suite(self):
+        bundle = self.bundle(late=True)
+        text = bundle.actions[0].content.replace("unsigned char storage[3]", "unknown_storage_type storage[3]")
+        # Keep the assertion/call fixed: the free proposal repairs the declaration, not a guessed error class.
+        text = text.replace("packet_probe(&storage, 3)", "packet_probe(storage, 3)")
+        bundle.actions[0].content = text
+        seen = []
+        def propose(task, context):
+            seen.append(context)
+            self.assertIn("UT_TEST(test_packet_payload)", context)
+            self.assertIn("unknown_storage_type storage[3]", context)
+            return {"edits": [{"path": self.layout.suite_file, "old": "unknown_storage_type storage[3]",
+                               "new": "unsigned char storage[3]"}], "reason": "use the parameter element type"}
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([UTBrain(repairs=propose)], 0.0))
+        request = uc.VerifyRequest(layout=self.layout, stage="gate", bundle=bundle)
+        before = comp.execute(request)
+        self.assertFalse(before.build_ok)
+        self.assertGreater(max(d.line for d in before.diagnostics), 11000)
+        tool = next(t for t in comp.tools() if t.name == "gate")
+        repaired = run(tool.work(request, None, None))
+        self.assertTrue(repaired.build_ok, repaired.reason)
+        self.assertFalse(repaired.quarantined)
+        self.assertTrue(seen)
+        bundle.actions[0].content = repaired.repaired_files[self.layout.suite_file]
+        executed = comp.execute(uc.VerifyRequest(layout=self.layout, stage="observe", bundle=bundle))
+        self.assertEqual(executed.passed, 2, executed.reason)
+        self.assertTrue(any(v == "7" for v in executed.observed.values()), executed.observed)
+
+    def test_verification_repairs_new_tests_before_quarantine_can_hide_the_errors(self):
+        bundle = self.bundle("storage")
+        bundle.actions[0].content = bundle.actions[0].content.replace(
+            "unsigned char storage[3]", "missing_element_type storage[3]")
+        response = {"edits": [{"path": self.layout.suite_file, "old": "missing_element_type storage[3]",
+                               "new": "unsigned char storage[3]"}], "reason": "match the function parameter type"}
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([UTBrain(repairs=response)], 0.0))
+        verify = next(t for t in comp.tools() if t.name == "verify")
+        result = run(verify.work(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=bundle), None, None))
+        self.assertTrue(result.link_ok, result.reason)
+        self.assertEqual(result.passed, 2, result.reason)
+        self.assertFalse(result.quarantined)
+        self.assertIn(self.layout.suite_file, result.repaired_files)
+
+    def test_security_block_during_model_repair_is_not_retried_as_a_bad_answer(self):  # REC-13
+        bundle = self.bundle("storage")
+        bundle.actions[0].content = bundle.actions[0].content.replace(
+            "unsigned char storage[3]", "missing_element_type storage[3]")
+        response = {"edits": [{"path": self.layout.suite_file, "old": "missing_element_type storage[3]",
+                               "new": "unsigned char storage[3]"}], "reason": "use the parameter type"}
+        model = UTBrain(repairs=response)
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([model], 0.0))
+        real, runs = a3._run, []
+        def blocked(cmd, cwd, timeout, env=None, quiet=False):
+            if Path(str(cmd[0])).stem == "ut_runner":
+                runs.append(cmd)
+                return -126, "[WinError 225] quarantined"
+            return real(cmd, cwd, timeout, env, quiet)
+        verify = next(t for t in comp.tools() if t.name == "verify")
+        with mock.patch.object(a3, "_run", blocked), self.assertRaises(ba.AgentFault) as caught:
+            run(verify.work(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=bundle), None, None))
+        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertEqual(len(runs), 1)
+        self.assertLessEqual(len(model.generate_calls), 1)
+
+    def test_security_block_in_an_offered_repair_propagates(self):                  # REC-13
+        model = UTBrain(dependency="fix")
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([model], 0.0))
+        async def apply(key):
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", "tool quarantined")
+        with self.assertRaises(ba.AgentFault) as caught:
+            run(comp.resolve(ba.RuleFailure(rule="fixture repair", failure="fixture does not compile", subject="x"),
+                task="repair the fixture", context="compiler diagnostics", output_model=a3.BuildRepair,
+                verify=lambda answer: "", options={"fix": "repair the fixture"}, apply_option=apply,
+                free_brains=[], step="A3.repair"))
+        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertFalse(model.generate_calls)
+
+    def test_free_edit_permissions_apply_without_offered_options(self):            # REC-10
+        model = UTBrain(repairs={"edits": [], "reason": "not permitted"})
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([model], 0.0))
+        answer = run(comp.resolve(ba.RuleFailure(rule="permission fixture", failure="invalid generated file", subject="x"),
+            task="repair the file", context="compiler diagnostics", output_model=a3.BuildRepair,
+            verify=lambda answer: "", free_brains=[], step="A3.repair"))
+        self.assertIsNone(answer)
+        self.assertFalse(model.generate_calls)
+
+    def test_cpp_namespace_errors_are_repaired_by_a_model_proposal_and_the_compiler(self):  # REC-10
+        repo = self.d / "cpp"
+        shutil.copytree(up.CONSTRUCTS / "cpp_diagnostic_feedback", repo)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/decode.cpp"))
+        text = ('#include "ut_harness.h"\n#include "decode.hpp"\n'
+                'UT_TEST(test_scaled_sample) {\n    Sample value = {13};\n'
+                '    Encoding encoding = Encoding::Scaled;\n'
+                '    UT_EXPECT_EQ_INT(telemetry::decode(value, encoding), 1);\n}\n'
+                'UT_SUITE_BEGIN\nUT_CASE(test_scaled_sample)\nUT_SUITE_END\n')
+        bundle = uc.FileActionBundle(bundle_id="cpp", tests=["test_scaled_sample"], new_tests=["test_scaled_sample"],
+            actions=[uc.FileAction(path=layout.suite_file, action="create", role="testsuite", content=text),
+                     uc.FileAction(path="tests/stubs/hooks.cpp", action="create", role="stub",
+                                   content='extern "C" void ut_before_each(void) {}\n')])
+        answer = {"edits": [
+            {"path": layout.suite_file, "old": "Sample value = {13};", "new": "telemetry::Sample value = {13};"},
+            {"path": layout.suite_file, "old": "Encoding encoding = Encoding::Scaled;",
+             "new": "telemetry::Encoding encoding = telemetry::Encoding::Scaled;"}],
+            "reason": "use the declarations in the repository's namespace"}
+        comp = a3.CompilationAgent(config=self.comp.cfg, router=ba.BrainRouter([UTBrain(repairs=answer)], 0.0))
+        req = uc.VerifyRequest(layout=layout, stage="gate", bundle=bundle)
+        rejected = comp.execute(req)
+        self.assertFalse(rejected.build_ok)
+        self.assertTrue(any("unknown type name" in d.message for d in rejected.diagnostics), rejected.reason)
+        gate = next(t for t in comp.tools() if t.name == "gate")
+        accepted = run(gate.work(req, None, None))
+        self.assertTrue(accepted.build_ok, accepted.reason)
+        bundle.actions[0].content = accepted.repaired_files[layout.suite_file]
+        measured_result = comp.execute(uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle))
+        self.assertEqual((measured_result.passed, measured_result.failed), (1, 0), measured_result.reason)
+        self.assertIn("LC:5", measured_result.coverage.covered_items)
+
+    def recover(self, bad="&storage", unavailable=False, bad_answer=False):
+        bundle = self.bundle(bad)
+        original = self.scenario(bad)
+        plan = uc.UTPlan(plan_id="feedback", stage="coverage", layout=self.layout,
+                         scenarios=[original], gaps=[self.gap])
+        orch = up.Orchestrator(pipeline_config(self.d))
+        orch.layout = self.layout
+        state = up.RunState(req=uc.PipelineRequest(repo_root=str(self.repo), sut_file=self.layout.sut_file),
+                            repo=self.repo, out=self.d / "out", workspace=self.repo)
+        state.layout, state.last = self.layout, measured(self.layout, [self.gap])
+        state.kinds_available = list(uc.MINIMUM_KINDS)
+        generator = a2.GeneratorAgent(config=a2.GeneratorConfig(mode="deterministic", max_auto_tests_per_function=0))
+        requests, checks = [], []
+        answer = planned(gap_ids=[self.gap.gap_id], name="test_packet_payload", purpose="reach the payload match",
+                         args=[{"name": "payload", "elements": ["not_declared_here"] if bad_answer else ["19", "0", "0"]},
+                               {"name": "length", "value": "3"}])
+        answer.pop("setup")  # the compact on-wire schema asks for typed elements, not arbitrary C declarations
+        async def handoff(role, tool, payload, expect):
+            if role == "compilation":
+                if checks and unavailable:
+                    raise ba.AgentFault("ENVIRONMENT_ERROR", "gate measurement unavailable")
+                result = self.comp.execute(payload)
+                checks.append(result)
+                return result
+            if role == "analyzer":
+                requests.append(payload)
+                return await planner.plan(payload)
+            if role == "generator":
+                return await generator.generate_bundle(payload)
+            return uc.LearnAck(stored=True)
+        orch.call = handoff
+        model = RecordingBrain(plans={"packet_probe": [answer]})
+        planner = a1.AnalyzerAgent(router=ba.BrainRouter([model], 0.0))
+        with brain(model):
+            result = run(orch._compile_gate(state, plan, bundle, {}, uc.KBGuidance()))
+        state.feedback_contexts = [context for task, context in model.contexts if task.startswith("Plan unit-test scenarios")]
+        return result, state, plan, requests, checks
+
+    def test_structured_model_recovers_pointer_and_unknown_name_from_real_diagnostics(self):
+        for invalid in ("&storage", "not_declared_here", "storage +"):
+            with self.subTest(invalid=invalid):
+                bundle, state, plan, requests, checks = self.recover(invalid)
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(requests[0].retry_scenarios)
+                self.assertTrue(requests[0].failed_tests)
+                self.assertIn(invalid, requests[0].journal["packet_probe"])
+                self.assertTrue(any(invalid in c and "COMPILE GATE" in c for c in state.feedback_contexts),
+                                state.feedback_contexts)
+                self.assertFalse(checks[0].build_ok)
+                self.assertTrue(checks[-1].build_ok, checks[-1].reason)
+                self.assertIn("test_packet_payload", bundle.tests, bundle.notes)
+                self.assertFalse(state.quarantine)
+                old = uc.test_sources(uc.suite_of(self.bundle(invalid)))["test_existing"]
+                self.assertEqual(uc.test_sources(uc.suite_of(bundle))["test_existing"], old)
+                observed = self.comp.execute(uc.VerifyRequest(layout=self.layout, stage="observe", bundle=bundle))
+                self.assertEqual(observed.passed, 2, observed.reason)
+                final = a2.finalize_bundle(bundle, observed.observed, ran=[t.name for t in observed.tests])
+                verified = self.comp.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=final))
+                self.assertEqual(verified.failed, 0, verified.reason)
+                self.assertIn("LC:5", verified.coverage.covered_items)
+                successful = next(sc for sc in plan.scenarios if "-repair-" in sc.scenario_id)
+                self.assertEqual(successful.test_name, "test_packet_payload")
+                self.assertTrue(successful.checked)
+                self.assertNotIn("S-packet-initial", [sc.scenario_id for sc in plan.scenarios])
+
+    def test_unavailable_gate_does_not_claim_repair_success(self):
+        bundle, state, _, requests, _ = self.recover(unavailable=True)
+        self.assertEqual(len(requests), 1)
+        self.assertNotIn("test_packet_payload", bundle.tests)
+        self.assertIn("test_packet_payload", state.quarantine)
+        self.assertTrue(any("no successful gate measurement" in n for n in state.notes), state.notes)
+
+    def test_repeating_invalid_proposals_stop_at_the_configured_bound(self):
+        bundle, state, _, requests, checks = self.recover(bad_answer=True)
+        self.assertEqual(len(requests), 1)
+        self.assertLessEqual(len(checks), 2)
+        self.assertLessEqual(len(state.feedback_contexts), self.agent.cfg.max_brain_calls_per_function)
+        self.assertNotIn("test_packet_payload", bundle.tests)
+        self.assertIn("test_packet_payload", state.quarantine)
+        self.assertIn("test_existing", bundle.tests)
+
+    def test_gate_repair_preserves_older_tests_assertions_and_registration(self):
+        bundle = self.bundle("storage")
+        edits = [a3.FileEdit(path=self.layout.suite_file, old="packet_probe(0, 0)", new="packet_probe(0, 1)"),
+                 a3.FileEdit(path=self.layout.suite_file, old="UT_CASE(test_existing)", new=""),
+                 a3.FileEdit(path=self.layout.suite_file, old="-1);", new="0);")]
+        for edit in edits:
+            with self.subTest(edit=edit.old):
+                changed, reason = self.comp._apply_edits(bundle, a3.BuildRepair(edits=[edit], reason="invalid repair"),
+                                                       protected_tests={"test_existing"})
+                self.assertIsNone(changed)
+                self.assertTrue(reason)
+
+    def test_planning_prioritizes_latest_state_sequence_and_distinguishes_missing_measurement(self):
+        cases = [f"UT_TEST(test_old_{i}) {{ unsigned char b[1] = {{0}}; packet_probe(b, 1); }}" for i in range(20)]
+        cases.append("UT_TEST(test_latest_sequence) { unsigned char b[1] = {19}; "
+                     "packet_probe(b, 1); packet_probe(b, 1); }")
+        request = uc.PlanRequest(layout=self.layout, last=measured(self.layout, [self.gap]),
+            existing_suite="\n".join(cases), test_items={"test_latest_sequence": []})
+        facts = self.agent._facts(self.fn, [self.gap], {self.gap.gap_id}, self.layout, request,
+                                 (self.repo / self.layout.sut_file).read_text(), [], [])
+        tried = next(p.text for p in facts if p.name == "tried")
+        self.assertIn("test_latest_sequence", tried)
+        self.assertNotIn("test_old_0 (", tried)
+        self.assertIn("reached: none", tried)
+        self.assertIn("targets not reached: LC:5", tried)
+        self.assertIn("unknown: not measured per test", tried)
+        self.assertIn("packet_probe(b, 1); packet_probe(b, 1);", tried)
+
+
 def _test_ids(suite):
     for item in suite:
         if isinstance(item, unittest.TestSuite):
