@@ -1094,7 +1094,7 @@ def parse_suite(text: str) -> dict[str, dict[str, str]]:
                 if depth == 0:
                     break
             i += 1
-        tests[m.group(3)] = {"source": text[m.start(): i + 1], "evidence": m.group(1) or "E8",
+        tests[m.group(3)] = {"source": text[m.start(): i + 1], "evidence": m.group(1) or "",
                              "linked": bool(m.group(2))}
     return tests
 
@@ -2628,6 +2628,16 @@ class GeneratorAgent(ba.AgentCore):
                                                      "repair requested by Agent1"), evidence=old["evidence"]))
             elif name in rewrite and replacement is None:
                 pass                                         # dropped with its reason above [A2-21p]
+        labeled = []
+        for name, body, cls in new_tests:
+            targets = sorted({g for sc in plan.scenarios if sc.scenario_id and
+                re.search(r"(?<![\w.-])" + re.escape(sc.scenario_id) + r"(?![\w.-])", body)
+                for g in sc.gap_ids if g.startswith("EVIDENCE:") and "@" in g})
+            if len(targets) == 1 and cls and cls != "E8" and re.search(r"\bUT_(EXPECT|ASSERT)\w*\s*\(", body):
+                at = uc.c_masked(body).find("{") + 1
+                body = body[:at] + "\n    /* obligations: " + " ".join(targets) + " */" + body[at:]
+            labeled.append((name, body, cls))
+        new_tests = labeled
         tests = kept + new_tests
         final = {n for n, _, _ in tests}
         kinds = {r.affected_test: r.failure_kind for r in plan.repairs if r.affected_test}
@@ -2635,9 +2645,15 @@ class GeneratorAgent(ba.AgentCore):
                                                                                   "with its expected values")
                    for n in drop if n in existing and n not in final}
         suite = assemble_suite(plan, tests, stub_header, [shared[k] for k in sorted(shared)])
+        evidence_refs = {n: list(refs) for n, refs in req.existing_evidence.items() if n in final}
+        for name, body, cls in new_tests:
+            refs = [e for sc in plan.scenarios if sc.scenario_id and
+                    re.search(r"(?<![\w.-])" + re.escape(sc.scenario_id) + r"(?![\w.-])", body) for e in sc.evidence]
+            if refs:
+                evidence_refs[name] = list({e.model_dump_json(): e for e in refs}.values())
         actions.append(uc.FileAction(path=layout.suite_file, action="replace" if existing_text else "create",
                                      role="testsuite", content=suite,
-                                     evidence_classes={n: e for n, _, e in tests},
+                                     evidence_classes={n: e for n, _, e in tests if e}, evidence_refs=evidence_refs,
                                      linked_tests=sorted(linked & {n for n, _, _ in tests})))
         bundle = uc.FileActionBundle(bundle_id=f"bundle-{uuid.uuid4().hex[:8]}", actions=actions,
                                      tests=[n for n, _, _ in tests], new_tests=[n for n, _, _ in new_tests],

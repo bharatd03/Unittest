@@ -1,0 +1,26 @@
+{
+  "construct": "C++ method fuzzing links a generated C support unit with its own language flags [REC-18]",
+  "sut": "src/drive.cpp",
+  "language": "cpp",
+  "expect": {
+    "final_state": "any"
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "Drive::step",
+        "answer": {
+          "args": [
+            {
+              "name": "delta",
+              "value": "11"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
+    ]
+  }
+}

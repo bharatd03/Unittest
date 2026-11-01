@@ -116,6 +116,15 @@ class ParamInfo(Contract):
     canonical: str = ""                  # the type with typedefs resolved (u32_t -> unsigned long) [A3-HW4]
 
 
+class ControlRegion(Contract):
+    start_line: int
+    end_line: int
+    start_column: int
+    end_column: int
+    condition: str
+    proof_safe: bool = False
+
+
 class FunctionInfo(Contract):
     name: str
     qualified_name: str
@@ -129,6 +138,9 @@ class FunctionInfo(Contract):
     params: list[ParamInfo] = Field(default_factory=list)
     from_frontend: bool = False          # False: text parsing only (A1-DA14, estimated)
     member: bool = False                 # C++ class member (method, constructor, destructor)
+    control_regions: list[ControlRegion] = Field(default_factory=list)   # compiler AST, not text nesting [REC-16]
+    control_source_sha256: str = ""
+    unsafe_proof_lines: list[int] = Field(default_factory=list)   # conversions, side effects, volatile reads [REC-16]
 
 
 class TestCaseInfo(Contract):
@@ -957,7 +969,7 @@ class DefectCandidate(Contract):
     function: str = ""
     decision: str                        # the decision as written
     proof: str                           # the proof of A1-37
-    change: str                          # the operator change that removes the proof
+    change: str = ""                     # no correction is established by infeasibility alone [REC-16]
     evidence: str = ""                   # the comment or requirement that names the bounds
     items: list[str] = Field(default_factory=list)              # the items it blocks
 
@@ -975,6 +987,7 @@ class GapItem(Contract):
     attempts: int = 0
     estimated: bool = False
     variant_proofs: list["VariantProof"] = Field(default_factory=list)   # per build variant [A1-37b, A1-37c]
+    proof_origin_line: int = 0           # certificate dependency for measured refutation [REC-16]
     defect: DefectCandidate | None = None      # the proof is explained by a wrong operator [A1-37f]
 
 
@@ -1004,6 +1017,14 @@ class CoverageReport(Contract):
     covered_items: list[str] = Field(default_factory=list)    # stable ids of covered items [A3-108a]
 
 
+class ValidationCheck(Contract):
+    status: Literal["passed", "failed", "unknown"] = "unknown"
+    basis: str
+
+
+SOURCE_DEFECT_CHECKS = ("interface", "inputs", "expected_behavior", "stubs", "framework", "sut_origin")
+
+
 class Failure(Contract):
     failure_id: str
     kind: Literal["compile", "link", "test", "crash", "timeout", "regression", "environment"]
@@ -1018,6 +1039,7 @@ class Failure(Contract):
     affected_test: str = ""
     affected_function: str = ""
     evidence: list[str] = Field(default_factory=list)
+    source_checks: dict[str, ValidationCheck] = Field(default_factory=dict)   # independent A3-170 checks [REC-15]
 
 
 class Finding(Contract):
@@ -1087,6 +1109,11 @@ class EvidenceRef(Contract):
 def evidence_key(e: "EvidenceRef") -> str:
     """Stable identity of an evidence item across plans: where it is [A1-PL13]."""
     return f"{e.source}:{e.line}"
+
+
+def behavior_item(function: str, evidence: "EvidenceRef") -> str:
+    key = hashlib.sha256((evidence.evidence_class + "|" + evidence_key(evidence) + "|" + evidence.text).encode()).hexdigest()[:12]
+    return f"EVIDENCE:{function}@{key}"
 
 
 class StubSpec(Contract):
@@ -1211,6 +1238,7 @@ class UTPlan(Contract):
     deferred: list[str] = Field(default_factory=list)          # functions left for a later brain round [A1-PL16]
     # macros and enumerators only the SUT file defines: a test cannot name them, it writes the value [A1-PL2a]
     internal_values: dict[str, str] = Field(default_factory=dict)
+    refuted_proofs: list[str] = Field(default_factory=list)       # measured counterexamples [REC-16]
 
 
 class FuzzResult(Contract):
@@ -1221,6 +1249,9 @@ class FuzzResult(Contract):
     crashes: list[str] = Field(default_factory=list)        # inputs that crashed the SUT (reported, never asserted)
     reason: str = ""
     engine: str = ""                                        # "libFuzzer" or "ut_search" [A3-FZ11]
+    replayed: int = 0
+    outcomes: dict[str, str] = Field(default_factory=dict)     # per-target, includes explicit failures [REC-18]
+    execution_sources: dict[str, str] = Field(default_factory=dict)
 
 
 # ============================================================================ learning between attempts [LA-1 .. LA-10]
@@ -1363,6 +1394,7 @@ class FunctionRequirements(Contract):
 
 class RequirementStatus(Contract):
     functions: list[FunctionRequirements] = Field(default_factory=list)
+    unlinked: list[str] = Field(default_factory=list)           # requirements without a function association [REC-17]
 
 
 class EvidenceResult(Contract):
@@ -1388,6 +1420,7 @@ class FileAction(Contract):
     content: str
     evidence_classes: dict[str, str] = Field(default_factory=dict)   # test name -> strongest class [A2-21d]
     linked_tests: list[str] = Field(default_factory=list)             # rest on brain-linked evidence [A3-CL11]
+    evidence_refs: dict[str, list[EvidenceRef]] = Field(default_factory=dict)  # canonical Agent1 provenance [REC-14]
 
 
 class FileActionBundle(Contract):
@@ -1447,6 +1480,7 @@ class GenerationRequest(Contract):
     plan: UTPlan
     guidance: KBGuidance = Field(default_factory=KBGuidance)
     existing_suite: str = ""
+    existing_evidence: dict[str, list[EvidenceRef]] = Field(default_factory=dict)  # REC-14
     journal: dict[str, str] = Field(default_factory=dict)        # function -> journal excerpt [LA-4]
     item_kinds: dict[str, str] = Field(default_factory=dict)     # item -> answer kind of its next attempt [BP-3]
 
@@ -1828,7 +1862,10 @@ class PipelineResult(Contract):
     lookups: list[str] = Field(default_factory=list)           # A1-25s
     requirement_links: list[str] = Field(default_factory=list)  # linked by the brain [A1-PL13]
     requirement_documents: list[str] = Field(default_factory=list)   # "name sha256 (given as ...)" [A1-RQ3]
+    requirements_complete: bool | None = None  # independent of structural-coverage completion [REC-17]
     requirement_status: list[FunctionRequirements] = Field(default_factory=list)   # per function [A1-RQ5]
+    unlinked_requirements: list[str] = Field(default_factory=list)                # REC-17
+    source_validation: dict[str, dict[str, ValidationCheck]] = Field(default_factory=dict)  # REC-15
     suggested_flags: list[str] = Field(default_factory=list)   # A3-BD13
     fix_candidates: list[str] = Field(default_factory=list)    # candidates not chosen, with the reason [A4-23g]
     reviews: list[str] = Field(default_factory=list)           # second opinions [A4-23h]
@@ -1944,6 +1981,7 @@ def without_tests(bundle: "FileActionBundle", names: list[str] | set[str], note:
             action.content = remove_tests(action.content, gone)
             for name in gone:
                 action.evidence_classes.pop(name, None)
+                action.evidence_refs.pop(name, None)
     out.tests = [t for t in out.tests if t not in gone]
     out.characterization_tests = [t for t in out.characterization_tests if t not in gone]
     out.new_tests = [t for t in out.new_tests if t not in gone]
@@ -2123,7 +2161,7 @@ CACHE_DEFAULTS = {"enabled": True, "dir": "ut_cache/run_cache", "max_mb": 4096, 
                   "test_coverage": True, "verified_tests": True, "objects": True, "build_capture": True,
                   "failure_journal": True, "failure_analysis": True, "stage_a": True, "code_analysis": True,
                   "mutations": True, "search_corpus": True}           # CA-8 .. CA-13
-CACHE_VERSION = "1"            # the form of what the pipeline stores; a change makes every earlier entry a miss
+CACHE_VERSION = "2"            # the form of what the pipeline stores; a change makes every earlier entry a miss
 
 
 def cache_settings(config_path: str | Path | None) -> dict[str, Any]:

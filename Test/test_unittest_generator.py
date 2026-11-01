@@ -1255,7 +1255,7 @@ class CompilationTests(unittest.TestCase):
     def test_verify_measures_and_classifies(self):
         b = self.bundle('UT_TEST(test_heat) { ut_stub_read_sensor_return = 10; UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1); }\n'
                         'UT_TEST(test_char) { UT_EXPECT_EQ_INT(clamp_percent(50), 51); }\n'
-                        'UT_SUITE_BEGIN\nUT_CASE(test_heat) UT_CASE(test_char)\nUT_SUITE_END\n')
+                        'UT_SUITE_BEGIN\nUT_CASE(test_heat) UT_CASE(test_char)\nUT_SUITE_END\n', classes={"test_char": "E8"})
         r = self.agent.execute(uc.VerifyRequest(layout=self.layout, stage="verify", bundle=b))
         self.assertTrue(r.build_ok and r.link_ok)
         self.assertEqual((r.total, r.passed, r.failed), (2, 1, 1))
@@ -2062,6 +2062,7 @@ class BuildVariantTests(unittest.TestCase):
         self.assertEqual(old.variants, [])                                              # older caches still load
 
     def measured_gaps(self, layout, agent):
+        layout = run(a1.AnalyzerAgent().dependencies(uc.DependencyRequest(layout=layout, build=layout.build)))
         suite = ('#include "ut_harness.h"\n#include "chan.h"\nvoid ut_before_each(void) {}\n'
                  'UT_TEST(test_gate) { UT_EXPECT_EQ_INT(channel_gate(0), 0); UT_EXPECT_EQ_INT(channel_gate(5), 0); }\n'
                  'UT_SUITE_BEGIN\nUT_CASE(test_gate)\nUT_SUITE_END\n')
@@ -2084,8 +2085,8 @@ class BuildVariantTests(unittest.TestCase):
         self.assertTrue(any("brake_ecu_1ch (BRAKE_CHANNELS = 1): no proof - may be reachable there" in t for t in text),
                         text)
         line = next(g for g in gaps if g.metric == "LC" and g.line == 7)
-        self.assertIn("unreachable_code", line.detail)
-        self.assertEqual({v.variant for v in line.variant_proofs}, {"brake_ecu", "brake_ecu_1ch"})   # inherited
+        self.assertNotIn("unreachable_code", line.detail)  # macro source range is conservative
+        self.assertEqual(line.variant_proofs, [])
 
     def test_one_variant_proves_as_before(self):                                    # nothing changes with one
         layout, agent, _ = self.capture(("brake_ecu", 2))
@@ -2518,6 +2519,10 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertEqual(first.engine, "ut_search")
         self.assert_control_input(first)
         self.assertEqual(first.executions, second.executions)
+        self.assertGreater(first.executions, 0)
+        self.assertTrue(first.replayed)
+        self.assertTrue(first.execution_sources and all(v == "native JSON" for v in first.execution_sources.values()))
+        self.assertTrue(first.outcomes and all(v == "completed" for v in first.outcomes.values()))
         self.assertEqual([(i.args, i.setup, i.covers) for i in first.inputs],
                          [(i.args, i.setup, i.covers) for i in second.inputs])
 
@@ -2825,7 +2830,9 @@ class PipelineTests(unittest.TestCase):
             {"original_fragment": "return 2;", "corrected_fragment": "return 1; /* heat, see @return */",
              "rationale": "E2: @return 1 to heat"},
             {"original_fragment": "return 2;", "corrected_fragment": "return 1;", "rationale": "E2: @return 1 to heat"}])
-        with writer_brain(fix_brain):                 # its E2 test is a whole test, written by a full profile [BP-2]
+        with writer_brain(fix_brain), mock.patch.object(a3.CompilationAgent, "_source_defect_checks",
+                return_value={k: uc.ValidationCheck(status="passed", basis="independent seeded-fixture receipt")
+                              for k in uc.SOURCE_DEFECT_CHECKS}):                 # its E2 test is a whole test, written by a full profile [BP-2]
             result = self.run_pipeline(repo, "src/thermostat.c")
         print("\n" + up.report(result))
         self.assertEqual(len(result.source_fixes), 1, result.open_items)
@@ -2857,31 +2864,24 @@ class PipelineTests(unittest.TestCase):
                                     text=True).stdout
             self.assertEqual(status, "")                                         # nothing changed in the worktree
 
-    def test_a_wrong_brain_test_takes_its_values_from_the_run_when_no_source_change_exists(self):
-        """A4-23j, from the first pilot run with the remote Qwen: the brain's test sets a temperature at the edge of the
-        band and expects heating; the classification blames the source, Agent4 finds no change - the test keeps its
-        inputs and takes its values from the run (A2-21p), the run ends verified and the report keeps the item for the
-        developer."""
+    def test_unproven_source_claim_keeps_the_failure_and_original_assertion(self):
+        """REC-15: a model confidence is not proof of domain-valid inputs or framework correctness."""
         wrong = "ut_stub_read_sensor_return = 18;\nUT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);"
         tests = dict(CANNED_TESTS, thermostat_command=[{"name": "test_thermostat_heats_below_band", "scenario_ids": [],
                                                          "body": wrong, "evidence_class": "E2"}])
-        same = {"original_fragment": "return 1;", "corrected_fragment": "return 1;", "rationale": "E2: @return 1"}
         repo = copy_pilot("c_pilot", self.d)
-        with writer_brain(UTBrain(tests=tests, candidates=[same])):     # a brain that writes whole tests [BP-2]
+        with writer_brain(UTBrain(tests=tests)):
             result = self.run_pipeline(repo, "src/thermostat.c")
-        print("\n" + up.report(result))
-        self.assertEqual(result.final_state, "verified_measured", result.reason)
+        self.assertEqual(result.final_state, "incomplete", result.reason)
         self.assertEqual(result.source_fixes, [])
-        self.assertTrue(any("[A4-23j]" in item and "test_thermostat_heats_below_band" in item
-                            for item in result.open_items), result.open_items)
-        suite = (repo / "tests/test_thermostat.c").read_text()
-        self.assertIn("ut_stub_read_sensor_return = 18;", suite)                     # its inputs kept ...
-        self.assertIn("UT_EXPECT_EQ_INT(thermostat_command(20, 2), 0);", suite)      # ... its value from the run
-        self.assertEqual(sum("agent_sourcecode_corrector.candidates" in item for item in result.open_items), 1)
-        journal = Path(result.journal)                                           # LA-2: the deviation is recorded
-        self.assertTrue(journal.is_file(), result.journal)
-        self.assertIn("the test contradicts its own scenario or evidence", journal.with_suffix(".md").read_text())
-        self.assertTrue(any(line.startswith("learned (") for line in result.lessons), result.lessons)   # LA-8
+        suite = (Path(result.output_dir) / "unresolved_generated/tests/test_thermostat.c").read_text()
+        self.assertIn("ut_stub_read_sensor_return = 18;", suite)
+        self.assertIn("UT_EXPECT_EQ_INT(thermostat_command(20, 2), 1);", suite)
+        self.assertNotIn("UT_EXPECT_EQ_INT(thermostat_command(20, 2), 0);", suite)
+        self.assertTrue(result.source_validation)
+        checks = next(iter(result.source_validation.values()))
+        self.assertEqual(checks["inputs"].status, "unknown")
+        self.assertEqual(checks["framework"].status, "unknown")
 
     def test_brain_plans_the_documented_behaviour(self):
         """A1-PL1, A1-25y, A2-21m: after the deterministic tests, the brain plans a check of the stated
@@ -3397,6 +3397,9 @@ class BrainPlanningTests(unittest.TestCase):
         self.repo = copy_pilot("c_pilot", Path(self.tmp.name))
         self.agent = a1.AnalyzerAgent()
         self.layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/thermostat.c"))
+        compiler = a3.CompilationAgent()
+        self.layout = run(self.agent.dependencies(uc.DependencyRequest(
+            layout=self.layout, build=compiler.capture(uc.CaptureRequest(layout=self.layout)))))
         self.gaps = [uc.GapItem(gap_id="BC:thermostat_command:7:9:T", function="thermostat_command", metric="BC",
                                 line=7, column=9, detail="(t == SENSOR_ERROR) never true"),
                      uc.GapItem(gap_id="LC:thermostat_command:11", function="thermostat_command", metric="LC", line=11)]
@@ -3593,13 +3596,14 @@ class BrainPlanningTests(unittest.TestCase):
         self.assertTrue(all(g in {"BC:select_mode:29:10:T", "LC:select_mode:30"}
                             for s in by_fn["select_mode"] for g in s.gap_ids))
         thermo = by_fn.get("thermostat_command", [])
-        self.assertTrue(thermo and thermo[0].gap_ids == ["EVIDENCE:thermostat_command"], plan.planning)
+        self.assertTrue(thermo and len(thermo[0].gap_ids) == 1 and
+                        thermo[0].gap_ids[0].startswith("EVIDENCE:thermostat_command@"), plan.planning)
         self.assertEqual((thermo[0].expected_return, thermo[0].stub_values[0].returns), ("-1", ["SENSOR_ERROR"]))
         self.assertFalse(thermo[0].characterization)                       # normative: quoted E2 evidence
         self.assertTrue(by_fn.get("clamp_percent"), plan.planning)
         notes = " ".join(plan.planning)
         self.assertIn("args.window_open: ':1' -> '1'", notes)              # every fix recorded [ARCH-20]
-        self.assertIn("-> 'EVIDENCE:thermostat_command'", notes)
+        self.assertIn("-> 'EVIDENCE:thermostat_command@", notes)
 
     def test_format_fixes_never_change_content(self):
         """ARCH-20: only noise is removed; what is left is checked by the unchanged strict checks."""
@@ -3750,7 +3754,8 @@ class BrainPlanningTests(unittest.TestCase):
         with brain(UTBrain(links=links)):
             layout.requirement_links = run(self.agent._link_requirements(layout))
         self.assertEqual([(l.requirement_id, l.function) for l in layout.requirement_links],
-                         [("REQ-TH-9", "thermostat_command")])                             # A1-PL13
+                         [("REQ-TH-9", "thermostat_command"), ("REQ-TH-9", "clamp_percent")])  # canonical text, never the model copy
+        self.assertTrue(all("heater shall stay off" in link.quote for link in layout.requirement_links))
         ev = self.agent.collect_evidence(layout, "thermostat_command").evidence
         linked = [e for e in ev if e.linked_by]
         self.assertEqual(len(linked), 1)
@@ -4245,7 +4250,10 @@ class RepositoryTests(unittest.TestCase):
         fix = UTBrain(patch={"original_fragment": "return 2;", "corrected_fragment": "return 1;",
                              "rationale": "E2: @return 1 to heat"})
         with mock.patch.dict(os.environ, {"UT_TEST_PR_TOKEN": "s3cr3t-token", "NO_PROXY": "127.0.0.1",
-                                          "no_proxy": "127.0.0.1"}), writer_brain(fix):
+                                          "no_proxy": "127.0.0.1"}), writer_brain(fix), mock.patch.object(
+                a3.CompilationAgent, "_source_defect_checks", return_value={
+                    k: uc.ValidationCheck(status="passed", basis="independent seeded-fixture receipt")
+                    for k in uc.SOURCE_DEFECT_CHECKS}):
             result = self.run_repo(url, ["src/thermostat.c"], repositories=settings)
         server.shutdown()
         server.server_close()
@@ -4590,29 +4598,17 @@ class HandOverTests(unittest.TestCase):
             self.assertTrue(item.strategies, item)
         self.assertLessEqual(sum(1 for i in result.iterations if i.stage == "verify"), 3)   # COV-9
         self.assertTrue(result.action_needed)                                               # COV-11
-        self.assertEqual(len(result.suggestions), 1, (result.suggestions, result.open_items))   # COV-13
-        self.assertIn("dead code", result.suggestions[0])
-        self.assertIn("compared mutants still detected", result.suggestions[0])            # COV-17, COV-18
-        self.assertNotIn("without requirements", result.suggestions[0])                     # cites GRD-1 [COV-12]
-        self.assertFalse(any("Provide the requirement documents" in a for a in result.action_needed))
-        patches = list((Path(result.output_dir) / "coverage_suggestions").glob("*.patch"))
-        self.assertEqual(len(patches), 1)
-        patch = patches[0].read_text()
-        self.assertIn("-            return -1;", patch)
-        self.assertIn("not applied, not committed, not counted as coverage", patch)
-        self.assertIn("Fault detection:", patch)                                            # COV-18
-        record = uc.FaultCheckResult.model_validate_json(patches[0].with_suffix(".faults.json").read_text())
-        self.assertEqual(record.decision, "kept")
-        self.assertTrue(record.mutants and record.operators)
-        self.assertTrue(any("cov-" in n and "not shown" in n and "[COV-13]" in n for n in result.open_items),
-                        result.open_items)                                                  # the guess is not shown
+        self.assertEqual(result.suggestions, [])  # an unreachable proof does not justify a source patch
+        self.assertTrue(result.defect_candidates)
+        self.assertTrue(all(not item.change for item in result.defect_candidates))
+        self.assertFalse(list((Path(result.output_dir) / "coverage_suggestions").glob("*.patch")))
         self.assertEqual((self.repo / "src/guard.c").read_text(), GUARD_C)                # COV-7: never applied
         for title in ("## Coverage targets: ASIL D (default)", "## Action needed", "## Items not reached: evidence",
-                      "## Source-change suggestions"):
+                      "## Defect candidates [A1-37f]"):
             self.assertIn(title, text)
         self.assertNotIn("xclusion", text)
         self.assertIn("| MCDC | 0 | 0 | NA | not applicable |", text)                       # guard.c has no such decision
-        self.assertTrue(any("could not reach the ITEMS NOT REACHED" in c for c in b.generate_calls))
+        self.assertFalse(any("could not reach the ITEMS NOT REACHED" in c for c in b.generate_calls))
 
     def test_without_a_brain_the_run_is_not_started(self):
         """ARCH-24, ORC-34: the brain plans; without one the run does not start and nothing is written."""
@@ -5529,7 +5525,13 @@ class UssPilotFixTests(unittest.TestCase):
                                line_end=end, params=[uc.ParamInfo(name=param, type=ptype, kind="int")])
 
     def test_an_else_if_branch_needs_every_earlier_condition_false(self):            # A1-37
+        import hashlib
         fn = self.fn()
+        # Compiler branch ranges, rather than a text-based else/if stack.
+        fn.control_source_sha256 = hashlib.sha256(self.BODY.encode()).hexdigest()
+        fn.control_regions = [uc.ControlRegion(start_line=a, end_line=b, start_column=1, end_column=99, condition=c)
+            for a, b, c in [(3, 5, "(a > 10) is true"), (5, 9, "(a > 10) is false"),
+                             (5, 7, "(a > 5) is true"), (7, 9, "(a > 5) is false")]]
         self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 4), ["(a > 10) is true"])
         self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 6), ["(a > 10) is false", "(a > 5) is true"])
         self.assertEqual(a1.enclosing_conditions(self.BODY, fn, 8), ["(a > 10) is false", "(a > 5) is false"])
@@ -5550,14 +5552,14 @@ class UssPilotFixTests(unittest.TestCase):
         self.assertTrue(proof)
         d = a1.defect_candidate(wrong, "DC", None, "F", fn, constants, [], "", proof, lines, 5)
         self.assertIsNotNone(d)
-        self.assertEqual(d.change, wrong + " -> (d >= MIN_LEVEL) && (d <= MAX_LEVEL)")
+        self.assertEqual(d.change, "")  # a proof is a review hypothesis, not an operator correction
         self.assertIn("inside sensor range", d.evidence)
         right = "(d >= MIN_LEVEL) && (d <= MAX_LEVEL)"                                 # correct: nothing proven
         self.assertEqual(a1.prove_infeasible(right, "DC", None, "F", fn, constants), "")
         redundant = "(d >= 0) || (d < 0)"                                              # swapped it is never true
         proof = a1.prove_infeasible(redundant, "DC", None, "F", fn, constants)
         self.assertTrue(proof)
-        self.assertIsNone(a1.defect_candidate(redundant, "DC", None, "F", fn, constants, [], "", proof, lines, 5))
+        self.assertIsNotNone(a1.defect_candidate(redundant, "DC", None, "F", fn, constants, [], "", proof, lines, 5))
 
     def test_a_quote_written_as_text_is_its_evidence_id_and_words(self):            # A1-PL3, ARCH-20b
         for text in ("EV-f-1: returns -1 on error", "[EV-f-1] returns -1 on error", 'EV-f-1 "returns -1 on error"'):
@@ -5656,6 +5658,9 @@ class TargetsAndFamiliesTests(unittest.TestCase):
         shutil.copytree(up.CONSTRUCTS / "c_function_family", self.repo)
         self.agent = a1.AnalyzerAgent()
         self.layout = self.agent.discover(uc.DiscoverRequest(repo_root=str(self.repo), sut_file="src/doors.c"))
+        compilation = a3.CompilationAgent()
+        self.layout = run(self.agent.dependencies(uc.DependencyRequest(
+            layout=self.layout, build=compilation.capture(uc.CaptureRequest(layout=self.layout)))))
         self.text = (self.repo / "src/doors.c").read_text()
 
     def tearDown(self):
@@ -7742,6 +7747,290 @@ def parallel_main(workers: int) -> int:
         return 1
     print("Summary: OK" + (f" ({extra})" if extra else ""))
     return 0
+
+
+
+class EvidenceProofRecoveryTests(unittest.TestCase):
+    """REC-14..18: unknown is not proof; measured counterexamples override static hypotheses."""
+    def setUp(self):
+        self.tmp = tmpdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def layout(self, name="c_control_proof", sut="src/path.c"):
+        return CorpusAnswerTests._layout(None, up.CONSTRUCTS / name, {"sut": sut}, str(self.root))
+
+    def test_missing_metadata_is_not_characterization(self):
+        repo = copy_pilot("c_pilot", self.root)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        agent = a3.CompilationAgent()
+        t = uc.TestResult(name="test_clamp_percent", status="failed", message="expected 1")
+        for explicit, expected in ((None, "undetermined"), ("E8", "test_generation_defect")):
+            action = uc.FileAction(path="tests/t.c", action="create", role="testsuite", content="",
+                                   evidence_classes={t.name: explicit} if explicit else {})
+            req = uc.VerifyRequest(layout=layout, stage="verify", bundle=uc.FileActionBundle(bundle_id="b", actions=[action]))
+            [failure] = agent._classify_tests(layout, [t], repo, req)
+            self.assertEqual(failure.classification, expected)
+            self.assertNotIn(a3.NEEDS_BRAIN, failure.evidence)
+
+    def test_model_confidence_and_cached_answers_cannot_replace_independent_checks(self):
+        repo = copy_pilot("c_pilot", self.root)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        agent = a3.CompilationAgent()
+        test = uc.TestResult(name="test_clamp_percent", status="failed")
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(path="tests/t.c", action="create",
+            role="testsuite", content="UT_TEST(test_clamp_percent) { UT_EXPECT_EQ_INT(clamp_percent(2), 1); }")])
+        req = uc.VerifyRequest(layout=layout, stage="verify", bundle=bundle)
+        answer = ({"choice": "source_behavior_defect", "probabilities": {"source_behavior_defect": 0.99}}, "qwen", "cached")
+        for missing in [None, *uc.SOURCE_DEFECT_CHECKS]:
+            failure = uc.Failure(failure_id="f", kind="test", classification="undetermined", route="agent1",
+                affected_test=test.name, affected_function="clamp_percent", evidence=[a3.NEEDS_BRAIN])
+            result = measured(layout, [], tests=[test]).model_copy(update={"failures": [failure]})
+            checks = {k: uc.ValidationCheck(status="passed", basis="independent fixture receipt")
+                      for k in uc.SOURCE_DEFECT_CHECKS}
+            if missing:
+                checks[missing] = uc.ValidationCheck(status="unknown", basis="receipt absent")
+            with mock.patch.object(agent, "_analysed", new=mock.AsyncMock(return_value=answer)), \
+                    mock.patch.object(agent, "_source_defect_checks", return_value=checks):
+                refined = run(agent._refine(result, req))
+            self.assertEqual(refined.failures[0].classification, "undetermined" if missing else "source_behavior_defect")
+        actual = agent._source_defect_checks(result, req, failure, uc.test_sources(uc.suite_of(bundle)))
+        self.assertEqual(actual["inputs"].status, "unknown")
+        self.assertEqual(actual["framework"].status, "unknown")
+        compile_guess = ({"choice": "source_compilation_defect", "probabilities": {"source_compilation_defect": 0.99}},
+                         "qwen", "cached")
+        failure.evidence.append(a3.NEEDS_BRAIN)
+        with mock.patch.object(agent, "_analysed", new=mock.AsyncMock(return_value=compile_guess)):
+            guessed = run(agent._refine(result, req))
+        self.assertEqual(guessed.failures[0].classification, "undetermined")
+        self.assertIn("no compiler diagnostic", " ".join(guessed.failures[0].evidence))
+
+    def test_unknown_failure_keeps_its_assertion(self):
+        s = types.SimpleNamespace(open_items=set())
+        f = uc.Failure(failure_id="f", kind="test", classification="source_behavior_defect", route="agent4")
+        up.Orchestrator._back_to_the_test(s, f)
+        self.assertEqual(f.classification, "undetermined")
+        self.assertIn("assertion is retained", f.diagnostic)
+        self.assertTrue(s.open_items)
+        state = up.RunState(uc.PipelineRequest(repo_root=str(self.root), sut_file="f.c"),
+                            self.root, self.root / "out", self.root)
+        f.affected_test = "test_pending"
+        up.Orchestrator._back_to_the_test(state, f)
+        final = state.finish("verified_measured", "earlier coverage was measured")
+        self.assertEqual(final.final_state, "incomplete")
+        self.assertIn("earlier coverage was measured", final.reason)
+        self.assertIn("test_pending", state.unresolved_failures)
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_compiler_regions_respect_else_if_and_switch_fallthrough(self):
+        layout = self.layout()
+        fn = next(f for f in layout.functions if f.name == "route_value")
+        source = uc.read_source(Path(layout.repo_root) / layout.sut_file)
+        self.assertTrue(fn.from_frontend)
+        guards = a1.enclosing_conditions(source, fn, 12)
+        self.assertEqual(guards, ["(value < 0) is false", "(value < 10) is true", "(value >= 0) is true"])
+        self.assertFalse(any("mode" in g for g in guards))
+        self.assertEqual(a1.enclosing_conditions(source + "\n", fn, 12), [])
+        # The observed value 1 reaches both case labels: no contradictory conjunction.
+        self.assertEqual(a1.prove_infeasible("value >= 0", "DC", None, "T", fn, {}, guards[:-1]), "")
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_execution_refutes_a_certificate_and_its_inherited_line_proofs(self):
+        layout = self.layout()
+        source = uc.read_source(Path(layout.repo_root) / layout.sut_file)
+        agent = a1.AnalyzerAgent()
+        g = uc.GapItem(gap_id="LC:route_value:12", function="route_value", metric="LC", line=12,
+                       detail="unreachable_code: old hypothesis", proof_origin_line=11)
+        context = uc.execution_context(layout)
+        agent._proof_history = {context: {g.gap_id: g}}
+        agent._proof_refuted, agent._proof_refutations = {}, []
+        last = measured(layout, [])
+        last.coverage.covered_items = ["LC:12"]
+        agent._gaps(layout, last, source)
+        self.assertEqual(agent._proof_refutations, [g.gap_id])
+        self.assertIn(11, agent._proof_refuted[context])
+        state = up.RunState(uc.PipelineRequest(repo_root=layout.repo_root, sut_file=layout.sut_file),
+                            Path(layout.repo_root), self.root / "out", Path(layout.repo_root))
+        state.proofs[g.gap_id] = "old hypothesis"
+        state.final_items.add(g.gap_id)
+        state.take_plan(uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="counterexample",
+                                 refuted_proofs=[g.gap_id]))
+        self.assertNotIn(g.gap_id, state.proofs)
+        self.assertNotIn(g.gap_id, state.final_items)
+
+    def test_an_unsupported_control_structure_has_no_textual_proof_fallback(self):
+        source = "int x(int a) { if (a < 0) { case 1: return a; } return 0; }"
+        fn = uc.FunctionInfo(name="x", qualified_name="x", file="x.c", signature="int x(int a)", line_start=1, line_end=1)
+        self.assertEqual(a1.enclosing_conditions(source, fn, 1, 44), [])
+        self.assertEqual(a1.compiler_control_regions({"kind": "FunctionDecl", "inner": [{"kind": "GotoStmt"}]}, source.encode()), [])
+
+    def test_each_behavior_obligation_needs_its_own_passing_assertion(self):
+        agent = a1.AnalyzerAgent()
+        refs = [uc.EvidenceRef(evidence_id="EV-status-" + str(n), evidence_class="E1", source="requirements.md",
+                               line=n, text="REQ-S0" + str(n) + ": expected behavior") for n in (1, 2)]
+        first = uc.behavior_item("status_value", refs[0])
+        suite = ("/* evidence: E1 */\nUT_TEST(test_negative) { /* obligations: " + first + " */\n"
+                 "/* EV-status-1 EV-status-2 */ UT_EXPECT_EQ_INT(status_value(-2), -1); }\n")
+        counts = agent._asserted_evidence(refs, "status_value", suite, {"test_negative"})
+        self.assertEqual(counts, {"EV-status-1": ["test_negative"], "EV-status-2": []})
+        self.assertEqual(agent._asserted_evidence(refs, "status_value", suite, set()),
+                         {"EV-status-1": [], "EV-status-2": []})
+        ambiguous = suite.replace("/* obligations: " + first + " */", "")
+        self.assertEqual(agent._asserted_evidence(refs, "status_value", ambiguous, {"test_negative"}),
+                         {"EV-status-1": [], "EV-status-2": []})
+
+    def test_more_than_sixty_functions_and_failing_tests_do_not_disable_search(self):
+        repo = copy_pilot("c_pilot", self.root)
+        layout = a1.AnalyzerAgent().discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        gaps = [uc.GapItem(gap_id=f"LC:f{n}:{n+1}", function=f"f{n}", metric="LC", line=n+1) for n in range(70)]
+        result = measured(layout, gaps, tests=[uc.TestResult(name="test_bad", status="failed")])
+        state = up.RunState(uc.PipelineRequest(repo_root=str(repo), sut_file=layout.sut_file), repo, self.root / "out", repo)
+        state.bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(path="tests/t.c", action="create",
+            role="testsuite", content="UT_TEST(test_bad) { UT_EXPECT_EQ_INT(0, 1); }\nUT_TEST(test_good) { UT_EXPECT_EQ_INT(1, 1); }")])
+        orch = up.Orchestrator.__new__(up.Orchestrator)
+        orch.layout = layout
+        orch.cfg = up.PipelineConfig(fuzz_budget_seconds=70, fuzz_seconds=1, fuzz_functions_per_batch=8)
+        batches = []
+        async def call(role, method, req, kind):
+            self.assertEqual((role, method), ("compilation", "fuzz"))
+            self.assertNotIn("test_bad", uc.suite_of(req.bundle))
+            self.assertIn("test_good", uc.suite_of(req.bundle))
+            batches.extend(req.functions)
+            return uc.FuzzResult(engine="ut_search", functions=req.functions, executions=len(req.functions),
+                                 outcomes={fn: "completed" for fn in req.functions})
+        orch.call = call
+        searched = run(orch._fuzz(state, result))
+        self.assertEqual(batches, [f"f{n}" for n in range(70)])
+        self.assertEqual(searched.executions, 70)
+        self.assertEqual(len(state.fuzzed), 70)
+        self.assertIn("test_bad", uc.suite_of(state.bundle))
+        self.assertIsNone(run(orch._fuzz(state, result)))
+
+    def test_native_search_requires_structured_execution_receipts(self):
+        self.assertEqual(a3.search_execution_count('UT_SEARCH_STATS|{"executions":127}\n'), 127)
+        for text in ("stat::number_of_executed_units: 50", 'UT_SEARCH_STATS|{"executions":true}',
+                     'UT_SEARCH_STATS|{"executions":-1}', "UT_SEARCH_STATS|broken"):
+            self.assertIsNone(a3.search_execution_count(text))
+
+    def test_every_requirement_page_is_linked_using_canonical_source_text(self):
+        repo = copy_pilot("c_pilot", self.root)
+        (repo / "requirements.md").write_text("\n".join(
+            f"REQ-P-{n}: Behavior clause {n} shall be checked." for n in range(1, 77)))
+        agent = a1.AnalyzerAgent()
+        layout = agent.discover(uc.DiscoverRequest(repo_root=str(repo), sut_file="src/thermostat.c"))
+        asked = []
+        async def generate(task, context, schema, **kwargs):
+            text = "\n".join(part.text for part in context)
+            ids = re.findall(r"^- (REQ-P-\d+):", text, re.M)
+            asked.extend(ids)
+            return a1.LinkAnswers(links=[a1.LinkAnswer(requirement_id=rid, functions=["F1"],
+                quote="a paraphrase the agent must not store", probability=0.9) for rid in ids])
+        with mock.patch.object(agent, "generate", side_effect=generate):
+            layout.requirement_links = run(agent._link_requirements(layout))
+        self.assertEqual(len(layout.requirement_links), 76)
+        self.assertEqual(set(asked), {f"REQ-P-{n}" for n in range(1, 77)})
+        self.assertTrue(all("shall be checked" in item.quote for item in layout.requirement_links))
+        report = agent.requirement_status(uc.RequirementStatusRequest(layout=layout))
+        self.assertEqual(sum("not asserted" in line and "REQ-P-" in line for fn in report.functions for line in fn.requirements), 76)
+        self.assertEqual(report.unlinked, [])
+        layout.requirement_links.pop()
+        self.assertEqual(len(agent.requirement_status(uc.RequirementStatusRequest(layout=layout)).unlinked), 1)
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_infeasibility_is_reviewed_against_comment_evidence_without_an_operator_fix(self):
+        layout = self.layout("c_range_operator", "src/level.c")
+        source = uc.read_source(Path(layout.repo_root) / layout.sut_file)
+        g = uc.GapItem(gap_id="DC:level_valid:6:5", function="level_valid", metric="DC", line=6, column=5,
+                       observed=["decision=T"])
+        agent = a1.AnalyzerAgent()
+        gaps = agent._gaps(layout, measured(layout, [g]), source)
+        self.assertTrue(gaps[0].defect)
+        self.assertEqual(gaps[0].defect.change, "")
+        self.assertIn("inside sensor range", gaps[0].defect.evidence)
+        ev = agent.collect_evidence(layout, "level_valid").evidence
+        self.assertTrue(any(e.evidence_class == "E6" and "inside sensor range" in e.text for e in ev))
+        scenarios = agent._evidence_scenarios(layout, uc.PlanRequest(layout=layout))
+        self.assertTrue(any(e.linked_by == "implementation comment hypothesis" for sc in scenarios for e in sc.evidence))
+
+    def test_search_security_block_is_visible_and_propagates(self):
+        agent = a3.CompilationAgent()
+        fn = uc.FunctionInfo(name="f", qualified_name="f", signature="int f(void)", file="f.c", line_start=1, line_end=1)
+        result = uc.FuzzResult(engine="ut_search")
+        with mock.patch.object(agent, "emit") as emit:
+            with self.assertRaises(ba.AgentFault) as fault:
+                with agent._search_progress(result, fn, "ut_search"):
+                    raise ba.AgentFault("ENVIRONMENT_BLOCKED", "scanner denied execution")
+        self.assertEqual(fault.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertEqual(result.outcomes, {"f": "blocked"})
+        self.assertEqual([call.kwargs["data"]["state"] for call in emit.call_args_list], ["started", "blocked"])
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_cpp_instance_method_runs_native_search_with_its_object_recipe(self):
+        layout = self.layout("cpp_search_support", "src/drive.cpp")
+        fn = next(fn for fn in layout.functions if fn.qualified_name == "Drive::step")
+        agent = a3.CompilationAgent(config=a3.CompilationConfig(work_dir=str(self.root / "search"),
+            search_executions=256, max_fuzz_replays=8))
+        chain = agent.toolchain()
+        plan = uc.UTPlan(plan_id="p", layout=layout, stage="coverage", reason="search support")
+        stub_path, _, header = a2.render_stubs(plan)
+        bundle = uc.FileActionBundle(bundle_id="b", actions=[uc.FileAction(
+            path=stub_path.rsplit(".", 1)[0] + ".h", role="helper", action="create", content=header)])
+        with mock.patch.object(chain.tools, "fuzzer", False), mock.patch.object(agent, "emit") as emit:
+            result = agent.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=[fn.name], seconds=1))
+        self.assertIn(fn.qualified_name, result.functions, result.unsupported)
+        self.assertGreater(result.executions, 0)
+        self.assertEqual(result.execution_sources[fn.qualified_name], "native JSON")
+        self.assertGreater(result.replayed, 0)
+        self.assertEqual(result.outcomes[fn.qualified_name], "completed")
+        stages = [call.kwargs.get("data", {}).get("state") for call in emit.call_args_list]
+        self.assertIn("started", stages)
+        self.assertIn("completed", stages)
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_bad_expectation_keeps_inputs_and_gets_bounded_behavior_feedback(self):
+        layout = self.layout("c_requirement_obligations", "src/status.c")
+        agent = a1.AnalyzerAgent()
+        [fn] = layout.functions
+        evidence = agent._behavior_evidence(layout, agent.collect_evidence(layout, fn.name).evidence)
+        ev = next(e for e in evidence if e.evidence_class == "E1")
+        target = uc.behavior_item(fn.name, ev)
+        good = planned(gap_ids=[target], name="test_negative_requirement", purpose="assert the negative requirement",
+            args=[{"name": "value", "value": "-2"}], expected_return="-1", classification="confirmed_gap",
+            evidence_ids=[ev.evidence_id], quotes=[{"evidence_id": ev.evidence_id, "text": ev.text}])
+        wrong = dict(good, quotes=[{"evidence_id": ev.evidence_id, "text": "invented expectation"}])
+        replies, contexts = [[wrong], [good]], []
+        def reply(context):
+            contexts.append(context)
+            return replies.pop(0) if replies else []
+        notes = {"planning": [], "lookups": [], "conflicts": []}
+        with brain(UTBrain(plans={fn.name: reply})):
+            scenarios = run(agent._brain_scenarios(fn, [], {target}, set(), layout,
+                uc.PlanRequest(layout=layout, last=measured(layout, []), iteration=2),
+                uc.read_source(Path(layout.repo_root) / layout.sut_file), [], evidence, notes))
+        self.assertEqual(len(contexts), 2)
+        self.assertIn("obligation remains open", contexts[1])
+        self.assertTrue(any(sc.characterization and not sc.gap_ids for sc in scenarios))
+        self.assertTrue(any(not sc.characterization and sc.gap_ids == [target] for sc in scenarios))
+
+    @unittest.skipIf(TOOLCHAIN_SKIP, TOOLCHAIN_SKIP or "")
+    def test_a_branch_proof_does_not_cover_a_statement_after_its_closing_brace(self):
+        layout = self.layout()
+        source = uc.read_source(Path(layout.repo_root) / layout.sut_file)
+        lines = source.splitlines()
+        decision = lines.index("        if (value < 0) {") + 1
+        inside = lines.index("            value = 4;") + 1
+        after = lines.index("        } value = 7;") + 1
+        col = lines[after - 1].index("value") + 1
+        gaps = [uc.GapItem(gap_id=f"DC:route_after:{decision}:9", function="route_after", metric="DC",
+                          line=decision, column=9, observed=["decision=F"]),
+                uc.GapItem(gap_id=f"SC:route_after:{inside}:13", function="route_after", metric="SC",
+                          line=inside, column=13),
+                uc.GapItem(gap_id=f"SC:route_after:{after}:{col}", function="route_after", metric="SC",
+                          line=after, column=col)]
+        checked = a1.AnalyzerAgent()._gaps(layout, measured(layout, gaps), source)
+        self.assertIn("infeasible_outcome", checked[0].detail)
+        self.assertIn("unreachable_code", checked[1].detail)
+        self.assertNotIn("unreachable_code", checked[2].detail)
 
 
 if __name__ == "__main__":

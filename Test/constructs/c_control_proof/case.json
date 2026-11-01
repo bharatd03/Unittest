@@ -1,0 +1,45 @@
+{
+  "construct": "C compiler-backed control regions: else-if and switch fallthrough",
+  "sut": "src/path.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "route_value",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "1"
+            },
+            {
+              "name": "mode",
+              "value": "0"
+            }
+          ]
+        },
+        "reaches": [
+          "result += 2;"
+        ]
+      },
+      {
+        "function": "route_after",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "2"
+            }
+          ]
+        },
+        "reaches": [
+          "return value;"
+        ]
+      }
+    ]
+  }
+}

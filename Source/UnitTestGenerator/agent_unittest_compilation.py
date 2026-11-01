@@ -941,7 +941,21 @@ def _run(cmd: list[str], cwd: Path, timeout: float, env: dict[str, str] | None =
             return -126, f"{Path(cmd[0]).name}: the command line is too long for Windows ({len(subprocess.list2cmdline(cmd))} characters)"
         return -127, f"tool not found: {cmd[0]}"
     except OSError as exc:
+        if hint := blocked_hint(-126, str(exc), Path(cmd[0])):
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)                 # REC-18: every native tool
         return -126, f"{cmd[0]}: {exc}"
+
+
+def search_execution_count(text: str) -> int | None:
+    for line in reversed(text.splitlines()):
+        if not line.startswith("UT_SEARCH_STATS|"):
+            continue
+        try:
+            count = json.loads(line.split("|", 1)[1]).get("executions")
+            return count if type(count) is int and 0 <= count < 2 ** 64 else None
+        except (ValueError, AttributeError):
+            return None
+    return None
 
 
 def _first_messages(outputs: list[str], limit: int) -> list[str]:
@@ -2067,6 +2081,7 @@ static void found_problem(const char *kind) {
     char name[64];
     snprintf(name, sizeof name, "../%s-%llu", kind, execs);
     if (current) save(name, current, current_len);
+    printf("UT_SEARCH_STATS|{\"executions\":%llu}\n", execs);
     printf("stat::number_of_executed_units: %llu\nstat::%s: 1\n", execs, kind);
     fflush(stdout);
 }
@@ -2308,6 +2323,7 @@ int main(int argc, char **argv) {
         for (k = 0; k < n; ++k) mutate(buf, len);
         if (run_one(buf, len)) keep(buf, len, 1);
     }
+    printf("UT_SEARCH_STATS|{\"executions\":%llu}\n", execs);
     printf("stat::number_of_executed_units: %llu\nstat::corpus_size: %u\nstat::counters: %u\nstat::mcdc_bitmap_bytes: %u\n",
            execs, (unsigned)corpus_n, (unsigned)n_cnt, (unsigned)n_bm);
     return 0;
@@ -4308,11 +4324,14 @@ class CompilationAgent(ba.AgentCore):
         for t in tests:
             if t.status == "passed":
                 continue
-            evidence_class = classes.get(t.name, "E8")
-            ev = [f"result: {t.status}", f"assertion: {t.message}", f"evidence class: {evidence_class}"]
+            evidence_class = classes.get(t.name, "")
+            ev = [f"result: {t.status}", f"assertion: {t.message}", f"evidence class: {evidence_class or 'missing'}"]
             if t.name in characterization or evidence_class == "E8":
                 # A1-25g: a characterization test can never prove a source defect.
                 category, confidence, deterministic = "test_generation_defect", 1.0, True
+            elif evidence_class not in {f"E{i}" for i in range(1, 8)}:
+                category, confidence, deterministic = "undetermined", 0.0, True
+                ev.append("missing evidence provenance; restore metadata before attributing the failure [A3-163, REC-14]")
             elif t.name in linked:
                 # A3-CL11: its expectation rests on a link the brain made; not enough to blame the source.
                 category, confidence, deterministic = "requirement_mismatch", 1.0, True
@@ -4737,12 +4756,68 @@ class CompilationAgent(ba.AgentCore):
                 failure.evidence.append(f"brain unavailable: {exc.code}")
                 continue
             choice, p = answer["choice"], answer["probabilities"][answer["choice"]]
-            if choice == "source_behavior_defect" and p < 0.8:
-                choice = "undetermined"                    # A4-23b: not on the brain's word alone
+            proposed, model_probability = choice, p
+            if choice == "source_compilation_defect":
+                # This path refines runtime test failures, not compiler diagnostics [REC-15].
+                failure.evidence.append("no compiler diagnostic establishes a source compilation defect [REC-15]")
+                choice, p = "undetermined", 0.0
+            elif choice == "source_behavior_defect":
+                failure.source_checks = self._source_defect_checks(result, req, failure, codes)
+                missing = [name for name in uc.SOURCE_DEFECT_CHECKS if name not in failure.source_checks or
+                           failure.source_checks[name].status != "passed"]
+                if missing or p < 0.8:
+                    failure.evidence.append("source-defect hypothesis held undetermined: " + ", ".join(missing)
+                                            + " [A3-170, REC-15]")
+                    choice = "undetermined"
+                    p = 0.0
             failure.classification, failure.confidence = choice, p
             failure.route = uc.ROUTES[choice]
-            failure.evidence.append(f"brain: {brain} p={p:.2f}{cached}")
+            failure.evidence.append(f"brain hypothesis: {proposed}; {brain} p={model_probability:.2f}{cached}; "
+                                    f"accepted classification: {choice}")
         return result
+
+    def _source_defect_checks(self, result: uc.VerificationResult, req: uc.VerifyRequest, failure: uc.Failure,
+                              codes: dict[str, str]) -> dict[str, uc.ValidationCheck]:
+        """Independent facts, never probabilities. Unsupported semantic checks stay unknown [REC-15].
+
+        A compile proves ABI consistency, not domain-valid inputs, stub behavior or a correct oracle. Providers
+        implementing stronger project contracts can extend these checks; the model cannot supply these receipts.
+        """
+        unknown = lambda why: uc.ValidationCheck(status="unknown", basis=why)
+        passed = lambda why: uc.ValidationCheck(status="passed", basis=why)
+        checks = {
+            "interface": unknown("no compiler-backed interface association"),
+            "inputs": unknown("no independent verification of the input-domain preconditions"),
+            "expected_behavior": unknown("no independently anchored normative expectation"),
+            "stubs": unknown("required stub behavior has not been independently validated"),
+            "framework": unknown("no independent framework self-test receipt for this build"),
+            "sut_origin": unknown("no per-test execution evidence tying the failure to the SUT"),
+        }
+        fn = uc.function_of(failure.affected_function, req.layout)
+        if fn and fn.from_frontend and result.build_ok and result.link_ok and failure.affected_test in codes:
+            checks["interface"] = passed("compiler-derived SUT interface and successfully linked failing test")
+        refs = [e for a in (req.bundle.actions if req.bundle else [])
+                for e in a.evidence_refs.get(failure.affected_test, []) if e.evidence_class in ("E1", "E2", "E3")
+                and not e.linked_by]
+        for e in refs:
+            path = Path(req.layout.repo_root) / e.source
+            if not uc.safe_relpath(e.source) or not path.is_file():
+                continue
+            lines = uc.read_source(path).splitlines()
+            words = lambda s: " ".join(re.findall(r"\w+", s))
+            window = "\n".join(lines[max(0, e.line - 5):e.line + 24])
+            if words(e.text) and words(e.text) in words(window):
+                checks["expected_behavior"] = passed(f"explicit Agent1 {e.evidence_class} anchor {uc.evidence_key(e)}")
+                break
+        deps = req.layout.dependencies
+        if deps is not None and not deps.estimated and not any(e.decision == "stub" for e in deps.entries):
+            checks["stubs"] = passed("captured dependency plan has no required substituted dependency")
+        if fn and result.coverage and result.coverage.measured:
+            items = result.test_items.get(failure.affected_test)
+            if items is not None and any(i.startswith("LC:") and i.split(":")[1].isdigit() and
+                                         fn.line_start <= int(i.split(":")[1]) <= fn.line_end for i in items):
+                checks["sut_origin"] = passed("per-test profile executed the associated SUT function")
+        return checks
 
     async def _analysed(self, step: str, layout: uc.LayoutProfile, facts: str, choices: set[str], ask, question: str
                         ) -> tuple[dict[str, Any], str, str]:
@@ -4797,6 +4872,8 @@ class CompilationAgent(ba.AgentCore):
         try:
             chain = self.toolchain()
         except ba.AgentFault as exc:
+            if exc.code == "ENVIRONMENT_BLOCKED":
+                raise
             return uc.FuzzResult(reason=exc.message)
         engine = "libFuzzer" if chain.tools.fuzzer else "ut_search"
         layout = req.layout
@@ -4828,13 +4905,30 @@ class CompilationAgent(ba.AgentCore):
         objects = []
         for index, src in enumerate(sources):
             rel = str(src.relative_to(repo)).replace("\\", "/") if src.is_relative_to(repo) else ""
-            flags = uc.expand_flags(entries[rel].flags, repo) if rel in entries else sut_flags + std
-            out = support / f"{index:02d}_{src.stem}.o"
             unit_cpp = src.suffix in (".cpp", ".cc", ".cxx")
+            # The support TU has its own language; the SUT may be C++ while this unit is C [REC-18].
+            inherited, skip = [], False
+            for flag in sut_flags:
+                if skip:
+                    skip = False
+                    continue
+                if flag == "-x":
+                    skip = True
+                elif not flag.startswith(("-std=", "-x")):
+                    inherited.append(flag)
+            flags = uc.expand_flags(entries[rel].flags, repo) if rel in entries else [
+                *inherited, f"-std={self.cfg.cxx_std if unit_cpp else self.cfg.c_std}"]
+            out = support / f"{index:02d}_{src.stem}.o"
             code, text = _run([chain.cxx if unit_cpp else chain.cc, "-c", str(src), "-o", str(out), "-g", "-w",
                                *chain.compile_flags(unit_cpp), *flags, *incs], repo, self.cfg.compile_timeout, chain.env())
             if code != 0:
-                return uc.FuzzResult(reason=f"support file {src.name} does not compile: {text.strip()[-300:]}")
+                reason = f"support file {src.name} does not compile: {text.strip()[-300:]}"
+                LOG.error("Search support build failed: %s", reason)
+                self.emit("stage", data={"stage": "search", "state": "support_build_failed"},
+                          summary="UT-Compilation: search support build failed")
+                return uc.FuzzResult(engine=engine, reason=reason,
+                    outcomes={f: "support_build_failed" for f in req.functions},
+                    unsupported=[f"{f}: {reason}" for f in req.functions])
             objects.append(str(out))
         controls = self._controls(layout, repo, actions)
         gaps_by_fn: dict[str, list[uc.GapItem]] = {}
@@ -4842,89 +4936,118 @@ class CompilationAgent(ba.AgentCore):
             gaps_by_fn.setdefault(g.function, []).append(g)
         covered = set(req.covered)
         for fn in [f for f in layout.functions if f.name in req.functions or f.qualified_name in req.functions]:
-            body = "\n".join((repo / layout.sut_file).read_text(encoding="utf-8", errors="replace").splitlines()
-                              [fn.line_start - 1: fn.line_end])
-            calls = {c.replace("::", "_") for c in fn.calls}
-            driven = {c.name + "()" for _, c in uc.project_controls(fn, layout)} | {   # A2-21ak, A3-FZ13
-                c.name for _, c in uc.project_controls(fn, layout) if c.kind == "variable"}
-            used = [(n, t) for n, t in controls if n in driven or (n.startswith("ut_stub_") and n[8:-7] in calls) or
-                    (not n.startswith("ut_stub_") and not n.endswith("()") and
-                     re.search(r"\b" + re.escape(n.split("::")[-1]) + r"\b", body))]
-            plan = FuzzPlan(fn, layout, used, self.cfg.stub_call_budget)
-            plan.body = body
-            source = plan.build(repo / layout.sut_file)
-            if source is None:
-                result.unsupported.append(f"{fn.qualified_name}: {plan.problem}")
-                continue
-            d = run_dir / ("fz_" + re.sub(r"\W", "_", fn.qualified_name))
-            d.mkdir(parents=True, exist_ok=True)
-            harness = d / ("target.cpp" if cpp else "target.c")
-            harness.write_text(source, encoding="utf-8")
-            (d / "replay.c").write_text(REPLAY_MAIN, encoding="utf-8")
-            compiler = chain.cxx if cpp else chain.cc
-            corpus = d / "corpus"
-            corpus.mkdir(exist_ok=True)
-            seconds = max(1, req.seconds)
-            for byte in (0, 1, 255):                         # full-length seeds: every parameter is decoded
-                (corpus / f"seed_{byte}").write_bytes(bytes([byte]) * (plan.size + 8))
-            corpus_key = self._corpus_key(source, engine, repo)
-            with contextlib.suppress(Exception):                          # a cache never fails a run [CA-1]
-                self._seed_corpus(corpus, corpus_key)                                          # CA-13
-            if engine == "libFuzzer":
-                problem, text = self._libfuzzer(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
-                                                corpus, seconds, plan, repo)
-            else:
-                problem, text = self._ut_search(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
-                                                corpus, seconds, repo)
-            if problem:
-                result.unsupported.append(f"{fn.qualified_name}: {problem}")
-                continue
-            (d / "fuzz.log").write_text(text, encoding="utf-8")
-            with contextlib.suppress(Exception):
-                self._keep_corpus(corpus, corpus_key)                                          # CA-13
-            m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text)
-            forked = re.findall(r"^#(\d+):\s+cov:", text, re.M)                  # -fork=1 prints progress only
-            LOG.info("search of %s (%s): %s", fn.qualified_name, engine,
-                     m.group(0) if m else (f"#{forked[-1]} (fork progress)" if forked else "no statistics line"))
-            if not m and not forked:                         # an error of the search, not 0 executions [A3-FZ13]
-                result.unsupported.append(f"{fn.qualified_name}: the search printed no statistics (no statistics "
-                                          f"line): {text.strip()[-200:]}")
-                continue
-            result.executions += int(m.group(1)) if m else int(forked[-1])
-            # Every corpus input is measured (not only libFuzzer's merged set): the last condition of a
-            # decision has no branch of its own, so its value is invisible to libFuzzer's features.
-            replay = d / f"replay{EXE}"
-            build = [compiler, "-g", "-O0", "-w", *chain.compile_flags(cpp), *sut_flags, *std, *incs,
-                     *chain.coverage_flags(), "-c", str(harness), "-o", str(d / "target.o")]
-            code1, text1 = _run(build, repo, self.cfg.compile_timeout, chain.env())
-            code2, text2 = _run([chain.cc, "-c", str(d / "replay.c"), "-o", str(d / "replay.o")], d,
-                                self.cfg.compile_timeout, chain.env())
-            code3, text3 = _run([chain.cxx if cpp else chain.cc, str(d / "target.o"), str(d / "replay.o"), *objects,
-                                 "-o", str(replay), *chain.link_flags(cpp)] + (["-lm"] if os.name != "nt" else []),
-                                d, self.cfg.compile_timeout, chain.env())
-            if code1 or code2 or code3:
-                result.unsupported.append(f"{fn.qualified_name}: replay build failed: {(text1 + text2 + text3).strip()[-200:]}")
-                continue
-            result.functions.append(fn.qualified_name)
-            for crash in sorted(list(d.glob("crash-*")) + list(d.glob("timeout-*")))[:3]:
-                code, out = _run_program([str(replay), str(crash)], d, 30, chain.env(UT_FUZZ_PRINT="1"))
-                line = next((x for x in out.splitlines() if x.startswith("UT_FUZZ")), "")
-                if line:
-                    args, setup = plan.to_input(line)
-                    result.crashes.append(f"{fn.qualified_name}({', '.join(args)}) "
-                                          f"{'with ' + ' '.join(setup) + ' ' if setup else ''}"
-                                          f"{'crashed' if crash.name.startswith('crash') else 'timed out'}")
-            inputs = sorted(corpus.iterdir(), key=lambda f: (not f.name.startswith("seed_"),        # A3-FZ10: in order
-                                                             0 if engine == "ut_search" else f.stat().st_mtime, f.name))
-            if engine == "libFuzzer" and len(inputs) > self.cfg.max_fuzz_replays:
-                inputs = self._replay_order(inputs, d, chain)                                   # A3-FZ4
-            result.inputs += self._select_inputs(fn, plan, inputs[: self.cfg.max_fuzz_replays],
-                                                 replay, d, repo, layout, chain, gaps_by_fn.get(fn.name, []) +
-                                                 gaps_by_fn.get(fn.qualified_name, []) if fn.name != fn.qualified_name
-                                                 else gaps_by_fn.get(fn.name, []), covered)
+            with self._search_progress(result, fn, engine):          # REC-18
+                body = "\n".join((repo / layout.sut_file).read_text(encoding="utf-8", errors="replace").splitlines()
+                                  [fn.line_start - 1: fn.line_end])
+                calls = {c.replace("::", "_") for c in fn.calls}
+                driven = {c.name + "()" for _, c in uc.project_controls(fn, layout)} | {   # A2-21ak, A3-FZ13
+                    c.name for _, c in uc.project_controls(fn, layout) if c.kind == "variable"}
+                used = [(n, t) for n, t in controls if n in driven or (n.startswith("ut_stub_") and n[8:-7] in calls) or
+                        (not n.startswith("ut_stub_") and not n.endswith("()") and
+                         re.search(r"\b" + re.escape(n.split("::")[-1]) + r"\b", body))]
+                plan = FuzzPlan(fn, layout, used, self.cfg.stub_call_budget)
+                plan.body = body
+                source = plan.build(repo / layout.sut_file)
+                if source is None:
+                    result.unsupported.append(f"{fn.qualified_name}: {plan.problem}")
+                    continue
+                d = run_dir / ("fz_" + re.sub(r"\W", "_", fn.qualified_name))
+                d.mkdir(parents=True, exist_ok=True)
+                harness = d / ("target.cpp" if cpp else "target.c")
+                harness.write_text(source, encoding="utf-8")
+                (d / "replay.c").write_text(REPLAY_MAIN, encoding="utf-8")
+                compiler = chain.cxx if cpp else chain.cc
+                corpus = d / "corpus"
+                corpus.mkdir(exist_ok=True)
+                seconds = max(1, req.seconds)
+                for byte in (0, 1, 255):                         # full-length seeds: every parameter is decoded
+                    (corpus / f"seed_{byte}").write_bytes(bytes([byte]) * (plan.size + 8))
+                corpus_key = self._corpus_key(source, engine, repo)
+                with contextlib.suppress(Exception):                          # a cache never fails a run [CA-1]
+                    self._seed_corpus(corpus, corpus_key)                                          # CA-13
+                if engine == "libFuzzer":
+                    problem, text = self._libfuzzer(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
+                                                    corpus, seconds, plan, repo)
+                else:
+                    problem, text = self._ut_search(chain, compiler, cpp, sut_flags, std, incs, harness, objects, d,
+                                                    corpus, seconds, repo)
+                if problem:
+                    result.unsupported.append(f"{fn.qualified_name}: {problem}")
+                    continue
+                (d / "fuzz.log").write_text(text, encoding="utf-8")
+                with contextlib.suppress(Exception):
+                    self._keep_corpus(corpus, corpus_key)                                          # CA-13
+                native_count = search_execution_count(text) if engine == "ut_search" else None
+                m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text) if engine != "ut_search" else None
+                forked = re.findall(r"^#(\d+):\s+cov:", text, re.M)                  # -fork=1 prints progress only
+                LOG.info("search of %s (%s): %s", fn.qualified_name, engine,
+                         m.group(0) if m else (f"#{forked[-1]} (fork progress)" if forked else "no statistics line"))
+                if native_count is None and not m and not forked:                         # an error of the search, not 0 executions [A3-FZ13]
+                    result.unsupported.append(f"{fn.qualified_name}: the search printed no statistics (no statistics "
+                                              f"line): {text.strip()[-200:]}")
+                    continue
+                result.executions += native_count if native_count is not None else int(m.group(1)) if m else int(forked[-1])
+                result.execution_sources[fn.qualified_name] = "native JSON" if native_count is not None else \
+                    "libFuzzer statistics" if m else "libFuzzer fork progress (lower bound)"
+                # Every corpus input is measured (not only libFuzzer's merged set): the last condition of a
+                # decision has no branch of its own, so its value is invisible to libFuzzer's features.
+                replay = d / f"replay{EXE}"
+                build = [compiler, "-g", "-O0", "-w", *chain.compile_flags(cpp), *sut_flags, *std, *incs,
+                         *chain.coverage_flags(), "-c", str(harness), "-o", str(d / "target.o")]
+                code1, text1 = _run(build, repo, self.cfg.compile_timeout, chain.env())
+                code2, text2 = _run([chain.cc, "-c", str(d / "replay.c"), "-o", str(d / "replay.o")], d,
+                                    self.cfg.compile_timeout, chain.env())
+                code3, text3 = _run([chain.cxx if cpp else chain.cc, str(d / "target.o"), str(d / "replay.o"), *objects,
+                                     "-o", str(replay), *chain.link_flags(cpp)] + (["-lm"] if os.name != "nt" else []),
+                                    d, self.cfg.compile_timeout, chain.env())
+                if code1 or code2 or code3:
+                    result.unsupported.append(f"{fn.qualified_name}: replay build failed: {(text1 + text2 + text3).strip()[-200:]}")
+                    continue
+                result.functions.append(fn.qualified_name)
+                for crash in sorted(list(d.glob("crash-*")) + list(d.glob("timeout-*")))[:3]:
+                    code, out = _run_program([str(replay), str(crash)], d, 30, chain.env(UT_FUZZ_PRINT="1"))
+                    line = next((x for x in out.splitlines() if x.startswith("UT_FUZZ")), "")
+                    if line:
+                        args, setup = plan.to_input(line)
+                        result.crashes.append(f"{fn.qualified_name}({', '.join(args)}) "
+                                              f"{'with ' + ' '.join(setup) + ' ' if setup else ''}"
+                                              f"{'crashed' if crash.name.startswith('crash') else 'timed out'}")
+                inputs = sorted(corpus.iterdir(), key=lambda f: (not f.name.startswith("seed_"),        # A3-FZ10: in order
+                                                                 0 if engine == "ut_search" else f.stat().st_mtime, f.name))
+                if engine == "libFuzzer" and len(inputs) > self.cfg.max_fuzz_replays:
+                    inputs = self._replay_order(inputs, d, chain)                                   # A3-FZ4
+                result.replayed += min(len(inputs), self.cfg.max_fuzz_replays)
+                result.inputs += self._select_inputs(fn, plan, inputs[: self.cfg.max_fuzz_replays],
+                                                     replay, d, repo, layout, chain, gaps_by_fn.get(fn.name, []) +
+                                                     gaps_by_fn.get(fn.qualified_name, []) if fn.name != fn.qualified_name
+                                                     else gaps_by_fn.get(fn.name, []), covered)
         result.reason = (f"{len(result.inputs)} input(s) reach uncovered items; {result.executions} executions"
                          if result.functions else "no function could be fuzzed")
         return result
+
+    @contextlib.contextmanager
+    def _search_progress(self, result: uc.FuzzResult, fn: uc.FunctionInfo, engine: str):
+        before, inputs, replayed = result.executions, len(result.inputs), result.replayed
+        result.outcomes[fn.qualified_name] = "running"
+        LOG.info("Search start: %s, engine=%s", fn.qualified_name, engine)
+        self.emit("stage", data={"stage": "search", "state": "started", "function": fn.qualified_name,
+                                 "engine": engine}, summary=f"UT-Compilation: search started for {fn.qualified_name}")
+        try:
+            yield
+        except BaseException as exc:
+            result.outcomes[fn.qualified_name] = "blocked" if isinstance(exc, ba.AgentFault) and \
+                exc.code == "ENVIRONMENT_BLOCKED" else "failed"
+            raise
+        finally:
+            if result.outcomes[fn.qualified_name] == "running":
+                result.outcomes[fn.qualified_name] = "completed" if fn.qualified_name in result.functions else "unsupported"
+            status = result.outcomes[fn.qualified_name]
+            count, found = result.executions - before, len(result.inputs) - inputs
+            LOG.info("Search end: %s, outcome=%s, executions=%s, replayed=%s, useful_inputs=%s", fn.qualified_name,
+                     status, count, result.replayed - replayed, found)
+            self.emit("stage", data={"stage": "search", "state": status, "function": fn.qualified_name,
+                "engine": engine, "executions": count, "replayed": result.replayed - replayed, "inputs": found},
+                summary=f"UT-Compilation: search {status} for {fn.qualified_name}: {count} executions, {found} useful inputs")
 
     # ---------------------------------------------------------------- CA-13: the search corpus across runs
     CORPUS_INPUTS, CORPUS_INPUT_BYTES = 256, 64 * 1024
@@ -5032,27 +5155,31 @@ class CompilationAgent(ba.AgentCore):
                 return f"ut_search target does not build: {_first_message(text)}", ""
         # A3-FZ12: a crash ends only that input: the search starts again, with the inputs it kept and the next seed,
         # in the time and executions left (deterministic: the same restarts in the same order)
-        started, executions, logs = time.monotonic(), 0, []
+        started, executions, logs, reported = time.monotonic(), 0, [], False
         for restart in range(self.cfg.search_restarts + 1):
             left = seconds - (time.monotonic() - started)
-            if left < 1 or executions >= self.cfg.search_executions:
+            if left < 0.001 or executions >= self.cfg.search_executions:
                 break
             for kept in sorted(corpus.glob("s_*")):                  # keep the inputs of the earlier round
                 kept.rename(corpus / f"r{restart}_{kept.name}")
             seeds = sorted(str(p) for p in corpus.glob("seed_*")) + sorted(str(p) for p in corpus.glob("r*_s_*"))
-            code, text = _run([str(search), str(corpus), f"{left:.0f}", str(self.cfg.search_executions - executions),
+            code, text = _run([str(search), str(corpus), f"{left:.3f}", str(self.cfg.search_executions - executions),
                                str(self.cfg.search_seed + restart), str(self.cfg.search_input_timeout), *seeds], d,
                               left + 120, chain.env(LLVM_PROFILE_FILE=str(d / f"search{restart}.profraw")))
             hint = blocked_hint(code, text, search)
             if hint:
                 raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)              # REC-9
-            m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text or "")
-            executions += int(m.group(1)) if m else 0
+            count = search_execution_count(text or "")
+            reported |= count is not None
+            executions += count if count is not None else 0
             logs.append(text or "")
             if "stat::crash" not in (text or "") and "stat::timeout" not in (text or ""):
                 break
+        if not reported:
+            return "native search printed no statistics (structured counter missing)", ""
         merged = re.sub(r"stat::number_of_executed_units:\s*\d+\n?", "", "\n".join(logs))
-        return "", merged + f"\nstat::number_of_executed_units: {executions}\n"
+        return "", merged + f"\nstat::number_of_executed_units: {executions}\n" + \
+            "UT_SEARCH_STATS|" + json.dumps({"executions": executions}) + "\n"
 
     @staticmethod
     def _controls(layout: uc.LayoutProfile, repo: Path, actions: list[uc.FileAction]) -> list[tuple[str, str]]:
@@ -5094,7 +5221,9 @@ class CompilationAgent(ba.AgentCore):
                 continue
             try:
                 report, show = self._items_of(replay, raw, d, repo, layout, chain)
-            except ba.AgentFault:
+            except ba.AgentFault as exc:
+                if exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
                 continue
             gain = [wanted[k].gap_id for k in report.covered_items if k in wanted]
             for decision in parse_mcdc_show(show):

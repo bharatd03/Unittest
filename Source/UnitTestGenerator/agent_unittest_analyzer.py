@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import csv
 import functools
+import hashlib
 import itertools
 import json
 import os
@@ -862,44 +863,86 @@ def _vec_text(leaves: list[str], vec: tuple[bool, ...], result: bool) -> str:
         f" -> decision {'true' if result else 'false'}"
 
 
-def enclosing_conditions(source: str, fn: uc.FunctionInfo, line: int) -> list[str]:
-    """Reaching conditions: the if/else chain that must hold to reach ``line`` [A1-37]. An else-if branch is reached
-    only when every earlier condition of its chain is false and its own condition is true; an else branch when every
-    condition of the chain is false. Each open block is [depth, its conditions, the raw conditions of its chain]."""
-    lines = source.splitlines()
-    stack: list[list[Any]] = []
-    closed: list[Any] | None = None                    # the block that closed last: an else on the next line extends it
-    for number in range(fn.line_start, min(line, fn.line_end) + 1):
-        text = strip_comments(lines[number - 1]) if number - 1 < len(lines) else ""
-        if not text.strip():
+def enclosing_conditions(source: str, fn: uc.FunctionInfo, line: int, column: int = 0) -> list[str]:
+    """REC-16: necessary guards from compiler regions only; no inferred stack from source lines."""
+    if not fn.control_source_sha256 or hashlib.sha256(source.encode("utf-8")).hexdigest() != fn.control_source_sha256:
+        return []
+    out = []
+    for region in fn.control_regions:
+        if not region.start_line <= line <= region.end_line:
             continue
-        elif_ = re.search(r"\belse\s+if\s*\((.*)\)\s*\{", text)
-        else_ = None if elif_ else re.search(r"\belse\s*\{", text)
-        if elif_ or else_:
-            if text.lstrip().startswith("}") and stack:      # "} else ..." closes the previous branch here
-                closed = stack.pop()
-            chain = list(closed[2]) if closed else []
-            conds = [f"({c}) is false" for c in chain]
-            if elif_ and number < line:
-                conds.append(f"({elif_.group(1).strip()}) is true")
-            stack.append([1, conds, chain + ([elif_.group(1).strip()] if elif_ else [])])
-            closed = None
+        if line in (region.start_line, region.end_line):
+            if not column or line == region.start_line and column < region.start_column or \
+                    line == region.end_line and column > region.end_column:
+                continue
+        if region.condition not in out:
+            out.append(region.condition)
+    return out
+
+
+def compiler_control_regions(node: dict, source: bytes) -> list[uc.ControlRegion]:
+    """Structured AST reachability over-approximation. Case labels and nonlocal entry invalidate lexical guards.
+    Switch selection/fallthrough and loops are deliberately not reduced to conjunctions [REC-16]."""
+    if any(n.get("kind") in ("GotoStmt", "IndirectGotoStmt", "LabelStmt") for n in _walk(node)):
+        return []
+    regions = []
+    def external_case(part):
+        if part.get("kind") == "SwitchStmt":
+            return False
+        return part.get("kind") in ("CaseStmt", "DefaultStmt") or any(
+            external_case(child) for child in part.get("inner", []))
+    def bounds(part):
+        r = part.get("range", {})
+        if any("spellingLoc" in r.get(k, {}) or "expansionLoc" in r.get(k, {}) for k in ("begin", "end")):
+            return None
+        begin, end = _offset(r.get("begin", {})), _end_offset(r.get("end", {}))
+        return (begin, end) if begin is not None and end is not None and 0 <= begin < end <= len(source) else None
+    for statement in _walk(node):
+        if statement.get("kind") != "IfStmt":
             continue
-        m = re.search(r"\b(if|while)\s*\((.*)\)\s*\{", text)
-        if m and number < line:
-            stack.append([max(1, text.count("{") - text.count("}")), [f"({m.group(2).strip()}) is true"],
-                          [m.group(2).strip()] if m.group(1) == "if" else []])
-            closed = None
+        inner = statement.get("inner", [])
+        count = 3 if statement.get("hasElse") else 2
+        if len(inner) < count:
             continue
-        delta = text.count("{") - text.count("}")
-        if stack and delta:
-            stack[-1][0] += delta
-            if stack[-1][0] <= 0:
-                closed = stack.pop()
+        condition, yes = inner[-count], inner[-count + 1]
+        where = bounds(condition)
+        if where is None:
             continue
-        if not text.strip().startswith("}"):
-            closed = None                                    # a statement between: no else can follow
-    return [c for block in stack for c in block[1]]
+        expression = source[where[0]:where[1]].decode("utf-8", "replace")
+        branches = [(yes, "true")] + ([(inner[-1], "false")] if count == 3 else [])
+        for branch, outcome in branches:
+            if external_case(branch):
+                continue
+            span = bounds(branch)
+            if span is None:
+                continue
+            start, end = span
+            regions.append(uc.ControlRegion(
+                start_line=source.count(b"\n", 0, start) + 1, end_line=source.count(b"\n", 0, end - 1) + 1,
+                start_column=start - source.rfind(b"\n", 0, start), end_column=end - source.rfind(b"\n", 0, end - 1) - 1,
+                condition=f"({expression}) is {outcome}", proof_safe=not unsafe_proof_lines(condition, source)))
+    return regions
+
+
+def unsafe_proof_lines(node: dict, source: bytes) -> list[int]:
+    unsafe = set()
+    for expression in _walk(node):
+        if expression.get("kind") not in ("BinaryOperator", "CXXOperatorCallExpr"):
+            continue
+        children = list(_walk(expression))
+        if not any(n.get("castKind") not in (None, "LValueToRValue", "NoOp", "IntegralToBoolean") or n.get("kind") in
+                   ("CallExpr", "CXXMemberCallExpr", "CXXOperatorCallExpr", "CStyleCastExpr", "CXXStaticCastExpr") or
+                   n.get("opcode") in ("++", "--", "=", "+=", "-=") or
+                   re.search(r"\b(volatile|float|double)\b", (n.get("type") or {}).get("qualType", "")) or
+                   (n.get("kind") == "DeclRefExpr" and (n.get("referencedDecl") or {}).get("kind") == "VarDecl")
+                   for n in children):
+            continue
+        r = expression.get("range", {})
+        start, end = _offset(r.get("begin", {})), _end_offset(r.get("end", {}))
+        if start is not None and end is not None:
+            first = source.count(b"\n", 0, start) + 1
+            unsafe.update(range(first, max(first, source.count(b"\n", 0, end)) + 2))
+    return sorted(unsafe)
 
 
 # ============================================================================ Clang front end [A1-DA1 .. A1-DA14]
@@ -1730,17 +1773,14 @@ def leaf_constraint(leaf: str, constants: dict[str, int]) -> tuple[str, str, int
 
 
 def domains_of(fn: uc.FunctionInfo) -> dict[str, list[tuple[float, float]]]:
+    """Conservative integer domains: no assumed ABI width or plain-char signedness [REC-16]."""
     out = {"<constant>": [(1, 1)]}
     for p in fn.params:
-        t = re.sub(r"\b(const|volatile)\b", "", p.type).strip()
+        t = p.canonical or p.type
         if p.kind == "bool":
             out[p.name] = [(0, 1)]
-        elif p.kind == "int":
-            bits = {"char": 8, "short": 16, "int": 32, "long": 64, "long long": 64, "size_t": 64}
-            width = next((int(m) for m in re.findall(r"int(8|16|32|64)_t", t)), None) or \
-                next((b for k, b in sorted(bits.items(), key=lambda kv: -len(kv[0])) if re.search(r"\b" + k + r"\b", t)), 32)
-            unsigned = "unsigned" in t or t.startswith("uint") or t == "size_t"
-            out[p.name] = [(0, 2 ** width - 1)] if unsigned else [(-(2 ** (width - 1)), 2 ** (width - 1) - 1)]
+        elif p.kind == "int" and re.search(r"\bunsigned\b|\buint(?:8|16|32|64)_t\b|\bsize_t\b", t):
+            out[p.name] = [(0, INF)]
     return out
 
 
@@ -1803,8 +1843,14 @@ def prove_infeasible(expr: str, metric: str, index: int | None, outcome: str, fn
     constraints = [leaf_constraint(leaf, constants) for leaf in leaves]
     if any(c is None for c in constraints):
         return ""
+    # Mathematical helper; callers must also validate compiler types and conversions [REC-16].
+    typed = {p.name: p for p in fn.params}
+    if any(c[0] in typed and (typed[c[0]].kind not in ("int", "bool", "enum") or typed[c[0]].by_ref) for c in constraints):
+        return ""
+    if index is not None and not 0 <= index < len(leaves):
+        return ""
     domains, on_path = path_domains(path or [], before, constants, domains_of(fn),
-                                    {p.name for p in fn.params if p.kind in ("int", "bool", "enum", "float")})
+                                    {p.name for p in fn.params if p.kind in ("int", "bool", "enum") and not p.by_ref})
     if any(not iv for iv in domains.values()):
         return "the conditions on the path to it contradict each other: " + " and ".join(on_path)
     vectors: dict[tuple, tuple[bool, dict[int, bool]]] = {}
@@ -1845,31 +1891,19 @@ def prove_infeasible(expr: str, metric: str, index: int | None, outcome: str, fn
     return ""
 
 
-RANGE_WORDS = re.compile(r"\b(range|ranges|limit|limits|bound|bounds|inside|within|between|valid|allowed|min|max)\b",
-                         re.I)
-
-
 def defect_candidate(expr: str, metric: str, index: int | None, outcome: str, fn: uc.FunctionInfo,
                      constants: dict[str, int], path: list[str], before: str, proof: str, lines: list[str],
                      line: int) -> uc.DefectCandidate | None:
-    """A1-37f: the proof no longer holds when the operators are swapped (|| for &&, && for ||) - then the operator is
-    the likely defect. The comment at the decision is its evidence when it names the bounds or a range."""
-    if "||" not in expr and "&&" not in expr:
+    """REC-16: review a proof against behavior evidence; the proof does not establish an operator correction."""
+    if not proof:
         return None
-    mutant = re.sub(r"\|\||&&", lambda m: "&&" if m.group(0) == "||" else "||", expr)
-    if prove_infeasible(mutant, metric, index, outcome, fn, constants, path, before) or \
-            any(prove_infeasible(mutant, "DC", None, o, fn, constants, path, before) for o in ("T", "F")):
-        return None                         # the swap does not explain it, or makes the decision constant: redundant
-    names = set(re.findall(r"\b([A-Za-z_]\w*)\b", expr))
-    evidence = ""
-    for k in (line - 1, line - 2, line - 3, line):             # the comment above it, or at its end
-        if 0 < k <= len(lines):
-            m = re.search(r"(//.*|/\*.*?\*/|/\*.*$|^\s*\*.*$)", lines[k - 1])
-            if m and (RANGE_WORDS.search(m.group(1)) or names & set(re.findall(r"\b([A-Za-z_]\w*)\b", m.group(1)))):
-                evidence = f"line {k}: {m.group(1).strip()[:160]}"
-                break
-    return uc.DefectCandidate(line=line, function=fn.qualified_name, decision=expr.strip(), proof=proof[:400],
-                              change=f"{expr.strip()} -> {mutant.strip()}", evidence=evidence)
+    nearby = []
+    for k in range(max(1, line - 2), min(len(lines), line + 1) + 1):
+        m = re.search(r"//.*|/\*.*?(?:\*/|$)|^\s*\*.*$", lines[k - 1])
+        if m:
+            nearby.append(f"line {k}: {m.group(0).strip()}")
+    return uc.DefectCandidate(line=line, function=fn.qualified_name, decision=expr.strip(), proof=proof[:600],
+                              evidence=" | ".join(nearby), change="")
 
 
 def block_lines(lines: list[str], line: int, branch: str) -> tuple[int, int, int] | None:
@@ -2615,12 +2649,12 @@ def planned_model(open_ids: Any, evidence_ids: Any, params: Any, stubs: Any, var
 class LinkAnswer(BaseModel):
     requirement_id: str
     functions: list[str] = Field(description="names of FUNCTIONS whose behaviour the requirement states")
-    quote: str = Field(description="the exact sentence of the requirement that states it")
+    quote: str = Field(default="", description="optional explanation; canonical text is retained by the agent", max_length=600)
     probability: float = Field(description="0..1: how sure the link is")
 
 
 class LinkAnswers(BaseModel):
-    links: list[LinkAnswer]
+    links: list[LinkAnswer] = Field(max_length=40)
 
 
 class DeclarationAnswer(BaseModel):
@@ -2798,7 +2832,7 @@ def plan_forms(fn: uc.FunctionInfo, lists: dict[str, Any]) -> str:
 LINK_TASK = (
     "Some REQUIREMENTS below do not name a function. For each one, decide which FUNCTIONS (if any) implement the "
     "behaviour it states. Return JSON {\"links\": [{\"requirement_id\", \"functions\", \"quote\", \"probability\"}]}: "
-    "quote is the exact sentence of the requirement you rely on, copied word for word; leave out requirements that "
+    "the agent retains the indexed requirement text and source anchor, so quote may be omitted; leave out requirements that "
     "describe none of the FUNCTIONS. Do not invent ids or names.")
 DECLARATION_TASK = (
     "The C/C++ symbol {name} is used by the code below, but no declaration of it exists in the repository. Propose "
@@ -3350,7 +3384,7 @@ class AnalyzerAgent(ba.AgentCore):
             found = [p for p in files if p.suffix.lower() in (".reqif", ".reqifz") or (
                 p.suffix.lower() in (".md", ".txt") and re.search(r"req|spec", p.stem, re.I))]
         rel = lambda p: str(p.relative_to(root)).replace("\\", "/")
-        return sorted({rel(p) for p in found if "ut_output" not in p.relative_to(root).parts})[:20]
+        return sorted({rel(p) for p in found if "ut_output" not in p.relative_to(root).parts})
 
     @property
     def _columns(self) -> Columns:
@@ -3450,6 +3484,11 @@ class AnalyzerAgent(ba.AgentCore):
             if rid in tags or re.search(r"\b" + re.escape(short) + r"\b", text):
                 add("E1", source, line, f"{rid}: {text}")             # requirement document [A1-25x]
         body = "\n".join(sut_text.splitlines()[fn.line_start - 1: fn.line_end])
+        hypotheses = getattr(self, "_behavior_hypotheses", {}).get(uc.execution_context(layout), set())
+        for m in re.finditer(r"//[^\n]*|/\*.*?\*/", body, re.S):
+            number = fn.line_start + body[:m.start()].count("\n")
+            if number in hypotheses:
+                add("E6", layout.sut_file, number, m.group(0), "implementation comment hypothesis")
         for m in re.finditer(r"\b(assert|static_assert)\s*\((.*?)\)\s*;", body):
             add("E3", layout.sut_file, fn.line_start + body[: m.start()].count("\n"), m.group(0))
         macros = {}
@@ -3488,32 +3527,50 @@ class AnalyzerAgent(ba.AgentCore):
         return uc.EvidenceResult(function=fn.name, evidence=refs, exhausted=True)
 
 
+    def _asserted_evidence(self, evidence: list[uc.EvidenceRef], function: str, suite: str,
+                           passed: set[str]) -> dict[str, list[str]]:
+        asserted = {e.evidence_id: [] for e in evidence}
+        for name, source in uc.test_sources(suite).items():
+            if name not in passed or not re.match(r"/\*\s*evidence:\s*E[1-7]\b", source) or \
+                    not re.search(r"\bUT_(?:EXPECT|ASSERT)\w*\s*\(", source):
+                continue
+            cited = [e for e in evidence if re.search(r"\b" + re.escape(e.evidence_id) + r"\b", source)]
+            explicit = "obligations:" in source
+            for e in cited:
+                target = uc.behavior_item(function, e)
+                if (explicit and target in source) or (not explicit and len(cited) == 1):
+                    asserted[e.evidence_id].append(name)
+        return asserted
+
+    def _behavior_evidence(self, layout: uc.LayoutProfile, evidence: list[uc.EvidenceRef]) -> list[uc.EvidenceRef]:
+        # A source tag associates a requirement; it is not an additional copy of the canonical requirement.
+        canonical = {rid: (source, line) for rid, _, source, line in self._requirements(layout)}
+        return [e for e in evidence if e.evidence_class != "E1" or e.text.split(":", 1)[0] not in canonical or
+                (e.source, e.line) == canonical[e.text.split(":", 1)[0]]]
+
     def requirement_status(self, req: uc.RequirementStatusRequest) -> uc.RequirementStatus:
-        """A1-RQ5: a requirement counts as asserted when a test that passed cites its evidence item and asserts
-        something, and is not a characterization test (E8)."""
-        blocks = {}
-        for m in re.finditer(r"/\*\s*evidence:\s*(E\d)[^*]*\*/\s*UT_TEST\((\w+)\)\s*\{(.*?)\n\}", req.suite, re.S):
-            blocks[m.group(2)] = (m.group(1), m.group(3))
-        passed = set(req.passed)
-        out = []
+        """REC-17: a passing assertion for one obligation does not discharge another obligation."""
+        out, mapped = [], set()
         for fn in req.layout.functions:
-            evidence = self.collect_evidence(req.layout, fn.name).evidence
+            evidence = self._behavior_evidence(req.layout, self.collect_evidence(req.layout, fn.name).evidence)
+            asserted = self._asserted_evidence(evidence, fn.name, req.suite, set(req.passed))
             lines, seen = [], set()
             for e in evidence:
                 if e.evidence_class != "E1":
                     continue
                 rid = e.text.split(":", 1)[0].strip()
+                mapped.add(rid)
                 if (rid, e.source) in seen:
                     continue
                 seen.add((rid, e.source))
-                cite = re.compile(r"\b" + re.escape(e.evidence_id) + r"\b")
-                by = sorted(name for name, (cls, body) in blocks.items() if name in passed and cls != "E8"
-                            and cite.search(body) and re.search(r"\bUT_(EXPECT|ASSERT)\w*\s*\(", body))
+                by = asserted[e.evidence_id]
                 lines.append(f"{rid} ({e.linked_by or 'rule'}) {uc.evidence_key(e)}: "
                              + (f"asserted by {', '.join(by[:5])}" if by else "not asserted by a test"))
             out.append(uc.FunctionRequirements(function=fn.qualified_name or fn.name, requirements=lines,
                                                stated=any(e.evidence_class in ("E1", "E2", "E3") for e in evidence)))
-        return uc.RequirementStatus(functions=out)
+        unlinked = [f"{rid} {source}:{line}: not linked to a function; not asserted"
+                    for rid, _, source, line in self._requirements(req.layout) if rid not in mapped]
+        return uc.RequirementStatus(functions=out, unlinked=unlinked)
 
     def _source_texts(self, root: Path) -> list[tuple[str, str]]:
         """The C and C++ sources of the working copy, read once and again only when a file changed [A1-31b]."""
@@ -3749,7 +3806,9 @@ class AnalyzerAgent(ba.AgentCore):
                 is_static=node.get("storageClass") == "static" or "(anonymous namespace)" in qualified or
                 (node.get("kind") == "FunctionDecl" and node.get("id") in fe.ast.internal),   # unnamed namespace [A2-21k]
                 calls=calls, return_type=ret, params=params, from_frontend=True,
-                member=node["kind"] in ("CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl")))
+                member=node["kind"] in ("CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl"),
+                control_regions=compiler_control_regions(body, src),
+                control_source_sha256=hashlib.sha256(src.replace(b"\r\n", b"\n")).hexdigest(), unsafe_proof_lines=unsafe_proof_lines(body, src)))
         out.sort(key=lambda f: f.line_start)
         return out, nodes
 
@@ -4957,6 +5016,12 @@ class AnalyzerAgent(ba.AgentCore):
         ids = []
         for g in planned.gap_ids:
             new = fix_gap_id(g, open_ids, fn.name, set(evidence))
+            matches = [uc.behavior_item(fn.name, e) for e in evidence.values()
+                       if uc.behavior_item(fn.name, e) in open_ids and
+                       (g == e.evidence_id or g == f"EVIDENCE:{fn.name}" and
+                        e.evidence_id in {q.evidence_id for q in planned.quotes})]
+            if len(matches) == 1:
+                new = matches[0]
             if new != g:
                 fixes.append(f"gap_ids: {g[:60]!r} -> {new!r}")
             if new not in ids:
@@ -5168,6 +5233,15 @@ class AnalyzerAgent(ba.AgentCore):
                 normative = False
                 notes.append(f"expectation not usable ({problem}): kept as a characterization scenario, its result "
                              "is observed [A1-PL4]")
+        obligations = [g for g in gaps if g.startswith("EVIDENCE:") and "@" in g]
+        if obligations:
+            quoted = {q.evidence_id for q in planned.quotes}
+            supported = {uc.behavior_item(fn.name, e) for e in cited if e.evidence_id in quoted}
+            if not normative:
+                gaps = [g for g in gaps if g not in obligations]
+                notes.append("behavior obligation remains open; retained inputs as characterization only [REC-17]")
+            elif len(obligations) != 1 or obligations[0] not in supported:
+                return None, ["a behavior scenario must assert one target obligation using its own quoted evidence [REC-17]"]
         linked = bool(strong) and all(e.linked_by for e in strong)       # rests only on brain links
         scenario = uc.Scenario(
             scenario_id="", function=fn.name, gap_ids=gaps, description=planned.purpose[:300] or "planned by the brain",
@@ -5320,7 +5394,7 @@ class AnalyzerAgent(ba.AgentCore):
         gap_rows = []
         for g in gaps:
             code = lines[g.line - 1].strip() if 0 < g.line <= len(lines) else ""
-            path = enclosing_conditions(sut_text, fn, g.line) if g.line else []
+            path = enclosing_conditions(sut_text, fn, g.line, g.column) if g.line else []
             tried = req.attempts.get(g.gap_id, 0)
             gap_rows.append(f"- {g.gap_id} [{g.metric}] line {g.line}: `{code}` {g.detail[:160]}"
                             + (f" | needs: {'; '.join(g.required[:4])}" if g.required else "")
@@ -5334,8 +5408,9 @@ class AnalyzerAgent(ba.AgentCore):
             for tg in targets:
                 if tg.tid.startswith("EVIDENCE:"):
                     if tg.tid in open_ids:
-                        gap_rows.append(f"- {tg.tid}: check the behaviour the EVIDENCE states (results, error values, "
-                                        "limits) with asserted expected values")
+                        own = next((e for e in evidence if uc.behavior_item(fn.name, e) == tg.tid), None)
+                        gap_rows.append(f"- {tg.tid}: check this obligation with an asserted expected value"
+                                        + (f"; evidence {own.evidence_id}: {own.text}" if own else ""))
                     continue
                 if not set(tg.items) & open_ids:
                     continue
@@ -5638,8 +5713,14 @@ class AnalyzerAgent(ba.AgentCore):
             calls += 1
             covered = {g for s in accepted for g in s.gap_ids}
             left = left_targets(covered)
-            shown = [tg for tg in left if tg.tid in focus] if focus else left              # ARCH-19b: one at a time
-            context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, evidence, profile, sequence,
+            shown = [tg for tg in left if tg.tid in focus] if focus else left
+            checks_only = all(g.startswith("EVIDENCE:") for g in open_ids)
+            if checks_only:
+                shown = shown[:max(1, profile.scenarios_per_call)]
+            page_ids = {tg.tid for tg in shown}
+            page_evidence = [e for e in evidence if e.evidence_class != "E1" or uc.behavior_item(fn.name, e) in page_ids] \
+                if checks_only and any("@" in g for g in page_ids) else evidence              # ARCH-19b: one at a time
+            context = self._facts(fn, gaps, open_ids, layout, req, sut_text, stubs, page_evidence, profile, sequence,
                                   targets=shown, structured=lists)
             if calls == 1:                       # A1-PL18: the same facts give the same answer - not asked again
                 # REC-4: diagnostic evidence is part of the question; iteration numbers and call IDs are not.
@@ -5677,7 +5758,7 @@ class AnalyzerAgent(ba.AgentCore):
                 if sequence:                                   # BP-3: only a brain whose profile allows it [BP-2]
                     allowed = [b for b in (allowed if allowed is not None else seq_brains) if b in seq_brains] or allowed
                 answer = await self.generate(
-                    task, context, self._plan_model(fn, open_ids, evidence, stubs, [tg.tid for tg in shown],
+                    task, context, self._plan_model(fn, open_ids, page_evidence, stubs, [tg.tid for tg in shown],
                                                     self.cfg.targets_per_scenario, lists),
                     need=need, step="A1.plan", project=layout.repo_root, allowed=allowed,
                     vary=calls > 1)                                                         # ARCH-20, ARCH-20a
@@ -5710,7 +5791,7 @@ class AnalyzerAgent(ba.AgentCore):
             if not book.allows(used.get("brain", ""), "call_sequence"):      # BP-3: never taken from a brain whose
                 for planned in answer.scenarios:                            # profile does not allow the kind
                     planned.calls_before, planned.calls = [], []
-            problems, sought, before, repeats = [], [], len(accepted), 0
+            problems, followup, sought, before, repeats = [], [], [], len(accepted), 0
             for k, planned in enumerate(answer.scenarios[: self.cfg.max_brain_scenarios], 1):
                 aimed = [str(t) for t in (planned.targets or planned.gap_ids)] or sorted(open_ids)
                 purpose = "requirement check" if aimed and all(t.startswith("EVIDENCE:") for t in aimed) \
@@ -5768,6 +5849,9 @@ class AnalyzerAgent(ba.AgentCore):
                 self._tried_text.setdefault(fn.name, {})[uc.scenario_signature(scenario, execution_context)] = brief(scenario,
                                                                                                     by_tid)  # A1-PL18
                 accepted.append(scenario)
+                if checks_only and not any(g.startswith("EVIDENCE:") for g in scenario.gap_ids):
+                    followup.append("behavior obligation remains open: retained these inputs as characterization; "
+                                    "supply an asserted expected value with its exact target evidence quote [REC-17]")
                 if kept is not None:                                                            # A1-PL17
                     kept.append((scenario, answered))
                 if reasons:
@@ -5798,12 +5882,17 @@ class AnalyzerAgent(ba.AgentCore):
             elif split_size and remaining and not problems and len(accepted) > before and splits < self.cfg.split_calls:
                 splits, limit = splits + 1, limit + 1          # ARCH-19b: the rest of the split work, as small
                 focus = [remaining[0]] if focus else []
+            elif checks_only and remaining and set(done_targets) - {tg.tid for tg in targets
+                    if any(set(tg.items) & set(sc.gap_ids) for sc in accepted[:before])} and not problems:
+                # Only demonstrated planning progress earns another bounded page, never an empty retry loop.
+                limit = max(limit, calls + self.cfg.max_brain_calls_per_function)
+                focus, splits = [], 0
             elif not accepted and calls >= limit and not tried:     # A1-PL8: once more with the next brain
                 tried.add(used.get("brain", ""))
                 if not next_brains():
                     break                                         # no other brain is available
                 limit += self.cfg.max_brain_calls_per_function
-            elif not (problems or found) and accepted or not remaining or calls >= limit:
+            elif not (problems or followup or found) and accepted or not remaining or calls >= limit:
                 break
             elif problems and repeats == len(problems) and not found and len(accepted) == before:
                 plan_notes["planning"].append(f"{fn.name}: the answer repeated what was tried - not asked again with "
@@ -5811,8 +5900,8 @@ class AnalyzerAgent(ba.AgentCore):
                 break
             extra = ("\n\nYOUR PREVIOUS ANSWER WAS CHECKED. Scenarios already accepted reach the targets: "
                      + (", ".join(done_targets) or "none") + ". Plan only these targets now: " + ", ".join(remaining)
-                     + ("\nProblems found (fix them):\n" + "\n".join(problems) + "\n" + self._expected_form(fn, open_ids)
-                        if problems else "")
+                     + ("\nProblems found (fix them):\n" + "\n".join(problems + followup) + "\n" + self._expected_form(fn, open_ids)
+                        if problems or followup else "")
                      + ("\nNew evidence from the look-up:\n" + "\n".join(
                          f"- {e.evidence_id} {e.evidence_class} (linked by look-up) {e.source}:{e.line}: {e.text[:300]}"
                          for e in found) if found else ""))
@@ -5847,57 +5936,65 @@ class AnalyzerAgent(ba.AgentCore):
         return accepted
 
     async def _link_requirements(self, layout: uc.LayoutProfile) -> list[uc.RequirementLink]:
-        """A1-PL13: requirements written in prose, linked by the brain and checked here."""
+        """REC-17: every requirement/function page is visited; the agent retains canonical source text."""
         if not self.cfg.link_requirements or not (layout.requirement_files or layout.given_requirements):
             return []
-        root = Path(layout.repo_root)
-        reqs = self._requirements(layout)
-        shorts = {f.name.split("::")[-1]: f for f in layout.functions}
-        tags = set()
-        for rel in [layout.sut_file] + layout.headers:
-            if (root / rel).is_file():
-                tags |= set(re.findall(r"\b([A-Z]{2,}(?:-[A-Z0-9]+)*-\d+)\b",
-                                       (root / rel).read_text(encoding="utf-8", errors="replace")))
-        unlinked = [r for r in reqs if r[0] not in tags and not any(
-            re.search(r"\b" + re.escape(n) + r"\b", r[1]) for n in shorts)][: self.cfg.max_requirements_to_link]
-        if not unlinked or not shorts:
+        root, reqs = Path(layout.repo_root), self._requirements(layout)
+        if not reqs or not layout.functions:
             return []
-        key = ba.contract_digest([[list(r) for r in unlinked], sorted(shorts)])
+        key = ba.contract_digest([reqs, [(f.qualified_name, f.signature) for f in layout.functions],
+                                  self.cfg.min_link_probability])
         if key in self._link_cache:
             return self._link_cache[key]
-        functions = []
-        lines = (root / layout.sut_file).read_text(encoding="utf-8", errors="replace").splitlines()
-        for f in layout.functions:
-            comment = []
-            n = f.line_start - 2
-            while n >= 0 and len(comment) < 4 and lines[n].strip().startswith(("/*", "*", "//")):
-                comment.insert(0, lines[n].strip())
-                n -= 1
-            functions.append(f"- {f.signature.strip().rstrip('{').strip()}  {' '.join(comment)[:200]}")
-        context = [uc.part("functions", "FUNCTIONS:\n" + "\n".join(functions)),
-                   uc.part("requirements", "REQUIREMENTS:\n" + "\n".join(
-                       f"- {rid}: {text[:400]}" for rid, text, _, _ in unlinked))]
-        try:
-            answer = await self.generate(LINK_TASK, context, LinkAnswers, step="A1.links", project=layout.repo_root,
-                                         need=ba.OutputNeed(items=len(unlinked), tokens_per_item=120, overhead=50))
-        except ba.AgentFault as exc:
-            LOG.info("requirement links by the brain unavailable (%s)", exc.code)
-            return []
-        by_id = {rid: (text, source, line) for rid, text, source, line in unlinked}
-        links = []
-        for a in answer.links:
-            item = by_id.get(a.requirement_id)
-            if item is None or not norm_text(a.quote) or norm_text(a.quote) not in norm_text(item[0]):
-                continue
-            if not 0.0 <= a.probability <= 1.0 or a.probability < self.cfg.min_link_probability:
-                continue
-            for name in a.functions:
-                fn = shorts.get(name.split("::")[-1])
-                if fn is not None:
-                    links.append(uc.RequirementLink(requirement_id=a.requirement_id, function=fn.name, source=item[1],
-                                                    line=item[2], quote=a.quote[:400], probability=round(a.probability, 2)))
-        self._link_cache[key] = links
-        return links
+        profile = await uc.answering_profile(self, "A1.links")
+        batch = max(1, min(40, self.cfg.max_requirements_to_link, profile.scenarios_per_call))
+        function_batch = max(1, min(64, profile.window_tokens // 256))
+        links, unavailable = {}, False
+        for offset in range(0, len(reqs), batch):
+            page = reqs[offset:offset + batch]
+            by_id = {rid: (text, source, line) for rid, text, source, line in page}
+            for start in range(0, len(layout.functions), function_batch):
+                functions = layout.functions[start:start + function_batch]
+                aliases = {f"F{start + i + 1}": f for i, f in enumerate(functions)}
+                context = [uc.part("functions", "FUNCTIONS:\n" + "\n".join(
+                    f"- {fid}: {f.qualified_name}: {f.signature}" for fid, f in aliases.items())),
+                    uc.part("requirements", "REQUIREMENTS:\n" + "\n".join(f"- {rid}: {text}" for rid, text, _, _ in page))]
+                answer = None
+                for attempt in range(max(1, self.cfg.rule_attempts)):
+                    try:
+                        answer = await self.generate(LINK_TASK, context, LinkAnswers, step="A1.links",
+                            project=layout.repo_root, vary=bool(attempt),
+                            need=ba.OutputNeed(items=len(page), tokens_per_item=80, overhead=100))
+                        break
+                    except ba.AgentFault as exc:
+                        LOG.info("requirement link page %s unavailable (%s)", offset // batch + 1, exc.code)
+                        if exc.code in ba.NO_BRAIN_CODES:
+                            break
+                if answer is None:
+                    unavailable = True
+                    continue
+                for item in answer.links:
+                    canonical = by_id.get(item.requirement_id)
+                    if canonical is None or not self.cfg.min_link_probability <= item.probability <= 1:
+                        continue
+                    for name in item.functions:
+                        fn = aliases.get(name)
+                        if fn is None:
+                            matches = [f for f in functions if name in (f.name, f.qualified_name)]
+                            if not matches:
+                                matches = [f for f in functions if f.qualified_name.split("::")[-1] == name]
+                            fn = matches[0] if len(matches) == 1 else None
+                        if fn is None:
+                            continue
+                        link = uc.RequirementLink(requirement_id=item.requirement_id, function=fn.name,
+                            source=canonical[1], line=canonical[2], quote=canonical[0], probability=round(item.probability, 2))
+                        links[(item.requirement_id, fn.qualified_name, fn.line_start)] = link
+            self.emit("stage", data={"stage": "A1.links", "done": min(offset + batch, len(reqs)), "of": len(reqs)},
+                      summary=f"UT-Analyzer: linked requirement page {offset // batch + 1}")
+        result = list(links.values())
+        if not unavailable:
+            self._link_cache[key] = result
+        return result
 
     async def _missing_declarations(self, layout: uc.LayoutProfile, symbols: list[str],
                                     no_brain: set[str] | frozenset = frozenset()) -> tuple[
@@ -6083,11 +6180,16 @@ class AnalyzerAgent(ba.AgentCore):
         # Stage B: coverage plan
         sut_text = (root / layout.sut_file).read_text(encoding="utf-8", errors="replace")
         gaps = self._gaps(layout, last, sut_text)
+        base["refuted_proofs"] = list(getattr(self, "_proof_refutations", []))
         repairs, drop = [], []
         scenarios, open_items = [], []
         new_disputes: set[str] = set()
         for f in (last.failures if last else []):
             if f.route != "agent1":
+                continue
+            if f.classification == "undetermined":                       # REC-15: no basis to change its oracle
+                open_items.append(f"{f.affected_test or f.failure_id}: failure undetermined; assertion retained; "
+                                  "obtain independent validation/evidence before changing test or source [A3-163]")
                 continue
             if f.kind in ("test", "crash", "timeout", "regression"):
                 drop.append(f.affected_test) if f.affected_test else None
@@ -6275,8 +6377,8 @@ class AnalyzerAgent(ba.AgentCore):
                 continue
             gaps = active_by_fn.get(uc.function_stem(fn, layout), [])
             open_ids = {g.gap_id for g in gaps}
-            if any(mine(s, fn) and s.scenario_id.startswith("S-evidence-") for s in scenarios):
-                open_ids.add(f"EVIDENCE:{name}")
+            open_ids.update(g for sc in scenarios if mine(sc, fn) and sc.scenario_id.startswith("S-evidence-")
+                            for g in sc.gap_ids if g.startswith("EVIDENCE:"))
             if not open_ids:
                 continue
             evidence = [e for e in self.collect_evidence(layout, name).evidence if uc.evidence_key(e) not in disputed]
@@ -6293,7 +6395,7 @@ class AnalyzerAgent(ba.AgentCore):
                                      f"{' ...' if len(names) > 8 else ''} [A1-PL16]")
         carried: dict[str, list[uc.Scenario]] = {}                                               # A1-PL17
         shapes, fam = ({}, {})
-        if self.cfg.carry_families:
+        if self.cfg.carry_families and not any(g.startswith("EVIDENCE:") for w in work for g in w[3]):
             shapes = function_shapes(layout, sut_text)
             fam = function_families(shapes)
             store = self._families.setdefault(layout.sut_file, {})
@@ -6356,7 +6458,7 @@ class AnalyzerAgent(ba.AgentCore):
             self.emit("stage", data={"stage": "A1.plan", "done": 0, "of": total},
                       summary=f"UT-Analyzer: the brain plans {total} functions")
         results = await self.in_parallel([job(fn, gaps, open_ids, evidence) for _, fn, gaps, open_ids, evidence in work])
-        if self.cfg.carry_families:                       # the family's plan, in the order of the functions [ARCH-18]
+        if self.cfg.carry_families and fam:               # the family's plan, in the order of the functions [ARCH-18]
             store = self._families.setdefault(layout.sut_file, {})
             for (name, fn, gaps, *_), result in zip(work, results):
                 key = fam.get(name)
@@ -6460,33 +6562,25 @@ class AnalyzerAgent(ba.AgentCore):
 
     def _evidence_scenarios(self, layout: uc.LayoutProfile, req: uc.PlanRequest,
                             disputed: set[str] | None = None) -> list[uc.Scenario]:
-        """A1-25y: a function whose expected behaviour is stated (E1 requirement, E2 interface contract,
-        E3 executable contract) gets tests that check that behaviour, even when characterization tests
-        already reach full coverage; otherwise a defect against the documented behaviour stays hidden.
-        Planned until such a test exists or the attempts are used up."""
+        """REC-17: independent behavior obligations, discharged only by explicit passing assertions."""
         out = []
-        suite = uc.test_sources(req.existing_suite)
+        passed = {t.name for t in (req.last.tests if req.last else []) if t.status == "passed"}
         for fn in layout.functions:
-            short = fn.name.split("::")[-1]
-            key = f"EVIDENCE:{fn.name}"
-            if req.attempts.get(key, 0) >= self.cfg.max_attempts_per_gap:
-                continue
-            checked = any(not src.startswith("/* evidence: E8") and re.search(r"\b" + re.escape(short) + r"\s*\(", src)
-                          for src in suite.values())
-            if checked:
-                continue
             all_evidence = [e for e in self.collect_evidence(layout, fn.name).evidence
                             if uc.evidence_key(e) not in (disputed or set())]
-            evidence = [e for e in all_evidence if e.evidence_class in ("E1", "E2", "E3")]
-            if not evidence:
-                continue
-            out.append(uc.Scenario(
-                scenario_id=f"S-evidence-{uc.function_stem(fn, layout)}", function=fn.name, gap_ids=[key],
-                function_line=fn.line_start,
-                description=f"Check the behaviour of {fn.qualified_name} that the evidence states (results, error "
-                            "values, limits); assert the stated values, do not observe them.",
-                expected="exactly as stated by the evidence", evidence=all_evidence,
-                strongest_class=min(e.evidence_class for e in evidence), characterization=False))
+            evidence = [e for e in self._behavior_evidence(layout, all_evidence) if e.evidence_class in ("E1", "E2", "E3") or
+                        e.linked_by == "implementation comment hypothesis"]
+            asserted = self._asserted_evidence(evidence, fn.name, req.existing_suite, passed)
+            for e in evidence:
+                key = uc.behavior_item(fn.name, e)
+                if asserted[e.evidence_id] or req.attempts.get(key, 0) >= self.cfg.max_attempts_per_gap:
+                    continue
+                out.append(uc.Scenario(
+                    scenario_id=f"S-evidence-{uc.function_stem(fn, layout)}-{key.rsplit('@', 1)[-1]}",
+                    function=fn.name, gap_ids=[key], function_line=fn.line_start,
+                    description=f"Assert obligation {e.evidence_id} at {uc.evidence_key(e)}: {e.text}",
+                    expected="as stated by this evidence item", evidence=all_evidence,
+                    strongest_class=e.evidence_class, characterization=False))
         return out
 
     def _stubs(self, layout: uc.LayoutProfile, last: uc.VerificationResult | None) -> list[uc.StubSpec]:
@@ -6548,19 +6642,36 @@ class AnalyzerAgent(ba.AgentCore):
     def _gaps(self, layout: uc.LayoutProfile, last: uc.VerificationResult | None, sut_text: str) -> list[uc.GapItem]:
         measured = last is not None and last.coverage is not None and last.coverage.measured
         if measured:
-            gaps = [g for fc in last.coverage.functions for g in fc.gaps]   # measured replaces estimated [A3-143]
+            gaps = [g.model_copy(deep=True) for fc in last.coverage.functions for g in fc.gaps]  # REC-16
         else:
             gaps = self._estimated_gaps(layout, sut_text)
         lines = sut_text.splitlines()
         constants = self._constants(layout) if measured else {}
         variants = self._variant_macros(layout) if measured else []                  # A1-37a
         differing = variant_dependent(variants)
-        functions = {f.name: f for f in layout.functions}
-        unreachable: list[tuple[int, int, str]] = []
-        block_variants: dict[tuple[int, int, int], list[uc.VariantProof]] = {}
+        functions = {name: f for f in layout.functions for name in (f.name, f.qualified_name)}
+        context = uc.execution_context(layout)
+        if not hasattr(self, "_proof_history"):
+            self._proof_history, self._proof_refuted, self._proof_refutations = {}, {}, []
+        history = self._proof_history.setdefault(context, {})
+        invalid = self._proof_refuted.setdefault(context, set())
+        observed = set(last.coverage.covered_items) if measured else set()
+        counterexamples = {old.proof_origin_line or old.line for old in history.values() if uc.gap_item(old) in observed}
+        invalid.update(counterexamples)
+        self._proof_refutations = [gid for gid, old in history.items()
+                                  if (old.proof_origin_line or old.line) in invalid]
+        for g in gaps:
+            g.detail = " | ".join(p for p in g.detail.split(" | ") if not p.startswith(("infeasible_", "unreachable_code:")))
+            g.defect, g.proof_origin_line = None, 0
+        unreachable: list[tuple[int, int, int, int, str]] = []
+        block_variants: dict[tuple[int, int, int, int], list[uc.VariantProof]] = {}
         for g in gaps:
             expr = decision_text(lines[g.line - 1], g.column) if 0 < g.line <= len(lines) else ""
-            if g.metric in ("MCDC", "DC") and expr:
+            fn = functions.get(g.function)
+            safe = bool(fn and fn.from_frontend and fn.control_source_sha256 == hashlib.sha256(sut_text.encode()).hexdigest()
+                        and g.line not in fn.unsafe_proof_lines and g.line not in invalid
+                        and all(r.proof_safe for r in fn.control_regions if r.start_line <= g.line <= r.end_line))
+            if g.metric in ("MCDC", "DC") and expr and safe:
                 leaves, pairs, infeasible = mcdc_pairs(expr)
                 if g.metric == "MCDC" and g.condition_index is not None:
                     if g.condition_index in infeasible:
@@ -6571,12 +6682,15 @@ class AnalyzerAgent(ba.AgentCore):
                     g.required = ["decision true", "decision false"]
             if g.metric == "BC" and expr and g.detail:
                 g.required = [g.detail.replace("never", "must be")]
-            fn = functions.get(g.function)
-            if not measured or not expr or fn is None or "infeasible" in g.detail:
+            if "infeasible" in g.detail and safe:
+                g.proof_origin_line = g.line
+                g.defect = defect_candidate(expr, g.metric, g.condition_index, "", fn, constants, [], "", g.detail,
+                                            lines, g.line)
+            if not measured or not expr or not safe or "infeasible" in g.detail:
                 continue
             # A deterministic proof that the remaining item cannot be covered [A3-120, A3-121a], with the
             # conditions on the path to it [A1-37].
-            path = enclosing_conditions(sut_text, fn, g.line)
+            path = enclosing_conditions(sut_text, fn, g.line, g.column)
             before = "\n".join(lines[fn.line_start - 1: g.line - 1])
             use = constants
             used = differing & set(re.findall(r"[A-Za-z_]\w*", " ".join([expr, *path])))
@@ -6603,20 +6717,37 @@ class AnalyzerAgent(ba.AgentCore):
                                                 lines, g.line)                                    # A1-37f
                     if g.metric == "DC" or len(split_conditions(expr)) == 1:
                         for o in missing:
-                            block = block_lines(lines, g.line, o)
-                            if block:
+                            condition = f"({expr}) is {'true' if o == 'T' else 'false'}"
+                            for region in fn.control_regions:
+                                if " ".join(region.condition.split()) != " ".join(condition.split()):
+                                    continue
+                                block = (region.start_line, region.end_line, region.start_column, region.end_column)
                                 unreachable.append((*block, f"line {g.line}: {proofs[0]}"))
-                                if g.variant_proofs:                          # A1-37c: the lines inherit them
-                                    block_variants[tuple(block)] = g.variant_proofs
+                                if g.variant_proofs:
+                                    block_variants[block] = g.variant_proofs
         for g in gaps:
             if g.metric in ("LC", "SC") and "unreachable_code" not in g.detail:
-                hit = next(((a, b, col, w) for a, b, col, w in unreachable if a <= g.line <= b and
-                            (g.line != a or col == 0 or g.column >= col) and
-                            (g.metric == "SC" or a != b or col == 0)), None)
-                why = hit[3] if hit else ""
+                hit = next(((a, b, col, endcol, w) for a, b, col, endcol, w in unreachable if a <= g.line <= b and
+                            (g.line != a or g.column >= col) and (g.line != b or g.column <= endcol) and
+                            (g.metric == "SC" or a < g.line < b)), None)
+                why = hit[4] if hit else ""
                 if why:
                     g.detail += f" | unreachable_code: the branch is never taken ({why}) [A3-116, A3-121a]"
-                    g.variant_proofs = list(block_variants.get(hit[:3], g.variant_proofs))
+                    g.variant_proofs = list(block_variants.get(hit[:4], g.variant_proofs))
+        for g in gaps:
+            if "infeasible_" in g.detail or "unreachable_code" in g.detail:
+                if not g.proof_origin_line:
+                    m = re.search(r"line (\d+):", g.detail)
+                    g.proof_origin_line = int(m.group(1)) if m else g.line
+                history[g.gap_id] = g.model_copy(deep=True)
+                if g.defect is not None:
+                    if not hasattr(self, "_behavior_hypotheses"):
+                        self._behavior_hypotheses = {}
+                    self._behavior_hypotheses.setdefault(context, set()).update(range(max(1, g.line - 2), g.line + 2))
+                    refs = [e for e in self.collect_evidence(layout, g.function).evidence
+                            if e.evidence_class in ("E2", "E3", "E4", "E5", "E6")]
+                    g.defect.evidence = " | ".join([g.defect.evidence] + [
+                        f"{e.evidence_class} {uc.evidence_key(e)}: {e.text[:240]}" for e in refs[:8]]).strip(" |")
         return gaps
 
     def _variant_macros(self, layout: uc.LayoutProfile) -> list[tuple[uc.BuildVariant, dict[str, int]]]:

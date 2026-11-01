@@ -1,0 +1,41 @@
+{
+  "construct": "Independent behavioral obligations of one function",
+  "sut": "src/status.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "status_value",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "-2"
+            }
+          ]
+        },
+        "reaches": [
+          "return -1;"
+        ]
+      },
+      {
+        "function": "status_value",
+        "answer": {
+          "args": [
+            {
+              "name": "value",
+              "value": "2"
+            }
+          ]
+        },
+        "reaches": [
+          "return 1;"
+        ]
+      }
+    ]
+  }
+}

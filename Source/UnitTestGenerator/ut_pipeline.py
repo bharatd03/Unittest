@@ -126,6 +126,7 @@ class PipelineConfig(BaseModel):
     fuzz_after_stagnation: bool = True       # ORC-5a
     fuzz_seconds: int = Field(default=60, ge=1, le=3600)
     fuzz_budget_seconds: int = Field(default=300, ge=0, le=36_000)   # the search of a whole run [ORC-5a, A3-FZ3]
+    fuzz_functions_per_batch: int = Field(default=8, ge=1, le=256)  # bounded scheduling, not a file-size exclusion [REC-18]
     # the documented-behaviour round after every target is met; 0 = no limit [ORC-32, ORC-7]
     after_target_seconds: float = Field(default=600.0, ge=0)
     repo_cache: str = "ut_cache"             # one clone per repository and PC [ORC-20]
@@ -662,6 +663,13 @@ class Orchestrator:
             result.open_items.append(f"note: requirement status not determined: {exc}"[:300])
             return
         result.requirement_status = status.functions
+        result.unlinked_requirements = status.unlinked
+        missing = list(status.unlinked) + [line for fn in status.functions for line in fn.requirements
+                                          if "not asserted by a test" in line]
+        result.requirements_complete = not missing if status.unlinked or any(
+            fn.requirements for fn in status.functions) else None
+        if missing:
+            result.open_items.extend(missing)
 
     async def _brains_available(self) -> str:
         """ARCH-24: "" when a configured brain is available, else why none is (every brain with its status)."""
@@ -852,8 +860,8 @@ class Orchestrator:
                     if plan.stage == "blocked":
                         return s.finish("incomplete", "Agent1 blocked: " + plan.reason, last)
                     if self._only_proven(plan, last):                                       # COV-4, COV-7
-                        return await self._stop(s, "no test can reach the remaining items: each has a deterministic proof, "
-                                                   "so only a change of the source can reach them [COV-4, COV-7]", last)
+                        return await self._stop(s, "remaining items have analysis proofs; review the assumptions and "
+                                                   "behavioral evidence before proposing any source change [REC-16]", last)
                     # LA-5; the rule round writes no brain test: its scenarios are facts, not attempts [A1-PL1]
                     attempted = [] if plan.rules_only else Journal.attempts_of(plan, iteration)
                     if not plan.scenarios and not plan.repairs and self._settled(s, last):     # LA-7 b
@@ -956,7 +964,7 @@ class Orchestrator:
                             s.targets_met_at = time.monotonic()
                             budget.reschedule(asyncio.get_running_loop().time() + self.cfg.after_target_seconds)
                         continue                      # Agent1 decides whether the documented behaviour is checked [A1-25y]
-                    if not result.failures and result.coverage is not None and self.cfg.fuzz_after_stagnation \
+                    if result.build_ok and result.link_ok and result.coverage is not None and self.cfg.fuzz_after_stagnation \
                             and self._open(result):
                         pending = asyncio.create_task(self._fuzz(s, result, iteration))   # ORC-5a, A3-FZ1, COV-6
                         if stagnant >= self.cfg.stagnation_limit:      # the search may be the progress: wait for it
@@ -1524,8 +1532,8 @@ class Orchestrator:
         self._stage("Stopped below target: collecting the evidence for the developer")
         s.not_reached = s.evidence(last)
         if s.not_reached and all(i.proof for i in s.not_reached):                          # COV-4, COV-7
-            reason = (f"no test can reach the {len(s.not_reached)} remaining item(s): each has a deterministic proof, so "
-                      "only a change of the source can reach them [COV-4, COV-7]; stopped after: " + reason)
+            reason = (f"analysis proofs for {len(s.not_reached)} remaining item(s) require review against execution "
+                      "and behavioral evidence; they do not establish a source correction [REC-16]; stopped after: " + reason)
         await self._suggest(s, last)
         self._final_statuses(s, last)                                                          # LA-6
         await self._decide(s)                                                                  # LA-9
@@ -1660,8 +1668,8 @@ class Orchestrator:
                     status = s.journal.final_status(g.gap_id, fc.name, s.proofs.get(g.gap_id, ""), s.suggested)
                 blocker = next((d for d in getattr(s, "defects", {}).values() if g.gap_id in d.items), None)
                 if blocker is not None and status.status == "proven_unreachable":          # A1-37f, COV-7
-                    status.reason = (f"blocked by defect candidate {blocker.candidate_id} (line {blocker.line}: "
-                                     f"{blocker.change}) - " + status.reason)[:600]
+                    status.reason = (f"behavioral review hypothesis {blocker.candidate_id} at line {blocker.line}; "
+                                     "no correction established - " + status.reason)[:600]
                 s.item_status.append(status)
                 if status.status == "pipeline_limitation" and g.gap_id not in shared:          # NC-5
                     fn = next((f for f in self.layout.functions if fc.name in (f.name, f.qualified_name)), None) \
@@ -1862,7 +1870,8 @@ class Orchestrator:
 
     async def _suggest(self, s: "RunState", last: uc.VerificationResult) -> None:
         """COV-12, COV-13: source-change suggestions from the requirements, each checked on a trial copy."""
-        items = s.not_reached[:30]
+        proof_functions = {item.function for item in s.not_reached if item.proof}
+        items = [item for item in s.not_reached if item.function not in proof_functions][:30]  # REC-16
         if not items or last.coverage is None or not (last.build_ok and last.link_ok):
             return
         evidence: dict[str, uc.EvidenceRef] = {}
@@ -2040,46 +2049,89 @@ class Orchestrator:
                     for d in s.layout.dependencies.entries))
 
     async def _fuzz(self, s: "RunState", result: uc.VerificationResult, iteration: int = 0) -> uc.FuzzResult | None:
-        """Coverage-guided search once per set of remaining gaps [ORC-5a]."""
+        """REC-18: fair bounded batches, including builds with failing assertions; explicit partial outcomes."""
+        if result.coverage is None:
+            s.fuzzing.append("not run: no measured coverage to target")
+            return None
+        if self.cfg.fuzz_budget_seconds - s.fuzz_spent < 1:
+            s.fuzzing.append("not searched: run search budget exhausted [REC-18]")
+            return None
         gaps = [g for fc in result.coverage.functions for g in fc.gaps if fc.name != "<file>"]
-        key = frozenset(g.gap_id for g in gaps)
-        if not gaps or key in s.fuzzed:
+        if not gaps:
             return None
-        s.fuzzed.add(key)
-        functions = sorted({g.function for g in gaps})
-        left = self.cfg.fuzz_budget_seconds - s.fuzz_spent                    # one budget per run [ORC-5a, A3-FZ3]
-        seconds = min(self.cfg.fuzz_seconds, left // max(1, len(functions)))
-        if seconds < min(5, self.cfg.fuzz_seconds):                # at least 5 s per function, or the configured time
-            s.fuzzing.append(f"not run: the search budget of the run ({self.cfg.fuzz_budget_seconds} s) is used up")
+        context = uc.execution_context(self.layout, s.bundle)
+        functions = list(dict.fromkeys(g.function for g in gaps))
+        keys = {fn: frozenset([context, f"function:{fn}", *[g.gap_id for g in gaps if g.function == fn]])
+                for fn in functions}
+        pending = [fn for fn in functions if keys[fn] not in s.fuzzed]
+        if not pending:
             return None
-        s.fuzz_spent += seconds * len(functions)
-        try:
-            fuzz = await self.call("compilation", "fuzz", uc.FuzzRequest(
-                layout=self.layout, bundle=s.bundle, functions=functions, gaps=gaps,
-                covered=result.coverage.covered_items, seconds=seconds), uc.FuzzResult)
-        except (Rejected, ba.AgentFault) as exc:
-            if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
-                raise
-            s.fuzzing.append(f"not run: {exc}")
-            return None
-        engine = fuzz.engine or "libFuzzer"                                                 # A3-FZ11
-        s.fuzzing.append(f"{engine}: {', '.join(fuzz.functions) or '-'}: {fuzz.reason}")
-        failed = {u.split(": ", 1)[0]: u.split(": ", 1)[-1] for u in fuzz.unsupported}
-        for name, why in failed.items():                    # A3-FZ13: a target that does not build is a finding
-            if re.search(r"does not build|build failed|no statistics", why):
+        failures = {t.name for t in result.tests if t.status in ("failed", "crashed", "timeout")}
+        bundle = uc.without_tests(s.bundle, sorted(failures), "isolated failing tests from search [REC-18]") \
+            if s.bundle and failures else s.bundle
+        aggregate = uc.FuzzResult()
+        while pending:
+            left = self.cfg.fuzz_budget_seconds - s.fuzz_spent
+            if left < 1:
+                s.fuzzing.append(f"not searched: {len(pending)} function(s); run budget of "
+                                 f"{self.cfg.fuzz_budget_seconds} s exhausted [REC-18]")
+                break
+            seconds = max(1, min(self.cfg.fuzz_seconds, left // len(pending)))
+            count = min(self.cfg.fuzz_functions_per_batch, len(pending), left // seconds)
+            batch, pending = pending[:count], pending[count:]
+            s.fuzz_spent += seconds * len(batch)
+            try:
+                searched = await self.call("compilation", "fuzz", uc.FuzzRequest(
+                    layout=self.layout, bundle=bundle, functions=batch,
+                    gaps=[g for g in gaps if g.function in batch], covered=result.coverage.covered_items,
+                    seconds=seconds), uc.FuzzResult)
+            except (Rejected, ba.AgentFault) as exc:
+                if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
+                s.fuzzing.append(f"search batch unavailable: {exc}")
+                break
+            aggregate.engine = searched.engine or aggregate.engine
+            aggregate.inputs.extend(searched.inputs)
+            aggregate.functions.extend(searched.functions)
+            aggregate.unsupported.extend(searched.unsupported)
+            aggregate.crashes.extend(searched.crashes)
+            aggregate.executions += searched.executions
+            aggregate.replayed += searched.replayed
+            aggregate.outcomes.update(searched.outcomes)
+            aggregate.execution_sources.update(searched.execution_sources)
+            for fn in batch:
+                function = uc.function_of(fn, self.layout)
+                names = {fn, function.qualified_name if function else fn}
+                if names & (set(searched.outcomes) | set(searched.functions)) or any(
+                        u.startswith(tuple(n + ":" for n in names)) for u in searched.unsupported):
+                    s.fuzzed.add(keys[fn])
+            s.fuzzing.append(f"{searched.engine or 'search'}: {len(batch)} target(s), {searched.executions} executions, "
+                            f"{len(searched.inputs)} useful input(s); {searched.reason}")
+            s.fuzzing.extend(f"not fuzzed: {u}" for u in searched.unsupported)
+            if searched.outcomes and all(o == "support_build_failed" for o in searched.outcomes.values()):
+                if pending:
+                    s.fuzzing.append(f"{len(pending)} further function(s) not attempted: shared support build failed")
+                break
+        aggregate.reason = f"{len(aggregate.inputs)} useful input(s), {aggregate.executions} executions; " \
+                           f"{len(pending)} target(s) not attempted"
+        failed = {u.split(": ", 1)[0]: u.split(": ", 1)[-1] for u in aggregate.unsupported}
+        for name, why in failed.items():
+            if re.search(r"does not compile|does not build|build failed|no statistics", why):
                 s.findings.append(self._finding("pipeline_limitation", f"fuzz target of {name}", why))
-        for g in gaps:                                                                       # COV-6, COV-10
-            fn = self._function_of(g.function)
-            why = failed.get(fn.qualified_name if fn else g.function) or failed.get(g.function)
-            if why:                                         # never "none reached it" for a search that did not run
-                s.note(g.gap_id, f"iteration {iteration}: not searched ({engine}): {why[:200]} [A3-FZ13]")
-                continue
-            s.note(g.gap_id, f"iteration {iteration}: coverage-guided search ({engine}, {fuzz.executions:,} inputs run, "
-                             + (f"{len(fuzz.inputs)} reached new items)" if fuzz.inputs else "none reached it)"))
-        s.fuzzing += [f"not fuzzed: {u}" for u in fuzz.unsupported]
+        for g in gaps:
+            fn = uc.function_of(g.function, self.layout)
+            name = fn.qualified_name if fn else g.function
+            why = failed.get(name) or failed.get(g.function)
+            if why:
+                s.note(g.gap_id, f"iteration {iteration}: not searched: {why[:200]} [REC-18]")
+            elif keys[g.function] not in s.fuzzed:
+                s.note(g.gap_id, f"iteration {iteration}: not searched: no completed search receipt [REC-18]")
+            else:
+                s.note(g.gap_id, f"iteration {iteration}: coverage-guided search ({aggregate.engine}); "
+                                f"outcome {aggregate.outcomes.get(name, 'returned')} [REC-18]")
         s.open_items.update(f"input that crashes the SUT (characterization only, not a proven defect): {c}"
-                            for c in fuzz.crashes)
-        return fuzz
+                            for c in aggregate.crashes)
+        return aggregate
 
     @staticmethod
     def _take_repairs(s: "RunState", bundle: uc.FileActionBundle, result: uc.VerificationResult) -> uc.FileActionBundle:
@@ -2161,6 +2213,7 @@ class Orchestrator:
             LOG.warning("KB guidance unavailable: %s", exc)
         bundle = await self.call("generator", "generate", uc.GenerationRequest(
             plan=plan, guidance=guidance, existing_suite=self.suite, journal=journal or {},
+            existing_evidence={n: e for a in (s.bundle.actions if getattr(s, "bundle", None) else []) for n, e in a.evidence_refs.items()},
             item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
         self.check_bundle(bundle)
         if isinstance(getattr(s, "written", None), set):                                       # ORC-12b
@@ -2278,6 +2331,7 @@ class Orchestrator:
                     replan = plan.model_copy(update={"scenarios": recovered.scenarios, "repairs": [], "drop_tests": []})
                 again = await self.call("generator", "generate", uc.GenerationRequest(
                     plan=replan, guidance=guidance, existing_suite=uc.suite_of(base), journal=feedback,
+                    existing_evidence={n: e for a in base.actions for n, e in a.evidence_refs.items()},
                     item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
                 self.check_bundle(again)
                 old_tests, new_tests = uc.test_sources(uc.suite_of(base)), uc.test_sources(uc.suite_of(again))
@@ -2517,16 +2571,17 @@ class Orchestrator:
 
     @staticmethod
     def _back_to_the_test(s: "RunState", failure: uc.Failure) -> None:
-        """A4-23j: Agent4 found no source change for this failure, so the source is not shown to be wrong. The
-        failure goes back to Agent1 as undetermined: the test keeps its inputs and observes its results (A2-21p); the
-        report keeps the open item and the change of expectation for the developer."""
-        note = "Agent4 found no source change that passes its checks: the test observes its results [A4-23j]"
+        """REC-15, A4-23j: no validated correction establishes neither a source defect nor a wrong assertion."""
+        note = "Agent4 found no validated source change; failure remains undetermined and its assertion is retained [A4-23j] [REC-15]"
         failure.classification, failure.route = "undetermined", "agent1"
+        if hasattr(s, "unresolved_failures") and failure.affected_test:
+            s.unresolved_failures[failure.affected_test] = failure
+            s.unresolved_bundle = s.bundle
         if note not in failure.diagnostic:
             failure.diagnostic = f"{failure.diagnostic} | {note}"[:600]
         s.open_items.add(f"{failure.affected_test or failure.failure_id}: failed against its evidence "
-                         f"({failure.diagnostic.split(' | ')[0][:200]}); Agent4 found no source change, so the test "
-                         "observes its results - review whether the source or the test is wrong [A4-23j]")
+                         f"({failure.diagnostic.split(' | ')[0][:200]}); obtain independent validation before changing "
+                         "the assertion or the source [REC-15]")
 
     async def _correct_source(self, s: "RunState", failure: uc.Failure, result: uc.VerificationResult,
                               last_good: uc.VerificationResult | None) -> uc.VerificationResult | None:
@@ -2729,6 +2784,12 @@ class Orchestrator:
         for action in (bundle.actions if bundle else []):
             (files_dir / action.path).parent.mkdir(parents=True, exist_ok=True)
             (files_dir / action.path).write_text(stamp(action.content), encoding="utf-8", newline="")
+        if s.unresolved_failures and s.unresolved_bundle is not None:
+            unresolved = s.out / "unresolved_generated"
+            for action in s.unresolved_bundle.actions:
+                (unresolved / action.path).parent.mkdir(parents=True, exist_ok=True)
+                (unresolved / action.path).write_text(stamp(action.content), encoding="utf-8", newline="")
+            notes.append(f"unresolved assertions and fixtures retained in {unresolved}; not a passing test delivery [REC-15]")
         if s.mode == "repository":
             pass                                  # delivered by RepositoryRun into the repository [ORC-24..ORC-31]
         elif bundle and self.cfg.deliver_tests_to_repo and s.best_bundle is not None:
@@ -2989,7 +3050,9 @@ class Journal:
             source = sources.get(name, "")
             fn = next((f for f in layout.functions if re.search(
                 r"\b" + re.escape(f.qualified_name.split("::")[-1]) + r"\s*\(", source)), None)
-            cause = "wrong_expectation" if t.status == "failed" else "wrong_inputs"
+            attributed = next((f for f in result.failures if f.affected_test == name), None)
+            cause = "undetermined" if attributed is None or attributed.classification == "undetermined" else \
+                "wrong_expectation" if t.status == "failed" else "wrong_inputs"
             message = (f"{name} failed: expected {t.expected}, actual {t.actual}" if t.status == "failed"
                        else f"{name} {t.status}: {t.message}")
             new |= self._entry(fn.qualified_name if fn else "", [f"test:{name}"], cause, message, iteration=iteration,
@@ -3021,7 +3084,10 @@ class Journal:
         for sc in plan.scenarios:
             tests = by_scenario.get(sc.scenario_id, [])
             if tests and set(tests) <= passed and not sc.characterization:
-                resolved.update(g for g in sc.gap_ids if g.startswith("EVIDENCE:"))
+                resolved.update(g for g in sc.gap_ids if g.startswith("EVIDENCE:") and
+                                ("@" not in g or any(g in sources.get(name, "") and
+                                 re.search(r"\bUT_(?:EXPECT|ASSERT)\w*\s*\(", sources.get(name, ""))
+                                 for name in tests)))
         self.close(resolved)
         return new
 
@@ -3130,6 +3196,9 @@ class RunState:
         self.notes: list[str] = []
         self.oracle_checks: list[uc.OracleResult] = []
         self.source_fixes: list[uc.SourcePatch] = []
+        self.source_validation: dict[str, dict[str, uc.ValidationCheck]] = {}
+        self.unresolved_failures: dict[str, uc.Failure] = {}
+        self.unresolved_bundle: uc.FileActionBundle | None = None
         self.asil, self.asil_source, self.iter_limit = "D", "default", uc.DEFAULT_ITERATIONS   # COV-2, COV-9
         self.targets: dict[str, str] = dict(uc.MIN_TARGETS["D"])                             # COV-1
         self.strategies: dict[str, list[str]] = {}                # item -> strategies tried [COV-6, COV-10]
@@ -3219,6 +3288,20 @@ class RunState:
                               (self.lookups, plan.lookups)):
             target.extend(line for line in lines if line not in target)
         self.disputed |= set(plan.disputed_evidence)
+        refuted = set(plan.refuted_proofs) & set(self.proofs)
+        for item in refuted:
+            self.proofs.pop(item, None)
+            self.variant_proofs.pop(item, None)
+            self.final_items.discard(item)
+            self.attempts.pop(item, None)
+            self.note(item, "measured execution refuted the prior proof; analysis reopened [REC-16]")
+        for line, candidate in list(self.defects.items()):
+            candidate.items = [i for i in candidate.items if i not in refuted]
+            if not candidate.items:
+                del self.defects[line]
+        for entry in self.journal.entries:
+            if set(entry.items) & refuted and entry.final_status in ("proven_unreachable", "needs_source_change"):
+                entry.status, entry.final_status = "open", ""
 
     def note(self, item: str, text: str) -> None:
         tried = self.strategies.setdefault(item, [])
@@ -3318,9 +3401,9 @@ class RunState:
 
     def actions(self, last: uc.VerificationResult) -> list[str]:
         """COV-11: what the developer can do; the run does not wait for it."""
-        rows = [f"review defect candidate {d.candidate_id} at line {d.line}: `{d.decision}` - {d.proof[:160]}; with "
-                f"`{d.change.split(' -> ')[-1]}` it would not be - either the operator is wrong or the condition is "
-                f"redundant; it blocks {len(d.items)} item(s) [A1-37f, COV-7]"
+        rows = [f"review behavioral hypothesis {d.candidate_id} at line {d.line}: `{d.decision}` - {d.proof[:160]}; "
+                f"compare with {d.evidence or 'independent requirements'}; no correction is established; "
+                f"{len(d.items)} item(s) remain open [A1-37f, REC-16]"
                 for d in sorted(getattr(self, "defects", {}).values(), key=lambda d: d.line)]
         metrics = last.coverage.file_metrics if last.coverage else None
         for name in uc.METRICS:
@@ -3375,6 +3458,16 @@ class RunState:
     def record(self, iteration: int, stage: str, result: uc.VerificationResult,
                bundle: uc.FileActionBundle | None) -> None:
         """A3-109..A3-111: progress per iteration."""
+        for failure in result.failures:
+            if failure.source_checks:
+                self.source_validation[failure.affected_test or failure.failure_id] = failure.source_checks
+            if failure.classification == "undetermined" and failure.affected_test:
+                self.unresolved_failures[failure.affected_test] = failure
+                self.unresolved_bundle = bundle
+        if result.build_ok and result.link_ok and result.run_ok:
+            for test in result.tests:
+                if test.status == "passed":
+                    self.unresolved_failures.pop(test.name, None)
         gaps = sum(len(f.gaps) for f in result.coverage.functions) if result.coverage else 0
         previous = len(self.bundle.tests) if self.bundle and bundle is not self.bundle else 0
         self.iterations.append(uc.IterationRecord(
@@ -3400,8 +3493,14 @@ class RunState:
     def finish(self, state: str, reason: str, last: uc.VerificationResult | None = None) -> uc.PipelineResult:
         last = last or self.last
         bundle = self.best_bundle or self.bundle
+        if self.unresolved_failures:
+            if state == "verified_measured":
+                state, reason = "incomplete", "unresolved failures retained for independent validation [REC-15]; " + reason
+            self.open_items.update(f"{name}: unresolved failure; original assertion retained [REC-15]"
+                                   for name in self.unresolved_failures)
         return uc.PipelineResult(
             final_state=state, reason=reason, sut_file=self.req.sut_file,
+            source_validation=dict(self.source_validation),
             language=self.layout.language if self.layout else "",
             compiler=f"{last.compiler} {last.compiler_version}".strip() if last else "",
             iterations=self.iterations, metrics=last.coverage.file_metrics if last and last.coverage else None,
@@ -3468,6 +3567,9 @@ def report(r: uc.PipelineResult) -> str:
                  f"- Delivery: {r.delivery or 'not delivered yet'}"]
         if r.previous_review:
             rows.append(f"- Previous review pull request: {r.previous_review} [ORC-26]")
+    if r.requirements_complete is not None:
+        rows.append("- Requirement obligations: " + ("all recorded items asserted" if r.requirements_complete else
+                    "incomplete; see requirement status and unlinked items below") + " [REC-17]")
     planning = next((line for line in r.brain_answers if line.startswith("A1.plan:")), "")
     rows += [f"- Open items: {r.open_summary}"] if r.open_summary else []                        # LA-3a
     rows += [f"- Defect candidates: {len(r.defect_candidates)} (see below) [A1-37f]"] if r.defect_candidates else []
@@ -3496,14 +3598,21 @@ def report(r: uc.PipelineResult) -> str:
         rows += [f"## Coverage targets: ASIL {r.asil} ({r.asil_source}) [COV-1, COV-2]", ""]
         rows += [f"- {line}" for line in r.target_check] + [""]
     if r.defect_candidates:                                                              # A1-37f
-        rows += ["## Defect candidates [A1-37f]", "", "A condition the analysis proves can never take a value, and that "
-                 "takes it when its operator is swapped: likely a wrong operator. A finding for the developer - the "
-                 "source is not changed by the pipeline (COV-7).", ""]
+        rows += ["## Defect candidates [A1-37f]", "", "Infeasibility hypotheses to compare with behavioral evidence. "
+                 "A proof alone establishes neither a production defect nor a correction [REC-16].", ""]
         for d in r.defect_candidates:
             rows += [f"- **{d.candidate_id}** line {d.line} ({d.function}): `{d.decision}`", f"  - proof: {d.proof}",
-                     f"  - the change that removes the proof: `{d.change}`"]
+                     f"  - correction: {d.change or 'not established; review the evidence'}"]
             rows += ([f"  - evidence: {d.evidence}"] if d.evidence else [])
             rows += [f"  - blocks {len(d.items)} item(s): {', '.join(d.items[:8])}", ""]
+    if r.unlinked_requirements:
+        rows += ["## Unlinked requirements", ""] + [f"- {line}" for line in r.unlinked_requirements] + [""]
+    if r.source_validation:
+        rows += ["## Source-defect validation", ""]
+        for name, checks in r.source_validation.items():
+            rows.append(f"- {name}")
+            rows.extend(f"  - {key}: {check.status} — {check.basis}" for key, check in checks.items())
+        rows.append("")
     if r.action_needed:                                                                  # COV-11
         rows += ["## Action needed", "", "The run did not wait for this; it stopped with the evidence below.", ""]
         rows += [f"- {line}" for line in r.action_needed] + [""]
