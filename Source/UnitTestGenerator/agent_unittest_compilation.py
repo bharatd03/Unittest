@@ -987,23 +987,30 @@ def _plain_exit_text(code: int, text: str = "") -> str:
 
 # A program the pipeline just built that the operating system refuses to start (Smart App Control, App
 # Control for Business, AppLocker, a group policy) [TP-9, TP-9a]
-BLOCKED_RUN = re.compile(r"WinError (4551|4556|1260|225)\b|Application Control|blocked by (your )?(group )?policy", re.I)
-BLOCKED_HINT = ("Windows refused to run {name}, a program the pipeline has just built (an application-control "
-                "policy such as Smart App Control). Allow programs built in the tool's work folder, or have the "
-                "policy changed; nothing was worked around [TP-9, TP-9a].")
-VIRUS_HINT = ("The virus scanner stopped {name}, a program the pipeline has just built from your code and its tests "
-              "(Windows: WinError 225, or the program removed right after it was built). Exclude the tool's work folder "
-              "{folder} from the scanning (Windows Security: Virus & threat protection > Exclusions, or your IT); "
-              "nothing was worked around, the run goes on without it [TP-9, TP-9a].")
+BLOCKED_RUN = re.compile(r"WinError (4551|4556|1260|225|226|577|5)\b|\[Errno 13\]|Application Control|blocked by (your )?(group )?policy", re.I)
+BLOCKED_HINT = ("The operating system refused to run {name}, a program the pipeline has just built. "
+                "Execution is blocked by security policy or access permissions; stop this batch and request IT review or use an "
+                "IT-approved build/test worker. Protection was not bypassed [TP-9, TP-9a, REC-9].")
+VIRUS_HINT = ("The just-built runner {name} was blocked or could not be found. Windows errors 225/226 report "
+              "a virus-scanner block or removal. "
+              "A missing runner can also indicate removal by another process; inspect quarantine and OS logs. "
+              "Stop this batch and request security review or use an IT-approved build/test worker. "
+              "Do not disable protection or automatically restore quarantined files [TP-9, TP-9a, REC-9].")
 
 
 def blocked_hint(code: int, text: str, program: Path) -> str:
-    """TP-9a: why Windows did not run a program the pipeline built - the virus scanner or an application-control
-    policy - or "" when it ran. A program that no longer exists right after its build was removed by a scanner."""
-    if re.search(r"WinError 225\b", text or "") or (code == -127 and not program.exists()):
-        work = next((p for p in program.parents if p.name.endswith(("-fuzz", "ut_work"))), program.parent)
-        return VIRUS_HINT.format(name=program.name, folder=work.parent if work.name.endswith("-fuzz") else work)
+    """TP-9a, REC-9: distinguish blocked/missing execution from a failing test."""
+    if (code == -126 and re.search(r"WinError (225|226)\b", text or "")) or (code == -127 and not program.exists()):
+        return VIRUS_HINT.format(name=program.name)
     return BLOCKED_HINT.format(name=program.name) if code == -126 and BLOCKED_RUN.search(text or "") else ""
+
+
+def _run_program(cmd, cwd, timeout, env=None, quiet=False):
+    """REC-9: detect denial even on list, isolated rerun and retry paths."""
+    code, text = _run(cmd, cwd, timeout, env, quiet)
+    if hint := blocked_hint(code, text, Path(cmd[0])):
+        raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)
+    return code, text
 
 
 # ============================================================================ build variants [A3-BD14]
@@ -3228,6 +3235,8 @@ class CompilationAgent(ba.AgentCore):
                     else:
                         result.test_items = items
                 except ba.AgentFault as exc:
+                    if exc.code == "ENVIRONMENT_BLOCKED":                    # REC-9
+                        raise
                     LOG.warning("Per-test coverage unavailable: %s", exc.message)
             return result
         if req.stage == "build_check":
@@ -3961,13 +3970,13 @@ class CompilationAgent(ba.AgentCore):
         else:
             # every test ends within the harness's time limit [A3-45d], so the whole run is bounded by the
             # number of tests: a suite of many slow tests is not cut off by run_timeout
-            c, listed = _run([str(binary), "--list"], run_dir, self.cfg.test_timeout,
+            c, listed = _run_program([str(binary), "--list"], run_dir, self.cfg.test_timeout,
                              chain.env(LLVM_PROFILE_FILE=str(run_dir / "list.profraw")), quiet=True)
             if blocked_hint(c, listed, binary):                            # TP-9a: once, no retries
                 raise ba.AgentFault("ENVIRONMENT_BLOCKED", blocked_hint(c, listed, binary))
             count = sum(1 for line in listed.splitlines() if line.startswith("UT_LIST|"))
             limit = max(self.cfg.run_timeout, count * (self.cfg.test_time_limit_ms / 1000.0 + 0.25) + 10.0)
-            code, text = _run([str(binary), *(["--isolate"] if isolate else [])], run_dir, limit, env)
+            code, text = _run_program([str(binary), *(["--isolate"] if isolate else [])], run_dir, limit, env)
         if blocked_hint(code, text, binary):                               # TP-9a: once, no retries
             raise ba.AgentFault("ENVIRONMENT_BLOCKED", blocked_hint(code, text, binary))
         (run_dir / "run_output.txt").write_text(text, encoding="utf-8")
@@ -3977,7 +3986,7 @@ class CompilationAgent(ba.AgentCore):
         if summary is None:
             # Every test of the suite runs alone [A3-45a]: the list comes from the test program itself, not
             # from the tests that started before the abnormal end; profiles of all runs are merged.
-            c, listed = _run([str(binary), "--list"], run_dir, self.cfg.test_timeout,
+            c, listed = _run_program([str(binary), "--list"], run_dir, self.cfg.test_timeout,
                              chain.env(LLVM_PROFILE_FILE=str(run_dir / "list.profraw")), quiet=True)
             names = [line.split("|", 1)[1].strip() for line in listed.splitlines() if line.startswith("UT_LIST|")]
             started = [line.split("|")[1] for line in text.splitlines() if line.startswith("UT_START|")]
@@ -3987,10 +3996,10 @@ class CompilationAgent(ba.AgentCore):
                             _exit_text(code, text, getattr(chain, "facts", None)), len(names))
             results = []
             if not names:                  # no test to run alone: one run of the program writes the profile [A3-60]
-                c, t = _run([str(binary)], run_dir, self.cfg.test_timeout, alone(), quiet=True)
+                c, t = _run_program([str(binary)], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                 outputs.append(t)
             for name in names:
-                c, t = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
+                c, t = _run_program([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                 outputs.append(t)
                 single, obs, summ = parse_run_output(t)
                 observed.update(obs)
@@ -4006,7 +4015,7 @@ class CompilationAgent(ba.AgentCore):
                     timed_out = "UT_TIMEOUT" in t
                     if not timed_out and uc.program_outcome(c, t, facts) == "unknown":
                         # NC-12: an end the facts do not describe - once more alone, to tell a fluke from a property
-                        c2, t2 = _run([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
+                        c2, t2 = _run_program([str(binary), "--only", name], run_dir, self.cfg.test_timeout, alone(), quiet=True)
                         outputs.append(t2)
                         again, obs2, summ2 = parse_run_output(t2)
                         again_done = next((r for r in again if r.name == name), None)
@@ -4104,10 +4113,17 @@ class CompilationAgent(ba.AgentCore):
                 self._per_test_runs[name] = "measured alone in an earlier run, taken from the cache [CA-3]"
         names = [n for n in names if n not in out]
 
+        stopped = threading.Event()                                         # REC-9
         def one(index: int, name: str):
+            if stopped.is_set():
+                raise ba.AgentFault("ENVIRONMENT_BLOCKED", "per-test measurement stopped after an execution denial")
             raw = base / f"t{index}.profraw"
-            code, text = _run([str(binary), "--only", name], run_dir, self.cfg.run_timeout,
-                              chain.env(LLVM_PROFILE_FILE=str(raw.resolve())), quiet=True)   # one entry [VIEW-14]
+            try:
+                code, text = _run_program([str(binary), "--only", name], run_dir, self.cfg.run_timeout,
+                                         chain.env(LLVM_PROFILE_FILE=str(raw.resolve())), quiet=True)
+            except ba.AgentFault:
+                stopped.set()
+                raise
             lines = [x for x in text.replace("\r", "").splitlines() if x.strip()]
             how = f"exit {code}, profile {'written' if raw.is_file() else 'missing'}, " + \
                 (lines[-1][:120] if lines else "no output")                                      # A3-OBS6
@@ -4786,9 +4802,6 @@ class CompilationAgent(ba.AgentCore):
             used = [(n, t) for n, t in controls if n in driven or (n.startswith("ut_stub_") and n[8:-7] in calls) or
                     (not n.startswith("ut_stub_") and not n.endswith("()") and
                      re.search(r"\b" + re.escape(n.split("::")[-1]) + r"\b", body))]
-            if getattr(self, "_search_blocked", ""):          # one refusal, not one per function [TP-9a]
-                result.unsupported.append(f"{fn.qualified_name}: not searched: {self._search_blocked}")
-                continue
             plan = FuzzPlan(fn, layout, used, self.cfg.stub_call_budget)
             plan.body = body
             source = plan.build(repo / layout.sut_file)
@@ -4846,7 +4859,7 @@ class CompilationAgent(ba.AgentCore):
                 continue
             result.functions.append(fn.qualified_name)
             for crash in sorted(list(d.glob("crash-*")) + list(d.glob("timeout-*")))[:3]:
-                code, out = _run([str(replay), str(crash)], d, 30, chain.env(UT_FUZZ_PRINT="1"))
+                code, out = _run_program([str(replay), str(crash)], d, 30, chain.env(UT_FUZZ_PRINT="1"))
                 line = next((x for x in out.splitlines() if x.startswith("UT_FUZZ")), "")
                 if line:
                     args, setup = plan.to_input(line)
@@ -4917,8 +4930,10 @@ class CompilationAgent(ba.AgentCore):
         merged = d / "merged"
         shutil.rmtree(merged, ignore_errors=True)
         merged.mkdir()
-        _run([str(d / f"fuzz{EXE}"), "-merge=1", "-use_value_profile=1", "-timeout=5", str(merged), str(d / "corpus")],
+        code, text = _run([str(d / f"fuzz{EXE}"), "-merge=1", "-use_value_profile=1", "-timeout=5", str(merged), str(d / "corpus")],
              d, 300, chain.env())
+        if hint := blocked_hint(code, text, d / f"fuzz{EXE}"):
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)                  # REC-9
         kept = {p.name for p in merged.iterdir()}            # merge names its copies by content (SHA-1)
         by_hash = {hashlib.sha1(p.read_bytes()).hexdigest(): p for p in inputs}
         first = [p for p in inputs if p.name.startswith("seed_")]
@@ -4945,6 +4960,8 @@ class CompilationAgent(ba.AgentCore):
                            "-use_value_profile=1", "-fork=1", "-ignore_crashes=1", "-ignore_timeouts=1",   # A3-FZ12
                            f"-max_len={max(64, plan.size + 16)}", "-timeout=5", "-rss_limit_mb=2048",
                            f"-artifact_prefix={d}{os.sep}", "-print_final_stats=1"], d, seconds + 120, chain.env())
+        if hint := blocked_hint(code, text, fuzzer):
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)                  # REC-9
         return "", text
 
     def _ut_search(self, chain: "Toolchain", compiler: str, cpp: bool, sut_flags: list[str], std: list[str],
@@ -4980,8 +4997,7 @@ class CompilationAgent(ba.AgentCore):
                               left + 120, chain.env(LLVM_PROFILE_FILE=str(d / f"search{restart}.profraw")))
             hint = blocked_hint(code, text, search)
             if hint:
-                self._search_blocked = hint                    # not built and run again in this run [TP-9a]
-                return hint, ""
+                raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)              # REC-9
             m = re.search(r"stat::number_of_executed_units:\s*(\d+)", text or "")
             executions += int(m.group(1)) if m else 0
             logs.append(text or "")
@@ -5024,7 +5040,7 @@ class CompilationAgent(ba.AgentCore):
         chosen: list[uc.FuzzInput] = []
         for index, path in enumerate(inputs):
             raw = d / f"in{index}.profraw"
-            code, out = _run([str(replay), str(path)], d, 30, chain.env(UT_FUZZ_PRINT="1", LLVM_PROFILE_FILE=str(raw)))
+            code, out = _run_program([str(replay), str(path)], d, 30, chain.env(UT_FUZZ_PRINT="1", LLVM_PROFILE_FILE=str(raw)))
             line = next((x for x in out.splitlines() if x.startswith("UT_FUZZ")), "")
             if not line or not raw.is_file():
                 continue
@@ -5157,6 +5173,8 @@ class CompilationAgent(ba.AgentCore):
                                     [req.test], [m for m in mutants if m[0] in killed_ref], time.monotonic() + limit,
                                     workers) if ref is not None else None
         except ba.AgentFault as exc:
+            if exc.code == "ENVIRONMENT_BLOCKED":                             # REC-9
+                raise
             return uc.OracleResult(test=req.test, decision="oracle_strength_undetermined", mutants=total,
                                    reason=f"the test program could not be built for the check: {exc.message}")
         ba.emit_event("program", app="UT", agent=CompilationAgent.name, label="UT-Compilation",       # VIEW-14
@@ -5179,6 +5197,8 @@ class CompilationAgent(ba.AgentCore):
         bundle = _replace_suite(req.bundle, req.layout.suite_file, suite)
         res = self.execute(uc.VerifyRequest(layout=req.layout, stage="observe", bundle=bundle, measure_tests=[]))
         shutil.rmtree(res.run_dir, ignore_errors=True)
+        if any(f.failure_id == "env-blocked" for f in res.failures):
+            raise ba.AgentFault("ENVIRONMENT_BLOCKED", res.reason)            # REC-9
         return {t.line: t.actual for t in res.tests if t.name == req.test and t.status == "failed" and t.line}
 
     # ---------------------------------------------------------------- fault check of a suggestion [COV-14..COV-19]
@@ -5277,10 +5297,11 @@ class CompilationAgent(ba.AgentCore):
             else:
                 after = None
         except ba.AgentFault as exc:
+            if exc.code == "ENVIRONMENT_BLOCKED":                             # REC-9
+                raise
             return uc.FaultCheckResult(**base, decision="not_checked", changed_line_mutants=changed_count,
                                        compared=len(compared), elapsed_s=round(time.monotonic() - started, 2),
-                                       reason=exc.message if exc.code == "ENVIRONMENT_BLOCKED" else
-                                       f"the test program could not be built for the check: {exc.message}")
+                                       reason=f"the test program could not be built for the check: {exc.message}")
         chain = self.toolchain()
         base["compiler"] = f"{chain.cc if req.layout.language == 'c' else chain.cxx} {chain.version}"
         if ran is None or after is None:
@@ -5334,6 +5355,8 @@ class CompilationAgent(ba.AgentCore):
             return repo, compile_sut, build["commands"][-1], build["binary"]
 
         def work(index: int) -> None:
+            if stop.is_set():                                                  # REC-9
+                return
             repo, compile_sut, link, binary = prepare(index)
             env = chain.env(LLVM_PROFILE_FILE=str(root / f"w{index}" / "m-%p.profraw"))
             target = repo / sut_name
@@ -5346,14 +5369,24 @@ class CompilationAgent(ba.AgentCore):
                     stop.set()
                     return
                 self._write_new(target, uc.encode_like(Path(layout.repo_root) / sut_name, source))
-                code, _ = _run(compile_sut, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                code, text = _run(compile_sut, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                hint = blocked_hint(code, text, Path(compile_sut[0]))
+                if stop.is_set():
+                    return                                                    # REC-9: a sibling was blocked
                 if code == 0:
-                    code, _ = _run(link, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                    code, text = _run(link, repo, self.cfg.compile_timeout, chain.env(), quiet=True)
+                    hint = blocked_hint(code, text, Path(link[0]))
+                if hint:
+                    stop.set()
+                    raise ba.AgentFault("ENVIRONMENT_BLOCKED", hint)          # REC-9
+                if stop.is_set():
+                    return                                                    # REC-9: do not start another runner
                 if code != 0:
                     detected = True                                  # does not build: detected [A3-85b]
                 else:
                     code, text = _run([str(binary)], repo, self.cfg.mutant_run_timeout, env, quiet=True)
                     if blocked_hint(code, text, binary):                       # TP-9a: not a detection
+                        stop.set()                                            # REC-9: stop sibling workers
                         raise ba.AgentFault("ENVIRONMENT_BLOCKED", blocked_hint(code, text, binary))
                     tests, _, summary = parse_run_output(text)
                     status = {t.name: t.status for t in tests}

@@ -1499,6 +1499,46 @@ class CompilationTests(unittest.TestCase):
         self.assertEqual([f.classification for f in r.failures], ["environment_defect"])
         self.assertEqual(len(runs), 1)                                   # no test-by-test reruns
 
+    def test_blocked_mutations_propagate_instead_of_undetermined(self):             # REC-9
+        fault = ba.AgentFault("ENVIRONMENT_BLOCKED", "[WinError 226] quarantined")
+        with mock.patch.object(self.agent, "_mutant_runs", side_effect=fault):
+            with self.assertRaises(ba.AgentFault) as caught:
+                self.fault(lambda s: s.replace("    return value;\n", "    /* retained */\n    return value;\n"))
+            self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+            original = self.bundle(self.CLAMP_TESTS)
+            with mock.patch.object(self.agent, "_observe_failures", return_value={}):
+                with self.assertRaises(ba.AgentFault) as caught:
+                    self.agent.oracle_check(uc.OracleRequest(
+                        layout=self.layout, test="test_clamp", function="clamp_percent",
+                        original_suite=uc.suite_of(original), changed_suite=uc.suite_of(original), bundle=original))
+            self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+
+    def test_blocked_mutation_worker_does_not_run_remaining_mutants(self):        # REC-9
+        real, runs = a3._run, []
+        def blocked(cmd, cwd, timeout, env=None, quiet=False):
+            if Path(str(cmd[0])).stem == "ut_runner":
+                runs.append(cmd)
+                return -126, "[WinError 226] quarantined"
+            return real(cmd, cwd, timeout, env, quiet)
+        source = uc.read_source(Path(self.layout.repo_root) / self.layout.sut_file)
+        with mock.patch.object(a3, "_run", blocked):
+            with self.assertRaises(ba.AgentFault) as caught:
+                self.agent._mutant_runs(self.layout, self.bundle(self.CLAMP_TESTS), ["test_clamp"],
+                                        [(str(i), source) for i in range(8)], time.monotonic() + 60, 1)
+        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertEqual(len(runs), 1)
+
+    def test_blocked_per_test_measurement_stops_queued_runs(self):                # REC-9
+        directory = Path(self.tmp.name) / "measurement"
+        directory.mkdir()
+        with mock.patch.object(self.agent.cfg, "parallel_runs", 1), \
+             mock.patch.object(a3, "_run", return_value=(-126, "[WinError 225]")) as execute:
+            with self.assertRaises(ba.AgentFault) as caught:
+                self.agent._per_test_items(directory / "runner", directory,
+                    Path(self.layout.repo_root), self.layout, [f"case_{i}" for i in range(10)], self.agent.toolchain())
+        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertEqual(execute.call_count, 1)
+
     def test_mutant_sites_are_the_mutants_of_the_oracle_check(self):                # COV-15: same operators
         source = (Path(self.layout.repo_root) / self.layout.sut_file).read_text()
         for fn in self.layout.functions:
@@ -2431,8 +2471,7 @@ class CaptureAndDependencyTests(unittest.TestCase):
 
     def test_a_search_the_virus_scanner_stops_is_reported_once(self):                  # TP-9a
         """The virus scanner stops the search program the pipeline built (WinError 225): the report says so and names
-        the work folder to exclude; no other search program is built and run in this run - one alert, not one per
-        function (the medium run of 14:09)."""
+        an approved worker; it raises ENVIRONMENT_BLOCKED instead of continuing planning [REC-9]."""
         real, runs = a3._run, []
 
         def scanner(cmd, cwd, timeout, env=None, quiet=False):
@@ -2453,10 +2492,11 @@ class CaptureAndDependencyTests(unittest.TestCase):
         self.assertGreater(len(names), 1)
         chain = self.a3.toolchain()
         with mock.patch.object(a3, "_run", scanner), mock.patch.object(chain.tools, "fuzzer", False):
-            result = self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=names, seconds=3))
-        self.assertEqual(len(runs), 1, result.unsupported)
-        self.assertTrue(any("virus scanner" in u and "Exclude the tool's work folder" in u for u in result.unsupported))
-        self.assertTrue(any("not searched" in u for u in result.unsupported), result.unsupported)
+            with self.assertRaises(ba.AgentFault) as raised:
+                self.a3.fuzz(uc.FuzzRequest(layout=layout, bundle=bundle, functions=names, seconds=3))
+        self.assertEqual(raised.exception.code, "ENVIRONMENT_BLOCKED")
+        self.assertIn("IT-approved", raised.exception.message)
+        self.assertEqual(len(runs), 1)
 
     @full_run
     def test_fuzzer_finds_inputs_for_gaps(self):
@@ -2545,6 +2585,68 @@ class SetupTests(unittest.TestCase):
 
 
 class LedgerTests(unittest.TestCase):
+    def test_execution_block_stops_agent_calls_across_files(self):                # REC-9
+        owner = up.RepositoryRun()
+        owner.orchestrator.execution_block["reason"] = "quarantined runner"
+        orch = owner._orchestrator()
+        client = mock.AsyncMock()
+        orch.clients["analyzer"] = client
+        with self.assertRaises(ba.AgentFault) as caught:
+            run(orch.call("analyzer", "plan", uc.PipelineRequest(repo_root=".", sut_file="other.c"), uc.UTPlan))
+        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+        client.call.assert_not_awaited()
+
+    def test_execution_denial_latches_from_error_and_verification(self):          # REC-9
+        blocked = uc.VerificationResult(run_id="blocked", stage="verify", sut_sha256="a" * 64,
+            suite_sha256="b" * 64, decision="environment_error", reason="runner quarantined",
+            failures=[uc.Failure(failure_id="env-blocked", kind="environment",
+                                 classification="environment_defect", route="stop")])
+        responses = [ba.ContractResponse(request_id="r", status="error",
+                         error=ba.ErrorInfo(code="ENVIRONMENT_BLOCKED", message="runner quarantined")),
+                     ba.ContractResponse(request_id="r", status="success", contract="VerificationResult",
+                         data=blocked.model_dump(mode="json"))]
+        with tmpdir() as d:
+            for response in responses:
+                with self.subTest(status=response.status):
+                    orch = up.Orchestrator()
+                    orch.ledger = up.Ledger(Path(d) / "ledger.jsonl")
+                    client = mock.AsyncMock()
+                    client.call.return_value = response
+                    orch.clients["compilation"] = client
+                    req = uc.DiscoverRequest(repo_root=d, sut_file="sample.c")
+                    for _ in range(2):
+                        with self.assertRaises(ba.AgentFault) as caught:
+                            run(orch.call("compilation", "verify", req, uc.VerificationResult))
+                        self.assertEqual(caught.exception.code, "ENVIRONMENT_BLOCKED")
+                    self.assertEqual(client.call.await_count, 1)
+
+    def test_execution_denial_stops_later_folders(self):                          # REC-9
+        with tmpdir() as d:
+            runner = up.RepositoryRun(pipeline_config(Path(d)))
+            async def blocked(req, out):
+                runner.orchestrator.execution_block["reason"] = "runner quarantined"
+                return uc.RepositoryResult(repository=req.repository, reason="ENVIRONMENT_BLOCKED")
+            with mock.patch.object(runner, "_folder", side_effect=blocked) as folder:
+                results = run(runner.run_many([
+                    uc.RepositoryRequest(repository=d, sut_files=["first.c"]),
+                    uc.RepositoryRequest(repository=d, sut_files=["second.c"])], ["one", "two"]))
+            self.assertEqual(folder.await_count, 1)
+            self.assertEqual(len(results), 2)
+            self.assertIn("not run: runner quarantined", results[1].reason)
+
+    def test_startup_denials_are_distinct_from_test_output(self):                 # REC-9
+        with tmpdir() as d:
+            program = Path(d) / "runner"
+            program.touch()
+            for error in ("[WinError 225]", "[WinError 226]", "[WinError 5]", "[Errno 13]"):
+                with self.subTest(error=error):
+                    self.assertTrue(a3.blocked_hint(-126, error, program))
+                    self.assertEqual(a3.blocked_hint(0, error, program), "")
+            self.assertEqual(a3.blocked_hint(-126, "[WinError 206] path too long", program), "")
+            self.assertEqual(a3.blocked_hint(-127, "not found", program), "")
+            program.unlink()
+            self.assertIn("missing runner", a3.blocked_hint(-127, "not found", program))
+
     def test_hash_chain_detects_tampering(self):
         with tmpdir() as d:
             path = Path(d) / "ledger.jsonl"
@@ -2595,6 +2697,29 @@ class PipelineTests(unittest.TestCase):
     def run_pipeline(self, repo: Path, sut: str, **pipeline) -> uc.PipelineResult:
         orchestrator = up.Orchestrator(pipeline_config(self.d, **pipeline))
         return run(orchestrator.run(uc.PipelineRequest(repo_root=str(repo), sut_file=sut)))
+
+    def test_execution_block_preserves_measurement_and_stops_planning(self):      # REC-9
+        repo = copy_pilot("c_pilot", self.d)
+        orch = up.Orchestrator(pipeline_config(self.d))
+        measured = uc.VerificationResult(run_id="earlier", stage="verify", sut_sha256="a" * 64,
+            suite_sha256="b" * 64, build_ok=True, link_ok=True, run_ok=True,
+            total=7, passed=7, decision="gaps_remain",
+            coverage=uc.CoverageReport(toolchain="recorded", definitions="measured",
+                file_metrics=uc.Metrics(LC=uc.MetricValue(covered=9, total=10, percent=90, status="incomplete"))))
+        async def interrupted(s):
+            s.best_result = measured
+            orch.execution_block["reason"] = "[WinError 226] quarantined"
+            # An optional check might swallow the original exception; run_state must still stop.
+            return s.finish("verified_measured", "must not be delivered as success")
+        with mock.patch.object(orch, "_run", interrupted), \
+             mock.patch.object(orch, "_run_start", new=mock.AsyncMock()), \
+             mock.patch.object(orch, "_requirement_status", new=mock.AsyncMock()) as status:
+            result = run(orch.run(uc.PipelineRequest(repo_root=str(repo), sut_file="src/thermostat.c")))
+        self.assertEqual(result.final_state, "incomplete")
+        self.assertIn("ENVIRONMENT_BLOCKED", result.reason)
+        self.assertEqual((result.total_tests, result.passed), (7, 7))
+        self.assertEqual(result.metrics.LC.percent, 90)
+        status.assert_not_awaited()
 
     def test_c_pilot_reaches_full_coverage(self):
         repo = copy_pilot("c_pilot", self.d)
