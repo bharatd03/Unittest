@@ -118,3 +118,60 @@ Validation for REC-9 in the cloud Linux environment:
 - Python compilation and whitespace checks passed. These checks use scripted brains; real Qwen responses and Windows/McAfee acceptance were not tested.
 
 An initial sandboxed attempt stalled even on `asyncio.run(asyncio.to_thread(lambda: 1))`; those processes were terminated. The completed checks above ran with the cloud sandbox restriction lifted. No model endpoint was contacted and no assertion was relaxed to accommodate that environment limitation.
+
+## Generic compiler-feedback recovery (REC-10 through REC-13)
+
+The uploaded `pipeline_findings.jsonl` contains 866 records across seven source files, including repeated rows and multiple target items affected by one failure. It records syntax errors, undeclared names, incompatible pointer types and passing tests that miss their targets. It contains no raw model responses or `MODEL_OUTPUT_INVALID` records, so it cannot establish the underlying cause of the two reported A1.plan events.
+
+Four implementation gaps prevented useful recovery:
+
+- The syntax gate called synchronous compilation directly and then excluded bad tests. It bypassed Agent3's model-assisted repair. The full-build path could also quarantine the failing tests before repair inspected the result.
+- Gate rewrites required whole-test-writing capability, although the minimum Qwen profile supports structured scenarios and bounded generated-file edits. Structured candidates therefore had no same-round recovery path after compiler rejection.
+- Repair context showed the start of a generated suite. An error around line 11,000 could be accompanied by the wrong test body. Planning also selected the first six prior tests, hiding recent attempts in a large suite.
+- The generic resolution helper could treat a security block from a repair's tool validation as an invalid proposal, and could omit the free-edit permission filter when no repair options were offered.
+
+The resulting flow is:
+
+```mermaid
+flowchart TD
+    A[Generated tests] --> B[Compiler syntax gate]
+    B -->|diagnostics| C[Model proposes edits in generated files]
+    C --> D[Preservation guards and compiler recheck]
+    D -->|still failing| E[Scoped structured replanning with diagnostics and failing code]
+    E --> F[Validate scenario and regenerate]
+    F --> G[Compiler recheck]
+    B -->|compiles| H[Execute tests]
+    D -->|compiles| H
+    G -->|compiles| H
+    G -->|bounded recovery exhausted| I[Explicit unresolved compiler feedback]
+    H --> J[Measure coverage and update journal]
+    J --> K[Next plan receives recent attempts and measured misses]
+```
+
+Repair proposals are produced by the configured model. No source-name substitutions, type-name dictionaries or pilot-specific branches were added. The compiler uses the captured build flags. File edits retain assertions, observations, test names, registration and older test bodies. Structured recovery uses Agent1's existing evidence, value and scenario validation. A successful same-identity replacement supersedes the original scenario's bookkeeping; its corrected scenario is counted only after execution. A missing compiler result does not establish successful repair. Attempt and rewrite limits remain bounded.
+
+Error-local test bodies and line windows are prioritized in repair prompts. The rest of the generated files remains budgeted context. Planner feedback now prefers failures and recent attempts, includes their actual setup/call sequence, and distinguishes an empty measured coverage set from unavailable measurement. Coverage targets still close only from measured evidence. This improves stateful recovery context; it does not implement a symbolic or concolic execution engine.
+
+A `false_refusal` finding is historical evidence that a compiler/execution trial accepted a candidate despite a predictive check. Those records remain traceable; they are not automatically unresolved failures.
+
+New C and C++ construct fixtures and recovery regressions reconstruct error forms from the findings with different identifiers. They exercise malformed expressions, array-pointer shape errors, undeclared names, qualified types, errors beyond line 11,000, failed/inaccessible repair checks, existing-test preservation and native security blocks. Compiler-backed tests execute repaired candidates and verify their measured target items. Model replies in regression tests are controlled; these checks do not establish live Qwen acceptance rates or universal coverage within three iterations.
+
+For a small live-model run from `Source/UnitTestGenerator` on Windows, with the existing remote-Qwen configuration and an approved native execution environment:
+
+```powershell
+.\unittest_generator.bat run ..\..\Test\constructs\c_diagnostic_feedback src\packet.c --view --no-cache
+.\unittest_generator.bat run ..\..\Test\constructs\cpp_diagnostic_feedback src\decode.cpp --view --no-cache
+```
+
+These run the ordinary pipeline with the configured model; they do not inject the deliberately bad responses used in regression tests. Then rerun `pilot-medium --view --no-cache` to assess the original plateau. Compare accepted/refused planning, compiler recovery, passing tests and all five measured metrics. Keep the per-run `brain_answers.jsonl`, `ledger.jsonl`, `report.md` and `result.json`; the cumulative findings file alone cannot reconstruct iteration order. The remote API key remains on the user's machine and is not needed in shared artifacts.
+
+Validation for REC-10 through REC-13 (cloud Linux):
+
+- Component selection: 348 tests, 308 passed and 40 deferred whole-pipeline checks, zero failures/errors.
+- Full release selection: 393 invocations, all passed, zero failures/errors/skips. The existing parallel helper splits the construct corpus into individual cases without changing their assertions. This selection contains 46 full construct cases and was captured before four additional focused methods and the C++ fixture were added.
+- Additional C++ construct full run: passed, `verified_measured`; together the full runs cover all 47 construct cases. Its structured answers are also exercised by the corpus validation.
+- Final focused recovery run: 11 passed, zero failures/errors/skips. The four methods added after the full selection cover native security blocks during both repair modes, free-edit profile permissions without offered options, and C++ namespace repair. The focused run also verifies that the actual packed planner prompt contains the compiler feedback, and tests three C failure forms with unchanged older tests and measured target execution.
+- BaseAgent: 227 tests, 212 passed, 15 existing optional live-model/browser skips. The four resolution tests were rerun successfully after the profile-filter change.
+- Python compilation and whitespace checks passed. No existing failing assertion was relaxed and no new test was skipped to make the change pass.
+
+These results validate recovery wiring with controlled model replies and actual native compilation/execution. They do not validate the user's live Qwen endpoint, Windows antivirus acceptance, or every historical finding in the uploaded file. Those require a fresh live run and its per-run logs.

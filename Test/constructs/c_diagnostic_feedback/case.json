@@ -1,0 +1,35 @@
+{
+  "construct": "C compiler-diagnostic feedback: array storage passed to a const element pointer",
+  "sut": "src/packet.c",
+  "language": "c",
+  "expect": {
+    "final_state": "any",
+    "statuses": {}
+  },
+  "answers": {
+    "structured": [
+      {
+        "function": "packet_probe",
+        "answer": {
+          "args": [
+            {
+              "name": "payload",
+              "elements": [
+                "19",
+                "0",
+                "0"
+              ]
+            },
+            {
+              "name": "length",
+              "value": "3"
+            }
+          ]
+        },
+        "reaches": [
+          "return 7;"
+        ]
+      }
+    ]
+  }
+}

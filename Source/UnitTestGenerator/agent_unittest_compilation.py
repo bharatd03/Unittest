@@ -2791,8 +2791,18 @@ class CompilationAgent(ba.AgentCore):
 
         def run(stage):
             async def work(payload: uc.VerifyRequest, request, scratch):
-                result = await asyncio.to_thread(self.execute, payload)
+                result = await asyncio.to_thread(self.execute, payload, quarantine=False)   # REC-10
                 result = await self._repair_generated(result, payload)                      # A3-CL14
+                if not result.link_ok and result.decision != "environment_error" and \
+                        payload.stage in ("verify", "observe"):
+                    repaired = dict(result.repaired_files)
+                    bundle = payload.bundle
+                    if bundle is not None and repaired:
+                        bundle = bundle.model_copy(update={"actions": [
+                            a.model_copy(update={"content": repaired[a.path]}) if a.path in repaired else a
+                            for a in bundle.actions]})
+                    result = await asyncio.to_thread(self.execute, payload.model_copy(update={"bundle": bundle}))
+                    result.repaired_files.update(repaired)
                 result = await self._classify_outcomes(result, payload)                     # NC-12
                 return await self._refine(result, payload)
             return work
@@ -2801,7 +2811,8 @@ class CompilationAgent(ba.AgentCore):
             return await asyncio.to_thread(self.capture, payload)
 
         async def gate(payload: uc.VerifyRequest, request, scratch):                          # A3-CL15
-            return await asyncio.to_thread(self.execute, payload)
+            result = await asyncio.to_thread(self.execute, payload)
+            return await self._repair_generated(result, payload)                             # REC-10
 
         def flags_pre(payload: uc.FlagRequest, request):
             uc.check_signature(payload.layout, request)
@@ -3145,7 +3156,7 @@ class CompilationAgent(ba.AgentCore):
         return build
 
     # ---------------------------------------------------------------- the main pipeline step
-    def execute(self, req: uc.VerifyRequest) -> uc.VerificationResult:
+    def execute(self, req: uc.VerifyRequest, *, quarantine: bool = True) -> uc.VerificationResult:
         layout = req.layout
         run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         run_dir = Path(self.cfg.work_dir) / run_id
@@ -3173,7 +3184,7 @@ class CompilationAgent(ba.AgentCore):
                     compiler=chain.cc if layout.language == "c" else chain.cxx, compiler_version=chain.version)
         build = self._build(layout, req, repo, run_dir, chain)
         quarantined: list[uc.Failure] = []
-        if not build["linked"] and req.stage in ("verify", "observe") and not req.source_overrides:
+        if quarantine and not build["linked"] and req.stage in ("verify", "observe") and not req.source_overrides:
             build, quarantined = self._quarantine(layout, req, repo, run_dir, chain, build)
             if quarantined:
                 base.update(suite_sha256=uc.files_signature(repo, suite_files))
@@ -3850,6 +3861,7 @@ class CompilationAgent(ba.AgentCore):
         diagnostics: list[uc.Diagnostic] = []
         per_test: dict[str, uc.Failure] = {}
         outside: list[str] = []
+        outside_failures: list[uc.Failure] = []                           # REC-11: shared errors are not gate success
         for a in suites:
             src = repo / a.path
             if not src.is_file():
@@ -3873,6 +3885,7 @@ class CompilationAgent(ba.AgentCore):
                 where = self._tests_of(f, texts, layout)
                 if not where:
                     outside.append(f"{Path(d.file).name}:{d.line}: {d.message}"[:300])
+                    outside_failures.append(f)
                 for path, name in where:
                     if name not in per_test:
                         per_test[name] = f.model_copy(update={
@@ -3882,7 +3895,7 @@ class CompilationAgent(ba.AgentCore):
         reason = (f"{len(per_test)} test(s) with compile errors" if per_test else "no compile error in the tests") + \
             (f"; {len(outside)} error(s) outside every test: " + " | ".join(outside[:3]) if outside else "")
         return uc.VerificationResult(**base, build_ok=not diagnostics, diagnostics=diagnostics[:200],
-                                     quarantined=list(per_test.values()),
+                                     quarantined=list(per_test.values()), failures=outside_failures,
                                      decision="complete" if not diagnostics else "failures", reason=reason[:1000])
 
     @staticmethod
@@ -4338,7 +4351,7 @@ class CompilationAgent(ba.AgentCore):
     def _repairable(self, result: uc.VerificationResult, req: uc.VerifyRequest) -> list[uc.Diagnostic]:
         """The build errors a repair of the generated files may fix: none in the SUT itself (that is the host
         adaptation of A3-BD16 or a source defect), none that only a second SUT object explains (A3-CL13)."""
-        if result.link_ok or not req.bundle or req.source_overrides or req.stage not in ("build_check", "verify", "observe"):
+        if result.link_ok or not req.bundle or req.source_overrides or req.stage not in ("gate", "build_check", "verify", "observe"):
             return []
         if any("[A3-CL13]" in e for f in result.failures for e in f.evidence):
             return []
@@ -4349,7 +4362,8 @@ class CompilationAgent(ba.AgentCore):
 
     @staticmethod
     def _apply_edits(bundle: uc.FileActionBundle, repair: BuildRepair, facts: "uc.PlatformFacts | None" = None,
-                     layout: uc.LayoutProfile | None = None) -> tuple[uc.FileActionBundle | None, str]:
+                     layout: uc.LayoutProfile | None = None,
+                     protected_tests: set[str] | None = None) -> tuple[uc.FileActionBundle | None, str]:
         """The bundle with the brain's edits, or the reason they are refused: only generated files, a fragment
         that occurs once, and no change to what a test asserts, observes or is called [A3-CL14, A3-85a]."""
         actions = {a.path: a for a in bundle.actions}
@@ -4371,6 +4385,13 @@ class CompilationAgent(ba.AgentCore):
                                 sorted(uc.test_sources(t)))
             if checks(text) != checks(before):
                 return None, f"{path}: a UT_EXPECT / UT_OBSERVE line or a test name would change [A3-CL14]"
+            if protected_tests is not None:                                   # REC-10: never edit an older test
+                original, candidate = uc.test_sources(before), uc.test_sources(text)
+                if any(candidate.get(n) != body for n, body in original.items() if n in protected_tests):
+                    return None, f"{path}: an existing test body would change [REC-10]"
+            registrations = lambda t: re.findall(r"\bUT_CASE\s*\([^)]*\)", t)
+            if registrations(before) != registrations(text):
+                return None, f"{path}: test registration would change [REC-10]"
         if not changed:
             return None, "no edit"
         if layout is not None:                                                                # A3-CL14b
@@ -4402,11 +4423,30 @@ class CompilationAgent(ba.AgentCore):
         for action in req.bundle.actions:
             text = action.content
             if action.role == "testsuite":                 # its includes and declarations, then a few tests
+                # REC-10: line 11,000 is not explained by the first tests of the file. Keep the failing bodies
+                # verbatim so exact-fragment edits are possible, even in a very large suite.
+                errors = [d for d in result.diagnostics if d.severity in ("error", "fatal", "fatal error") and
+                          self._action_of(req.bundle, d.file) is action]
+                lines = text.splitlines(keepends=True)
+                bodies = uc.test_sources(text)
+                focused: dict[str, str] = {}
+                for d in errors:
+                    offset = sum(map(len, lines[:max(0, d.line - 1)]))
+                    name = next((n for n, body in bodies.items() if
+                                 (start := text.find(body)) >= 0 and start <= offset < start + len(body)), "")
+                    if name and len(bodies[name]) <= 4000:
+                        focused[name] = bodies[name]
+                    elif d.line:
+                        focused[f"lines near {d.line}"] = "".join(lines[max(0, d.line - 9):d.line + 8])
+                for name, body in list(focused.items())[:4]:
+                    parts.append(uc.part(f"FAILING TEST {action.path}: {name}", body[:4000],
+                                         priority=uc.P_FACTS, min_chars=min(len(body), 800)))
                 first = re.search(r"^(?:/\*\s*evidence:.*\n)?UT_TEST\(", text, re.M)
                 head = text[: first.start()] if first else text
-                text = head + "\n/* ... tests ... */\n" + text[first.start(): first.start() + 1500] if first else head
+                text = head if focused else (head + "\n/* ... tests ... */\n" +
+                                             text[first.start(): first.start() + 1500] if first else head)
             parts.append(uc.part(f"GENERATED FILE {action.path}", text[:12_000],
-                                 priority=uc.P_FACTS if action.role != "testsuite" else uc.P_EVIDENCE))
+                                 priority=uc.P_EVIDENCE))                    # REC-10: preserve error-local facts first
         return parts
 
     # ---------------------------------------------------------------- A3-CL14a: facts and rule-built repairs
@@ -4589,6 +4629,8 @@ class CompilationAgent(ba.AgentCore):
         uc.resolution_project(self, req.layout)
         bundle, current = req.bundle, result
         for _ in range(max(1, self.cfg.repair_rounds)):
+            if not errors:
+                break
             first = errors[0]
             failure = ba.RuleFailure(
                 rule="A3-CL14 generated files", failure="the test program does not build: the errors are in files the "
@@ -4597,24 +4639,30 @@ class CompilationAgent(ba.AgentCore):
             trial: dict[str, Any] = {}
 
             async def build_with(repair: BuildRepair) -> str:
-                candidate, problem = self._apply_edits(bundle, repair, self.toolchain().facts, req.layout)
+                protected = set(bundle.tests) - set(bundle.new_tests) if req.stage == "gate" else None
+                candidate, problem = self._apply_edits(bundle, repair, self.toolchain().facts, req.layout, protected)
                 if candidate is None:
                     return problem
-                attempt = await asyncio.to_thread(self.execute, req.model_copy(update={"bundle": candidate}))
+                attempt = await asyncio.to_thread(self.execute, req.model_copy(update={"bundle": candidate}),
+                                                  quarantine=False)                         # REC-10
                 left = [d for d in attempt.diagnostics if d.severity in ("error", "fatal")]
-                if attempt.link_ok or len(left) < len(errors):
+                if attempt.decision == "environment_error":
+                    if any(f.failure_id == "env-blocked" for f in attempt.failures):
+                        raise ba.AgentFault("ENVIRONMENT_BLOCKED", attempt.reason)    # REC-13
+                    return "execution environment unavailable: " + attempt.reason
+                if attempt.link_ok or (req.stage == "gate" and attempt.build_ok) or len(left) < len(errors):
                     trial.update(bundle=candidate, result=attempt, errors=left)
                     return ""
                 return "with these edits the build still fails:\n" + "\n".join(
                     f"{Path(d.file).name}:{d.line}: {d.message}" for d in left[:8])
 
             now = req.model_copy(update={"bundle": bundle})
-            offered = self._repair_options(now, errors)                                     # A3-CL14b
+            offered = self._repair_options(now, errors) if req.stage != "gate" else {}        # REC-10: compiler-led
 
             async def apply_option(key: str) -> str:
                 return await build_with(offered[key][1])
             # BP-10: after the offered repairs, a free edit only from a brain whose profile allows file_edit
-            free = await uc.brains_for(self, "file_edit", "A3.repair") if offered else None
+            free = await uc.brains_for(self, "file_edit", "A3.repair")
             answer = await self.resolve(failure, task=REPAIR_TASK, context=self._context_of_repair(now, current),
                                         output_model=BuildRepair, verify=build_with, step="A3.repair",
                                         attempts=self.cfg.rule_attempts, project=req.layout.repo_root,
@@ -4624,7 +4672,7 @@ class CompilationAgent(ba.AgentCore):
             if answer is None or "result" not in trial:
                 break
             bundle, current, errors = trial["bundle"], trial["result"], trial["errors"]
-            if current.link_ok:
+            if current.link_ok or (req.stage == "gate" and current.build_ok):
                 break
         if current is result:
             return result

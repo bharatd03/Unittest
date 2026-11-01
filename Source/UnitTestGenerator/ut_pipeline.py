@@ -867,6 +867,7 @@ class Orchestrator:
                             for g in sc.gap_ids:
                                 s.item_brains.setdefault(g, set()).add(sc.made_by.split(":", 1)[1].split("/")[0])
                     bundle = await self._generate(s, plan, journal=journal)
+                    attempted = [] if plan.rules_only else Journal.attempts_of(plan, iteration)  # REC-11: include repairs
                     generated_suite = uc.suite_of(bundle)                     # before tests are left out [LA-2]
                     s.made.update(bundle.made)                                                    # BP-7
                     for item, kind in bundle.needs_kind.items():                                 # BP-9
@@ -2201,85 +2202,123 @@ class Orchestrator:
 
     async def _compile_gate(self, s: "RunState", plan: uc.UTPlan, bundle: uc.FileActionBundle,
                             journal: dict[str, str], guidance: uc.KBGuidance) -> uc.FileActionBundle:
-        """A3-CL15: the round's new tests are checked with the compiler's syntax check before any build. A test the
-        brain planned or wrote that has an error goes back to Agent2 in the same round with the compiler's message and
-        its scenario (A2-21p, LA-4); what still does not compile - and a rule-based test with an error - is left out
-        with its message for the journal (LA-3) and the knowledge base. An error outside every test is left to the
-        build (A3-CL12)."""
+        """REC-10, REC-11: compiler repair first; bounded scenario recovery before exclusion."""
         new = set(bundle.new_tests)
         cfg = getattr(self, "cfg", None)
-        if not getattr(cfg, "compile_gate", True) or not new or getattr(plan, "stage", "") != "coverage":
+        if not getattr(cfg, "compile_gate", True) or not new or plan.stage != "coverage":
             return bundle
 
-        async def check(b: uc.FileActionBundle) -> dict[str, str]:
+        async def check(candidate: uc.FileActionBundle) -> dict[str, str] | None:
             try:
-                res = await self.call("compilation", "gate", uc.VerifyRequest(
-                    layout=self.layout, stage="gate", bundle=b), uc.VerificationResult)
-            except Exception as exc:                 # the gate is a shortcut, never a judge: the build decides
+                result = await self.call("compilation", "gate", uc.VerifyRequest(
+                    layout=self.layout, stage="gate", bundle=candidate), uc.VerificationResult)
+            except Exception as exc:
+                if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
                 LOG.warning("compile gate unavailable: %s", exc)
-                return {}
-            if res.decision == "environment_error":
-                return {}
-            return {f.affected_test: f.diagnostic for f in res.quarantined if f.affected_test}
+                return None
+            if result.decision == "environment_error":
+                return None
+            fixed = self._take_repairs(s, candidate, result)
+            candidate.actions = fixed.actions                       # use exactly what the compiler checked
+            if result.failures or (not result.build_ok and not result.quarantined):
+                return None                                         # shared/setup failure: the full build decides
+            return {f.affected_test: f.diagnostic for f in result.quarantined if f.affected_test}
 
-        failing = {n: d for n, d in (await check(bundle)).items() if n in new}
+        checked = await check(bundle)
+        if checked is None:
+            return bundle                                           # the full build still decides
+        failing = {n: d for n, d in checked.items() if n in new}
         if not failing:
             return bundle
         sources = uc.test_sources(uc.suite_of(bundle))
-        ids = {n: set(SCENARIO_ID.findall(sources.get(n, ""))) for n in failing}
-        # only a brain that writes whole tests rewrites one (BP-2); for the others the message goes to the journal
-        # and the next plan changes the scenario [structured]
-        writes = "test" in (getattr(s, "kinds_available", None) or uc.MINIMUM_KINDS)
-        redo = [sc for sc in plan.scenarios if not sc.inputs and any(sc.scenario_id in i for i in ids.values())
-                and (sc.made_by.startswith("brain:") or not sc.checked)] \
-            if not plan.rules_only and writes and getattr(cfg, "gate_rewrites", 1) > 0 else []
         note = (f"{len(failing)} new test(s) did not compile in the gate [A3-CL15]: "
                 + "; ".join(d[:160] for d in list(failing.values())[:4]))[:1200]
         base = uc.without_tests(bundle, sorted(failing), note)
-        rewritten: dict[str, str] = {}
-        if redo:
-            again_journal = dict(journal)
+        pending = dict(failing)
+        rewritten: set[str] = set()
+        writes = "test" in (getattr(s, "kinds_available", None) or uc.MINIMUM_KINDS)
+        for round_number in range(getattr(cfg, "gate_rewrites", 1) if not plan.rules_only else 0):
+            ids = {n: set(SCENARIO_ID.findall(sources.get(n, ""))) for n in pending}
+            redo = [sc for sc in plan.scenarios if not sc.inputs and
+                    any(sc.scenario_id in i for i in ids.values()) and
+                    (sc.made_by.startswith("brain:") or not sc.checked)]
+            if not redo:
+                break
+            feedback = dict(journal)
             for sc in redo:
                 names = [n for n, i in ids.items() if sc.scenario_id in i]
-                lesson = "\n".join(f"- COMPILE GATE (this round): {n}, written from scenario {sc.scenario_id}, does "
-                                   f"not compile - {failing[n][:400]}\n{sources.get(n, '')[:900]}" for n in names[:2])
+                lesson = "\n".join(f"COMPILE GATE: {n}, scenario {sc.scenario_id}: {pending[n]}\n"
+                                   + sources.get(n, "")[:4000] for n in names[:3])
                 for key in {sc.function, sc.function.split("::")[-1]}:
-                    again_journal[key] = (again_journal.get(key, "") + "\n" + lesson).strip()
-            replan = plan.model_copy(update={
-                "scenarios": [sc.model_copy(update={"kind": "test", "trial": []}) for sc in redo],
-                "repairs": [], "drop_tests": []})
-            self._stage(f"{len(failing)} new test(s) did not compile; the brain writes {len(redo)} of them again "
-                        "with the compiler's message [A3-CL15]")
+                    feedback[key] = lesson + "\n" + feedback.get(key, "")   # current error first [REC-12]
+            self._stage(f"compile gate: repairing {len(pending)} test(s) from compiler feedback [REC-11]")
             try:
+                if writes:
+                    replan = plan.model_copy(update={"scenarios": [sc.model_copy(update={"kind": "test", "trial": []})
+                                                                 for sc in redo], "repairs": [], "drop_tests": []})
+                else:
+                    # Structured models repair inputs/setup with Agent1's usual evidence and shape validation.
+                    # No whole-test-writing capability is required, and no SUT-specific syntax rewrite is added.
+                    scoped = []
+                    for sc in redo:
+                        names = [n for n, i in ids.items() if sc.scenario_id in i]
+                        scoped.append(sc.model_copy(update={"test_name": names[0] if len(names) == 1 else sc.test_name}))
+                    recovered = await self.call("analyzer", "plan", uc.PlanRequest(
+                        layout=self.layout, last=s.last, iteration=plan.iteration,
+                        execution_context=uc.execution_context(self.layout, base),
+                        existing_suite=uc.suite_of(bundle), retry_scenarios=scoped,
+                        failed_tests=pending, journal=feedback, test_items=s.test_items,
+                        tried_scenarios=sorted(s.tried_scenarios), item_kinds=dict(s.item_kinds),
+                        iterations_left=max(0, s.iter_limit - plan.iteration)), uc.UTPlan)
+                    if not recovered.scenarios:
+                        break
+                    plan.scenarios.extend(recovered.scenarios)
+                    s.brain_scenarios.update({sc.scenario_id: sc for sc in recovered.scenarios})
+                    replan = plan.model_copy(update={"scenarios": recovered.scenarios, "repairs": [], "drop_tests": []})
                 again = await self.call("generator", "generate", uc.GenerationRequest(
-                    plan=replan, guidance=guidance, existing_suite=uc.suite_of(base), journal=again_journal,
+                    plan=replan, guidance=guidance, existing_suite=uc.suite_of(base), journal=feedback,
                     item_kinds=dict(getattr(s, "item_kinds", {}) or {})), uc.FileActionBundle)
                 self.check_bundle(again)
-            except Exception as exc:                                 # the tests left out stay left out
-                LOG.warning("gate rewrite failed: %s", exc)
-                again = None
-            if again is not None:
+                old_tests, new_tests = uc.test_sources(uc.suite_of(base)), uc.test_sources(uc.suite_of(again))
+                if any(new_tests.get(n) != source for n, source in old_tests.items()):
+                    s.notes.append("compiler-feedback candidate changed an existing test; repair remains open [REC-10]")
+                    break
                 fresh = [n for n in again.new_tests if n not in set(base.tests)]
-                still = {n: d for n, d in (await check(again)).items() if n in set(fresh)}
-                if still:
-                    again = uc.without_tests(again, sorted(still), f"{len(still)} rewritten test(s) still did not "
-                                             "compile and were left out [A3-CL15]")
-                    failing.update(still)
-                again = again.model_copy(update={
-                    "new_tests": list(dict.fromkeys(base.new_tests + [n for n in fresh if n not in still])),
-                    "trial": {**base.trial, **again.trial},
-                    "trial_targets": {**base.trial_targets, **again.trial_targets},
-                    "made": {**base.made, **again.made}, "recipes": {**base.recipes, **again.recipes},
-                    "needs_kind": {**base.needs_kind, **again.needs_kind},
-                    "crashed_calls": list(dict.fromkeys(base.crashed_calls + again.crashed_calls)),
-                    "expectation_changes": base.expectation_changes + again.expectation_changes,
-                    "notes": list(dict.fromkeys(base.notes + again.notes))})
-                rewritten = {n: "" for n in fresh if n not in still}
-                if isinstance(getattr(s, "written", None), set):
-                    s.written |= {n for n in rewritten if n in again.made}
-                base = again
+                checked = await check(again)
+            except Exception as exc:
+                if isinstance(exc, ba.AgentFault) and exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
+                LOG.warning("compiler-feedback recovery failed: %s", exc)
+                s.notes.append(f"compiler-feedback recovery unavailable: {exc}"[:500])
+                break
+            if checked is None:
+                s.notes.append("compiler-feedback candidate has no successful gate measurement; repair remains open")
+                break
+            sources.update(uc.test_sources(uc.suite_of(again)))
+            still = {n: d for n, d in checked.items() if n in set(fresh)}
+            if still:
+                again = uc.without_tests(again, sorted(still), "compiler-feedback candidate still does not compile [REC-11]")
+                failing.update(still)
+            if not writes:
+                superseded = {sid for n in fresh if n not in still for sid in ids.get(n, set())}
+                plan.scenarios = [sc for sc in plan.scenarios if sc.scenario_id not in superseded]
+            again = again.model_copy(update={
+                "new_tests": list(dict.fromkeys(base.new_tests + [n for n in fresh if n not in still])),
+                "trial": {**base.trial, **again.trial}, "trial_targets": {**base.trial_targets, **again.trial_targets},
+                "made": {**base.made, **again.made}, "recipes": {**base.recipes, **again.recipes},
+                "needs_kind": {**base.needs_kind, **again.needs_kind},
+                "crashed_calls": list(dict.fromkeys(base.crashed_calls + again.crashed_calls)),
+                "expectation_changes": base.expectation_changes + again.expectation_changes,
+                "notes": list(dict.fromkeys(base.notes + again.notes))})
+            rewritten.update(n for n in fresh if n not in still)
+            if isinstance(getattr(s, "written", None), set):
+                s.written |= {n for n in rewritten if n in again.made}
+            base, pending = again, still
+            if not pending:
+                break
         gone = [n for n in failing if n not in base.tests]
-        for n in gone:                                     # the journal's facts [LA-3, LA-4] and the rates [ORC-12b]
+        for n in gone:
             s.quarantine[n] = (failing[n], sources.get(n, ""))
             s.open_items.add(f"{n}: left out by the compile gate: {failing[n][:300]} [A3-CL12, A3-CL15]")
             if isinstance(getattr(s, "lost", None), dict):
@@ -2290,8 +2329,8 @@ class Orchestrator:
                     kind="negative", language=self.layout.language, framework=self.layout.framework,
                     category="test_generation_defect", snippet=sources.get(n, failing[n])[:4000],
                     reason=failing[n][:1000]), uc.LearnAck)
-        s.notes.append(note + (f"; {len(rewritten)} written again by the brain and compiled" if rewritten else ""))
-        self._stage(f"compile gate: {len(gone)} new test(s) left out, {len(rewritten)} written again [A3-CL15]")
+        s.notes.append(note + (f"; {len(rewritten)} recovered and compiled" if rewritten else ""))
+        self._stage(f"compile gate: {len(gone)} left open, {len(rewritten)} recovered [REC-11]")
         return base
 
     def _count_attempts(self, s: "RunState", plan: uc.UTPlan, attempted: list[uc.Scenario], suite: str,

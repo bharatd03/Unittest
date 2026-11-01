@@ -4769,6 +4769,8 @@ class AgentCore:
                 if inspect.isawaitable(verdict):
                     verdict = await verdict
             except AgentFault as exc:
+                if exc.code == "ENVIRONMENT_BLOCKED":
+                    raise                 # a tool security block cannot be repaired by another model answer
                 verdict = exc.message
             return str(verdict or "")
 
@@ -4778,6 +4780,8 @@ class AgentCore:
                 if inspect.isawaitable(verdict):
                     verdict = await verdict
             except AgentFault as exc:
+                if exc.code == "ENVIRONMENT_BLOCKED":
+                    raise
                 verdict = exc.message
             return str(verdict or "")
 
@@ -4860,12 +4864,12 @@ class AgentCore:
                     return done(ChosenOption(option=option))
                 record.attempts.append(f"option {option}: {verdict}"[:600])
                 messages.append(f"the offered repair {option} ({options[option][:160]}) was tried: {verdict}")
-            if free_brains is not None:
-                allowed = [b for b in free_brains if allowed is None or b in allowed]
-                if not allowed:
-                    failed_models |= used_models
-                    record.outcome = "rejected"
-                    return done(None)
+        if free_brains is not None:
+            allowed = [b for b in free_brains if allowed is None or b in allowed]
+            if not allowed:
+                failed_models |= used_models
+                record.outcome = "rejected" if options else "needs_brain"
+                return done(None)
         if self.resolutions is not None:
             examples = [x[:800] for x in self.resolutions.recent(self.name, failure.rule, 2)]
             if examples:                                                                  # ARCH-23 as examples
