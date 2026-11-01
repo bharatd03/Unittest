@@ -1,5 +1,70 @@
 # Recovery fixes: validation record
 
+## Evidence, control-flow proofs and search recovery (2026-11-01)
+
+Based on main `132bf76` (the merged compiler-feedback recovery). The changes implement REC-14 through REC-18.
+They use compiler facts, explicit evidence provenance, measured counterexamples and bounded model planning;
+there are no pilot-specific source rewrites or operator substitutions.
+
+- Missing evidence metadata remains unknown. Explicit E8 characterization remains distinguishable from missing
+  provenance. Evidence references survive generation and retained-test merging; removed tests lose their metadata.
+- A source-defect model hypothesis, including a cached one, must pass all six independent A3-170 checks before
+  promotion. Each check records passed, failed or unknown and its basis. The generic implementation cannot
+  independently establish arbitrary semantic input preconditions or framework correctness and leaves those checks
+  unknown. Therefore high model confidence alone does not trigger automatic source correction. The positive
+  correction/review delivery fixtures explicitly inject independent fixture receipts; they do not demonstrate a
+  general semantic validator. Negative regressions test the real conservative defaults and every missing gate.
+- An undetermined failure keeps its input and assertion. It cannot be rewritten as an observation just because
+  Agent4 supplied no correction. A later unresolved failure also prevents an earlier passing suite from hiding it.
+  The last passing suite remains deliverable; the unresolved suite and fixtures are retained separately in
+  `unresolved_generated/`, with validation checks in `result.json` and `report.md`.
+- Reachability guards come from compiler AST regions, bound to the source and build context. Else-if chains,
+  switch fallthrough, unsupported control transfers, conversions and unknown types are handled conservatively.
+  Mathematical domains do not assume an ABI width or plain-char signedness. Observed execution refutes previous
+  certificates and their inherited line proofs, reopens journal entries and clears stale advice. A macro-expanded
+  condition without a trustworthy source region does not propagate a block-level proof.
+- Supported infeasibility, including MC/DC independence limitations, becomes a behavioral review hypothesis
+  associated with E2-E6 evidence. Nearby implementation comments can enter model behavior planning as lower
+  authority hypotheses. Proofs establish no operator correction, and functions with proof-only diagnoses are not
+  sent for coverage-driven production patch advice. Measured coverage denominators stay unchanged.
+- Requirement linking visits all indexed requirements and functions in bounded pages. The agent retains canonical
+  indexed text, so linking does not require the model to reproduce it exactly. Normative expectations still require
+  valid evidence quotes. Planning and reporting track individual evidence obligations; one passing test no longer
+  discharges every requirement of a function. Unlinked requirements remain visible. Requirement completion is
+  reported separately from the structural coverage verdict, especially for project-wide documents in per-file runs.
+- Search uses fair, budgeted batches, without the 60-function or failing-assertion skip. A search-only copy isolates
+  failing tests while the main suite retains them. Native JSON receipts distinguish actual executions from unknown
+  counts. Start/end events, replay counts, useful inputs and outcomes are logged and emitted to the live viewer.
+  One-second native allocations actually start the driver. C++ instance-method search uses existing constructor
+  recipes, and C support units no longer inherit the SUT's C++ language standard. Security blocks propagate fatally
+  through support builds, native search and replay measurement. Earlier cache contracts are invalidated.
+
+Validation uses scripted model responses and real Linux compilers, LLVM coverage, native search/replay and local
+Git repositories. It does not contact the user's remote Qwen or run Windows/McAfee. The full release run passed
+414 checks with zero failures, errors or skips. Two subsequently added focused
+methods (bounded behavior feedback and exact closing-brace region bounds) also passed individually with zero skips.
+All 15 focused evidence/proof/search regressions passed together. After the final runtime/source-compilation
+category guard was added, those 15 checks and all 28 compilation checks passed again. Structured answers for all three new constructs
+compiled and ran successfully; the updated control-flow and requirement cases were also rerun through the whole pipeline.
+The final component run passed 367 checks: 327 executed successfully and the usual 40 full-pipeline methods
+were excluded by quick mode; those methods ran in the full selection. Passing the corpus means each case meets its explicit expectations, including
+honest incomplete outcomes; it does not imply universal 100% coverage or three-round convergence.
+
+The new construct cases are `c_control_proof`, `c_requirement_obligations`, and `cpp_search_support`. The focused
+`EvidenceProofRecoveryTests` checks provenance, cached confidence, all six source gates, assertion retention,
+AST control regions, proof refutation, per-obligation assertions, all 76 requirements, 70-function search,
+structured counters, security propagation, comment hypotheses and native C++ instance-method search.
+
+The full selection was invoked with its corpus method split into one independent invocation per case (four worker
+processes), preserving the existing assertions. It includes all 50 construct cases, the C/C++/dependency pilots,
+source-fix validation and local Git review delivery. Positive source-fix fixtures supply explicit validator receipts;
+unknown-receipt tests retain the original failing assertion. The earlier observation-rewrite expectation and
+proof-driven operator/removal advice tests were changed to assert the new fail-closed contract. No tests are hidden
+behind new skip conditions and no coverage denominator or target was reduced.
+
+## Earlier recovery validation (2026-10-31)
+
+
 Validated on Linux on 2026-10-31. The implementation commits are `5bf330a` and `cfec7a3`, based on incoming main
 `6c45292`. The latest component and release checks pass. No live remote model was contacted. The tests use scripted brains; the remote thinking-off request
 was checked using a mocked transport.
